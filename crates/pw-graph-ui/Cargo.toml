@@ -6,7 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-egui.workspace = true
 pw-graph-core = { path = "../pw-graph-core" }
 pw-graph-i18n = { path = "../pw-graph-i18n" }
 pw-graph-utils = { path = "../pw-graph-utils" }

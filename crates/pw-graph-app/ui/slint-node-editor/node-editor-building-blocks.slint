@@ -1,0 +1,875 @@
+// Node Editor Building Blocks
+//
+// This file contains the foundational components for building node editors:
+// - PinTypes: Standard pin type constants
+// - NodeLayout: Layout constants and helper functions
+// - Minimap: Bird's-eye view component
+// - Link: Bezier link rendering component
+// - BaseNode: Base component for creating custom nodes
+// - Pin: Connection point component
+
+/// Standard pin types for library components.
+/// Applications can extend these by defining their own globals.
+export global PinTypes {
+    /// Input pin type (standard for data/signal inputs)
+    out property <int> input: 1;
+    /// Output pin type (standard for data/signal outputs)
+    out property <int> output: 2;
+}
+
+/// Viewport state shared from NodeEditor to all child components.
+/// This allows nodes and pins to access zoom/pan without requiring
+/// these properties to be passed explicitly by examples.
+export global ViewportState {
+    /// Current zoom level (updated by NodeEditor)
+    in-out property <float> zoom: 1.0;
+    /// Current pan X offset (updated by NodeEditor)
+    in-out property <length> pan-x: 0px;
+    /// Current pan Y offset (updated by NodeEditor)
+    in-out property <length> pan-y: 0px;
+}
+
+/// Drag state shared from NodeEditor to all child nodes.
+/// This allows BaseNode to compute drag offsets internally without
+/// requiring examples to pass drag state to each node.
+export global DragState {
+    /// Whether any node is currently being dragged
+    in-out property <bool> is-dragging: false;
+    /// ID of the node currently being dragged (0 if none)
+    in-out property <int> dragged-node-id: 0;
+    /// X offset of the drag operation
+    in-out property <length> drag-offset-x: 0px;
+    /// Y offset of the drag operation
+    in-out property <length> drag-offset-y: 0px;
+}
+
+/// Geometry version counter for link path invalidation.
+/// BaseNode/Pin increment this automatically when geometry changes.
+/// NodeEditor binds to it for live link updates.
+export global GeometryVersion {
+    /// Counter incremented on every geometry change
+    in-out property <int> version: 0;
+}
+
+/// Link creation lifecycle states.
+export enum LinkCreationState { idle, started, updating, complete }
+
+/// Link creation state - updated by Pin, consumed by NodeEditor.
+/// This allows Pin to trigger link creation without manual callback forwarding.
+export global LinkCreation {
+    /// Version counter - incremented on every start/update/complete
+    in-out property <int> version: 0;
+    /// Current lifecycle state
+    in-out property <LinkCreationState> state: LinkCreationState.idle;
+    /// The pin ID that started the link
+    in-out property <int> start-pin-id: 0;
+    /// Current X position (screen coordinates)
+    in-out property <length> current-x: 0px;
+    /// Current Y position (screen coordinates)
+    in-out property <length> current-y: 0px;
+}
+
+/// Selection request state - updated by BaseNode, consumed by NodeEditor.
+/// This allows BaseNode to request selection changes without manual callback forwarding.
+export global SelectionRequest {
+    /// Version counter - incremented on every selection request
+    in-out property <int> version: 0;
+    /// The node ID to select/deselect
+    in-out property <int> node-id: 0;
+    /// Whether shift key was held during the click
+    in-out property <bool> shift-held: false;
+}
+
+/// Hover state - updated by BaseNode, consumed by NodeEditor.
+/// Mirrors the node-selection flow: BaseNode writes the hovered node's ID here
+/// on pointer enter/exit and NodeEditor exposes it as `hovered-node-id`.
+/// Hover is *state* (not a command), so no version counter is needed — the
+/// editor binds directly to this property.
+///
+/// Sentinel: `0` means "no node hovered", matching BaseNode's `node-id == 0`
+/// = not-a-node convention (note: negative IDs are valid node IDs, so `-1`
+/// would be ambiguous here — unlike the link-hover API).
+export global HoverState {
+    /// The node ID currently under the pointer, or 0 if none.
+    in-out property <int> hovered-node-id: 0;
+}
+
+/// Internal callback registry for BaseNode/Pin → Rust communication.
+/// Wired automatically by `wire_node_editor!` — examples don't touch this.
+export global NodeEditorInternalCallbacks {
+    /// Report node rectangle (world coordinates)
+    callback report-node-rect(/* id */ int, /* x */ length, /* y */ length, /* width */ length, /* height */ length);
+    /// Report pin position relative to node
+    callback report-pin-position(/* pin-id */ int, /* node-id */ int, /* pin-type */ int, /* rel-x */ length, /* rel-y */ length);
+    /// Start node drag
+    callback start-node-drag(/* node-id */ int, /* already-selected */ bool, /* world-x */ length, /* world-y */ length);
+    /// Update node drag
+    callback update-node-drag(/* delta-x */ length, /* delta-y */ length);
+    /// End node drag. Carries the dragged node so the commit is self-contained:
+    /// the host moves the dragged node, plus whatever else its rows show as
+    /// selected. Nothing depends on when the press-time selection intent landed.
+    callback end-node-drag(/* node-id */ int, /* delta-x */ length, /* delta-y */ length);
+    /// Click on node
+    callback click-node(/* node-id */ int, /* shift-held */ bool);
+    /// Double-click on node
+    callback double-click-node(/* node-id */ int);
+    /// Start link from pin
+    callback start-link-from-pin(/* pin-id */ int, /* abs-x */ length, /* abs-y */ length);
+    /// Update link preview during pin drag
+    callback update-link-preview(/* x */ length, /* y */ length);
+    /// Complete link creation
+    callback complete-link();
+}
+
+/// Computational callbacks wired by Rust - examples don't touch these!
+/// NodeEditor calls these for expensive operations.
+export global NodeEditorComputations {
+    /// Compute SVG path commands for a link between two pins.
+    /// The geometry-version parameter triggers re-evaluation when geometry changes.
+    pure callback compute-link-path(
+        /* start-pin-id */ int,
+        /* end-pin-id */ int,
+        /* geometry-version */ int) -> string;
+
+    /// Viewport state changed (zoom or pan)
+    callback viewport-changed(
+        /* zoom */ float,
+        /* pan-x */ float,
+        /* pan-y */ float);
+
+    /// Compute pin ID at screen coordinates (for hit testing)
+    pure callback compute-pin-at(
+        /* x */ float,
+        /* y */ float,
+        /* pin-hit-radius */ float) -> int;
+
+    /// Compute link preview path (for link creation drag)
+    pure callback compute-link-preview-path(
+        /* start-x */ float,
+        /* start-y */ float,
+        /* end-x */ float,
+        /* end-y */ float,
+        /* zoom */ float,
+        /* bezier-offset */ float) -> string;
+}
+
+/// Optional layout helpers for common node structures.
+///
+/// This global provides sensible defaults for positioning pins and calculating coordinates
+/// in nodes with a standard layout: [pin-margin] [title-height] [pin-margin] [pin].
+///
+/// **Important:** These are purely optional convenience helpers. Applications can:
+/// 1. Override individual properties to customize node appearance
+/// 2. Define their own globals with different layout assumptions
+/// 3. Not use these functions at all and calculate positions manually
+///
+/// This design prevents coupling the library to specific node structures while providing
+/// useful defaults for the common case.
+export global NodeStyleDefaults {
+    // === Layout Constants (OPTIONAL - override to customize) ===
+
+    /// Pin diameter (customize this to change pin size)
+    in-out property <length> pin-size: 12px;
+    /// Margin from node edge to pin center (customize this to change spacing)
+    in-out property <length> pin-margin: 8px;
+    /// Title bar height (customize this if your nodes have different title sizes)
+    in-out property <length> title-height: 24px;
+    /// Grid spacing (for reference, not used by library)
+    in-out property <length> grid-spacing: 24px;
+
+    // === Position Computation Functions (OPTIONAL) ===
+    //
+    // These functions assume a specific node layout. If your nodes have a different
+    // structure, don't use these functions—calculate positions directly instead.
+
+    /// Compute node screen X position from world coordinates
+    pure public function screen-x(world-x: float, zoom: float, pan-x: length) -> length {
+        return world-x * 1px * zoom + pan-x;
+    }
+
+    /// Compute node screen Y position from world coordinates
+    pure public function screen-y(world-y: float, zoom: float, pan-y: length) -> length {
+        return world-y * 1px * zoom + pan-y;
+    }
+
+    // === Pin Position Computation (Absolute Screen Coordinates) ===
+
+    /// Compute input pin absolute X position
+    pure public function input-pin-x(node-world-x: float, zoom: float, pan-x: length) -> length {
+        return node-world-x * 1px * zoom + pan-x + (self.pin-margin + self.pin-size / 2) * zoom;
+    }
+
+    /// Compute input pin absolute Y position
+    pure public function input-pin-y(node-world-y: float, zoom: float, pan-y: length) -> length {
+        return node-world-y * 1px * zoom + pan-y + (self.pin-margin + self.title-height + self.pin-margin + self.pin-size / 2) * zoom;
+    }
+
+    // === Pin Relative Offsets (Unscaled, From Node Origin) ===
+
+    /// Input pin relative X offset (unscaled, from node top-left)
+    pure public function input-pin-relative-x() -> length {
+        return self.pin-margin + self.pin-size / 2;
+    }
+
+    /// Input pin relative Y offset (unscaled, from node top-left)
+    pure public function input-pin-relative-y() -> length {
+        return self.pin-margin + self.title-height + self.pin-margin + self.pin-size / 2;
+    }
+
+    /// Output pin relative Y offset (unscaled, from node top-left)
+    pure public function output-pin-relative-y() -> length {
+        return self.pin-margin + self.title-height + self.pin-margin + self.pin-size / 2;
+    }
+}
+
+/// Simplified node representation for minimap rendering.
+export struct MinimapNode {
+    /// Unique node identifier
+    id: int,
+    /// X position in graph coordinates
+    x: length,
+    /// Y position in graph coordinates
+    y: length,
+    /// Node width
+    width: length,
+    /// Node height
+    height: length,
+    /// Optional per-node color for minimap rendering
+    color: color,
+}
+
+/// Positioning options for minimap placement within the NodeEditor.
+export enum MinimapPosition {
+    top-left,
+    top-right,
+    bottom-left,
+    bottom-right,
+}
+
+/// Standard link status constants for computation graphs.
+/// Applications can use these or define their own status values.
+/// Status < 0 means "no status" — the link uses its `color` field directly.
+/// Note: Slint struct fields default to 0 (= idle). Applications that use
+/// explicit colors instead of statuses must set `status: LinkStatus.none` (-1).
+export global LinkStatus {
+    /// No status — link uses its color field directly.
+    out property <int> none: -1;
+    /// Not yet computed / idle.
+    out property <int> idle: 0;
+    /// Computation in progress.
+    out property <int> running: 1;
+    /// Computation completed successfully.
+    out property <int> succeeded: 2;
+    /// Computation completed with an error.
+    out property <int> failed: 3;
+}
+
+/// Colors for the built-in link statuses.
+/// Override these properties to customize status colors.
+export global LinkStatusColors {
+    /// Color for idle links (status == 1). Default: gray.
+    in-out property <color> idle: #888888;
+    /// Color for running links (status == 2). Default: yellow.
+    in-out property <color> running: #e8b830;
+    /// Color for succeeded links (status == 3). Default: green.
+    in-out property <color> succeeded: #50c878;
+    /// Color for failed links (status == 4). Default: red.
+    in-out property <color> failed: #e05050;
+}
+
+/// Logical link data (what the application provides)
+export struct LinkData {
+    id: int,
+    start-pin-id: int,
+    end-pin-id: int,
+    color: color,
+    /// Whether this link is selected — the application owns selection state and
+    /// projects it into this field (the editor never writes it).
+    selected: bool,
+    /// Line width in pixels (default: 2.0 if not specified)
+    line-width: float,
+    /// Computation status (-1 = no status, use color field; >= 0 = use status color).
+    /// Default (0) maps to idle. Set to LinkStatus.none (-1) to use the color field.
+    status: int,
+}
+
+/// Minimap component for bird's-eye view of the node graph.
+export component Minimap inherits Rectangle {
+    // === Data Input ===
+    in property <[MinimapNode]> nodes;
+
+    // === Path-based rendering (optimization for large graphs) ===
+    // When nodes-path is non-empty, it's used instead of the nodes array for rendering.
+    // The path should contain SVG path commands for all node rectangles.
+    in property <string> nodes-path: "";
+
+    // Callback to compute the nodes path. Called when scale/offset/version changes.
+    // Parameters: version (for cache invalidation), scale, offset-x, offset-y
+    // Returns: SVG path string for all nodes
+    pure callback compute-nodes-path(/* version */ int, /* scale */ float, /* offset-x */ float, /* offset-y */ float) -> string;
+
+    // Version counter to trigger path recomputation
+    in property <int> path-version: 0;
+
+    // === Viewport State ===
+    in property <length> viewport-x;
+    in property <length> viewport-y;
+    in property <float> viewport-zoom: 1.0;
+    in property <length> viewport-width;
+    in property <length> viewport-height;
+
+    // === Graph Bounds ===
+    in property <length> graph-min-x;
+    in property <length> graph-min-y;
+    in property <length> graph-max-x;
+    in property <length> graph-max-y;
+
+    // === Styling ===
+    in property <length> minimap-width: 200px;
+    in property <length> minimap-height: 150px;
+    in property <color> minimap-background-color: #1a1a1aee;
+    in property <color> minimap-node-color: #4a4a4a;
+    in property <color> minimap-viewport-border-color: #ffffff;
+    in property <length> minimap-viewport-border-width: 2px;
+    in property <color> minimap-border-color: #333333;
+    in property <length> minimap-border-width: 1px;
+    in property <length> minimap-padding: 8px;
+
+    // === Interaction ===
+    callback navigate-to(/* graph-x */ length, /* graph-y */ length);
+    callback update-pan(/* new-pan-x */ length, /* new-pan-y */ length);
+
+    // === Internal drag state ===
+    property <bool> internal-is-panning: false;
+    property <length> pan-start-mouse-x: 0px;
+    property <length> pan-start-mouse-y: 0px;
+    property <length> pan-start-viewport-x: 0px;
+    property <length> pan-start-viewport-y: 0px;
+    property <length> drag-threshold: 3px;
+
+    // === Coordinate Transformation ===
+    // Visible region in graph/world coordinates.
+    // Derived from screen = pan + world * zoom, inverted at screen origin (0,0).
+    property <length> visible-min-x: -root.viewport-x / root.viewport-zoom;
+    property <length> visible-min-y: -root.viewport-y / root.viewport-zoom;
+    property <length> visible-max-x: root.visible-min-x + (root.viewport-width / root.viewport-zoom);
+    property <length> visible-max-y: root.visible-min-y + (root.viewport-height / root.viewport-zoom);
+
+    // Minimap content = union(graph bounds, visible viewport). Using the union
+    // guarantees the viewport indicator always fits inside the minimap: when
+    // the viewport is zoomed out past the graph, the minimap "zooms out" so
+    // both the graph and the viewport are visible.
+    property <length> content-min-x: min(root.graph-min-x, root.visible-min-x);
+    property <length> content-min-y: min(root.graph-min-y, root.visible-min-y);
+    property <length> content-max-x: max(root.graph-max-x, root.visible-max-x);
+    property <length> content-max-y: max(root.graph-max-y, root.visible-max-y);
+    property <length> content-width: max(root.content-max-x - root.content-min-x, 1px);
+    property <length> content-height: max(root.content-max-y - root.content-min-y, 1px);
+
+    property <length> available-width: root.minimap-width - 2 * root.minimap-padding;
+    property <length> available-height: root.minimap-height - 2 * root.minimap-padding;
+    property <float> scale: min(
+        root.available-width / root.content-width,
+        root.available-height / root.content-height);
+
+    // === Viewport Indicator in Minimap Coordinates ===
+    property <length> viewport-indicator-x: root.minimap-padding + (root.visible-min-x - root.content-min-x) * root.scale;
+    property <length> viewport-indicator-y: root.minimap-padding + (root.visible-min-y - root.content-min-y) * root.scale;
+    property <length> viewport-indicator-width: (root.visible-max-x - root.visible-min-x) * root.scale;
+    property <length> viewport-indicator-height: (root.visible-max-y - root.visible-min-y) * root.scale;
+
+    width: root.minimap-width;
+    height: root.minimap-height;
+    background: root.minimap-background-color;
+    border-color: root.minimap-border-color;
+    border-width: root.minimap-border-width;
+    border-radius: 4px;
+
+    // Computed path for optimized rendering (recomputed when path-version changes)
+    // Note: path-version is passed to force Slint to re-evaluate when it changes
+    property <string> computed-path: root.compute-nodes-path(
+        root.path-version,
+        root.scale,
+        root.minimap-padding / 1px - (root.content-min-x / 1px) * root.scale,
+        root.minimap-padding / 1px - (root.content-min-y / 1px) * root.scale);
+
+    // Use computed path, or nodes-path if provided externally
+    property <string> effective-path: root.nodes-path != "" ? root.nodes-path : root.computed-path;
+
+    // Path-based rendering (optimized - single element for all nodes).
+    // The viewbox locks path-command coordinates to logical pixels in the
+    // minimap's local space; without it, Slint auto-fits the bounding box
+    // of the commands to the element size, stretching node rectangles.
+    if root.effective-path != "": Path {
+        x: 0;
+        y: 0;
+        width: root.minimap-width;
+        height: root.minimap-height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: max(self.width / 1px, 1);
+        viewbox-height: max(self.height / 1px, 1);
+        commands: root.effective-path;
+        fill: root.minimap-node-color;
+    }
+
+    // Fallback: individual rectangles (used when no path callback is set)
+    if root.effective-path == "": Rectangle {
+        for node in root.nodes: Rectangle {
+            x: root.minimap-padding + (node.x - root.content-min-x) * root.scale;
+            y: root.minimap-padding + (node.y - root.content-min-y) * root.scale;
+            width: node.width * root.scale;
+            height: node.height * root.scale;
+            background: node.color.alpha > 0 ? node.color : root.minimap-node-color;
+        }
+    }
+
+    Rectangle {
+        x: root.viewport-indicator-x;
+        y: root.viewport-indicator-y;
+        width: root.viewport-indicator-width;
+        height: root.viewport-indicator-height;
+        background: transparent;
+        border-color: root.minimap-viewport-border-color;
+        border-width: root.minimap-viewport-border-width;
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: root.internal-is-panning ? MouseCursor.grabbing : MouseCursor.grab;
+
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                // Store initial state
+                root.pan-start-mouse-x = self.mouse-x;
+                root.pan-start-mouse-y = self.mouse-y;
+                root.pan-start-viewport-x = root.viewport-x;
+                root.pan-start-viewport-y = root.viewport-y;
+                root.internal-is-panning = false;
+            }
+            if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                if !root.internal-is-panning {
+                    // Treat as click: center viewport
+                    root.navigate-to(
+                        root.content-min-x + ((self.mouse-x - root.minimap-padding) / root.scale),
+                        root.content-min-y + ((self.mouse-y - root.minimap-padding) / root.scale));
+                }
+                root.internal-is-panning = false;
+            }
+        }
+
+        moved => {
+            if self.pressed {
+                // Check drag threshold
+                if !root.internal-is-panning {
+                    root.internal-is-panning = sqrt(
+                        pow((self.mouse-x - root.pan-start-mouse-x) / 1px, 2) + pow((self.mouse-y - root.pan-start-mouse-y) / 1px, 2)) * 1px > root.drag-threshold;
+                }
+                if root.internal-is-panning {
+                    // Calculate delta in minimap space
+                    root.update-pan(
+                        root.pan-start-viewport-x - (self.mouse-x - root.pan-start-mouse-x) / root.scale * root.viewport-zoom,
+                        root.pan-start-viewport-y - (self.mouse-y - root.pan-start-mouse-y) / root.scale * root.viewport-zoom);
+                }
+            }
+        }
+    }
+}
+
+/// A bezier link between two pins using SVG path commands.
+export component Link inherits Path {
+    in property <string> path-commands;
+    in property <color> link-color: #888888;
+    in property <length> line-width: 2px;
+    in property <bool> selected: false;
+    in property <bool> hovered: false;
+
+    width: 100%;
+    height: 100%;
+    stroke: selected ? link-color.brighter(50%) : (hovered ? link-color.brighter(25%) : link-color);
+    stroke-width: selected ? line-width * 1.5 : (hovered ? line-width * 1.25 : line-width);
+    fill: transparent;
+
+    viewbox-x: 0;
+    viewbox-y: 0;
+    viewbox-width: max(self.width / 1px, 1);
+    viewbox-height: max(self.height / 1px, 1);
+
+    commands: path-commands;
+}
+
+/// Base component for all node types in the node editor.
+/// Nodes are positioned in pure WORLD coordinates. The parent container (at pan-x, pan-y)
+/// applies transform-scale for zoom, so nodes just use x: world-x, y: world-y directly.
+///
+/// Zoom/pan values are accessed from the ViewportState global - examples don't need to pass them.
+///
+/// **Accessibility:** BaseNode defaults to `accessible-label: "Node " + node-id`.
+/// Override this in your node component with the node's title for better screen reader
+/// and MCP introspection support: `accessible-label: title;`
+export component BaseNode inherits Rectangle {
+    // === Common Properties ===
+    in property <int> node-id;
+    in property <bool> selected: false;
+    in property <length> world-x;
+    in property <length> world-y;
+
+    // === Accessibility ===
+    accessible-role: list-item;
+    accessible-label: "Node " + node-id;
+    accessible-description: selected ? "selected" : "";
+    // Persistent position offset (survives drag end until model updates)
+    property <length> persistent-offset-x: 0px;
+    property <length> persistent-offset-y: 0px;
+    // === Viewport (for visibility culling) - provided by parent ===
+    in property <length> viewport-width: 10000px;
+    in property <length> viewport-height: 10000px;
+
+    // === Node Size ===
+    // Set these to match your node's visual dimensions.
+    in property <length> node-width: 150px;
+    in property <length> node-height: 100px;
+
+    // === Styling Properties (overridable) ===
+    in property <color> background-color: #2d2d2d;
+    in property <color> background-color-selected: #3a3a4a;
+    in property <color> border-color-normal: #555;
+    in property <color> border-color-selected: #4a9eff;
+    in property <length> border-radius-base: 8px;
+    in property <length> border-width-normal: 1px;
+    in property <length> border-width-selected: 2px;
+
+    // === Computed Properties ===
+    // World position (for reporting to Rust)
+    // For multi-node drag: selected nodes that aren't being directly dragged use global DragState offset
+    property <length> world-pos-x: world-x + persistent-offset-x + (DragState.is-dragging && root.selected && node-id != DragState.dragged-node-id ? DragState.drag-offset-x : drag-area.current-drag-offset-x);
+    property <length> world-pos-y: world-y + persistent-offset-y + (DragState.is-dragging && root.selected && node-id != DragState.dragged-node-id ? DragState.drag-offset-y : drag-area.current-drag-offset-y);
+    // Screen position (for external reference only)
+    out property <length> screen-x: world-pos-x * ViewportState.zoom + ViewportState.pan-x;
+    out property <length> screen-y: world-pos-y * ViewportState.zoom + ViewportState.pan-y;
+
+    // === Common Styling ===
+    // Pure world coordinates - container handles pan and transform-scale handles zoom
+    x: world-pos-x;
+    y: world-pos-y;
+    width: node-width;
+    height: node-height;
+    // BaseNode is transparent - visual styling should be in child elements
+    background: transparent;
+    clip: false;
+
+    // Report rect on changes (in WORLD coordinates - without offset).
+    // Guard against node-id == 0 (Slint default before parent binds the real ID).
+    // Negative IDs are valid (e.g. viewport-anchored edge ports).
+    init => {
+        if (node-id != 0) {
+            NodeEditorInternalCallbacks.report-node-rect(node-id, world-pos-x, world-pos-y, node-width, node-height);
+        }
+    }
+
+    changed node-id => {
+        if (node-id != 0) {
+            NodeEditorInternalCallbacks.report-node-rect(node-id, world-pos-x, world-pos-y, node-width, node-height);
+        }
+    }
+
+    changed world-x => {
+        // Model updated — clear persistent offset (world-pos-x changed handler reports geometry)
+        if abs(persistent-offset-x) > 0.1px {
+            root.persistent-offset-x = 0px;
+        }
+    }
+    changed world-y => {
+        if abs(persistent-offset-y) > 0.1px {
+            root.persistent-offset-y = 0px;
+        }
+    }
+    changed node-width => {
+        if (node-id != 0) {
+            NodeEditorInternalCallbacks.report-node-rect(node-id, world-pos-x, world-pos-y, node-width, node-height);
+        }
+    }
+    changed node-height => {
+        if (node-id != 0) {
+            NodeEditorInternalCallbacks.report-node-rect(node-id, world-pos-x, world-pos-y, node-width, node-height);
+        }
+    }
+
+    // Watch world-pos-x/y for live link updates during multi-node drag
+    changed world-pos-x => {
+        if (node-id != 0) {
+            NodeEditorInternalCallbacks.report-node-rect(node-id, world-pos-x, world-pos-y, node-width, node-height);
+        }
+    }
+    changed world-pos-y => {
+        if (node-id != 0) {
+            NodeEditorInternalCallbacks.report-node-rect(node-id, world-pos-x, world-pos-y, node-width, node-height);
+        }
+    }
+
+    // === Hover ===
+    // Exposed so subclasses can react to hover directly (e.g. show pills/badges),
+    // and aggregated to NodeEditor.hovered-node-id via the HoverState global.
+    // drag-area owns pointer events for the whole node, so its has-hover is the
+    // authoritative hover signal (a subclass can't layer its own TouchArea
+    // without swallowing selection/drag).
+    out property <bool> hovered: drag-area.has-hover;
+    changed hovered => {
+        // Guard against node-id == 0 (unbound) — same convention as geometry reporting.
+        if (node-id != 0) {
+            if (self.hovered) {
+                HoverState.hovered-node-id = node-id;
+            } else if (HoverState.hovered-node-id == node-id) {
+                // Only clear if we're still the reported node; if the pointer moved
+                // straight onto another node that already claimed the slot, leave it.
+                HoverState.hovered-node-id = 0;
+            }
+        }
+    }
+
+    // === Double-click detection ===
+    property <bool> dbl-click-armed: false;
+    dbl-click-timer := Timer {
+        interval: 400ms;
+        triggered => {
+            root.dbl-click-armed = false;
+        }
+    }
+
+    // === Drag Handling ===
+    // TouchArea covers the full node area
+    drag-area := TouchArea {
+        x: 0;
+        y: 0;
+        width: root.node-width;
+        height: root.node-height;
+
+        property <bool> shift-held: false;
+        property <bool> is-dragging: false;
+        property <length> drag-threshold: 5px;
+        property <length> start-abs-x: 0px;
+        property <length> start-abs-y: 0px;
+        property <bool> was-selected-on-press: false;
+        // Whether this press emitted a selection intent. Together with
+        // was-selected-on-press it answers "is this node selected?" from
+        // press-time facts alone, so the drag never has to read the flag back
+        // and never depends on when the host applied the intent.
+        property <bool> selection-intent-sent: false;
+        property <length> current-drag-offset-x: 0px;
+        property <length> current-drag-offset-y: 0px;
+
+        // True screen mouse position: absolute-position is in screen space,
+        // but self.mouse-x/y is in world space (inside scaled container)
+        property <length> screen-mouse-x: self.absolute-position.x + self.mouse-x * ViewportState.zoom;
+        property <length> screen-mouse-y: self.absolute-position.y + self.mouse-y * ViewportState.zoom;
+
+        // True for the duration of a press whose gesture should not produce
+        // any node behavior (no selection change, no drag, no double-click).
+        // Currently set for Ctrl/Cmd+left-click, which is reserved for
+        // canvas-level box selection.
+        property <bool> press-inert: false;
+
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                // Always initialize tracking state — even for inert presses —
+                // so `moved` and `up` never observe stale values.
+                shift-held = event.modifiers.shift;
+                is-dragging = false;
+                start-abs-x = screen-mouse-x;
+                start-abs-y = screen-mouse-y;
+                current-drag-offset-x = 0px;
+                current-drag-offset-y = 0px;
+                was-selected-on-press = selected;
+                selection-intent-sent = false;
+                press-inert = event.modifiers.control;
+
+                if !press-inert {
+                    // Only select immediately if shift is held (multi-select toggle)
+                    // or if node is not already selected. Otherwise defer selection
+                    // until release to distinguish click from drag.
+                    if shift-held || !selected {
+                        SelectionRequest.node-id = node-id;
+                        SelectionRequest.shift-held = shift-held;
+                        SelectionRequest.version += 1;
+                        selection-intent-sent = true;
+                    }
+                }
+            }
+            if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                if !press-inert {
+                    if is-dragging {
+                        // Transfer drag offset to persistent before ending drag
+                        root.persistent-offset-x += current-drag-offset-x;
+                        root.persistent-offset-y += current-drag-offset-y;
+                        // End drag using the tracked offset, not recalculated from mouse position
+                        NodeEditorInternalCallbacks.end-node-drag(node-id, current-drag-offset-x, current-drag-offset-y);
+                        is-dragging = false;
+                        current-drag-offset-x = 0px;
+                        current-drag-offset-y = 0px;
+                        // Reset global drag state
+                        DragState.is-dragging = false;
+                        DragState.dragged-node-id = 0;
+                        DragState.drag-offset-x = 0px;
+                        DragState.drag-offset-y = 0px;
+                    } else {
+                        // Click without drag - if we deferred selection, do it now
+                        if was-selected-on-press && !shift-held {
+                            SelectionRequest.node-id = node-id;
+                            SelectionRequest.shift-held = shift-held;
+                            SelectionRequest.version += 1;
+                        }
+                        // Double-click detection
+                        if root.dbl-click-armed {
+                            NodeEditorInternalCallbacks.double-click-node(node-id);
+                            root.dbl-click-armed = false;
+                        } else {
+                            root.dbl-click-armed = true;
+                            dbl-click-timer.restart();
+                        }
+                    }
+                }
+                press-inert = false;
+            }
+        }
+
+        moved => {
+            if self.pressed && !press-inert {
+                if !is-dragging {
+                    if abs(screen-mouse-x - start-abs-x) > drag-threshold || abs(screen-mouse-y - start-abs-y) > drag-threshold {
+                        is-dragging = true;
+                        // Selected as of this press — either it already was, or
+                        // this press asked for it. Read from the latches, never
+                        // from the live flag: the host may not have applied the
+                        // intent yet, and re-reading would silently re-emit a
+                        // replacing click over a shift-toggle in flight.
+                        NodeEditorInternalCallbacks.start-node-drag(node-id, was-selected-on-press || selection-intent-sent, world-x, world-y);
+                        // Set global drag state for multi-node drag
+                        DragState.is-dragging = true;
+                        DragState.dragged-node-id = node-id;
+                    }
+                }
+                if is-dragging {
+                    current-drag-offset-x = (screen-mouse-x - start-abs-x) / ViewportState.zoom;
+                    current-drag-offset-y = (screen-mouse-y - start-abs-y) / ViewportState.zoom;
+
+                    NodeEditorInternalCallbacks.update-node-drag(current-drag-offset-x, current-drag-offset-y);
+                    // Update global drag offset for other selected nodes
+                    DragState.drag-offset-x = current-drag-offset-x;
+                    DragState.drag-offset-y = current-drag-offset-y;
+                    // Update geometry for live link updates
+                    GeometryVersion.version += 1;
+                    NodeEditorInternalCallbacks.report-node-rect(node-id, world-pos-x, world-pos-y, node-width, node-height);
+                }
+            }
+        }
+    }
+}
+
+/// A connection point on a node where links can be attached.
+export component Pin inherits Rectangle {
+    in property <int> pin-id;
+    in property <int> node-id;  // Node this pin belongs to (for position reporting)
+    in property <int> pin-type;  // Type of pin (input/output/custom)
+
+    // === Accessibility ===
+    accessible-role: button;
+    accessible-label: pin-type == 1 ? "input pin" : pin-type == 2 ? "output pin" : "pin";
+    in property <color> base-color: #888888;
+    in property <color> hover-color: #aaaaaa;
+    in property <length> base-size: 12px;
+    in property <length> node-screen-x: 0px;  // Needed for drag preview coordinates
+    in property <length> node-screen-y: 0px;
+    in property <length> parent-offset-x: 0px;  // For wrapped pins (offset from node)
+    in property <length> parent-offset-y: 0px;  // For wrapped pins (offset from node)
+    /// Increment this to force pin position re-reporting (workaround for init timing)
+    in property <int> refresh-trigger: 0;
+
+    property <length> pin-radius: base-size / 2;
+
+    /// Pin center X relative to node top-left
+    out property <length> center-x: parent-offset-x + self.x + self.width / 2;
+    /// Pin center Y relative to node top-left
+    out property <length> center-y: parent-offset-y + self.y + self.height / 2;
+
+    width: base-size;
+    height: base-size;
+    background: touch.has-hover ? hover-color : base-color;
+    border-radius: pin-radius;
+
+    init => {
+        if (pin-id > 0) {
+            GeometryVersion.version += 1;
+            NodeEditorInternalCallbacks.report-pin-position(pin-id, node-id, pin-type, center-x, center-y);
+        }
+    }
+    // Bump the geometry version so links re-route when a pin settles to a new
+    // position (e.g. a card resizing to its real size after a relayout). But NOT
+    // while a node is being dragged: consumers that report live world-space pin
+    // centres get a center-x/center-y change every drag frame, and each bump
+    // re-evaluates ALL link paths (every link is a world-sized Path) — doing that
+    // per frame makes dragging crawl on a software renderer. During a drag the
+    // dragged node's own move already repaints it; edges snap to the dropped
+    // position via the end-of-drag bump. report-pin-position still fires so the
+    // consumer's pin cache stays current for that release bump.
+    changed pin-id => {
+        if (pin-id > 0) {
+            if (!DragState.is-dragging) {
+                GeometryVersion.version += 1;
+            }
+            NodeEditorInternalCallbacks.report-pin-position(pin-id, node-id, pin-type, center-x, center-y);
+        }
+    }
+    changed center-x => {
+        if (pin-id > 0) {
+            if (!DragState.is-dragging) {
+                GeometryVersion.version += 1;
+            }
+            NodeEditorInternalCallbacks.report-pin-position(pin-id, node-id, pin-type, center-x, center-y);
+        }
+    }
+    changed center-y => {
+        if (pin-id > 0) {
+            if (!DragState.is-dragging) {
+                GeometryVersion.version += 1;
+            }
+            NodeEditorInternalCallbacks.report-pin-position(pin-id, node-id, pin-type, center-x, center-y);
+        }
+    }
+    changed refresh-trigger => {
+        if (pin-id > 0) {
+            NodeEditorInternalCallbacks.report-pin-position(pin-id, node-id, pin-type, center-x, center-y);
+        }
+    }
+
+    touch := TouchArea {
+        moved => {
+            if LinkCreation.state != LinkCreationState.idle {
+                // Include parent-offset in screen coordinate calculation so examples don't need zoom math
+                LinkCreation.current-x = node-screen-x + (parent-offset-x + root.x + self.mouse-x) * ViewportState.zoom;
+                LinkCreation.current-y = node-screen-y + (parent-offset-y + root.y + self.mouse-y) * ViewportState.zoom;
+                LinkCreation.state = LinkCreationState.updating;
+                LinkCreation.version += 1;
+            }
+        }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                // Set LinkCreation state to start link creation (NodeEditor watches this)
+                // Pin position within node must be scaled by zoom since we're inside a scaled container
+                LinkCreation.start-pin-id = pin-id;
+                LinkCreation.current-x = node-screen-x + (parent-offset-x + root.x + self.x + self.width / 2) * ViewportState.zoom;
+                LinkCreation.current-y = node-screen-y + (parent-offset-y + root.y + self.y + self.height / 2) * ViewportState.zoom;
+                LinkCreation.state = LinkCreationState.started;
+                LinkCreation.version += 1;
+            } else if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                // If we're currently creating a link (started from another pin), complete it
+                if LinkCreation.state != LinkCreationState.idle {
+                    LinkCreation.current-x = node-screen-x + (parent-offset-x + root.x + self.mouse-x) * ViewportState.zoom;
+                    LinkCreation.current-y = node-screen-y + (parent-offset-y + root.y + self.mouse-y) * ViewportState.zoom;
+                    LinkCreation.state = LinkCreationState.complete;
+                    LinkCreation.version += 1;
+                }
+            }
+        }
+    }
+}

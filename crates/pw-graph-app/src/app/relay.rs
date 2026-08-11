@@ -1,27 +1,13 @@
 use super::QpwgraphApp;
-use eframe::egui::TextureHandle;
 use pw_graph_backend::{
     relay_build_qr_payload, relay_parse_qr_payload, BackendError, BackendResult, RelayCodecKind,
-    RelayDeviceKind, RelayEvent, RelayHostRequest, RelayLinkKind, RelayLocalLink, RelayPeerInfo,
-    RelayRoles, RelaySessionId, RelaySessionStatus, RelayTransportPreference,
+    RelayEvent, RelayHostRequest, RelayLinkKind, RelayLocalLink, RelayPeerInfo, RelayRoles,
+    RelaySessionId, RelayTransportPreference,
 };
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-
-/// Tabs inside the relay panel.
-///
-/// Discovered devices and live sessions are one list, not two: a phone the
-/// user just connected to is the same row it was a moment earlier, only in a
-/// different state. Hosting is the one genuinely separate activity, so it
-/// keeps its own tab.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub(crate) enum RelayPanelTab {
-    #[default]
-    Connections,
-    Host,
-}
 
 /// What a device row in the Connections list is currently doing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,17 +25,8 @@ pub(crate) enum RelayDeviceState {
 #[derive(Clone, Debug)]
 pub(crate) struct RelayDeviceRow {
     pub(crate) name: String,
-    pub(crate) kind: RelayDeviceKind,
     pub(crate) addr: SocketAddr,
     pub(crate) state: RelayDeviceState,
-    /// Session details, present only for connected rows.
-    pub(crate) session: Option<RelaySessionStatus>,
-}
-
-impl RelayDeviceRow {
-    pub(crate) fn is_connected(&self) -> bool {
-        matches!(self.state, RelayDeviceState::Connected(_))
-    }
 }
 
 /// How long a connect attempt shows as "Connecting…" before the row falls
@@ -59,7 +36,6 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Default)]
 pub(crate) struct RelayUiState {
-    pub(crate) tab: RelayPanelTab,
     pub(crate) discovery_active: bool,
     pub(crate) peers: Vec<RelayPeerInfo>,
     pub(crate) message: String,
@@ -81,10 +57,10 @@ pub(crate) struct RelayUiState {
     /// Active USB tether link, when one is detected. USB is never a select
     /// option: `Auto` prefers it and the panel simply reports the link.
     pub(crate) usb_link: Option<RelayLocalLink>,
-    /// QR modal visibility and its cached payload/texture.
+    /// Whether a pairing payload has been requested and the cached payload
+    /// shown by the Slint relay overlay.
     pub(crate) show_qr: bool,
     pub(crate) qr_text: String,
-    pub(crate) qr_texture: Option<TextureHandle>,
     last_link_check: Option<Instant>,
 }
 
@@ -195,10 +171,8 @@ impl RelayUiState {
             .iter()
             .map(|session| RelayDeviceRow {
                 name: session.peer.name.clone(),
-                kind: session.peer.kind,
                 addr: session.peer.addr,
                 state: RelayDeviceState::Connected(session.id),
-                session: Some(session.clone()),
             })
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.addr.cmp(&b.addr)));
@@ -210,24 +184,20 @@ impl RelayUiState {
             }
             rows.push(RelayDeviceRow {
                 name: peer.name.clone(),
-                kind: peer.kind,
                 addr: peer.addr,
                 state: if connecting == Some(peer.addr) {
                     RelayDeviceState::Connecting
                 } else {
                     RelayDeviceState::Available
                 },
-                session: None,
             });
         }
         if let Some(addr) = connecting {
             if !rows.iter().any(|row| row.addr == addr) {
                 rows.push(RelayDeviceRow {
                     name: addr.to_string(),
-                    kind: RelayDeviceKind::Other,
                     addr,
                     state: RelayDeviceState::Connecting,
-                    session: None,
                 });
             }
         }

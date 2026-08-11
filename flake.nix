@@ -1,5 +1,5 @@
 {
-  description = "Rust/egui PipeWire patchbay with optional ALSA MIDI support";
+  description = "Rust/Slint PipeWire patchbay with optional ALSA MIDI support";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

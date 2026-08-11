@@ -1,11 +1,9 @@
 use super::QpwgraphApp;
-use eframe::egui;
 use pw_graph_backend::MeterPolicy;
 use pw_graph_ui::MeterReading;
 use std::collections::BTreeSet;
 
 impl QpwgraphApp {
-    /// Push a metering-policy change from the panel down to the driver.
     pub(super) fn sync_meter_policy(&mut self) {
         let policy = MeterPolicy::parse(&self.config.audio_meters);
         if policy == self.meter_policy {
@@ -21,14 +19,10 @@ impl QpwgraphApp {
         }
     }
 
-    /// Keep meters live for every audio node represented in a visible window.
-    /// A minimized/tray-hidden window submits an empty request, allowing the
-    /// backend's short linger period to release the helper streams.
-    pub(super) fn request_visible_meters(&mut self, ctx: &egui::Context) {
+    pub(super) fn request_visible_meters(&mut self, window_visible: bool) {
         if self.meter_policy != MeterPolicy::OnDemand {
             return;
         }
-        let window_visible = ctx.input(|input| input.viewport().minimized != Some(true));
         let requested = if window_visible {
             self.canvas.requested_meter_nodes(self.driver.graph())
         } else {
@@ -37,8 +31,6 @@ impl QpwgraphApp {
         let _ = self.driver.request_meters(&requested);
     }
 
-    /// Release every metering stream so the daemon can return the nodes it had
-    /// resumed to their configured state.
     pub(crate) fn reset_audio_config(&mut self) {
         self.canvas.pinned_meter = None;
         self.canvas.meters.clear();

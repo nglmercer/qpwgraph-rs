@@ -54,13 +54,6 @@ impl EffectGalleryState {
         }
     }
 
-    pub(crate) fn select_effect(&mut self, descriptor: &EffectDescriptor) {
-        if self.effect_id != descriptor.id {
-            self.effect_id = descriptor.id.clone();
-            self.parameters = default_parameters(descriptor);
-        }
-    }
-
     pub(crate) fn next_phase(&mut self) {
         if self.phase == EffectGalleryPhase::Choose {
             self.phase = EffectGalleryPhase::Configure;

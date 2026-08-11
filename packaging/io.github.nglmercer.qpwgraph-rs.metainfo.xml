@@ -12,7 +12,7 @@
   <url type="vcs-browser">https://github.com/nglmercer/qpwgraph-rs</url>
   <url type="bugtracker">https://github.com/nglmercer/qpwgraph-rs/issues</url>
   <description>
-    <p>qpwgraph-rs is a Rust/egui patchbay for PipeWire, with optional ALSA Sequencer MIDI support for routing audio and MIDI connections.</p>
+    <p>qpwgraph-rs is a Rust/Slint patchbay for PipeWire, with optional ALSA Sequencer MIDI support for routing audio and MIDI connections.</p>
     <p>Inspect, connect, disconnect, and persist PipeWire and ALSA Sequencer MIDI graphs.</p>
     <ul>
       <li>Visual graph-based connection management</li>

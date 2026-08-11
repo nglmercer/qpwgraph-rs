@@ -30,9 +30,9 @@ authors = ["qpwgraph-rs contributors"]
 
 [workspace.dependencies]
 anyhow = "1.0"
-eframe = { version = "0.29", default-features = false, features = ["glow", "x11"] }
-egui = "0.29"
-egui_extras = { version = "0.29", default-features = false, features = ["svg"] }
+slint = { git = "https://github.com/slint-ui/slint", rev = "e100f5e11da59897f58a2bf1937b245f4ca6c2e6", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "renderer-software"] }
+slint-build = { git = "https://github.com/slint-ui/slint", rev = "e100f5e11da59897f58a2bf1937b245f4ca6c2e6" }
+slint-node-editor = { git = "https://github.com/tilladam/slint-node-editor", rev = "f304fb1387664c0577337386416960fcb5e6952b" }
 rfd = "0.15"
 quick-xml = "0.41"
 serde = { version = "1.0", features = ["derive"] }

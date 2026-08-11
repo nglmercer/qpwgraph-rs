@@ -1,0 +1,562 @@
+import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ScrollView, Slider, SpinBox, StandardButton, VerticalBox } from "std-widgets.slint";
+import {
+    BaseNode,
+    Link,
+    LinkData,
+    NodeEditor,
+    NodeEditorComputations,
+    NodeEditorInternalCallbacks,
+    Pin,
+    PinTypes,
+    MinimapNode,
+} from "slint-node-editor/node-editor.slint";
+
+export struct PortData {
+    id: int,
+    label: string,
+    direction: int,
+    color: color,
+    y: float,
+}
+
+export struct NodeData {
+    id: int,
+    title: string,
+    node-type: string,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    selected: bool,
+    collapsed: bool,
+    color: color,
+    ports: [PortData],
+}
+
+export struct RelayRowData {
+    name: string,
+    address: string,
+    state: string,
+    level: float,
+}
+
+export struct EffectParameterData {
+    id: string,
+    name: string,
+    minimum: float,
+    maximum: float,
+    value: float,
+    unit: string,
+    boolean: bool,
+}
+
+export { NodeEditorComputations, NodeEditorInternalCallbacks }
+
+component GraphNode inherits BaseNode {
+    in property <NodeData> data;
+
+    node-id: data.id;
+    selected: data.selected;
+    world-x: data.x * 1px;
+    world-y: data.y * 1px;
+    node-width: data.width * 1px;
+    node-height: data.height * 1px;
+    accessible-label: data.title;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: data.selected ? #293d58 : #242a31;
+        border-color: data.selected ? #62a8ff : (data.color.alpha > 0 ? data.color : #59636e);
+        border-width: data.selected ? 2px : 1px;
+        border-radius: 7px;
+    }
+
+    Rectangle {
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: 28px;
+        background: data.color.alpha > 0 ? data.color : #35414d;
+        border-radius: 6px;
+
+        Text {
+            x: 8px;
+            width: parent.width - 16px;
+            height: parent.height;
+            text: data.title;
+            color: #f3f6f8;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    for port in data.ports: Rectangle {
+        x: 14px;
+        y: 34px + port.y * 1px;
+        width: parent.width - 28px;
+        height: 20px;
+
+        Text {
+            x: port.direction == 0 ? 16px : 0px;
+            width: parent.width - 16px;
+            height: parent.height;
+            text: port.label;
+            color: #d4dbe2;
+            font-size: 11px;
+            horizontal-alignment: port.direction == 0 ? left : right;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Pin {
+            x: port.direction == 0 ? -10px : parent.width - 2px;
+            y: 4px;
+            pin-id: port.id;
+            node-id: root.node-id;
+            pin-type: port.direction == 0 ? PinTypes.input : PinTypes.output;
+            node-screen-x: root.screen-x;
+            node-screen-y: root.screen-y;
+            base-color: port.color;
+            hover-color: port.color.brighter(25%);
+            base-size: 12px;
+            parent-offset-x: 0px;
+            parent-offset-y: 0px;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "qpwgraph-rs";
+    background: #15191d;
+    width: 1100px;
+    height: 760px;
+
+    in property <[NodeData]> nodes: [];
+    in property <[LinkData]> links: [];
+    in property <[MinimapNode]> minimap-nodes: [];
+    in property <[RelayRowData]> relay-rows: [];
+    in property <[EffectParameterData]> effect-parameters: [];
+    in property <string> status: "";
+    in property <string> backend: "";
+    in property <string> graph-counts: "";
+    in property <bool> show-statusbar: true;
+    in property <bool> show-minimap: false;
+    in property <bool> show-preferences: false;
+    in property <bool> show-history: false;
+    in property <bool> show-shortcuts: false;
+    in property <bool> show-effects: false;
+    in property <bool> show-relay: false;
+    in property <bool> effect-enabled: true;
+    in property <bool> repel-overlapping: false;
+    in property <bool> connect-through: false;
+    in-out property <string> search-text: "";
+    in-out property <string> relay-target: "";
+    in property <string> relay-message: "";
+    in property <string> effect-message: "";
+    in property <string> connect-mode: "advanced";
+    in property <string> media-filter: "all";
+    in-out property <length> pan-x: 24px;
+    in-out property <length> pan-y: 24px;
+    in-out property <float> zoom: 1.0;
+    in-out property <string> grid-commands: "";
+    out property <float> width_: self.width / 1px;
+    out property <float> height_: self.height / 1px;
+    property <length> chrome-height: 60px;
+    property <length> status-height: root.show-statusbar ? 30px : 0px;
+    property <length> sidebar-width: 192px;
+
+    callback action(string);
+    callback graph-node-selected(int, bool);
+    callback graph-link-selected(int, bool);
+    callback graph-selection-cleared();
+    callback graph-box-selected(length, length, length, length, bool);
+    callback graph-link-requested(int, int);
+    callback graph-link-dropped(int, float, float);
+    callback graph-link-cancelled();
+    callback graph-node-double-clicked(int);
+    callback graph-node-moved(int, float, float);
+    callback graph-delete-selection();
+    callback graph-compute-pin-at(length, length) -> int;
+    callback graph-compute-link-at(length, length) -> int;
+    callback graph-request-grid();
+    callback graph-close-requested();
+    callback relay-row-action(string);
+    callback effect-parameter-changed(string, float);
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: root.chrome-height;
+        background: #20262d;
+        Rectangle { y: parent.height - 1px; width: parent.width; height: 1px; background: #2d3843; }
+
+        Text {
+            x: 18px;
+            width: 120px;
+            height: parent.height;
+            text: "qpwgraph-rs";
+            color: #eef3f7;
+            font-size: 16px;
+            vertical-alignment: center;
+        }
+        Rectangle { x: 140px; y: 16px; width: 1px; height: 28px; background: #3a4652; }
+        LineEdit {
+            x: 156px;
+            y: 13px;
+            width: 210px;
+            height: 34px;
+            placeholder-text: "Search nodes or ports";
+            text <=> root.search-text;
+        }
+        ComboBox {
+            x: 374px;
+            y: 13px;
+            width: 104px;
+            height: 34px;
+            model: ["All", "Audio", "Video", "MIDI"];
+            current-index: root.media-filter == "audio" ? 1 : root.media-filter == "video" ? 2 : root.media-filter == "midi" ? 3 : 0;
+            selected(index) => {
+                root.action(index == 1 ? "filter-audio" : index == 2 ? "filter-video" : index == 3 ? "filter-midi" : "filter-all");
+            }
+        }
+        ComboBox {
+            x: 486px;
+            y: 13px;
+            width: 120px;
+            height: 34px;
+            model: ["Advanced", "Easy"];
+            current-index: root.connect-mode == "easy" ? 1 : 0;
+            selected(index) => { root.action(index == 1 ? "connect-easy" : "connect-advanced"); }
+        }
+        Button { x: 614px; y: 13px; width: 88px; height: 34px; text: "Refresh"; clicked => { root.action("refresh"); } }
+        Button { x: 710px; y: 13px; width: 88px; height: 34px; text: "Arrange"; visible: parent.width >= 860px; clicked => { root.action("arrange"); } }
+        Button { x: 806px; y: 13px; width: 94px; height: 34px; text: "Minimap"; visible: parent.width >= 960px; clicked => { root.action("toggle-minimap"); } }
+        Text {
+            x: parent.width - 178px;
+            width: 160px;
+            height: parent.height;
+            visible: parent.width >= 1050px;
+            text: root.graph-counts;
+            color: #9eabb6;
+            font-size: 11px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    Rectangle {
+        x: 0px;
+        y: root.chrome-height;
+        width: root.sidebar-width;
+        height: root.height - root.chrome-height - root.status-height;
+        background: #1b2128;
+        Rectangle { x: parent.width - 1px; width: 1px; height: parent.height; background: #2d3843; }
+
+        Text { x: 14px; y: 14px; width: parent.width - 28px; height: 16px; text: "CANVAS"; color: #7f91a0; font-size: 10px; font-weight: 600; }
+        Button { x: 12px; y: 36px; width: parent.width - 24px; height: 32px; text: "Refresh graph"; clicked => { root.action("refresh"); } }
+        Button { x: 12px; y: 74px; width: parent.width - 24px; height: 32px; text: "Arrange nodes"; clicked => { root.action("arrange"); } }
+        Button { x: 12px; y: 112px; width: parent.width - 24px; height: 32px; text: root.show-minimap ? "Hide minimap" : "Show minimap"; clicked => { root.action("toggle-minimap"); } }
+        Button { x: 12px; y: 150px; width: parent.width - 24px; height: 32px; text: root.zoom < 0.99 ? "Restore zoom" : "Thumbnail view"; clicked => { root.action(root.zoom < 0.99 ? "zoom-in" : "toggle-thumbnail"); } }
+        Button { x: 12px; y: 190px; width: 80px; height: 30px; text: "Zoom −"; clicked => { root.action("zoom-out"); } }
+        Button { x: 100px; y: 190px; width: 80px; height: 30px; text: "Zoom +"; clicked => { root.action("zoom-in"); } }
+
+        Text { x: 14px; y: 242px; width: parent.width - 28px; height: 16px; text: "PATCHBAY"; color: #7f91a0; font-size: 10px; font-weight: 600; }
+        Button { x: 12px; y: 264px; width: 80px; height: 32px; text: "Undo"; clicked => { root.action("undo"); } }
+        Button { x: 100px; y: 264px; width: 80px; height: 32px; text: "Redo"; clicked => { root.action("redo"); } }
+        Button { x: 12px; y: 302px; width: 80px; height: 32px; text: "Save"; clicked => { root.action("save-patchbay"); } }
+        Button { x: 100px; y: 302px; width: 80px; height: 32px; text: "Load"; clicked => { root.action("load-patchbay"); } }
+        Button { x: 12px; y: 340px; width: parent.width - 24px; height: 32px; text: "Disconnect all"; clicked => { root.action("disconnect-all"); } }
+
+        Text { x: 14px; y: 400px; width: parent.width - 28px; height: 16px; text: "PANELS"; color: #7f91a0; font-size: 10px; font-weight: 600; }
+        Button { x: 12px; y: 422px; width: 80px; height: 32px; text: "Effects"; clicked => { root.action("effects"); } }
+        Button { x: 100px; y: 422px; width: 80px; height: 32px; text: "History"; clicked => { root.action("history"); } }
+        Button { x: 12px; y: 460px; width: parent.width - 24px; height: 32px; text: "Preferences"; clicked => { root.action("preferences"); } }
+        Button { x: 12px; y: 498px; width: parent.width - 24px; height: 32px; text: "Relay"; clicked => { root.action("relay"); } }
+        Button { x: 12px; y: 548px; width: parent.width - 24px; height: 30px; text: "Keyboard shortcuts"; clicked => { root.action("shortcuts"); } }
+    }
+
+    workspace := Rectangle {
+            x: root.sidebar-width;
+            y: root.chrome-height;
+            width: root.width - root.sidebar-width;
+            height: root.height - root.chrome-height - root.status-height;
+            background: #15191d;
+
+            FocusScope {
+                width: 100%;
+                height: 100%;
+
+                key-pressed(event) => {
+                    if (event.text == Key.Delete || event.text == Key.Backspace) {
+                        root.graph-delete-selection();
+                        return accept;
+                    }
+                    if (event.text == Key.Escape) {
+                        root.action("escape");
+                        return accept;
+                    }
+                    if (event.text == Key.F1) {
+                        root.action("shortcuts");
+                        return accept;
+                    }
+                    if (event.modifiers.control && (event.text == "z" || event.text == "Z")) {
+                        root.action("undo");
+                        return accept;
+                    }
+                    if (event.modifiers.control && (event.text == "y" || event.text == "Y")) {
+                        root.action("redo");
+                        return accept;
+                    }
+                    if (event.modifiers.control && (event.text == "s" || event.text == "S")) {
+                        root.action("save-config");
+                        return accept;
+                    }
+                    if (event.modifiers.control && (event.text == "o" || event.text == "O")) {
+                        root.action("load-patchbay");
+                        return accept;
+                    }
+                    if (event.text == Key.LeftArrow) {
+                        root.action(event.modifiers.control ? "pan-left-fast" : event.modifiers.shift ? "pan-left-medium" : "pan-left");
+                        return accept;
+                    }
+                    if (event.text == Key.RightArrow) {
+                        root.action(event.modifiers.control ? "pan-right-fast" : event.modifiers.shift ? "pan-right-medium" : "pan-right");
+                        return accept;
+                    }
+                    if (event.text == Key.UpArrow) {
+                        root.action(event.modifiers.control ? "pan-up-fast" : event.modifiers.shift ? "pan-up-medium" : "pan-up");
+                        return accept;
+                    }
+                    if (event.text == Key.DownArrow) {
+                        root.action(event.modifiers.control ? "pan-down-fast" : event.modifiers.shift ? "pan-down-medium" : "pan-down");
+                        return accept;
+                    }
+                    if (event.text == "r" || event.text == "R") {
+                        root.action("refresh");
+                        return accept;
+                    }
+                    if (event.text == "a" || event.text == "A") {
+                        root.action("arrange");
+                        return accept;
+                    }
+                    if (event.text == "t" || event.text == "T") {
+                        root.action("toggle-thumbnail");
+                        return accept;
+                    }
+                    if (event.text == "0" || event.text == "1" || event.text == "2" || event.text == "3") {
+                        root.action(event.text == "0" ? "filter-all" : event.text == "1" ? "filter-audio" : event.text == "2" ? "filter-video" : "filter-midi");
+                        return accept;
+                    }
+                    if (event.text == "+" || event.text == "=") {
+                        root.action("zoom-in");
+                        return accept;
+                    }
+                    if (event.text == "-" || event.text == "_") {
+                        root.action("zoom-out");
+                        return accept;
+                    }
+                    return reject;
+                }
+
+                editor := NodeEditor {
+                    width: parent.width;
+                    height: parent.height;
+                    pan-x <=> root.pan-x;
+                    pan-y <=> root.pan-y;
+                    zoom <=> root.zoom;
+                    links <=> root.links;
+                    minimap-enabled <=> root.show-minimap;
+                    minimap-nodes <=> root.minimap-nodes;
+                    min-zoom: 0.35;
+                    max-zoom: 2.5;
+                    background-color: #15191d;
+                    grid-spacing: 24px;
+                    grid-color: #26313b;
+                    grid-commands <=> root.grid-commands;
+                    has-link-selection: true;
+
+                    compute-pin-at(x, y) => { root.graph-compute-pin-at(x, y) }
+                    compute-link-at(x, y) => { root.graph-compute-link-at(x, y) }
+                    request-grid-update => { root.graph-request-grid(); }
+                    node-selected(id, shift) => { root.graph-node-selected(id, shift); }
+                    select-link(id, shift) => { root.graph-link-selected(id, shift); }
+                    selection-cleared => { root.graph-selection-cleared(); }
+                    box-selection-committed(x, y, w, h, shift) => { root.graph-box-selected(x, y, w, h, shift); }
+                    link-requested(start, end) => { root.graph-link-requested(start, end); }
+                    link-dropped(start, x, y) => { root.graph-link-dropped(start, x, y); }
+                    link-cancelled => { root.graph-link-cancelled(); }
+                    node-double-clicked(id) => { root.graph-node-double-clicked(id); }
+
+                    for node-data in root.nodes: GraphNode {
+                        data: node-data;
+                        viewport-width: editor.width;
+                        viewport-height: editor.height;
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 16px;
+                y: 16px;
+                width: 430px;
+                height: 30px;
+                background: #202a34e8;
+                border-color: #344555;
+                border-width: 1px;
+                border-radius: 5px;
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    text: root.connect-mode == "easy" ? "Easy mode · drag between grouped ports" : "Advanced mode · drag from an output port to an input port";
+                    color: #c2ced7;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            if root.show-relay: Rectangle {
+                x: parent.width - 300px;
+                y: 0px;
+                width: 300px;
+                height: parent.height;
+                background: #20262dcc;
+                border-color: #4c5965;
+                border-width: 1px;
+                Text { x: 16px; y: 16px; text: "Relay"; color: white; font-size: 18px; }
+                Text { x: 16px; y: 50px; width: 268px; text: root.relay-message; color: #c5cdd4; wrap: word-wrap; }
+                LineEdit { x: 16px; y: 105px; width: 268px; placeholder-text: "host:port or qpw-relay://…"; text <=> root.relay-target; }
+                Button { x: 16px; y: 145px; text: "Discover"; clicked => { root.action("relay-discover"); } }
+                Button { x: 106px; y: 145px; text: "Refresh"; clicked => { root.action("relay-refresh"); } }
+                Button { x: 196px; y: 145px; text: "Connect"; clicked => { root.action("relay-connect"); } }
+                Button { x: 16px; y: 185px; text: "Start host"; clicked => { root.action("relay-host-start"); } }
+                Button { x: 106px; y: 185px; text: "Stop host"; clicked => { root.action("relay-host-stop"); } }
+                Button { x: 196px; y: 185px; text: "Show QR"; clicked => { root.action("relay-show-qr"); } }
+                VerticalBox {
+                    x: 16px;
+                    y: 230px;
+                    width: 268px;
+                    height: parent.height - 250px;
+                    spacing: 4px;
+                    for row in root.relay-rows: Rectangle {
+                        height: 42px;
+                        background: #2c343dcc;
+                        border-radius: 4px;
+                        Text { x: 8px; y: 3px; width: 165px; height: 18px; text: row.name; color: #edf2f5; overflow: elide; }
+                        Text { x: 8px; y: 21px; width: 165px; height: 16px; text: row.state + " · " + row.address; color: #aeb9c2; font-size: 10px; overflow: elide; }
+                        Rectangle { x: 178px; y: 9px; width: 35px; height: 6px; background: #14181c; border-radius: 3px; }
+                        Rectangle { x: 178px; y: 9px; width: row.level * 35px; height: 6px; background: #57c785; border-radius: 3px; }
+                        Button { x: 216px; y: 7px; width: 48px; height: 26px; text: row.state == "connected" ? "Drop" : row.state == "connecting" ? "Cancel" : "Join"; clicked => { root.relay-row-action(row.address); } }
+                    }
+                }
+                Button { x: 16px; y: parent.height - 42px; text: "Close"; clicked => { root.action("relay"); } }
+            }
+
+            if root.show-preferences || root.show-history || root.show-shortcuts || root.show-effects: Rectangle {
+                x: 90px;
+                y: 70px;
+                width: parent.width - 180px;
+                height: parent.height - 140px;
+                background: #20262df5;
+                border-color: #617080;
+                border-width: 1px;
+                border-radius: 8px;
+
+                Text {
+                    x: 20px;
+                    y: 16px;
+                    text: root.show-preferences ? "Preferences" : root.show-history ? "History" : root.show-shortcuts ? "Shortcuts" : "Effects";
+                    color: #f1f4f6;
+                    font-size: 19px;
+                }
+                Text {
+                    x: 20px;
+                    y: 58px;
+                    width: parent.width - 40px;
+                    text: root.show-preferences ? "Interface and patchbay settings are synchronized with the existing AppConfig." : root.show-history ? "Undo and redo history is managed by CommandStack." : root.show-shortcuts ? "F1 opens this help overlay. Escape closes overlays." : "Effect controls are managed by the backend effect host.";
+                    color: #c8d0d7;
+                    wrap: word-wrap;
+                }
+                if root.show-preferences: VerticalBox {
+                    x: 20px;
+                    y: 110px;
+                    width: parent.width - 40px;
+                    height: 170px;
+                    spacing: 8px;
+                    CheckBox { text: "Show status bar"; checked: root.show-statusbar; toggled => { root.action("toggle-statusbar"); } }
+                    CheckBox { text: "Show minimap"; checked: root.show-minimap; toggled => { root.action("toggle-minimap"); } }
+                    CheckBox { text: "Repel overlapping nodes"; checked: root.repel-overlapping; toggled => { root.action("toggle-repel"); } }
+                    CheckBox { text: "Connect through nodes"; checked: root.connect-through; toggled => { root.action("toggle-connect-through"); } }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: "Sort by name"; clicked => { root.action("sort-name"); } }
+                        Button { text: "Sort by id"; clicked => { root.action("sort-id"); } }
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: "Ascending"; clicked => { root.action("sort-ascending"); } }
+                        Button { text: "Descending"; clicked => { root.action("sort-descending"); } }
+                        Button { text: "Snapshot patchbay"; clicked => { root.action("snapshot-patchbay"); } }
+                        Button { text: "Activate patchbay"; clicked => { root.action("activate-patchbay"); } }
+                        Button { text: "Reset audio"; clicked => { root.action("reset-audio"); } }
+                    }
+                }
+                if root.show-history: HorizontalBox {
+                    x: 20px;
+                    y: 120px;
+                    width: parent.width - 40px;
+                    height: 34px;
+                    spacing: 8px;
+                    Button { text: "Undo"; clicked => { root.action("undo"); } }
+                    Button { text: "Redo"; clicked => { root.action("redo"); } }
+                }
+                if root.show-effects: VerticalBox {
+                    x: 20px;
+                    y: 108px;
+                    width: parent.width - 40px;
+                    height: parent.height - 175px;
+                    spacing: 6px;
+                    CheckBox { text: "Enable effect"; checked: root.effect-enabled; toggled => { root.action("effect-toggle-enabled"); } }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalBox {
+                            spacing: 6px;
+                            for parameter in root.effect-parameters: Rectangle {
+                                height: 34px;
+                                background: #2c343d;
+                                border-radius: 4px;
+                                Text { x: 8px; width: 150px; height: parent.height; text: parameter.name; color: #d9e0e5; vertical-alignment: center; overflow: elide; }
+                                if parameter.boolean: CheckBox { x: 164px; y: 4px; text: parameter.value >= 0.5 ? "On" : "Off"; checked: parameter.value >= 0.5; toggled => { root.effect-parameter-changed(parameter.id, self.checked ? 1.0 : 0.0); } }
+                                if !parameter.boolean: Slider { x: 164px; y: 7px; width: 190px; minimum: parameter.minimum; maximum: parameter.maximum; value: parameter.value; changed(value) => { root.effect-parameter-changed(parameter.id, value); } }
+                                Text { x: 360px; width: parent.width - 368px; height: parent.height; text: parameter.value + (parameter.unit == "" ? "" : " " + parameter.unit); color: #aeb9c2; vertical-alignment: center; horizontal-alignment: right; }
+                            }
+                        }
+                    }
+                    HorizontalBox {
+                        height: 34px;
+                        spacing: 8px;
+                        Button { text: "Add effect"; clicked => { root.action("create-effect"); } }
+                        Button { text: "Configure"; clicked => { root.action("effect-configure"); } }
+                        Button { text: "Choose"; clicked => { root.action("effect-choose"); } }
+                        Text { text: root.effect-message; color: #c8d0d7; vertical-alignment: center; }
+                    }
+                }
+                Button { x: parent.width - 110px; y: parent.height - 50px; text: "Close"; clicked => { root.action("escape"); } }
+            }
+        }
+
+    if root.show-statusbar: Rectangle {
+        x: 0px;
+        y: root.height - root.status-height;
+        width: parent.width;
+        height: root.status-height;
+        background: #20262d;
+        Rectangle { width: parent.width; height: 1px; background: #2d3843; }
+        Text { x: 14px; width: parent.width - 28px; height: parent.height; text: root.status + "  ·  " + root.graph-counts + "  [" + root.backend + "]"; color: #bbc5cc; vertical-alignment: center; overflow: elide; }
+    }
+}

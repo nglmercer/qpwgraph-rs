@@ -1,6 +1,6 @@
 # qpwgraph-rs
 
-Rust/egui patchbay for PipeWire, with optional ALSA Sequencer MIDI support.
+Rust/Slint patchbay for PipeWire, with optional ALSA Sequencer MIDI support.
 
 https://github.com/user-attachments/assets/d7a9b1d4-d6d3-4ef2-b0d1-4cfc2de64650
 
@@ -19,27 +19,26 @@ The code is split into small crates:
 - `pw-graph-patchbay`: qpwgraph-compatible XML and JSON persistence/activation.
 - `pw-graph-config`: TOML settings and XDG paths.
 - `pw-graph-i18n`: English, Spanish, and French catalogs with English fallback.
-- `pw-graph-ui`: the egui canvas plus reusable DOM-like controls and retained
-  forms. Canvas rendering and interaction are split into
-  `canvas/{mod,node,links,ports,names,geometry}.rs`; component usage is in
-  [`docs/ui-components.md`](docs/ui-components.md).
-- `pw-graph-app`: desktop shell, backend composition, panels, tray, and CLI.
+- `pw-graph-ui`: framework-neutral graph projection, selection state, ID
+  translation, filtering, meters, and Easy/Advanced connection semantics.
+- `pw-graph-app`: Slint desktop shell, the pinned `slint-node-editor` graph,
+  backend composition, tray, relay, and CLI.
 
 ## Interface
 
-The application uses a fixed navigation rail for common graph/history actions
-and a Preferences modal with Interface and Patchbay tabs. The graph itself is
-rendered in the main area; there is no separate Graph/Patchbay screen or right
-inspector panel.
-
-The rail provides refresh, undo/redo, Easy/Advanced connect mode, layout
-actions, filters, patchbay actions, and **Disconnect all**. Disconnect all is
-one undoable command and removes the live connections from the saved patchbay
-rules just like disconnecting an individual link.
+The application uses one Slint window with a toolbar, graph canvas, status bar,
+and modal overlays. The graph is rendered by the pinned
+[`slint-node-editor`](https://github.com/tilladam/slint-node-editor) component;
+the application owns the PipeWire model and projects it into Slint rows.
+Refresh, undo/redo, Easy/Advanced connect mode, layout, filters, patchbay
+actions, relay, effects, and **Disconnect all** are available from the
+toolbar or overlays. The node editor supplies selection, box selection,
+drag-to-connect, node dragging, minimap, pan/zoom, and curved links.
+Disconnect all is one undoable command and removes live connections from the
+saved patchbay rules just like an individual disconnect.
 
 The graph refreshes automatically when PipeWire registry events arrive. The
-search field filters nodes and ports by name; right-clicking a node offers
-node-local disconnect and arrange-selection actions. Dragging a group or a
+search field filters nodes and ports by name. Dragging an Easy-mode group or a
 node creates one undoable transaction.
 
 Easy mode groups compatible audio channels. PipeWire ports use the backend's
@@ -48,25 +47,6 @@ name-suffix fallback. Advanced mode always renders one row per port.
 
 Node names are displayed using read-only aliases. Native PipeWire rename is not
 exposed because client-owned names cannot be changed safely by the graph UI.
-
-### Panel components
-
-Interactive controls in `crates/pw-graph-app/src/panels` use the retained
-`pw-graph-ui::UiDocument` component layer. Each control has a stable DOM-like
-ID, keeps its value available through `get_element_by_id`/`value`, and can be
-grouped into a form or observed with change/input/click listeners. The app
-starts one document frame at the beginning of each update and dispatches its
-queued events after all panels render.
-
-Panel code uses the shared adapters for text inputs, numbers, sliders,
-selects, buttons, checkboxes, switches, tab labels, and modal dialogs.
-Custom-painted icon buttons and effect cards register their clicks through the
-same document, so they remain reusable without losing their existing
-appearance. All dialogs paint a translucent backdrop while keeping the graph
-rendered underneath, so modal windows do not replace the application with a
-black background. See
-[`docs/ui-components.md`](docs/ui-components.md) for the component and form
-API.
 
 ## Run
 
@@ -127,9 +107,9 @@ See [packaging/README.md](packaging/README.md) for download and installation
 instructions.
 
 Audio meters are opt-in. They can be off, on demand (the default), or always;
-on-demand meters attach only while a meter is hovered or pinned. PipeWire
-helper streams currently report one aggregate reading per node. The backend API
-also accepts optional port-associated readings for backends that can expose
+on-demand meters attach while the Slint graph window is visible. PipeWire
+helper streams currently report one aggregate reading per node. The backend
+API also accepts optional port-associated readings for backends that can expose
 independent port buffers; the UI falls back to the node reading. **Reset audio
 config** releases every helper stream.
 
@@ -158,23 +138,14 @@ belong on the control thread.
 ## Audio relay
 
 The desktop app includes the relay panel when the default `relay` feature is
-enabled. Open **Relay** from the navigation rail to dock the panel on the
-right of the canvas. It has two tabs:
+enabled. Open **Relay** from the toolbar to show the right-hand Slint overlay.
+It provides discovery and refresh, a manual target field, connect and host
+start/stop actions, a QR payload action, and one unified device list.
+Available, connecting, and connected rows expose the appropriate
+join/cancel/disconnect action; connected rows also show their live level.
 
-- **Connections** — one device list, in the shape of a system Bluetooth or
-  Wi-Fi pane. Discovered hosts and live sessions are the same rows in
-  different states: an available device offers **Connect**, a connecting one
-  shows a spinner and can be cancelled, and a connected one shows a live
-  level bar with disconnect and details actions. Connected devices are
-  grouped first. A refresh button in the header restarts the scan, and
-  disclosures below hold manual address entry and the advanced settings
-  (role, codec, frame duration, preferred link).
-- **Host** — device name, pairing PIN, control port, and the start/stop
-  action, plus the endpoint list and QR code while hosting.
-
-Discovery runs for as long as the panel is open, so the device list is
-already populated when you switch back to it. Relay settings are saved
-automatically in the app configuration.
+Opening the panel starts discovery and keeps polling while the window is open.
+Relay settings are saved automatically in the app configuration.
 
 Starting a host or connecting to a peer creates two PipeWire virtual nodes:
 `qpwgraph-rs.relay.source` exposes received peer audio as **Relay Microphone**,
@@ -183,20 +154,15 @@ receiving peers.
 
 ### Discovery and pairing
 
-Browsing starts as soon as the panel opens. Hosts announce themselves over
-mDNS (`_qpw-relay._udp`), and USB tether subnets are probed directly because
-mDNS often does not cross a tether. Discovered hosts are listed with their
-name, device kind, and endpoint, and connect with one click. The **Add a
-device manually** disclosure accepts a plain `host:port` or a pasted
+Hosts announce themselves over mDNS (`_qpw-relay._udp`), and USB tether
+subnets are probed directly because mDNS often does not cross a tether.
+Discovered hosts are listed with their name and endpoint, and connect with
+one click. The manual target field accepts a plain `host:port` or a pasted
 `qpw-relay://` QR payload for networks where mDNS is blocked.
 
-While the host runs, the **Host** tab shows every reachable
-`address:port` endpoint (the QR's primary endpoint highlighted), the pairing
-PIN, and a **Show QR** button. The QR carries a
-`qpw-relay://host:port?pin=123456` payload: the Android app scans it to fill
-in the address and PIN automatically, and the desktop Connections tab
-accepts the same payload pasted into its manual address field. Active links are listed
-first. If interface state flags are incomplete, the UI falls back to a
+While the host runs, **Show QR** exposes the same
+`qpw-relay://host:port?pin=123456` payload used by the Android app. Active
+links are listed first. If interface state flags are incomplete, the UI falls back to a
 non-loopback address on the default or physical interface so the endpoint and
 QR remain available; transport binding still uses the strict active-link
 selection and the operating system's default route.
@@ -271,9 +237,9 @@ cargo build --release -p pw-graph-app --no-default-features --features pipewire
 
 Files ending in `.qpwgraph` or `.xml` use the qpwgraph XML shape. Other
 extensions use JSON. The configured patchbay path is used for startup
-activation. Save/load use native dialogs, recent files are retained in
-configuration, and Preferences offers named patchbay profiles plus an editable
-connection-rule list. Graph connection changes are also written to the active
+activation. Save/load use native dialogs and recent paths are retained in
+configuration. Preferences exposes patchbay snapshot/activation and audio
+reset actions. Graph connection changes are also written to the active
 patchbay path automatically, including effect-node links and undo/redo changes.
 Effect-node links are restored with their saved effect instances even when
 full patchbay activation is disabled.

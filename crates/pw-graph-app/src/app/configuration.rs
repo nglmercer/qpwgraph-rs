@@ -1,5 +1,4 @@
 use super::{layout, QpwgraphApp};
-use eframe::egui;
 use pw_graph_core::NodeAppearance;
 use pw_graph_ui::MediaFilter;
 use std::collections::BTreeMap;
@@ -23,6 +22,7 @@ impl QpwgraphApp {
         self.config.connect_mode = self.canvas.connect_mode.as_str().into();
         self.config.media_filter = self.canvas.media_filter.as_str().into();
         self.config.graph_search = self.canvas.search_query.clone();
+
         let graph = self.driver.graph();
         let mut key_counts = BTreeMap::new();
         for node in graph.nodes.values() {
@@ -30,12 +30,12 @@ impl QpwgraphApp {
                 .entry(layout::node_layout_key(node))
                 .or_insert(0_usize) += 1;
         }
-        let node_positions = graph
+        self.config.node_positions = graph
             .nodes
             .iter()
             .map(|(id, node)| (id.0.to_string(), node.position))
             .collect();
-        let node_positions_by_name = graph
+        self.config.node_positions_by_name = graph
             .nodes
             .values()
             .filter_map(|node| {
@@ -43,7 +43,7 @@ impl QpwgraphApp {
                 (key_counts.get(&key) == Some(&1)).then_some((key, node.position))
             })
             .collect();
-        let node_view_by_name = graph
+        self.config.node_view_by_name = graph
             .nodes
             .values()
             .filter_map(|node| {
@@ -55,9 +55,7 @@ impl QpwgraphApp {
                 (appearance != NodeAppearance::default()).then_some((key, appearance))
             })
             .collect();
-        self.config.node_positions = node_positions;
-        self.config.node_positions_by_name = node_positions_by_name;
-        self.config.node_view_by_name = node_view_by_name;
+
         let effect_positions: BTreeMap<_, _> = self
             .driver
             .effect_instances()
@@ -115,12 +113,12 @@ impl QpwgraphApp {
 
     pub(super) fn update_canvas_from_config(&mut self) {
         self.canvas.media_filter = MediaFilter::parse(&self.config.media_filter);
-        self.canvas.search_query = self.config.graph_search.clone();
         self.canvas.sort_ports_by_name = self.config.sort_type != "id";
         self.canvas.sort_ports_descending = self.config.sort_order == "descending";
         self.canvas.node_text_scale = self.config.node_text_scale;
         self.canvas.repel_overlapping_nodes = self.config.repel_overlapping_nodes;
         self.canvas.connect_through_nodes = self.config.connect_through_nodes;
+
         let graph = self.driver.graph();
         let mut key_counts = BTreeMap::new();
         for node in graph.nodes.values() {
@@ -150,10 +148,10 @@ impl QpwgraphApp {
         self.config.connect_mode = self.canvas.connect_mode.as_str().into();
     }
 
-    pub(super) fn update_window_size(&mut self, ctx: &egui::Context) {
-        if let Some(rect) = ctx.input(|input| input.viewport().inner_rect) {
-            self.config.window_width = rect.width();
-            self.config.window_height = rect.height();
+    pub(super) fn update_window_size(&mut self, width: f32, height: f32) {
+        if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+            self.config.window_width = width;
+            self.config.window_height = height;
         }
     }
 }

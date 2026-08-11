@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "qpwgraph-rs"
@@ -17,9 +18,8 @@ relay = ["pw-graph-backend/relay", "pipewire"]
 tray = ["dep:ksni"]
 
 [dependencies]
-eframe.workspace = true
-egui.workspace = true
-egui_extras.workspace = true
+slint.workspace = true
+slint-node-editor.workspace = true
 rfd.workspace = true
 ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"], optional = true }
 pw-graph-backend = { path = "../pw-graph-backend" }
@@ -31,3 +31,6 @@ pw-graph-effects = { path = "../pw-graph-effects" }
 pw-graph-i18n = { path = "../pw-graph-i18n" }
 pw-graph-patchbay = { path = "../pw-graph-patchbay" }
 pw-graph-ui = { path = "../pw-graph-ui" }
+
+[build-dependencies]
+slint-build.workspace = true
