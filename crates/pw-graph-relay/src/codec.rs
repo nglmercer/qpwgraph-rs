@@ -9,12 +9,16 @@ use crate::protocol::CodecKind;
 use crate::RelayError;
 use std::fmt;
 
-/// Per-channel Opus bitrate. Generous for speech at 48 kHz while keeping a
-/// 10 ms frame comfortably inside one datagram.
-const OPUS_BITRATE_PER_CHANNEL: i32 = 64_000;
-/// Encoder complexity (0–10). Mid-range trades a little quality for markedly
-/// shorter encode times on the send path.
-const OPUS_COMPLEXITY: i32 = 5;
+/// Per-channel Opus bitrate. Music through the device-playback capture is the
+/// demanding case on this path; 96 kbps per channel sits well inside Opus's
+/// near-transparent range while the largest supported packet — stereo 60 ms at
+/// constrained VBR — still stays an order of magnitude below one datagram.
+const OPUS_BITRATE_PER_CHANNEL: i32 = 96_000;
+/// Encoder complexity (0–10). High, because the quality gap shows up exactly
+/// where this relay is used — full-band music playback capture — while the
+/// absolute cost stays small: one 20 ms frame encodes in about a millisecond
+/// on any phone made this decade, and the capture queue absorbs the jitter.
+const OPUS_COMPLEXITY: i32 = 8;
 
 /// Encode one frame of interleaved f32 PCM into `out`.
 pub trait AudioEncode: Send {

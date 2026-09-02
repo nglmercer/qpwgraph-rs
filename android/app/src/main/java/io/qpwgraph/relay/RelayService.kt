@@ -237,8 +237,8 @@ class RelayService : Service() {
         }
 
     private fun startAudio(request: AudioRequest) {
-        require(request.channels == 1) {
-            "Android relay audio is mono; stereo AudioRecord/AudioTrack is not enabled"
+        require(request.channels == 1 || request.channels == 2) {
+            "Android relay audio supports mono or stereo, got ${request.channels} channels"
         }
         val frames = audioFrameCount(request.sampleRate, request.frameMs)
         val samples = frames * request.channels
@@ -382,16 +382,21 @@ class RelayService : Service() {
     }
 
     private fun createMicrophoneRecord(request: AudioRequest, frames: Int): AudioRecord {
+        val inMask = if (request.channels == 2) {
+            AudioFormat.CHANNEL_IN_STEREO
+        } else {
+            AudioFormat.CHANNEL_IN_MONO
+        }
         val minimum = AudioRecord.getMinBufferSize(
             request.sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
+            inMask,
             AudioFormat.ENCODING_PCM_16BIT,
         )
         require(minimum > 0) { "AudioRecord returned invalid minimum buffer size $minimum" }
         return AudioRecord(
             MediaRecorder.AudioSource.MIC,
             request.sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
+            inMask,
             AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minimum, pcm16BufferBytes(frames, request.channels)),
         )
@@ -421,9 +426,14 @@ class RelayService : Service() {
             }
         }, null)
 
+        val inMask = if (request.channels == 2) {
+            AudioFormat.CHANNEL_IN_STEREO
+        } else {
+            AudioFormat.CHANNEL_IN_MONO
+        }
         val minimum = AudioRecord.getMinBufferSize(
             request.sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
+            inMask,
             AudioFormat.ENCODING_PCM_16BIT,
         )
         require(minimum > 0) { "AudioRecord returned invalid minimum buffer size $minimum" }
@@ -437,7 +447,7 @@ class RelayService : Service() {
         val format = AudioFormat.Builder()
             .setSampleRate(request.sampleRate)
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+            .setChannelMask(inMask)
             .build()
 
         // Do NOT combine setAudioSource with setAudioPlaybackCaptureConfig
@@ -453,26 +463,31 @@ class RelayService : Service() {
         var playing = false
         try {
             check(running.get() && activeRequest === request) { "relay audio service is stopping" }
-            val minimum = AudioTrack.getMinBufferSize(
-                request.sampleRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
+        val outMask = if (request.channels == 2) {
+            AudioFormat.CHANNEL_OUT_STEREO
+        } else {
+            AudioFormat.CHANNEL_OUT_MONO
+        }
+        val minimum = AudioTrack.getMinBufferSize(
+            request.sampleRate,
+            outMask,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        require(minimum > 0) { "AudioTrack returned invalid minimum buffer size $minimum" }
+        val created = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
             )
-            require(minimum > 0) { "AudioTrack returned invalid minimum buffer size $minimum" }
-            val created = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build(),
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setSampleRate(request.sampleRate)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build(),
-                )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(request.sampleRate)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(outMask)
+                    .build(),
+            )
                 .setBufferSizeInBytes(maxOf(minimum, pcm16BufferBytes(frames, request.channels)))
                 .build()
             track = created

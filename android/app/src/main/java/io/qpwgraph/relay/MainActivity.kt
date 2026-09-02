@@ -609,6 +609,11 @@ private fun EmitterTab(
         if (state.host.captureSource == CaptureSource.DEVICE_PLAYBACK) {
             Spacer(Modifier.height(8.dp))
             AppAlert(message = stringResource(R.string.emitter_playback_hint), severity = AlertSeverity.Info)
+            Spacer(Modifier.height(8.dp))
+            AppAlert(
+                message = stringResource(R.string.emitter_playback_call_audio_hint),
+                severity = AlertSeverity.Warning,
+            )
             if (!viewModel.hasMediaProjectionConsent() && hostEditable) {
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(onClick = requestPlaybackConsent) { Text(stringResource(R.string.emitter_grant_consent)) }

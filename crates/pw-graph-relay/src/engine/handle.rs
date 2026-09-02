@@ -369,6 +369,20 @@ impl RelayHandle {
         self.inner.mix_playback(&mut out[..usable], true)
     }
 
+    /// Decoded audio currently waiting for playback, summed across receiving
+    /// sessions, paired with the depth those queues are trimmed to.
+    ///
+    /// A pull loop that runs on its own consumer clock — the Windows render
+    /// endpoint, unlike PipeWire's clock-following streams — compares this
+    /// backlog against the target over time to learn whether the peer's
+    /// capture clock runs ahead of or behind the local render clock, and
+    /// micro-adjusts its read rate accordingly. Locks the session table, so
+    /// call it at control rate (a few times a second), never from a realtime
+    /// callback.
+    pub fn playback_levels(&self) -> (usize, usize) {
+        self.inner.playback_levels()
+    }
+
     pub fn status(&self) -> EngineStatus {
         self.inner.status()
     }

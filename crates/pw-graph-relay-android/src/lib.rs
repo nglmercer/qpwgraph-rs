@@ -196,15 +196,14 @@ fn positive_u32(name: &str, value: jint) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("{name} is out of range"))
 }
 
-/// Android's current audio pump is deliberately mono: both AudioRecord and
-/// AudioTrack use the mono channel masks and the PCM arrays contain one sample
-/// per frame. Rejecting stereo at the native boundary prevents the negotiated
-/// relay geometry from claiming two channels that the Java worker does not
-/// actually provide.
+/// The Android audio pump speaks mono and stereo: AudioRecord/AudioTrack use
+/// the matching channel masks and the PCM arrays hold one sample per channel.
+/// The negotiable wire set is exactly 1 or 2, so anything else is rejected at
+/// the native boundary before the Java worker can be asked for it.
 fn android_channels(value: jint) -> Result<u16, String> {
     let channels = positive_u16("channels", value)?;
-    if channels != 1 {
-        return Err("Android relay audio currently supports mono only (channels=1)".into());
+    if channels != 1 && channels != 2 {
+        return Err("Android relay audio supports mono or stereo (channels=1 or 2)".into());
     }
     Ok(channels)
 }
@@ -1589,9 +1588,11 @@ mod tests {
     }
 
     #[test]
-    fn android_audio_is_explicitly_mono_until_stereo_io_is_implemented() {
+    fn android_audio_accepts_the_negotiable_channel_set() {
         assert_eq!(android_channels(1).unwrap(), 1);
-        assert!(android_channels(2).is_err());
+        assert_eq!(android_channels(2).unwrap(), 2);
+        assert!(android_channels(0).is_err());
+        assert!(android_channels(3).is_err());
     }
 
     #[test]

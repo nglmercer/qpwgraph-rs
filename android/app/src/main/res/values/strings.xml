@@ -76,6 +76,7 @@
     <string name="emitter_capture_playback">Device playback</string>
     <string name="emitter_capture_tooltip">Microphone captures physical mic; device playback captures system audio (Android 10+).</string>
     <string name="emitter_playback_hint">Device playback capture requires audio-recording permission but captures system audio instead of the microphone. You will be asked to allow screen/audio capture.</string>
+    <string name="emitter_playback_call_audio_hint">Call and voice-chat audio (Discord, WhatsApp, Meet, phone calls) cannot be captured on Android: those apps play through the protected voice-communication channel, which the OS does not let any app record. Media, games, and browser audio work. To carry a call, emit this device\'s microphone instead, or run the call on the desktop.</string>
     <string name="emitter_grant_consent">Grant capture consent</string>
     <string name="emitter_start_host">Start host</string>
     <string name="emitter_stop_host">Stop host</string>

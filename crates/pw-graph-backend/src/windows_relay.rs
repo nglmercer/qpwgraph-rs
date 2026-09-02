@@ -386,6 +386,156 @@ fn capture_loop(
     }
 }
 
+/// Rate-correction step applied per adaptation tick, as a fraction of the
+/// nominal read rate. Two hundred parts per million per tick crosses any
+/// realistic clock drift within a few ticks, while each individual nudge
+/// stays far below audibility.
+const DRIFT_RATE_STEP: f64 = 0.0002;
+/// Hard clamp on the read rate's distance from nominal. Real crystal drift
+/// sits in the tens of ppm; the clamp is orders of magnitude wider so the
+/// adapter can also recover from a backlog burst, while linear interpolation
+/// at this ratio remains transparent.
+const DRIFT_RATE_LIMIT: f64 = 0.002;
+/// Render iterations between backlog samples. The poll loop turns over
+/// roughly every [`POLL_INTERVAL`], so this samples the backlog a couple of
+/// times per second — fast enough to track drift, slow enough that the
+/// session-table lock behind `playback_levels` is irrelevant.
+const DRIFT_TICK_INTERVAL: u32 = 128;
+
+/// Variable-rate reader between the relay engine and the render endpoint.
+///
+/// The engine fills its playback queues from the peer's capture clock; the
+/// render endpoint drains at its own device clock. The two disagree by tens
+/// of parts per million, and a fixed-rate reader turns that drift into
+/// audible events every few minutes: underrun silence when the local clock
+/// runs fast, drop-oldest clicks when it runs slow. The adapter reads at a
+/// micro-adjusted rate, nudged by the engine backlog, so the same drift is
+/// absorbed as a constant, inaudible resampling.
+///
+/// The interpolation is linear between neighbouring frames, with a small
+/// FIFO so frames the grid has not yet reached survive across pulls —
+/// stretching (rate < 1) must never discard audio, and squeezing (rate > 1)
+/// must never repeat it. At exactly 1.0 the grid lands on whole frames and
+/// the output is bit-identical to what the engine produced.
+struct DriftAdapter {
+    channels: usize,
+    /// Input frames consumed per output frame; 1.0 is exact passthrough.
+    rate: f64,
+    /// Grid position of the next output frame, in FIFO frames. Always kept
+    /// in `[0, 1)` between calls by the retirement step in [`Self::render`].
+    position: f64,
+    /// Valid frames currently held in `fifo`.
+    filled: usize,
+    /// PCM handed over by the engine but not yet consumed by the grid.
+    fifo: Vec<f32>,
+    ticks: u32,
+}
+
+impl DriftAdapter {
+    fn new(channels: usize, max_output_frames: usize) -> Self {
+        let frames = ((max_output_frames as f64 * (1.0 + DRIFT_RATE_LIMIT)) as usize) + 4;
+        Self {
+            channels,
+            rate: 1.0,
+            position: 0.0,
+            filled: 0,
+            fifo: vec![0.0; frames * channels],
+            ticks: 0,
+        }
+    }
+
+    /// Sample the engine backlog every [`DRIFT_TICK_INTERVAL`] calls and
+    /// nudge the read rate back toward equilibrium. The receive queues trim
+    /// to `target` on every push, so aiming at its midpoint keeps the depth
+    /// clear of both the drop-oldest trim and the underrun floor: a deep
+    /// backlog means the peer's clock runs fast here and the grid must
+    /// advance quicker, a starved one means it runs slow and the grid must
+    /// stretch.
+    fn observe(&mut self, depth: usize, target: usize) {
+        self.ticks += 1;
+        if self.ticks < DRIFT_TICK_INTERVAL {
+            return;
+        }
+        self.ticks = 0;
+        if target == 0 {
+            return;
+        }
+        let ideal = target / 2;
+        if depth > ideal + ideal / 2 {
+            self.rate += DRIFT_RATE_STEP;
+        } else if depth < ideal / 2 {
+            self.rate -= DRIFT_RATE_STEP;
+        } else {
+            return;
+        }
+        self.rate = self
+            .rate
+            .clamp(1.0 - DRIFT_RATE_LIMIT, 1.0 + DRIFT_RATE_LIMIT);
+    }
+
+    fn tick(&mut self, handle: &RelayHandle) {
+        let (depth, target) = handle.playback_levels();
+        self.observe(depth, target);
+    }
+
+    /// Fill `output` completely from the engine, pulling through `pull` at
+    /// the adapted rate. Whatever the engine cannot supply plays as silence.
+    fn render(&mut self, output: &mut [f32], mut pull: impl FnMut(&mut [f32]) -> usize) {
+        let channels = self.channels;
+        let out_frames = output.len() / channels;
+        if out_frames == 0 {
+            return;
+        }
+        // Keep a little more on hand than one output's worth: interpolation
+        // always needs one lookahead frame, and the grid may run up to one
+        // `rate` step past the last producible point before the next pull.
+        let want_frames = (((out_frames as f64) * self.rate).ceil() as usize + 4)
+            .min(self.fifo.len() / channels);
+        if self.filled < want_frames {
+            let room = want_frames - self.filled;
+            let got =
+                pull(&mut self.fifo[self.filled * channels..(self.filled + room) * channels]);
+            self.filled += got / channels;
+        }
+
+        let mut produced = 0usize;
+        let mut position = self.position;
+        while produced < out_frames {
+            let base = position.floor();
+            let right = base as isize + 1;
+            if right < 0 || right as usize >= self.filled {
+                // The grid ran past the audio on hand: play silence until
+                // the engine catches up. Unread frames stay buffered.
+                break;
+            }
+            debug_assert!(base >= 0.0, "the grid never moves backwards");
+            let fraction = (position - base) as f32;
+            for channel in 0..channels {
+                let left = self.fifo[base as usize * channels + channel];
+                let sample = self.fifo[right as usize * channels + channel];
+                output[produced * channels + channel] = left + (sample - left) * fraction;
+            }
+            produced += 1;
+            position += self.rate;
+        }
+        for slot in output[produced * channels..].iter_mut() {
+            *slot = 0.0;
+        }
+
+        // Retire the frames the grid has fully passed, so the next call's
+        // grid starts inside `[0, 1)` again and the FIFO cannot grow.
+        let used = position.floor().max(0.0) as usize;
+        let dropped = used.min(self.filled);
+        if dropped > 0 {
+            self.fifo
+                .copy_within(dropped * channels..self.filled * channels, 0);
+            self.filled -= dropped;
+            position -= dropped as f64;
+        }
+        self.position = position;
+    }
+}
+
 /// Drain audio received from peers onto the playback endpoint.
 fn render_loop(
     client: &Audio::IAudioClient,
@@ -406,6 +556,11 @@ fn render_loop(
     }
     let channels = usize::from(RELAY_CHANNELS);
     let mut scratch = vec![0.0f32; buffer_frames as usize * channels];
+    // The engine fills its queues from the peer's capture clock while this
+    // loop drains on the endpoint's own clock; the adapter absorbs the
+    // difference as a micro-adjusted read rate instead of letting it
+    // accumulate into underrun silence and drop-oldest clicks.
+    let mut adapter = DriftAdapter::new(channels, buffer_frames as usize);
 
     while !stop.load(Ordering::Acquire) {
         let padding = match unsafe { client.GetCurrentPadding() } {
@@ -421,12 +576,8 @@ fn render_loop(
             continue;
         }
         let wanted = available as usize * channels;
-        let filled = handle.pull_playback(&mut scratch[..wanted]);
-        // The engine reports how much it had. Anything short is silence, so a
-        // starved session plays quiet rather than repeating the last buffer.
-        if filled < wanted {
-            scratch[filled..wanted].fill(0.0);
-        }
+        adapter.tick(handle);
+        adapter.render(&mut scratch[..wanted], |out| handle.pull_playback(out));
 
         let data = match unsafe { render.GetBuffer(available) } {
             Ok(data) => data,
@@ -480,5 +631,123 @@ mod tests {
         // pitch-shifted rather than failing outright.
         assert_eq!(block_align, RELAY_CHANNELS * 4);
         assert_eq!(avg_bytes, RELAY_SAMPLE_RATE * u32::from(block_align));
+    }
+
+    /// Deterministic engine stand-in: hands out consecutive frames, then runs
+    /// dry, so adapter tests never need WASAPI or a live relay engine.
+    struct ScriptedSource {
+        pcm: Vec<f32>,
+        offset: usize,
+    }
+
+    impl ScriptedSource {
+        fn pull(&mut self, out: &mut [f32]) -> usize {
+            let count = out.len().min(self.pcm.len() - self.offset);
+            out[..count].copy_from_slice(&self.pcm[self.offset..self.offset + count]);
+            self.offset += count;
+            count
+        }
+    }
+
+    #[test]
+    fn identity_rate_is_bit_exact_across_calls() {
+        let channels = 2;
+        let mut adapter = DriftAdapter::new(channels, 8);
+        let fifo_capacity = adapter.fifo.len();
+        // More stream than the run consumes, so the final output still has
+        // its interpolation lookahead; running a resampler to exact end of
+        // stream legitimately decays to silence on the last frame.
+        let pcm: Vec<f32> = (0..256 * channels)
+            .map(|i| ((i % 7) as f32 / 7.0) - 0.5)
+            .collect();
+        let mut source = ScriptedSource {
+            pcm,
+            offset: 0,
+        };
+        let mut played = Vec::new();
+        for _ in 0..12 {
+            let mut out = vec![0.0f32; 8 * channels];
+            adapter.render(&mut out, |buf| source.pull(buf));
+            played.extend_from_slice(&out);
+        }
+        // At rate 1.0 the grid lands on whole frames, so nothing may be
+        // resampled, dropped, or duplicated across the call boundaries.
+        assert_eq!(played, source.pcm[..played.len()]);
+        assert_eq!(played.len(), 96 * channels);
+        assert!(played.iter().all(|sample| sample.is_finite()));
+        assert_eq!(adapter.fifo.len(), fifo_capacity, "the FIFO must not grow");
+    }
+
+    #[test]
+    fn backlog_nudges_the_read_rate_both_ways_and_clamps() {
+        let mut adapter = DriftAdapter::new(2, 8);
+        // Four frames of stereo 48 kHz — the receive queues' trim depth.
+        let target = 4 * 960 * 2;
+        // Dead centre of the comfort band: no correction.
+        adapter.ticks = DRIFT_TICK_INTERVAL - 1;
+        adapter.observe(target / 2, target);
+        assert_eq!(adapter.rate, 1.0);
+        // Deep backlog: the peer's clock runs fast here, the grid squeezes,
+        // and repeated nudges stop at the limit.
+        for _ in 0..20 {
+            adapter.ticks = DRIFT_TICK_INTERVAL - 1;
+            adapter.observe(target * 2, target);
+        }
+        assert!((adapter.rate - (1.0 + DRIFT_RATE_LIMIT)).abs() < 1e-9);
+        // Starved: the peer's clock runs slow, the grid stretches, and the
+        // opposite clamp applies.
+        for _ in 0..20 {
+            adapter.ticks = DRIFT_TICK_INTERVAL - 1;
+            adapter.observe(0, target);
+        }
+        assert!((adapter.rate - (1.0 - DRIFT_RATE_LIMIT)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_empty_engine_plays_silence_then_resumes_at_the_stream_start() {
+        let channels = 2;
+        let mut adapter = DriftAdapter::new(channels, 8);
+        let mut out = vec![0.25f32; 8 * channels];
+        adapter.render(&mut out, |_| 0);
+        assert!(out.iter().all(|sample| *sample == 0.0));
+
+        let pcm: Vec<f32> = (0..16 * channels)
+            .map(|i| (i as f32 * 0.125).fract())
+            .collect();
+        let mut source = ScriptedSource {
+            pcm,
+            offset: 0,
+        };
+        let mut out = vec![-1.0f32; 8 * channels];
+        adapter.render(&mut out, |buf| source.pull(buf));
+        // The first rendered frame is the first frame of the stream, not a
+        // resume from stale grid state.
+        assert_eq!(&out[..2], &source.pcm[..2]);
+        assert!(out.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn the_rate_moves_input_consumption_in_the_right_direction() {
+        let channels = 1;
+        let pcm: Vec<f32> = vec![0.5; 4096];
+        let run = |rate_hint: f64| {
+            let mut adapter = DriftAdapter::new(channels, 64);
+            adapter.rate = rate_hint;
+            let mut source = ScriptedSource {
+                pcm: pcm.clone(),
+                offset: 0,
+            };
+            for _ in 0..32 {
+                let mut out = vec![0.0f32; 64];
+                adapter.render(&mut out, |buf| source.pull(buf));
+            }
+            source.offset
+        };
+        let squeezed = run(1.0 + DRIFT_RATE_LIMIT);
+        let stretched = run(1.0 - DRIFT_RATE_LIMIT);
+        assert!(squeezed > stretched, "a faster grid must read more input");
+        // 2048 outputs at ±0.2% differ by about 8 input frames; the slightly
+        // different FIFO leftovers at the end are worth a frame of slack.
+        assert!(squeezed - stretched >= 6, "{squeezed} vs {stretched}");
     }
 }

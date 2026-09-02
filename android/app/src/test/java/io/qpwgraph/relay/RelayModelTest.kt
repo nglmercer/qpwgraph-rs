@@ -21,10 +21,11 @@ class RelayModelTest {
     }
 
     @Test
-    fun android_host_default_is_the_usb_discovery_port_and_mono() {
+    fun android_host_default_is_the_usb_discovery_port_and_stereo() {
         assertEquals(48_123, DEFAULT_HOST_PORT)
-        assertEquals(1, HostSettings().channels)
-        assertEquals(1, RelaySettings().channels)
+        assertEquals(ANDROID_AUDIO_CHANNELS, HostSettings().channels)
+        assertEquals(ANDROID_AUDIO_CHANNELS, RelaySettings().channels)
+        assertEquals(2, ANDROID_AUDIO_CHANNELS)
     }
 
     @Test

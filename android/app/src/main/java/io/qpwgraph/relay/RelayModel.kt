@@ -16,7 +16,7 @@ data class RelaySettings(
     val autoConnectTrustedWifi: Boolean = false,
     val deviceName: String = "android-relay",
     val sampleRate: Int = 48_000,
-    val channels: Int = 1,
+    val channels: Int = ANDROID_AUDIO_CHANNELS,
     val frameMs: Int = 20,
 ) {
     override fun toString(): String =
@@ -48,7 +48,7 @@ data class HostSettings(
     val codec: String = "opus",
     val transport: String = "auto",
     val sampleRate: Int = 48_000,
-    val channels: Int = 1,
+    val channels: Int = ANDROID_AUDIO_CHANNELS,
     val frameMs: Int = 20,
     val captureSource: CaptureSource = CaptureSource.MICROPHONE,
 ) {
@@ -64,8 +64,11 @@ fun captureSourceFromString(value: String): CaptureSource = when (value.lowercas
 
 const val DEFAULT_HOST_PORT = 48123
 
-/** Android currently exposes mono PCM on both platform audio endpoints. */
-const val ANDROID_AUDIO_CHANNELS = 1
+/** Default channel count for the Android platform audio endpoints.
+ * Stereo is the quality default — device-playback capture keeps left/right
+ * separation and both AudioRecord/AudioTrack accept the stereo masks — while
+ * the mono geometry stays valid for callers that ask for it. */
+const val ANDROID_AUDIO_CHANNELS = 2
 const val PCM16_BYTES_PER_SAMPLE = 2
 
 /** Audio geometry copied into the foreground service start request. */

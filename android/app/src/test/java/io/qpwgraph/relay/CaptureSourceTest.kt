@@ -75,11 +75,15 @@ class CaptureSourceTest {
     }
 
     @Test
-    fun playback_capture_remains_mono() {
-        // Repository currently rejects Android stereo and expects mono PCM, so keep playback mono initially.
-        assertEquals(1, HostSettings(captureSource = CaptureSource.DEVICE_PLAYBACK).channels)
-        assertEquals(1, HostSettings(captureSource = CaptureSource.MICROPHONE).channels)
-        assertEquals(1, ANDROID_AUDIO_CHANNELS)
+    fun platform_audio_defaults_to_stereo_and_keeps_mono_valid() {
+        // Stereo is the quality default (device-playback capture keeps L/R
+        // separation); the mono geometry remains accepted by the service and
+        // the native boundary.
+        assertEquals(2, HostSettings(captureSource = CaptureSource.DEVICE_PLAYBACK).channels)
+        assertEquals(2, HostSettings(captureSource = CaptureSource.MICROPHONE).channels)
+        assertEquals(2, ANDROID_AUDIO_CHANNELS)
+        assertEquals(1, pcm16BufferBytes(480, 1))
+        assertEquals(960, pcm16BufferBytes(480, 2))
     }
 
     @Test

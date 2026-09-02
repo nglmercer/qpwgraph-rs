@@ -619,6 +619,28 @@ impl EngineInner {
         found && accepted
     }
 
+    /// Total decoded audio waiting for playback across receiving sessions,
+    /// paired with the queue depth the receive workers trim to.
+    ///
+    /// This is the drift-control signal for a playback consumer that runs on
+    /// its own clock (the Windows render endpoint): the peer's capture clock
+    /// and the local render clock disagree by tens of parts per million, and
+    /// an uncorrected consumer drifts into repeated underruns or into the
+    /// queues' drop-oldest trim. It locks the session table, so it belongs to
+    /// control-rate callers, not realtime callbacks.
+    pub(crate) fn playback_levels(&self) -> (usize, usize) {
+        let Ok(sessions) = self.sessions.lock() else {
+            return (0, 0);
+        };
+        let mut depth = 0usize;
+        let mut target = 0usize;
+        for record in sessions.values().filter(|record| record.receiving) {
+            depth += record.incoming.len();
+            target += record.incoming.target_depth();
+        }
+        (depth, target)
+    }
+
     /// Sum every receiving session's decoded audio into `out`.
     ///
     /// Each session decodes into its own queue in the engine's local format,

@@ -66,10 +66,22 @@ healthy Wi-Fi session is intentionally not proactively migrated just because
 USB appears; authenticated resume/failover performs the interface-scoped UDP
 switch and keeps the old path available if rebinding fails.
 
-On Android, the platform audio endpoints currently run mono PCM16. Android
-rejects stereo relay geometry until stereo `AudioRecord`/`AudioTrack` I/O is
-implemented, and it requests microphone permission only for Emit, Both, and
-Host modes. Receive-only playback uses no microphone permission.
+Android platform audio endpoints run stereo PCM16 by default; the mono
+geometry stays accepted for callers that explicitly ask for it. Stereo keeps
+left/right separation when capturing device playback instead of folding the
+mix to one channel. The microphone permission is requested only for Emit,
+Both, and Host modes; receive-only playback uses no microphone permission.
+
+## Voice-call audio is not capturable
+
+Device-playback capture cannot pick up call audio — Discord, WhatsApp, Meet,
+ordinary phone calls — on any Android version. Those apps play through the
+protected voice-communication channel, and Android's playback-capture API is
+not allowed to record it: its usage filter accepts only media, game, and
+unknown usages, and everything else is excluded by OS privacy policy. This is
+a platform rule, not a relay defect, and no app without privileged access can
+work around it. To carry a call, emit the phone's microphone to the desktop,
+or run the call on the desktop itself.
 
 ## Windows
 
