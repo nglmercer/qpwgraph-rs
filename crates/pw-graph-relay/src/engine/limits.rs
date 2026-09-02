@@ -30,7 +30,14 @@ pub const MAX_QUEUED_EVENTS: usize = 256;
 /// from turning the application callback into an allocation DoS.
 pub const MAX_PENDING_TRUST_ENROLLMENTS: usize = 64;
 /// A host embedding has this long to persist an enrollment and accept it.
-pub const TRUST_ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// This is the window a UI has to show its accept/decline decision, so it must
+/// be comfortable for a human. The paired client keeps waiting (and
+/// keepalive-ing) for the acknowledgement for this long plus handshake slack —
+/// a decision that arrives within the window must never reach a client that has
+/// already given up, or the host stores a credential the client discarded and
+/// every later reconnect falls back to PIN pairing.
+pub const TRUST_ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum discovered addresses retained for one stable peer identity.
 pub const MAX_TRUSTED_CANDIDATE_ADDRESSES: usize = 16;
 /// Maximum `(peer, address)` failure records retained for candidate backoff.

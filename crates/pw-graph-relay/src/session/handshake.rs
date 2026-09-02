@@ -217,6 +217,11 @@ pub(super) fn reject_pairing(
 /// pairing. The embedding is notified only after the authenticated host
 /// acknowledges the write; otherwise it could persist a credential that the
 /// host never actually accepted and every later auto-connect would fail.
+///
+/// The wait spans the host embedding's whole decision window (a UI may hold
+/// the accept/decline dialog open for many seconds), so keepalives are sent
+/// here too: without them the host's session timeout would tear down an
+/// otherwise healthy session while its own user is still deciding.
 pub(super) fn enroll_trusted_peer(
     inner: &Arc<EngineInner>,
     record: &Arc<SessionRecord>,
@@ -237,8 +242,23 @@ pub(super) fn enroll_trusted_peer(
     {
         return;
     }
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    // The handshake's 5s read timeout would let keepalive sends drift to the
+    // edge of the host's 6s session timeout; poll finely so they keep the
+    // cadence the control loop normally maintains. The control loop sets its
+    // own timeout when this wait ends, stretched or not.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let deadline = Instant::now() + ENROLLMENT_ACK_TIMEOUT;
+    let mut last_keepalive = Instant::now();
     while Instant::now() < deadline {
+        // A disconnect during the wait must end the wait immediately: the
+        // control loop that would otherwise deliver `bye` only runs after
+        // this returns, and a keepalive-fed host would never time out.
+        if record.bye_requested.load(Ordering::Relaxed)
+            || record.stop.load(Ordering::Relaxed)
+            || !inner.session_alive(record.id)
+        {
+            return;
+        }
         match cipher.receive(stream) {
             Ok(ControlMessage::TrustAccepted {}) => {
                 inner.emit(RelayEvent::TrustedPeerAvailable {
@@ -256,5 +276,16 @@ pub(super) fn enroll_trusted_peer(
             Err(error) if is_timeout(&error) => {}
             Err(_) => return,
         }
+        let now = Instant::now();
+        if now.duration_since(last_keepalive) >= KEEPALIVE_INTERVAL {
+            if cipher
+                .send(stream, &ControlMessage::Keepalive {})
+                .is_err()
+            {
+                return;
+            }
+            last_keepalive = now;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

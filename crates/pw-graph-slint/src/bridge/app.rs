@@ -5,7 +5,7 @@ use pw_graph_config::AppConfig;
 use pw_graph_core::PortKey;
 use pw_graph_i18n::I18n;
 use pw_graph_patchbay::Patchbay;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,13 @@ pub(crate) struct Application {
     /// spoofed stable ID must not make every other address for the same
     /// trusted peer unusable, nor couple unrelated peers sharing an address.
     pub(crate) relay_trusted_candidate_failures: BTreeMap<(String, String), (u8, Instant)>,
+    #[cfg(feature = "relay")]
+    /// Trusted-peer addresses that answered a dial with an active refusal or
+    /// unreachable verdict. A stored address here is no longer re-injected as
+    /// a reconnect candidate — without this, a phone that changed IP leaves
+    /// the app retrying its old lease forever. Cleared when discovery
+    /// re-announces the address or a session with it succeeds.
+    pub(crate) relay_trusted_refused: BTreeSet<(String, String)>,
     #[cfg(feature = "relay")]
     pub(crate) relay_pending_enrollment: Option<PendingEnrollment>,
     #[cfg(feature = "relay")]

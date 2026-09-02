@@ -541,6 +541,18 @@ pub(super) fn client_thread(
     // rule must not turn an otherwise healthy authenticated control session
     // into a false disconnect.
 
+    // The session is fully established here — audio workers are running and
+    // the sealed setup completed. Reporting it before the enrollment exchange
+    // keeps the UI from showing "connecting" for the whole host-side
+    // accept/decline window; the trust save is a background addendum and its
+    // own event (TrustedPeerAvailable) reports the outcome.
+    inner.emit(RelayEvent::SessionEstablished {
+        id,
+        peer: record.peer.clone(),
+        roles,
+        codec: config.codec,
+    });
+
     let trusted_secret = record.trust_secret.lock().ok().and_then(|slot| *slot);
     if let Some(secret) = trusted_secret {
         enroll_trusted_peer(
@@ -552,13 +564,6 @@ pub(super) fn client_thread(
             secret,
         );
     }
-
-    inner.emit(RelayEvent::SessionEstablished {
-        id,
-        peer: record.peer.clone(),
-        roles,
-        codec: config.codec,
-    });
 
     client_control_loop(inner, record, stream, cipher, socket, target);
 }

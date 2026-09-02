@@ -5,6 +5,7 @@
 //! which is why it does not sit in the constructor with the window wiring.
 
 use super::*;
+use std::collections::BTreeSet;
 
 /// The opened application state, plus the meter policy the window shows.
 pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, MeterPolicy) {
@@ -93,6 +94,8 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         relay_trusted_auto_attempt_at: None,
         #[cfg(feature = "relay")]
         relay_trusted_candidate_failures: BTreeMap::new(),
+        #[cfg(feature = "relay")]
+        relay_trusted_refused: BTreeSet::new(),
         #[cfg(feature = "relay")]
         relay_pending_enrollment: None,
         #[cfg(feature = "relay")]

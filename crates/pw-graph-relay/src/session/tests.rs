@@ -1110,3 +1110,81 @@ fn prepared_capture_converters_are_sized_for_the_realtime_quantum() {
         }
     }
 }
+
+#[test]
+fn enrollment_wait_keeps_the_session_alive_while_the_host_decides() {
+    let client_pake = pake_start(Side::Client, "123456");
+    let host_pake = pake_start(Side::Host, "123456");
+    let client_message = client_pake.message.clone();
+    let host_message = host_pake.message.clone();
+    let client_keys = client_pake.finish(&host_message).expect("client pairs");
+    let host_keys = host_pake.finish(&client_message).expect("host pairs");
+    let (client_sealer, client_opener) = client_keys.control_channel().expect("client cipher");
+    let (host_sealer, host_opener) = host_keys.control_channel().expect("host cipher");
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let target = listener.local_addr().unwrap();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let mut cipher = ControlCipher {
+            sealer: host_sealer,
+            opener: host_opener,
+        };
+        assert!(matches!(
+            cipher.receive(&mut stream).unwrap(),
+            ControlMessage::TrustEnroll { .. }
+        ));
+        // Simulate the host embedding's accept/decline dialog staying open
+        // well past one keepalive interval: the client must keep the control
+        // channel alive or the host's session timeout ends the session
+        // before any decision can be acknowledged.
+        std::thread::sleep(Duration::from_millis(2_400));
+        let mut saw_keepalive = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match cipher.receive(&mut stream) {
+                Ok(ControlMessage::Keepalive {}) => {
+                    saw_keepalive = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if is_timeout(&error) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_keepalive,
+            "client stopped keepalives while waiting for the enrollment decision"
+        );
+        cipher
+            .send(&mut stream, &ControlMessage::TrustAccepted {})
+            .unwrap();
+    });
+
+    let inner = EngineInner::new(crate::EngineConfig {
+        device_id: "client-id".into(),
+        ..crate::EngineConfig::default()
+    });
+    let record = resumable_session(7_021);
+    assert!(inner.insert_session(Arc::clone(&record)));
+    let mut client_stream = TcpStream::connect(target).unwrap();
+    let _ = client_stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut cipher = ControlCipher {
+        sealer: client_sealer,
+        opener: client_opener,
+    };
+    enroll_trusted_peer(
+        &inner,
+        &record,
+        &mut client_stream,
+        &mut cipher,
+        "client-id",
+        [0x2a; 32],
+    );
+    host.join().unwrap();
+    assert!(matches!(
+        inner.drain_events().as_slice(),
+        [RelayEvent::TrustedPeerAvailable { peer_id, .. }] if peer_id == "resume-peer-id"
+    ));
+}

@@ -210,6 +210,24 @@ fn connect_trusted_peer(
         Err(error) => {
             if automatic {
                 note_trusted_candidate_failure(application, &peer.id, &peer.addr.to_string());
+                // A refused dial means nothing is listening at this address
+                // right now. Stop re-injecting it as a candidate so the
+                // reconnect loop ends instead of chasing a stale address;
+                // discovery re-announcing the peer is what revives it.
+                let refused = error.contains("refused")
+                    || error.contains("os error 111")
+                    || error.contains("unreachable")
+                    || error.contains("No route to host")
+                    || error.contains("os error 113")
+                    || error.contains("os error 10061")
+                    || error.contains("os error 10051");
+                if refused {
+                    note_trusted_candidate_refused(
+                        application,
+                        &peer.id,
+                        &peer.addr.to_string(),
+                    );
+                }
             }
             application.status = application.tf("relay.error", &[("error", error)])
         }
@@ -218,8 +236,14 @@ fn connect_trusted_peer(
 }
 
 #[cfg(feature = "relay")]
-fn trusted_candidate_allowed(application: &mut Application, peer: &RelayPeerInfo) -> bool {
+pub(crate) fn trusted_candidate_allowed(application: &mut Application, peer: &RelayPeerInfo) -> bool {
     let key = (peer.id.clone(), peer.addr.to_string());
+    // An active refusal is not a backoff delay: until discovery re-announces
+    // this address, nothing is listening there and dialing it again only
+    // produces another 10061 loop.
+    if application.relay_trusted_refused.contains(&key) {
+        return false;
+    }
     let Some((_, retry_at)) = application.relay_trusted_candidate_failures.get(&key) else {
         return true;
     };
@@ -229,6 +253,29 @@ fn trusted_candidate_allowed(application: &mut Application, peer: &RelayPeerInfo
     } else {
         false
     }
+}
+
+/// Record that a trusted candidate at this address is actively unreachable
+/// (connection refused / no route). Unlike the timing backoff, this does not
+/// expire on its own: only discovery re-announcing the address or a successful
+/// session with it clears the mark.
+#[cfg(feature = "relay")]
+pub(crate) fn note_trusted_candidate_refused(application: &mut Application, peer_id: &str, address: &str) {
+    if peer_id.is_empty() || address.is_empty() {
+        return;
+    }
+    application
+        .relay_trusted_refused
+        .insert((peer_id.to_owned(), address.to_owned()));
+}
+
+/// Clear a refusal mark: discovery re-announced the address (the host came
+/// back, possibly at the same lease) or a session with it succeeded.
+#[cfg(feature = "relay")]
+pub(crate) fn clear_trusted_candidate_refused(application: &mut Application, peer_id: &str, address: &str) {
+    application
+        .relay_trusted_refused
+        .remove(&(peer_id.to_owned(), address.to_owned()));
 }
 
 #[cfg(feature = "relay")]
@@ -333,11 +380,21 @@ fn retry_trusted_auto_connect(application: &mut Application) {
                 }
             }
         }
-        peers.retain(|p| {
-            p.id == pending.peer_id
-                && trusted_secret_for(application, &p.id).is_some()
-                && trusted_candidate_allowed(application, p)
-        });
+        peers.retain(|p| p.id == pending.peer_id && trusted_secret_for(application, &p.id).is_some());
+        // If every candidate for this peer is actively refused, the stored
+        // address is dead until discovery re-announces it; holding the row
+        // would only loop "retry in 5s" against nothing.
+        let all_refused = !peers.is_empty()
+            && peers.iter().all(|p| {
+                application
+                    .relay_trusted_refused
+                    .contains(&(p.id.clone(), p.addr.to_string()))
+            });
+        if all_refused {
+            application.relay_reconnect_pending = None;
+            return;
+        }
+        peers.retain(|p| trusted_candidate_allowed(application, p));
         peers.sort_by_key(|peer| trusted_candidate_rank(application, peer));
         if let Some(peer) = peers.into_iter().next() {
             application.relay_reconnect_pending = None;
@@ -630,54 +687,78 @@ pub(crate) fn cancel_relay_connect(application: &mut Application) {
 /// Revoke a trusted identity in both the live engine and the durable desktop
 /// config. The engine operation comes first so a failed backend call never
 /// leaves the UI claiming that a credential was forgotten.
+/// Commit a host-side enrollment transaction to durable storage and accept it
+/// in the engine. Shared by the user's dialog confirmation and the
+/// re-enrollment auto-accept so both follow the identical
+/// persist-then-acknowledge (with rollback) order.
+#[cfg(feature = "relay")]
+fn commit_enrollment(
+    application: &mut Application,
+    pending: &crate::bridge::app::PendingEnrollment,
+) {
+    let before = application.config.clone();
+    let persisted = application
+        .source
+        .relay_trusted_enrollment_secret(pending.transaction_id)
+        .ok()
+        .flatten()
+        .map(|secret| {
+            remember_trusted_peer(
+                application,
+                &pending.peer_id,
+                &pw_graph_backend::RelayPeerInfo {
+                    id: pending.peer_id.clone(),
+                    name: pending.peer_name.clone(),
+                    kind: pw_graph_backend::RelayDeviceKind::Other,
+                    addr: pending
+                        .peer_addr
+                        .parse()
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                },
+                secret,
+            );
+            save_config(application, false);
+            application.config == application.config_saved_snapshot
+        })
+        .unwrap_or(false);
+    if persisted {
+        if let Err(error) = application
+            .source
+            .relay_accept_trusted_enrollment(pending.transaction_id)
+        {
+            application.config = before;
+            save_config(application, false);
+            application.status = application.tf("relay.error", &[("error", error)]);
+        } else {
+            application.status = application.t("relay.enrollment_accepted");
+        }
+    } else if let Err(error) = application.source.relay_reject_trusted_enrollment(
+        pending.transaction_id,
+        "trusted credential could not be durably persisted",
+    ) {
+        application.status = application.tf("relay.error", &[("error", error)]);
+    }
+}
+
+/// Whether this peer already holds a stored credential: its re-enrollment is
+/// a routine secret rotation that never needs the accept/decline dialog.
+#[cfg(feature = "relay")]
+pub(crate) fn is_trusted_peer(application: &Application, peer_id: &str) -> bool {
+    !peer_id.trim().is_empty()
+        && application
+            .config
+            .relay_trusted_peers
+            .iter()
+            .any(|stored| stored.peer_id == peer_id)
+}
+
 pub(crate) fn accept_pending_enrollment(application: &mut Application) {
     #[cfg(feature = "relay")]
     {
         let Some(pending) = application.relay_pending_enrollment.clone() else {
             return;
         };
-        let before = application.config.clone();
-        let persisted = application
-            .source
-            .relay_trusted_enrollment_secret(pending.transaction_id)
-            .ok()
-            .flatten()
-            .map(|secret| {
-                remember_trusted_peer(
-                    application,
-                    &pending.peer_id,
-                    &pw_graph_backend::RelayPeerInfo {
-                        id: pending.peer_id.clone(),
-                        name: pending.peer_name.clone(),
-                        kind: pw_graph_backend::RelayDeviceKind::Other,
-                        addr: pending
-                            .peer_addr
-                            .parse()
-                            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-                    },
-                    secret,
-                );
-                save_config(application, false);
-                application.config == application.config_saved_snapshot
-            })
-            .unwrap_or(false);
-        if persisted {
-            if let Err(error) = application
-                .source
-                .relay_accept_trusted_enrollment(pending.transaction_id)
-            {
-                application.config = before;
-                save_config(application, false);
-                application.status = application.tf("relay.error", &[("error", error)]);
-            } else {
-                application.status = application.t("relay.enrollment_accepted");
-            }
-        } else if let Err(error) = application.source.relay_reject_trusted_enrollment(
-            pending.transaction_id,
-            "trusted credential could not be durably persisted",
-        ) {
-            application.status = application.tf("relay.error", &[("error", error)]);
-        }
+        commit_enrollment(application, &pending);
         application.relay_pending_enrollment = None;
     }
     #[cfg(not(feature = "relay"))]
@@ -739,6 +820,11 @@ pub(crate) fn forget_trusted_peer(application: &mut Application, peer_id: &str) 
         {
             application.relay_reconnect_pending = None;
         }
+        // Forget also drops any stale-refusal mark, so a re-paired device is
+        // auto-connectable again without waiting for anything else.
+        application
+            .relay_trusted_refused
+            .retain(|(refused_id, _)| refused_id != peer_id);
         if application
             .relay_connecting
             .as_ref()
@@ -882,6 +968,10 @@ pub(crate) fn poll_relay_events(application: &mut Application) {
             RelayEvent::PeerDiscovered { peer } => {
                 application.status =
                     application.tf("relay.peer_discovered", &[("name", peer.name.clone())]);
+                // Discovery re-announcing an address is proof the host is
+                // listening there again, so a stale-refusal mark must not
+                // keep the auto-connect from dialing it.
+                clear_trusted_candidate_refused(application, &peer.id, &peer.addr.to_string());
                 if application.config.relay_auto_connect_trusted {
                     let _ = connect_trusted_peer(application, &peer, true);
                 }
@@ -901,23 +991,31 @@ pub(crate) fn poll_relay_events(application: &mut Application) {
                 peer_id,
                 peer,
             } => {
-                // Queue a user-visible confirmation – modal shows PIN + peer
-                // identity with Accept/Decline. No auto-accept; user must
-                // explicitly confirm. Engine holds the transaction 30s, so a
-                // missing action safely times out and client retries with PIN.
-                // This prevents silent trust and gives the pairing code a
-                // visible confirmation step (vs. redesigning the whole web UI).
-                application.relay_pending_enrollment =
-                    Some(crate::bridge::app::PendingEnrollment {
-                        transaction_id,
-                        peer_id: peer_id.clone(),
-                        peer_name: peer.name.clone(),
-                        peer_addr: peer.addr.to_string(),
-                    });
-                application.status = application.tf(
-                    "relay.enrollment_requested",
-                    &[("name", peer.name.clone()), ("addr", peer.addr.to_string())],
-                );
+                // Pairing policy: "pair code or accept dialog, never both."
+                // A peer presenting a credential we already store is rotating
+                // its secret after another PIN pairing — re-accept it
+                // silently, exactly like the Android host does. Only a
+                // first-contact device earns the Accept/Decline dialog. The
+                // engine holds the transaction 30s, so a missed dialog safely
+                // times out and the client retries with PIN.
+                let pending = crate::bridge::app::PendingEnrollment {
+                    transaction_id,
+                    peer_id: peer_id.clone(),
+                    peer_name: peer.name.clone(),
+                    peer_addr: peer.addr.to_string(),
+                };
+                if is_trusted_peer(application, &peer_id) {
+                    commit_enrollment(application, &pending);
+                } else {
+                    // Queue a user-visible confirmation – modal shows PIN +
+                    // peer identity with Accept/Decline. No auto-accept; user
+                    // must explicitly confirm.
+                    application.relay_pending_enrollment = Some(pending);
+                    application.status = application.tf(
+                        "relay.enrollment_requested",
+                        &[("name", peer.name.clone()), ("addr", peer.addr.to_string())],
+                    );
+                }
             }
             RelayEvent::SessionEstablished { id, peer, .. } => {
                 if application
@@ -936,6 +1034,8 @@ pub(crate) fn poll_relay_events(application: &mut Application) {
                     application.relay_reconnect_pending = None;
                 }
                 refresh_trusted_peer_address(application, &peer);
+                // A session succeeding proves the address is live again.
+                clear_trusted_candidate_refused(application, &peer.id, &peer.addr.to_string());
                 application.status =
                     application.tf("relay.session_connected", &[("name", peer.name)]);
             }
@@ -955,13 +1055,25 @@ pub(crate) fn poll_relay_events(application: &mut Application) {
                         note_trusted_candidate_failure(application, &peer_id, &target);
                     }
                     application.relay_connecting = None;
-                    // Keep a visible reconnecting state for the 5s retry interval
-                    // so Cancel/Forget stay on screen instead of flashing 0.1ms.
                     if let Some((Some(peer_id), target)) = pending_info {
-                        if reason.contains("Connection refused")
+                        let refused = reason.contains("Connection refused")
+                            || reason.contains("os error 111")
+                            || reason.contains("os error 10061")
                             || reason.contains("No route to host")
-                            || reason.contains("os error 11")
-                        {
+                            || reason.contains("os error 113")
+                            || reason.contains("os error 101")
+                            || reason.contains("os error 10051");
+                        if refused {
+                            // Nothing is listening at this address right now.
+                            // Marking it refused ends the auto-retry instead
+                            // of looping "Connecting (retry in 5s)" against a
+                            // dead address; discovery re-announcing the peer
+                            // clears the mark and revives auto-connect.
+                            note_trusted_candidate_refused(application, &peer_id, &target);
+                        } else if reason.contains("os error 11") {
+                            // Keep a visible reconnecting state for the 5s
+                            // retry interval so Cancel/Forget stay on screen
+                            // instead of flashing 0.1ms.
                             let name = application
                                 .config
                                 .relay_trusted_peers

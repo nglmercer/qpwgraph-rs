@@ -83,6 +83,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long a freshly paired client waits for the host embedding's
+/// accept/decline of its enrollment: the host's full decision window
+/// ([`crate::TRUST_ENROLLMENT_TIMEOUT`]) plus handshake slack for the decision
+/// and acknowledgement to cross the wire.
+const ENROLLMENT_ACK_TIMEOUT: Duration =
+    Duration::from_secs(crate::TRUST_ENROLLMENT_TIMEOUT.as_secs() + HANDSHAKE_TIMEOUT.as_secs());
 /// How long a host keeps a dropped session alive waiting for the client to
 /// re-establish its control channel (link roaming, brief Wi-Fi outages).
 const RESUME_GRACE: Duration = Duration::from_secs(15);

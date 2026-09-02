@@ -9,6 +9,7 @@ use crate::model::{resolve_drag_delta, ConnectMode};
 use pw_graph_core::Direction;
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{LogicalPosition, ModelRc};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 pub(super) fn demo_application() -> Application {
@@ -61,6 +62,8 @@ pub(super) fn demo_application() -> Application {
         relay_trusted_auto_attempt_at: None,
         #[cfg(feature = "relay")]
         relay_trusted_candidate_failures: BTreeMap::new(),
+        #[cfg(feature = "relay")]
+        relay_trusted_refused: BTreeSet::new(),
         #[cfg(feature = "relay")]
         relay_pending_enrollment: None,
         #[cfg(feature = "relay")]
@@ -1458,4 +1461,113 @@ fn body_drag_released_on_a_target_pin_still_connects_the_whole_group() {
         "drop on a pin fills the whole group"
     );
     assert!(channels_are_paired_straight(&harness.application));
+}
+
+#[cfg(feature = "relay")]
+#[test]
+fn refused_trusted_candidate_is_skipped_until_rediscovered() {
+    use pw_graph_backend::{RelayDeviceKind, RelayPeerInfo};
+    use pw_graph_config::PersistedRelayPeer;
+    use pw_graph_utils::hex::hex_encode;
+
+    let mut application = demo_application();
+    application
+        .config
+        .relay_trusted_peers
+        .push(PersistedRelayPeer {
+            peer_id: "phone-id".into(),
+            secret: hex_encode(&[7u8; 32]),
+            name: "phone".into(),
+            address: "192.0.2.10:48123".into(),
+        });
+    let peer = RelayPeerInfo {
+        id: "phone-id".into(),
+        name: "phone".into(),
+        kind: RelayDeviceKind::Other,
+        addr: "192.0.2.10:48123".parse().unwrap(),
+    };
+    assert!(super::relay::trusted_candidate_allowed(
+        &mut application,
+        &peer
+    ));
+
+    // A refused dial marks the address; without a re-announce the retry
+    // loop must stop chasing it.
+    super::relay::note_trusted_candidate_refused(
+        &mut application,
+        "phone-id",
+        "192.0.2.10:48123",
+    );
+    assert!(!super::relay::trusted_candidate_allowed(
+        &mut application,
+        &peer
+    ));
+
+    // Discovery re-announcing (or a successful session) revives it.
+    super::relay::clear_trusted_candidate_refused(
+        &mut application,
+        "phone-id",
+        "192.0.2.10:48123",
+    );
+    assert!(super::relay::trusted_candidate_allowed(
+        &mut application,
+        &peer
+    ));
+}
+
+#[cfg(feature = "relay")]
+#[test]
+fn trust_marks_are_scoped_per_peer_and_address() {
+    use pw_graph_backend::{RelayDeviceKind, RelayPeerInfo};
+
+    let mut application = demo_application();
+    let refused = RelayPeerInfo {
+        id: "phone-id".into(),
+        name: "phone".into(),
+        kind: RelayDeviceKind::Other,
+        addr: "192.0.2.10:48123".parse().unwrap(),
+    };
+    let other_address = RelayPeerInfo {
+        addr: "192.0.2.99:48123".parse().unwrap(),
+        ..refused.clone()
+    };
+    super::relay::note_trusted_candidate_refused(
+        &mut application,
+        "phone-id",
+        "192.0.2.10:48123",
+    );
+    assert!(!super::relay::trusted_candidate_allowed(
+        &mut application,
+        &refused
+    ));
+    // A different address for the same peer stays usable.
+    assert!(super::relay::trusted_candidate_allowed(
+        &mut application,
+        &other_address
+    ));
+}
+
+#[cfg(feature = "relay")]
+#[test]
+fn reenrollment_dialog_applies_only_to_first_contact() {
+    use pw_graph_config::PersistedRelayPeer;
+    use pw_graph_utils::hex::hex_encode;
+
+    let mut application = demo_application();
+    assert!(!super::relay::is_trusted_peer(&application, "phone-id"));
+    assert!(!super::relay::is_trusted_peer(&application, "   "));
+
+    application
+        .config
+        .relay_trusted_peers
+        .push(PersistedRelayPeer {
+            peer_id: "phone-id".into(),
+            secret: hex_encode(&[7u8; 32]),
+            name: "phone".into(),
+            address: "192.0.2.10:48123".into(),
+        });
+    // An already-stored peer rotating its secret re-accepts silently; the
+    // dialog is reserved for first contact.
+    assert!(super::relay::is_trusted_peer(&application, "phone-id"));
+    assert!(!super::relay::is_trusted_peer(&application, "stranger-id"));
 }
