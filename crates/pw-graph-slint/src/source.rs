@@ -122,6 +122,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(all(feature = "relay", target_os = "windows"))]
+    #[allow(dead_code)]
     pub(crate) fn windows_relay_endpoint_choices(&self) -> Vec<(String, String)> {
         match &self.backend {
             BackendKind::Demo(_) => Vec::new(),
@@ -130,6 +131,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(all(feature = "relay", target_os = "windows"))]
+    #[allow(dead_code)]
     pub(crate) fn windows_relay_endpoints(&self) -> RelayEndpoints {
         match &self.backend {
             BackendKind::Demo(_) => RelayEndpoints::default(),
@@ -138,6 +140,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(all(feature = "relay", target_os = "windows"))]
+    #[allow(dead_code)]
     pub(crate) fn set_windows_relay_endpoints(
         &mut self,
         endpoints: RelayEndpoints,
@@ -320,6 +323,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(feature = "relay")]
+    #[allow(dead_code)]
     pub(crate) fn relay_connect(
         &mut self,
         target: std::net::SocketAddr,
@@ -344,6 +348,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(feature = "relay")]
+    #[allow(dead_code)]
     pub(crate) fn relay_connect_trusted(
         &mut self,
         target: std::net::SocketAddr,
@@ -377,6 +382,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(feature = "relay")]
+    #[allow(dead_code)]
     pub(crate) fn relay_offer_direction(
         &mut self,
         session: RelaySessionId,
@@ -388,6 +394,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(feature = "relay")]
+    #[allow(dead_code)]
     pub(crate) fn relay_offer_flow(
         &mut self,
         session: RelaySessionId,
@@ -430,6 +437,7 @@ impl ApplicationDriver {
     }
 
     #[cfg(feature = "relay")]
+    #[allow(dead_code)]
     pub(crate) fn relay_ensure_local_route(
         &mut self,
         mode: RelayMode,

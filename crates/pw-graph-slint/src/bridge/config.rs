@@ -166,6 +166,23 @@ fn relay_send_source(selector: &str) -> RelaySendSource {
     }
 }
 
+#[cfg(all(feature = "relay", target_os = "windows"))]
+#[allow(dead_code)]
+fn relay_endpoint_id(
+    index: i32,
+    choices: &[(String, String)],
+    current: Option<&str>,
+) -> Option<String> {
+    if index <= 0 {
+        return None;
+    }
+    let position = (index as usize).checked_sub(1)?;
+    choices
+        .get(position)
+        .map(|(id, _)| id.clone())
+        .or_else(|| current.map(str::to_owned))
+}
+
 #[cfg(feature = "relay")]
 fn relay_receive_sink(selector: &str) -> RelayReceiveSink {
     match selector {

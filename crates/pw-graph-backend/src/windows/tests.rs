@@ -85,6 +85,7 @@ fn endpoint_notifications_mark_the_graph_dirty() {
     let callback: Audio::IMMNotificationClient = EndpointNotificationClient {
         dirty: Arc::clone(&dirty),
         topology_dirty: Arc::clone(&topology_dirty),
+        default_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
     .into();
 

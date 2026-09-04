@@ -1210,26 +1210,13 @@ pub struct RelayEndpointInfo {
 
 /// Result of reconciling the qpwgraph-owned local route for one mode.
 #[cfg(feature = "relay")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RelayLocalRouteState {
     pub mode: Option<RelayMode>,
     pub active: bool,
     pub source_id: Option<String>,
     pub sink_id: Option<String>,
     pub description: String,
-}
-
-#[cfg(feature = "relay")]
-impl Default for RelayLocalRouteState {
-    fn default() -> Self {
-        Self {
-            mode: None,
-            active: false,
-            source_id: None,
-            sink_id: None,
-            description: String::new(),
-        }
-    }
 }
 
 #[cfg(feature = "relay")]

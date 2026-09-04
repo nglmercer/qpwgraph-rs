@@ -215,18 +215,13 @@ impl WindowsAudioDriver {
             devices.endpoints() != &wanted
                 || devices.needs_restart(mode, &send_source, &receive_sink, default_generation)
         });
-        if self.relay.is_some() {
+        if let Some(devices) = self.relay.as_mut() {
             if restart {
                 // Keep the authenticated engine/session table alive while
                 // replacing only the WASAPI worker.
-                let devices = self.relay.as_mut().expect("relay exists");
                 devices.restart_endpoint(mode, send_source, receive_sink, default_generation)?;
             }
-            self.relay
-                .as_ref()
-                .expect("relay exists")
-                .handle()
-                .update_config(config);
+            devices.handle().update_config(config);
         } else {
             self.relay = Some(crate::windows_relay::WindowsRelayDevices::start_mode(
                 config,
@@ -296,6 +291,7 @@ impl WindowsAudioDriver {
 
     /// The relay's format, fixed by the WASAPI endpoints that carry it.
     #[cfg(feature = "relay")]
+    #[allow(deprecated)]
     fn relay_config(options: RelayConfigOptions) -> pw_graph_relay::EngineConfig {
         pw_graph_relay::EngineConfig {
             device_id: options.device_id,
@@ -887,6 +883,7 @@ impl api::RelayDriver for WindowsAudioDriver {
         Ok(())
     }
 
+    #[allow(deprecated)]
     fn relay_connect(
         &mut self,
         target: std::net::SocketAddr,
@@ -937,6 +934,7 @@ impl api::RelayDriver for WindowsAudioDriver {
         Ok(devices.handle().connect(target, pin, roles))
     }
 
+    #[allow(deprecated)]
     fn relay_connect_mode(
         &mut self,
         target: std::net::SocketAddr,
@@ -985,6 +983,7 @@ impl api::RelayDriver for WindowsAudioDriver {
         Ok(devices.handle().connect_mode(target, pin, mode))
     }
 
+    #[allow(deprecated)]
     fn relay_connect_trusted(
         &mut self,
         target: std::net::SocketAddr,
@@ -1038,6 +1037,7 @@ impl api::RelayDriver for WindowsAudioDriver {
             .connect_trusted(target, peer_id, secret, roles))
     }
 
+    #[allow(deprecated)]
     fn relay_connect_trusted_mode(
         &mut self,
         target: std::net::SocketAddr,

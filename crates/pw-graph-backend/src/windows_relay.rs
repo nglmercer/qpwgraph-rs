@@ -85,16 +85,8 @@ impl WindowsRelayDevices {
         &self.endpoints
     }
 
-    pub(crate) fn mode(&self) -> RelayMode {
-        self.mode
-    }
-
     pub(crate) fn resolved_endpoint(&self) -> Option<&str> {
         self.resolved_endpoint.as_deref()
-    }
-
-    pub(crate) fn default_generation(&self) -> u64 {
-        self.default_generation
     }
 
     pub(crate) fn needs_restart(
@@ -117,23 +109,6 @@ impl WindowsRelayDevices {
             || (mode == RelayMode::Emitter && &self.send_source != send_source)
             || (mode == RelayMode::Receiver && &self.receive_sink != receive_sink)
             || (follows_default && self.default_generation != default_generation)
-    }
-
-    pub(crate) fn start(config: EngineConfig, endpoints: RelayEndpoints) -> BackendResult<Self> {
-        // Keep the old constructor source-compatible, but route it through the
-        // one-way implementation so a legacy caller cannot start both paths.
-        let mode = config.mode;
-        let send_source = endpoints
-            .capture
-            .clone()
-            .map(RelaySendSource::OutputMonitor)
-            .unwrap_or(RelaySendSource::DefaultOutputMonitor);
-        let receive_sink = endpoints
-            .playback
-            .clone()
-            .map(RelayReceiveSink::OutputDevice)
-            .unwrap_or(RelayReceiveSink::DefaultOutput);
-        Self::start_mode(config, endpoints, mode, send_source, receive_sink, 0)
     }
 
     /// Start the direct Windows implementation for exactly one local mode.

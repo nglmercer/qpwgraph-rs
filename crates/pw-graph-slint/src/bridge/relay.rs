@@ -1880,6 +1880,7 @@ pub(crate) fn relay_rows(application: &Application, i18n: &I18n) -> Vec<RelayRow
     }
 }
 
+#[cfg(test)]
 pub(crate) fn relay_direction_tab(direction: AudioDirection) -> i32 {
     match direction {
         AudioDirection::MobileToDesktop => 0,
@@ -1887,6 +1888,7 @@ pub(crate) fn relay_direction_tab(direction: AudioDirection) -> i32 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn relay_direction_from_tab(index: i32, fallback: AudioDirection) -> AudioDirection {
     match index {
         0 => AudioDirection::MobileToDesktop,

@@ -520,6 +520,7 @@ pub(super) struct HostAuthenticatedPeer {
     pub(super) requested_id: Option<SessionId>,
 }
 
+#[allow(deprecated)]
 pub(super) fn host_session_after_auth(
     inner: Arc<EngineInner>,
     mut stream: TcpStream,
@@ -671,8 +672,6 @@ pub(super) fn host_session_after_auth(
         roles,
         codec,
         format,
-        sending: roles.receive,
-        receiving: roles.emit,
         active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
             emit: roles.receive,
             receive: roles.emit,

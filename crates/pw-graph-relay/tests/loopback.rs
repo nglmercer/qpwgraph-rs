@@ -175,6 +175,7 @@ fn bidirectional_sessions_are_rejected_before_audio_starts() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn authenticated_direction_offers_resolve_and_reject_stale_reversals() {
     let (_host, host_handle, port) = host_engine_with(EngineConfig {
         device_id: "desktop".into(),

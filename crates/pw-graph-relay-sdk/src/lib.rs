@@ -117,12 +117,16 @@ pub struct RelayHostBuilder {
 }
 
 impl RelayHostBuilder {
+    #[allow(deprecated)]
     pub fn new() -> Self {
-        let mut config = EngineConfig::default();
-        config.mode = RelayMode::Receiver;
-        config.direction = legacy_direction_for_host_mode(RelayMode::Receiver);
-        config.client_roles = Roles::receive_only();
-        Self { config }
+        Self {
+            config: EngineConfig {
+                mode: RelayMode::Receiver,
+                direction: legacy_direction_for_host_mode(RelayMode::Receiver),
+                client_roles: Roles::receive_only(),
+                ..Default::default()
+            },
+        }
     }
 
     pub fn device_name(mut self, name: impl Into<String>) -> Self {
@@ -151,6 +155,7 @@ impl RelayHostBuilder {
     /// User-facing direction served by this host. Session roles are derived
     /// internally from the direction; callers should configure connecting
     /// peers with the same direction.
+    #[allow(deprecated)]
     pub fn direction(mut self, direction: RelayDirection) -> Self {
         self.config.direction = direction;
         self.config.client_roles = Roles::for_direction(direction);
@@ -163,6 +168,7 @@ impl RelayHostBuilder {
 
     /// Select the host's local generic role. The host exposes one-way audio
     /// through `receive_audio` or `send_audio` accordingly.
+    #[allow(deprecated)]
     pub fn mode(mut self, mode: RelayMode) -> Self {
         self.config.direction = legacy_direction_for_host_mode(mode);
         self.config.client_roles = mode.roles();
@@ -434,6 +440,7 @@ impl RelayClientBuilder {
 
     /// Direction of this client's audio endpoint. Mobile → Desktop is
     /// emit-only; Desktop → Mobile is receive-only.
+    #[allow(deprecated)]
     pub fn direction(mut self, direction: RelayDirection) -> Self {
         self.config.direction = direction;
         self.config.client_roles = Roles::for_direction(direction);
@@ -446,6 +453,7 @@ impl RelayClientBuilder {
 
     /// Select this client's local generic role. The resulting handshake is
     /// always `emit_only` or `receive_only`.
+    #[allow(deprecated)]
     pub fn mode(mut self, mode: RelayMode) -> Self {
         self.config.direction = legacy_direction_for_client_mode(mode);
         self.config.client_roles = mode.roles();
@@ -881,6 +889,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn direction_builders_keep_one_way_roles_and_the_generation_together() {
         for direction in [
             RelayDirection::MobileToDesktop,

@@ -383,8 +383,6 @@ fn mixing_session(id: u64, receiving: bool) -> Arc<SessionRecord> {
         roles: Roles::both(),
         codec: CodecKind::Pcm,
         format,
-        sending: true,
-        receiving,
         active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
             emit: true,
             receive: receiving,

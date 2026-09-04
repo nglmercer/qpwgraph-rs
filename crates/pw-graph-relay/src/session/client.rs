@@ -65,6 +65,7 @@ pub(super) fn fail_trusted_attempt(
     fail_attempt(inner, id, reason);
 }
 
+#[allow(deprecated)]
 pub(super) fn trusted_client_thread(
     inner: Arc<EngineInner>,
     id: SessionId,
@@ -262,6 +263,7 @@ pub(super) fn trusted_client_thread(
 }
 
 /// Client side: connect, pair, negotiate, then keepalive watcher.
+#[allow(deprecated)]
 pub(super) fn client_thread(
     inner: Arc<EngineInner>,
     id: SessionId,
@@ -501,9 +503,6 @@ pub(super) fn client_thread(
         roles,
         codec: config.codec,
         format,
-        // Client perspective: it sends when emitting, receives when playing.
-        sending: roles.emit,
-        receiving: roles.receive,
         active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
             emit: roles.emit,
             receive: roles.receive,
@@ -616,6 +615,7 @@ pub(super) struct ClientAuthenticatedSession {
     pub(super) keys: SessionKeys,
 }
 
+#[allow(deprecated)]
 pub(super) fn client_session_after_auth(
     inner: Arc<EngineInner>,
     mut stream: TcpStream,
@@ -777,8 +777,6 @@ pub(super) fn client_session_after_auth(
         roles,
         codec: config.codec,
         format,
-        sending: roles.emit,
-        receiving: roles.receive,
         active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
             emit: roles.emit,
             receive: roles.receive,

@@ -66,6 +66,7 @@ pub struct EngineConfig {
 }
 
 impl fmt::Debug for EngineConfig {
+    #[allow(deprecated)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("EngineConfig")
@@ -96,6 +97,7 @@ impl fmt::Debug for EngineConfig {
 }
 
 impl Default for EngineConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             device_id: generate_device_id(),

@@ -355,12 +355,7 @@ pub(crate) struct SessionRecord {
     pub roles: Roles,
     pub codec: CodecKind,
     pub format: AudioFormat,
-    /// This side sends audio (peer receives).
-    pub sending: bool,
-    /// This side receives audio (peer sends).
-    pub receiving: bool,
-    /// Current local one-way role. The legacy booleans above describe the
-    /// handshake that created the record; this atomic is updated after an
+    /// Current local one-way role. This atomic is updated after an
     /// authenticated flow switch so realtime audio paths change without
     /// taking the session-table lock.
     pub active_roles: AtomicU8,

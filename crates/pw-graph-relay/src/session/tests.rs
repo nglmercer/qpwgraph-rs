@@ -117,8 +117,6 @@ fn resumable_session_with_udp(id: u64, udp_audio: Option<Arc<UdpAudioSlot>>) -> 
         roles: Roles::both(),
         codec: CodecKind::Pcm,
         format,
-        sending: true,
-        receiving: true,
         active_roles: AtomicU8::new(SessionRecord::role_bits(Roles::both())),
         stop: Arc::new(AtomicBool::new(false)),
         bye_requested: AtomicBool::new(false),
