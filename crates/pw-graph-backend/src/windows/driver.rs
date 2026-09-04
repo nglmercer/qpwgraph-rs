@@ -52,7 +52,8 @@ struct RelayConfigOptions {
     codec: api::RelayCodecKind,
     frame_ms: u16,
     transport: api::RelayTransportPreference,
-    roles: api::RelayRoles,
+    direction: api::RelayDirection,
+    direction_generation: u64,
     device_id: String,
     trusted_peers: Vec<api::RelayTrustedPeer>,
     trust_new_peers: bool,
@@ -262,7 +263,9 @@ impl WindowsAudioDriver {
             frame_ms: options.frame_ms,
             sample_rate: crate::windows_relay::RELAY_SAMPLE_RATE,
             channels: crate::windows_relay::RELAY_CHANNELS,
-            client_roles: options.roles,
+            client_roles: api::desktop_relay_client_roles(options.direction),
+            direction: options.direction,
+            direction_generation: options.direction_generation,
             transport: options.transport,
             trusted_peers: options.trusted_peers,
             trust_new_peers: options.trust_new_peers,
@@ -797,9 +800,8 @@ impl api::RelayDriver for WindowsAudioDriver {
             codec: request.codec,
             frame_ms: request.frame_ms,
             transport: request.transport,
-            // A host serves whatever a peer asks for; the client's own roles
-            // only matter when this machine is the one connecting out.
-            roles: api::RelayRoles::both(),
+            direction: request.direction,
+            direction_generation: request.direction_generation,
             device_id: request.device_id,
             trusted_peers: request.trusted_peers,
             trust_new_peers: request.trust_new_peers,
@@ -824,14 +826,9 @@ impl api::RelayDriver for WindowsAudioDriver {
         &mut self,
         target: std::net::SocketAddr,
         pin: &str,
-        roles: api::RelayRoles,
+        direction: api::RelayDirection,
+        direction_generation: u64,
     ) -> BackendResult<api::RelaySessionId> {
-        // Both roles work here. `emit` means "send what this machine's relay
-        // capture endpoint supplies", which on Windows is the playback
-        // loopback, and `receive` means "play what the peer sends", which is
-        // the render stream. What Windows cannot do is expose the received
-        // audio to *other applications* as a microphone -- a routing limit, not
-        // a role limit -- so neither role is refused here.
         if self.relay.is_none() {
             let config = Self::relay_config(RelayConfigOptions {
                 device_name: "qpwgraph-rs".into(),
@@ -840,7 +837,8 @@ impl api::RelayDriver for WindowsAudioDriver {
                 codec: api::RelayCodecKind::Opus,
                 frame_ms: 10,
                 transport: api::RelayTransportPreference::Auto,
-                roles,
+                direction,
+                direction_generation,
                 device_id: pw_graph_relay::generate_device_id(),
                 trusted_peers: Vec::new(),
                 trust_new_peers: true,
@@ -848,6 +846,12 @@ impl api::RelayDriver for WindowsAudioDriver {
             self.ensure_relay(config)?;
         }
         let devices = self.relay.as_ref().expect("relay was just created");
+        let mut config = devices.handle().config();
+        config.direction = direction;
+        config.direction_generation = direction_generation;
+        let roles = api::desktop_relay_client_roles(direction);
+        config.client_roles = roles;
+        devices.handle().update_config(config);
         Ok(devices.handle().connect(target, pin, roles))
     }
 
@@ -856,7 +860,8 @@ impl api::RelayDriver for WindowsAudioDriver {
         target: std::net::SocketAddr,
         peer_id: &str,
         secret: [u8; 32],
-        roles: api::RelayRoles,
+        direction: api::RelayDirection,
+        direction_generation: u64,
     ) -> BackendResult<api::RelaySessionId> {
         if self.relay.is_none() {
             let config = Self::relay_config(RelayConfigOptions {
@@ -866,7 +871,8 @@ impl api::RelayDriver for WindowsAudioDriver {
                 codec: api::RelayCodecKind::Opus,
                 frame_ms: 10,
                 transport: api::RelayTransportPreference::Auto,
-                roles,
+                direction,
+                direction_generation,
                 device_id: pw_graph_relay::generate_device_id(),
                 trusted_peers: Vec::new(),
                 trust_new_peers: false,
@@ -874,6 +880,12 @@ impl api::RelayDriver for WindowsAudioDriver {
             self.ensure_relay(config)?;
         }
         let devices = self.relay.as_ref().expect("relay was just created");
+        let mut config = devices.handle().config();
+        config.direction = direction;
+        config.direction_generation = direction_generation;
+        let roles = api::desktop_relay_client_roles(direction);
+        config.client_roles = roles;
+        devices.handle().update_config(config);
         Ok(devices
             .handle()
             .connect_trusted(target, peer_id, secret, roles))
@@ -899,7 +911,8 @@ impl api::RelayDriver for WindowsAudioDriver {
                 codec: api::RelayCodecKind::Opus,
                 frame_ms: 10,
                 transport,
-                roles: api::RelayRoles::both(),
+                direction: api::RelayDirection::MobileToDesktop,
+                direction_generation: 0,
                 device_id,
                 trusted_peers,
                 trust_new_peers: true,
@@ -919,6 +932,21 @@ impl api::RelayDriver for WindowsAudioDriver {
             .handle()
             .disconnect(session)
             .map_err(|error| BackendError::native(format!("relay disconnect failed: {error}")))
+    }
+
+    fn relay_offer_direction(
+        &mut self,
+        session: api::RelaySessionId,
+        direction: api::RelayDirection,
+        generation: u64,
+    ) -> BackendResult<()> {
+        let Some(devices) = self.relay.as_ref() else {
+            return Err(BackendError::native("no relay session exists"));
+        };
+        devices
+            .handle()
+            .offer_direction(session, direction, generation)
+            .map_err(|error| BackendError::native(format!("relay direction offer failed: {error}")))
     }
 
     fn relay_trusted_enrollment_secret(
@@ -985,7 +1013,8 @@ impl api::RelayDriver for WindowsAudioDriver {
                 codec: api::RelayCodecKind::Opus,
                 frame_ms: 10,
                 transport: api::RelayTransportPreference::Auto,
-                roles: api::RelayRoles::both(),
+                direction: api::RelayDirection::MobileToDesktop,
+                direction_generation: 0,
                 device_id: pw_graph_relay::generate_device_id(),
                 trusted_peers: Vec::new(),
                 trust_new_peers: true,

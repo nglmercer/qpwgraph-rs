@@ -4,13 +4,22 @@ use std::time::{Duration, Instant};
 use super::app::Application;
 use super::patchbay::activate_patchbay;
 use super::relay::{
-    relay_codec_from_index, relay_frame_from_index, relay_role_from_index,
+    handle_relay_direction_change, relay_codec_from_index, relay_direction_from_tab,
+    relay_frame_from_index,
     relay_transport_from_index,
 };
+#[cfg(feature = "relay")]
+use super::relay::relay_direction_tab;
 use super::utils::{language_code, localized_meter_policy, meter_policy_from_index};
 use super::MainWindow;
 
 pub(crate) fn read_window_state(window: &MainWindow, application: &mut Application) {
+    #[cfg(feature = "relay")]
+    if let Some(direction) = application.relay_direction_ui_sync.take() {
+        if window.get_relay_tab() < 2 {
+            window.set_relay_tab(relay_direction_tab(direction));
+        }
+    }
     let patchbay_was_activated = application.config.patchbay_activated;
     application.view.zoom = window.get_zoom().clamp(0.35, 2.5);
     application.view.pan = [window.get_pan_x(), window.get_pan_y()];
@@ -49,7 +58,17 @@ pub(crate) fn read_window_state(window: &MainWindow, application: &mut Applicati
     application.config.relay_client_target = window.get_relay_client_target().to_string();
     application.config.relay_client_pin = window.get_relay_client_pin().to_string();
     application.config.relay_auto_connect_trusted = window.get_relay_auto_connect_trusted();
-    application.config.relay_role = relay_role_from_index(window.get_relay_role_index()).into();
+    let old_direction = application.config.relay_direction;
+    let next_direction =
+        relay_direction_from_tab(window.get_relay_tab(), application.config.relay_direction);
+    if next_direction != old_direction {
+        application.config.relay_direction = next_direction;
+        application.config.relay_direction_generation = application
+            .config
+            .relay_direction_generation
+            .saturating_add(1);
+        handle_relay_direction_change(application, old_direction, next_direction);
+    }
     application.config.relay_codec = relay_codec_from_index(window.get_relay_codec_index()).into();
     application.config.relay_frame_ms = relay_frame_from_index(window.get_relay_frame_index());
     application.config.relay_transport =

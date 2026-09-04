@@ -22,7 +22,7 @@ use super::relay::relay_qr_payload;
 #[cfg(feature = "relay")]
 use super::relay::{qr_image, relay_host_endpoint};
 use super::relay::{
-    relay_codec_index, relay_frame_index, relay_nodes_visible, relay_role_index, relay_rows,
+    relay_codec_index, relay_direction_tab, relay_frame_index, relay_nodes_visible, relay_rows,
     relay_transport_index,
 };
 use super::utils::{
@@ -186,7 +186,9 @@ pub(crate) fn sync_models(
         application.config.relay_client_pin.clone(),
     ));
     window.set_relay_auto_connect_trusted(application.config.relay_auto_connect_trusted);
-    window.set_relay_role_index(relay_role_index(&application.config.relay_role));
+    if window.get_relay_tab() < 2 {
+        window.set_relay_tab(relay_direction_tab(application.config.relay_direction));
+    }
     window.set_relay_codec_index(relay_codec_index(&application.config.relay_codec));
     window.set_relay_frame_index(relay_frame_index(application.config.relay_frame_ms));
     window.set_relay_transport_index(relay_transport_index(&application.config.relay_transport));
@@ -299,6 +301,7 @@ pub(crate) fn sync_models(
             window.set_relay_pending_peer_id(SharedString::new());
         }
         window.set_relay_is_connecting(application.relay_connecting.is_some());
+        window.set_relay_direction_switching(application.relay_direction_switch.is_some());
     }
     #[cfg(not(feature = "relay"))]
     {

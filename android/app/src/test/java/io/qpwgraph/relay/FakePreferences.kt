@@ -30,7 +30,7 @@ class FakePreferences(
             arrayOf(SharedPreferences.Editor::class.java),
         ) { _, method, args ->
             when (method.name) {
-                "putString", "putInt", "putBoolean" -> {
+                "putString", "putInt", "putLong", "putBoolean" -> {
                     pending[args!![0] as String] = args[1]
                     editor
                 }
@@ -60,6 +60,7 @@ class FakePreferences(
                 "getString" -> values[args!![0] as String] as String? ?: args[1]
                 "getInt" -> values[args!![0] as String] as Int? ?: args[1]
                 "getBoolean" -> values[args!![0] as String] as Boolean? ?: args[1]
+                "getLong" -> values[args!![0] as String] as Long? ?: args[1]
                 "contains" -> values.containsKey(args!![0] as String)
                 else -> null
             }

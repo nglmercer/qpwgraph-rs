@@ -7,10 +7,29 @@ import org.junit.Test
 
 class RelayModelTest {
     @Test
-    fun microphone_permission_matrix_matches_audio_direction() {
-        assertTrue(clientNeedsMicrophone("emit"))
-        assertTrue(clientNeedsMicrophone("both"))
-        assertFalse(clientNeedsMicrophone("receive"))
+    fun direction_maps_to_one_way_android_roles() {
+        assertEquals(EffectiveAudioRole.Emitter, AudioDirection.MobileToDesktop.androidRole())
+        assertEquals(EffectiveAudioRole.Host, AudioDirection.DesktopToMobile.androidRole())
+        assertEquals("emit", AudioDirection.MobileToDesktop.androidClientRole())
+        assertEquals("receive", AudioDirection.DesktopToMobile.androidClientRole())
+        assertTrue(clientNeedsMicrophone(AudioDirection.MobileToDesktop))
+        assertFalse(clientNeedsMicrophone(AudioDirection.DesktopToMobile))
+        assertTrue(isOneWayAudioRole("emit"))
+        assertTrue(isOneWayAudioRole("receive"))
+        assertFalse(isOneWayAudioRole("both"))
+        assertFalse(isOneWayAudioRole("unknown"))
+        assertFalse(clientRoleEmits("both"))
+        assertFalse(clientRoleReceives("both"))
+    }
+
+    @Test
+    fun direction_settings_accept_canonical_and_legacy_values() {
+        assertEquals(AudioDirection.MobileToDesktop, audioDirectionFromString("mobile_to_desktop"))
+        assertEquals(AudioDirection.DesktopToMobile, audioDirectionFromString("desktop_to_mobile"))
+        assertEquals(AudioDirection.DesktopToMobile, audioDirectionFromString("pc_to_mobile"))
+        assertEquals(AudioDirection.MobileToDesktop, audioDirectionFromString("emit"))
+        assertEquals(AudioDirection.DesktopToMobile, audioDirectionFromString("receive"))
+        assertEquals(AudioDirection.MobileToDesktop, audioDirectionFromString("both"))
     }
 
     @Test

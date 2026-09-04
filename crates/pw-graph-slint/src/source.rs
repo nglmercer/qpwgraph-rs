@@ -16,7 +16,7 @@ use pw_graph_backend::{
 #[cfg(feature = "relay")]
 use pw_graph_backend::{
     RelayDriver, RelayEngineStatus, RelayEvent, RelayHostRequest, RelayLocalLink, RelayPeerInfo,
-    RelayRoles, RelaySessionId, RelayTrustedPeer,
+    RelayDirection, RelaySessionId, RelayTrustedPeer,
 };
 use pw_graph_core::{Graph, Node, NodeId, PortKey, PortType};
 use pw_graph_effects::EffectDescriptor;
@@ -323,9 +323,11 @@ impl ApplicationDriver {
         &mut self,
         target: std::net::SocketAddr,
         pin: &str,
-        roles: RelayRoles,
+        direction: RelayDirection,
+        direction_generation: u64,
     ) -> Result<RelaySessionId, String> {
-        RelayDriver::relay_connect(self, target, pin, roles).map_err(|error| error.to_string())
+        RelayDriver::relay_connect(self, target, pin, direction, direction_generation)
+            .map_err(|error| error.to_string())
     }
 
     #[cfg(feature = "relay")]
@@ -334,9 +336,28 @@ impl ApplicationDriver {
         target: std::net::SocketAddr,
         peer_id: &str,
         secret: [u8; 32],
-        roles: RelayRoles,
+        direction: RelayDirection,
+        direction_generation: u64,
     ) -> Result<RelaySessionId, String> {
-        RelayDriver::relay_connect_trusted(self, target, peer_id, secret, roles)
+        RelayDriver::relay_connect_trusted(
+            self,
+            target,
+            peer_id,
+            secret,
+            direction,
+            direction_generation,
+        )
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_offer_direction(
+        &mut self,
+        session: RelaySessionId,
+        direction: RelayDirection,
+        generation: u64,
+    ) -> Result<(), String> {
+        RelayDriver::relay_offer_direction(self, session, direction, generation)
             .map_err(|error| error.to_string())
     }
 
@@ -726,11 +747,16 @@ impl RelayDriver for ApplicationDriver {
         &mut self,
         target: std::net::SocketAddr,
         pin: &str,
-        roles: RelayRoles,
+        direction: RelayDirection,
+        direction_generation: u64,
     ) -> pw_graph_backend::BackendResult<RelaySessionId> {
         match &mut self.backend {
-            BackendKind::Demo(driver) => driver.relay_connect(target, pin, roles),
-            BackendKind::Live(driver) => driver.relay_connect(target, pin, roles),
+            BackendKind::Demo(driver) => {
+                driver.relay_connect(target, pin, direction, direction_generation)
+            }
+            BackendKind::Live(driver) => {
+                driver.relay_connect(target, pin, direction, direction_generation)
+            }
         }
     }
 
@@ -739,14 +765,27 @@ impl RelayDriver for ApplicationDriver {
         target: std::net::SocketAddr,
         peer_id: &str,
         secret: [u8; 32],
-        roles: RelayRoles,
+        direction: RelayDirection,
+        direction_generation: u64,
     ) -> pw_graph_backend::BackendResult<RelaySessionId> {
         match &mut self.backend {
             BackendKind::Demo(driver) => {
-                driver.relay_connect_trusted(target, peer_id, secret, roles)
+                driver.relay_connect_trusted(
+                    target,
+                    peer_id,
+                    secret,
+                    direction,
+                    direction_generation,
+                )
             }
             BackendKind::Live(driver) => {
-                driver.relay_connect_trusted(target, peer_id, secret, roles)
+                driver.relay_connect_trusted(
+                    target,
+                    peer_id,
+                    secret,
+                    direction,
+                    direction_generation,
+                )
             }
         }
     }
@@ -771,6 +810,18 @@ impl RelayDriver for ApplicationDriver {
         match &mut self.backend {
             BackendKind::Demo(driver) => driver.relay_disconnect(session),
             BackendKind::Live(driver) => driver.relay_disconnect(session),
+        }
+    }
+
+    fn relay_offer_direction(
+        &mut self,
+        session: RelaySessionId,
+        direction: RelayDirection,
+        generation: u64,
+    ) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_offer_direction(session, direction, generation),
+            BackendKind::Live(driver) => driver.relay_offer_direction(session, direction, generation),
         }
     }
 

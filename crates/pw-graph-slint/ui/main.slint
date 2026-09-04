@@ -115,7 +115,6 @@ export component MainWindow inherits Window {
     in-out property <string> relay-client-target: "";
     in-out property <string> relay-client-pin: "";
     in-out property <bool> relay-auto-connect-trusted: true;
-    in-out property <int> relay-role-index: 2;
     in-out property <int> relay-codec-index: 0;
     in-out property <int> relay-frame-index: 0;
     in-out property <int> relay-transport-index: 0;
@@ -131,6 +130,7 @@ export component MainWindow inherits Window {
     in property <bool> relay-host-active: false;
     in property <string> relay-host-endpoint: "";
     in property <bool> relay-is-connecting: false;
+    in property <bool> relay-direction-switching: false;
     in property <string> relay-qr-payload: "";
     in property <image> relay-qr-image;
     in property <bool> relay-pending-active: false;
@@ -472,7 +472,6 @@ export component MainWindow inherits Window {
                 relay-client-target <=> root.relay-client-target;
                 relay-client-pin <=> root.relay-client-pin;
                 relay-auto-connect-trusted <=> root.relay-auto-connect-trusted;
-                relay-role-index <=> root.relay-role-index;
                 relay-codec-index <=> root.relay-codec-index;
                 relay-frame-index <=> root.relay-frame-index;
                 relay-transport-index <=> root.relay-transport-index;
@@ -488,6 +487,7 @@ export component MainWindow inherits Window {
                 relay-host-endpoint: root.relay-host-endpoint;
                 relay-qr-payload: root.relay-qr-payload;
                 relay-is-connecting: root.relay-is-connecting;
+                relay-direction-switching: root.relay-direction-switching;
                 action(action) => { root.action(action); }
                 close => { root.action("relay"); }
             }

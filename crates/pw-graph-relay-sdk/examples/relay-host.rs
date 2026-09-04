@@ -2,10 +2,9 @@
 //!
 //! Usage: `cargo run -p pw-graph-relay-sdk --example relay-host -- [pin] [port]`
 //!
-//! Print incoming events; any peer that pairs with the PIN can emit audio
-//! (pull_playback) or receive audio pushed via push_capture.
+//! Print incoming events and drain the phone-to-desktop audio queue.
 
-use pw_graph_relay_sdk::RelayHostBuilder;
+use pw_graph_relay_sdk::{RelayDirection, RelayHostBuilder};
 use std::time::Duration;
 
 fn main() {
@@ -17,6 +16,7 @@ fn main() {
         .device_name("relay-host-example")
         .pin(pin.clone())
         .port(port)
+        .direction(RelayDirection::MobileToDesktop)
         .build()
         .expect("valid host configuration")
         .start()

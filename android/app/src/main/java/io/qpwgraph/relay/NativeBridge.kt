@@ -20,7 +20,8 @@ internal object NativeBridge {
         deviceName: String,
         deviceId: String,
         trustedPeersJson: String,
-        role: String,
+        direction: String,
+        generation: Long,
         codec: String,
         transport: String,
         sampleRate: Int,
@@ -45,6 +46,12 @@ internal object NativeBridge {
     external fun updateClientPeers(handle: Long, peersJson: String): Boolean
     /** Surface a fatal platform-audio failure through the relay event queue. */
     external fun reportError(handle: Long, message: String): Boolean
+    external fun offerDirection(
+        handle: Long,
+        sessionId: Long,
+        direction: String,
+        generation: Long,
+    ): String
 
     /**
      * Offer `length` samples from the prefix of `samples` to the realtime
@@ -77,6 +84,8 @@ internal object NativeBridge {
         port: Int,
         codec: String,
         transport: String,
+        direction: String,
+        generation: Long,
         sampleRate: Int,
         channels: Int,
         frameMs: Int,
@@ -93,6 +102,12 @@ internal object NativeBridge {
     external fun hostDisconnectSession(handle: Long, sessionId: Long): String
     /** Surface a fatal platform-audio failure through the host event queue. */
     external fun hostReportError(handle: Long, message: String): Boolean
+    external fun hostOfferDirection(
+        handle: Long,
+        sessionId: Long,
+        direction: String,
+        generation: Long,
+    ): String
 
     /** Same contract as [pushCapture], using the running host engine. */
     external fun hostPushCapture(handle: Long, samples: FloatArray, length: Int): Int

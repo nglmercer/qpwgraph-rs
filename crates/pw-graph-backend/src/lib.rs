@@ -86,6 +86,19 @@ mod tests {
         assert_eq!(MeterPolicy::default(), MeterPolicy::OnDemand);
     }
 
+    #[cfg(feature = "relay")]
+    #[test]
+    fn desktop_relay_roles_are_derived_from_direction() {
+        assert_eq!(
+            desktop_relay_client_roles(RelayDirection::MobileToDesktop),
+            RelayRoles::receive_only()
+        );
+        assert_eq!(
+            desktop_relay_client_roles(RelayDirection::DesktopToMobile),
+            RelayRoles::emit_only()
+        );
+    }
+
     /// Regression: metering eligibility used to require an audio *source*
     /// port, so a playback sink -- speakers, headphones, any output device --
     /// was never measurable and silently showed no meter, even though the
@@ -288,6 +301,8 @@ mod tests {
                 codec: RelayCodecKind::Opus,
                 frame_ms: 10,
                 transport: Default::default(),
+                direction: RelayDirection::MobileToDesktop,
+                direction_generation: 0,
             })
             .expect("relay host should start");
         assert!(port > 0, "an ephemeral control port should be bound");
@@ -306,18 +321,12 @@ mod tests {
         assert!(!driver.relay_status().host_active);
     }
 
-    /// Regression: `relay_connect` used to refuse any role containing `emit`,
-    /// reasoning that Windows cannot create a virtual microphone. That confuses
-    /// two different things. In this protocol `emit` means "send what the local
-    /// relay capture endpoint supplies", and on Windows that endpoint is the
-    /// playback loopback, which works. The default relay role in config is
-    /// `both`, so the refusal broke the ordinary client connection outright.
-    ///
-    /// What Windows genuinely cannot do is expose received audio to *other*
-    /// applications as a microphone. That is a routing limit, not a role limit.
+    /// Regression: both public directions must prepare the Windows endpoint
+    /// pair. The backend receives a direction, never an arbitrary role set,
+    /// and derives the exact one-way role internally.
     #[cfg(all(target_os = "windows", feature = "relay"))]
     #[test]
-    fn windows_relay_accepts_every_role_including_emit() {
+    fn windows_relay_accepts_each_direction() {
         if std::env::var_os("PW_GRAPH_TEST_RELAY").is_none() {
             return;
         }
@@ -329,14 +338,13 @@ mod tests {
         // that a peer answers.
         let target = "127.0.0.1:9".parse().expect("a valid address");
 
-        for roles in [
-            RelayRoles::emit_only(),
-            RelayRoles::receive_only(),
-            RelayRoles::both(),
+        for direction in [
+            RelayDirection::MobileToDesktop,
+            RelayDirection::DesktopToMobile,
         ] {
             driver
-                .relay_connect(target, "123456", roles)
-                .expect("every relay role is carried by the WASAPI endpoints");
+                .relay_connect(target, "123456", direction, 0)
+                .expect("every relay direction is carried by the WASAPI endpoints");
             assert!(driver.relay_devices_active());
         }
     }
@@ -385,6 +393,8 @@ mod tests {
                 codec: RelayCodecKind::Opus,
                 frame_ms: 10,
                 transport: Default::default(),
+                direction: RelayDirection::MobileToDesktop,
+                direction_generation: 0,
             })
             .expect("hosting works on a non-default endpoint");
         assert!(port > 0);
@@ -657,6 +667,8 @@ mod tests {
                 codec: RelayCodecKind::Opus,
                 frame_ms: 20,
                 transport: Default::default(),
+                direction: RelayDirection::MobileToDesktop,
+                direction_generation: 0,
             })
             .expect("relay host should start");
         assert!(port > 0);

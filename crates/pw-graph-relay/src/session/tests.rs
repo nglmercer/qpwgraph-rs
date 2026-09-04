@@ -2,6 +2,7 @@ use super::*;
 use crate::audio::{seal_datagram, AudioHeader};
 use crate::crypto::{pake_start, Side};
 use crate::PAIRING_ATTEMPT_LIMIT;
+use crate::RelayDirection;
 use std::net::{IpAddr, TcpListener, TcpStream};
 
 fn reject_worker_spawn(
@@ -133,6 +134,11 @@ fn resumable_session_with_udp(id: u64, udp_audio: Option<Arc<UdpAudioSlot>>) -> 
         capture_convert: Mutex::new((capture_converter, capture_destination)),
         audio_sealer: Mutex::new(audio_sealer),
         audio_opener: Mutex::new(audio_opener),
+        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
+            generation: 1,
+            direction: RelayDirection::MobileToDesktop,
+            device_id: "resume-peer-id".into(),
+        })),
     })
 }
 

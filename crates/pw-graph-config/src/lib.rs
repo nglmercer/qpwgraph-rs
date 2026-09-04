@@ -3,7 +3,8 @@
 pub use pw_graph_core::NodeAppearance;
 use pw_graph_core::PortKey;
 use pw_graph_effects::EffectInstanceConfig;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeserializeError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,70 @@ pub enum ConfigError {
     Format(#[from] toml::de::Error),
     #[error("could not serialize config TOML: {0}")]
     Serialize(#[from] toml::ser::Error),
+}
+
+/// The user-facing direction of a relay session.
+///
+/// Relay roles are deliberately not part of the persisted desktop state. The
+/// bridge derives a receive-only host or an emit-only client from this value,
+/// which keeps the direction visible without exposing the old three-way
+/// `emit`/`receive`/`both` switch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AudioDirection {
+    /// Audio flows from the phone into the desktop relay microphone.
+    #[default]
+    MobileToDesktop,
+    /// Audio flows from the desktop relay speaker into the phone.
+    DesktopToMobile,
+}
+
+impl AudioDirection {
+    pub const MOBILE_TO_DESKTOP: &'static str = "mobile_to_desktop";
+    pub const DESKTOP_TO_MOBILE: &'static str = "desktop_to_mobile";
+
+    /// Canonical value written to the configuration file.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MobileToDesktop => Self::MOBILE_TO_DESKTOP,
+            Self::DesktopToMobile => Self::DESKTOP_TO_MOBILE,
+        }
+    }
+
+    /// Parse both the current direction values and the desktop's legacy role
+    /// values. Legacy `emit` means the desktop was the client, so it maps to
+    /// PC → Mobile; `receive` and `both` map deterministically to Mobile → PC.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mobile_to_desktop" | "mobile_to_pc" | "receive" | "both" => {
+                Some(Self::MobileToDesktop)
+            }
+            "desktop_to_mobile" | "pc_to_mobile" | "emit" => Some(Self::DesktopToMobile),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for AudioDirection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AudioDirection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            D::Error::custom(format!(
+                "invalid relay direction '{value}'; expected mobile_to_desktop or desktop_to_mobile"
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -103,7 +168,16 @@ pub struct AppConfig {
     /// leaving a working credential in a world-readable file.
     #[serde(skip)]
     pub relay_client_pin: String,
-    pub relay_role: String,
+    /// Direction-first relay setting. `relay_role` is accepted as a serde
+    /// alias for one release so older config files migrate on read, but saves
+    /// always emit only this canonical key.
+    #[serde(default, alias = "relay_role")]
+    pub relay_direction: AudioDirection,
+    /// Monotonic generation used by the authenticated direction negotiation.
+    /// It is persisted with the desired direction so a reconnect cannot
+    /// resurrect an older offline choice.
+    #[serde(default)]
+    pub relay_direction_generation: u64,
     pub relay_codec: String,
     pub relay_frame_ms: u16,
     pub relay_transport: String,
@@ -149,7 +223,11 @@ impl fmt::Debug for AppConfig {
             .field("relay_host_port", &self.relay_host_port)
             .field("relay_client_target", &self.relay_client_target)
             .field("relay_client_pin", &"<redacted>")
-            .field("relay_role", &self.relay_role)
+            .field("relay_direction", &self.relay_direction)
+            .field(
+                "relay_direction_generation",
+                &self.relay_direction_generation,
+            )
             .field("relay_codec", &self.relay_codec)
             .field("relay_frame_ms", &self.relay_frame_ms)
             .field("relay_transport", &self.relay_transport)
@@ -256,7 +334,8 @@ impl Default for AppConfig {
             relay_host_port: 48123,
             relay_client_target: String::new(),
             relay_client_pin: String::new(),
-            relay_role: "both".into(),
+            relay_direction: AudioDirection::MobileToDesktop,
+            relay_direction_generation: 0,
             relay_codec: "opus".into(),
             // Ten milliseconds halves the codec-side latency floor of the
             // previous 20 ms default at the cost of doubling the packet rate
@@ -325,6 +404,11 @@ mod tests {
         assert!(AppConfig::default().relay_host_pin.is_empty());
         assert!(AppConfig::default().relay_client_pin.is_empty());
         assert_eq!(AppConfig::default().relay_host_port, 48123);
+        assert_eq!(
+            AppConfig::default().relay_direction,
+            AudioDirection::MobileToDesktop
+        );
+        assert_eq!(AppConfig::default().relay_direction_generation, 0);
         let directory =
             std::env::temp_dir().join(format!("pw-graph-config-{}", std::process::id()));
         let path = directory.join("config.toml");
@@ -348,6 +432,63 @@ mod tests {
         expected.save_to(&path).unwrap();
         assert_eq!(AppConfig::load_from(&path).unwrap(), expected);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn relay_direction_migrates_legacy_desktop_roles_and_writes_only_the_new_key() {
+        let cases = [
+            ("emit", AudioDirection::DesktopToMobile),
+            ("receive", AudioDirection::MobileToDesktop),
+            ("both", AudioDirection::MobileToDesktop),
+        ];
+        for (legacy_role, expected) in cases {
+            let config: AppConfig =
+                toml::from_str(&format!("language = 'en'\nrelay_role = '{legacy_role}'\n"))
+                    .unwrap();
+            assert_eq!(config.relay_direction, expected);
+            let serialized = toml::to_string(&config).unwrap();
+            assert!(serialized.contains("relay_direction ="));
+            assert!(!serialized.contains("relay_role ="));
+        }
+    }
+
+    #[test]
+    fn relay_direction_accepts_canonical_values_and_canonicalizes_pc_alias() {
+        let mobile_to_desktop: AppConfig =
+            toml::from_str("language = 'en'\nrelay_direction = 'mobile_to_desktop'\n").unwrap();
+        assert_eq!(
+            mobile_to_desktop.relay_direction,
+            AudioDirection::MobileToDesktop
+        );
+
+        let desktop_to_mobile: AppConfig =
+            toml::from_str("language = 'en'\nrelay_direction = 'pc_to_mobile'\n").unwrap();
+        assert_eq!(
+            desktop_to_mobile.relay_direction,
+            AudioDirection::DesktopToMobile
+        );
+        assert_eq!(
+            toml::to_string(&desktop_to_mobile)
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("relay_direction")),
+            Some("relay_direction = \"desktop_to_mobile\"")
+        );
+    }
+
+    #[test]
+    fn relay_direction_generation_is_persisted_with_the_canonical_direction() {
+        let config: AppConfig = toml::from_str(
+            "language = 'en'\nrelay_direction = 'desktop_to_mobile'\nrelay_direction_generation = 17\n",
+        )
+        .unwrap();
+        assert_eq!(config.relay_direction, AudioDirection::DesktopToMobile);
+        assert_eq!(config.relay_direction_generation, 17);
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("relay_direction = \"desktop_to_mobile\""));
+        assert!(serialized.contains("relay_direction_generation = 17"));
+        assert!(!serialized.contains("relay_role ="));
     }
 
     #[test]

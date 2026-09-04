@@ -91,12 +91,13 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         &mut self,
         target: std::net::SocketAddr,
         pin: &str,
-        roles: pw_graph_backend::RelayRoles,
+        direction: pw_graph_backend::RelayDirection,
+        direction_generation: u64,
     ) -> BackendResult<pw_graph_backend::RelaySessionId> {
         let session = self
             .relay_backend_mut()
             .ok_or_else(Self::relay_unavailable)?
-            .relay_connect(target, pin, roles)?;
+            .relay_connect(target, pin, direction, direction_generation)?;
         self.rebuild_after_native_mutation();
         Ok(session)
     }
@@ -106,12 +107,19 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         target: std::net::SocketAddr,
         peer_id: &str,
         secret: [u8; 32],
-        roles: pw_graph_backend::RelayRoles,
+        direction: pw_graph_backend::RelayDirection,
+        direction_generation: u64,
     ) -> BackendResult<pw_graph_backend::RelaySessionId> {
         let session = self
             .relay_backend_mut()
             .ok_or_else(Self::relay_unavailable)?
-            .relay_connect_trusted(target, peer_id, secret, roles)?;
+            .relay_connect_trusted(
+                target,
+                peer_id,
+                secret,
+                direction,
+                direction_generation,
+            )?;
         self.rebuild_after_native_mutation();
         Ok(session)
     }
@@ -120,6 +128,17 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         self.relay_backend_mut()
             .ok_or_else(Self::relay_unavailable)?
             .relay_disconnect(session)
+    }
+
+    fn relay_offer_direction(
+        &mut self,
+        session: pw_graph_backend::RelaySessionId,
+        direction: pw_graph_backend::RelayDirection,
+        generation: u64,
+    ) -> BackendResult<()> {
+        self.relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_offer_direction(session, direction, generation)
     }
 
     fn relay_configure_identity(
@@ -174,7 +193,11 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         // exposes a verified route without requiring a manual disconnect/reconnect.
         if events
             .iter()
-            .any(|e| matches!(e, pw_graph_backend::RelayEvent::SessionEstablished { .. }))
+            .any(|e| matches!(
+                e,
+                pw_graph_backend::RelayEvent::SessionEstablished { .. }
+                    | pw_graph_backend::RelayEvent::DirectionResolved { .. }
+            ))
         {
             self.rebuild_after_native_mutation();
             // Ensure the backend route was verified after the merged refresh.

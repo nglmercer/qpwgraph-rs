@@ -63,6 +63,15 @@ pub enum RelayEvent {
         roles: Roles,
         codec: CodecKind,
     },
+    /// The authenticated direction winner for a session. Both peers emit the
+    /// same winner after an offer/ack exchange; embedders use it to perform
+    /// their local two-phase endpoint switch.
+    DirectionResolved {
+        id: SessionId,
+        generation: u64,
+        direction: RelayDirection,
+        winner_device_id: String,
+    },
     SessionLost {
         id: SessionId,
         reason: String,
@@ -121,6 +130,18 @@ impl fmt::Debug for RelayEvent {
                 .field("peer", peer)
                 .field("roles", roles)
                 .field("codec", codec)
+                .finish(),
+            Self::DirectionResolved {
+                id,
+                generation,
+                direction,
+                winner_device_id,
+            } => formatter
+                .debug_struct("DirectionResolved")
+                .field("id", id)
+                .field("generation", generation)
+                .field("direction", direction)
+                .field("winner_device_id", winner_device_id)
                 .finish(),
             Self::SessionLost { id, reason } => formatter
                 .debug_struct("SessionLost")

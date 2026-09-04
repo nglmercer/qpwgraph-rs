@@ -32,11 +32,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.outlined.Cable
-import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material.icons.outlined.Speaker
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
@@ -95,6 +93,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 private val LINK_OPTIONS = listOf("auto", "wifi", "bluetooth", "lan", "adb")
+private val FRAME_OPTIONS = listOf("5", "10", "20", "40", "60")
 
 @Composable
 private fun linkDisplayMap(): Map<String, String> = mapOf(
@@ -158,8 +157,8 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     ) { result ->
         viewModel.onMediaProjectionResult(result.resultCode, result.data)
         val hasAudio = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        if (result.resultCode == Activity.RESULT_OK && hasAudio) {
-            viewModel.startHost()
+        if (result.resultCode == Activity.RESULT_OK && hasAudio && state.direction == AudioDirection.MobileToDesktop) {
+            viewModel.connect()
         }
     }
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
@@ -222,60 +221,66 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            RelayTabs(mode = state.mode, onSelected = viewModel::setMode)
+            DirectionTabs(direction = state.direction, onSelected = viewModel::setDirection)
+            DirectionHeader(state)
             UsbStatusBanner(link = state.usbLink)
 
-            // Global inline alert for current operation error
-            val globalError = when (state.mode) {
-                RelayMode.Receiver -> if (state.connection == RelayConnectionState.Error) state.message else ""
-                RelayMode.Emitter -> if (state.hostState == RelayHostState.Error) state.hostMessage else ""
-                RelayMode.Discover -> if (state.discoveryMessage.isNotBlank() && state.peers.isEmpty()) state.discoveryMessage else ""
+            // Global inline alert for the currently selected direction.
+            val globalError = when (state.direction) {
+                AudioDirection.MobileToDesktop -> if (state.connection == RelayConnectionState.Error) state.message else ""
+                AudioDirection.DesktopToMobile -> if (state.hostState == RelayHostState.Error) state.hostMessage else ""
             }
-            val globalSeverity = when (state.mode) {
-                RelayMode.Receiver -> if (state.connection == RelayConnectionState.Error) AlertSeverity.Error else AlertSeverity.Info
-                RelayMode.Emitter -> if (state.hostState == RelayHostState.Error) AlertSeverity.Error else AlertSeverity.Info
-                else -> AlertSeverity.Info
+            val globalSeverity = when (state.direction) {
+                AudioDirection.MobileToDesktop -> if (state.connection == RelayConnectionState.Error) AlertSeverity.Error else AlertSeverity.Info
+                AudioDirection.DesktopToMobile -> if (state.hostState == RelayHostState.Error) AlertSeverity.Error else AlertSeverity.Info
             }
-            if (globalError.isNotBlank() && state.mode != RelayMode.Discover) {
+            if (state.switchingDirection) {
+                AppAlert(message = stringResource(R.string.direction_switching), severity = AlertSeverity.Info)
+            } else if (globalError.isNotBlank()) {
                 AppAlert(message = globalError, severity = globalSeverity)
             }
 
-            when (state.mode) {
-                RelayMode.Receiver -> ReceiverTab(
+            when (state.direction) {
+                AudioDirection.MobileToDesktop -> PhoneToPcCard(
                     state, viewModel,
                     connectWithPermission = {
-                        runWithServicePermissions(clientNeedsMicrophone(state.settings.role), host = false, action = viewModel::connect)
-                    },
-                    openScanner = ::openScanner,
-                )
-                RelayMode.Emitter -> EmitterTab(
-                    state, viewModel,
-                    startHost = {
-                        val source = state.host.captureSource
-                        if (source == CaptureSource.DEVICE_PLAYBACK) {
-                            runWithServicePermissions(requiresMicrophone = true, host = true, action = {
-                                if (viewModel.hasMediaProjectionConsent()) viewModel.startHost()
-                                else {
+                        runWithServicePermissions(
+                            requiresMicrophone = true,
+                            host = false,
+                            action = {
+                                if (state.settings.captureSource == CaptureSource.DEVICE_PLAYBACK &&
+                                    !viewModel.hasMediaProjectionConsent()
+                                ) {
                                     val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                                     mediaProjectionLauncher.launch(mgr.createScreenCaptureIntent())
-                                }
-                            })
-                        } else {
-                            runWithServicePermissions(requiresMicrophone = true, host = true, action = viewModel::startHost)
-                        }
+                                } else viewModel.connect()
+                            },
+                        )
                     },
+                    openScanner = ::openScanner,
                     requestPlaybackConsent = {
                         val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                         mediaProjectionLauncher.launch(mgr.createScreenCaptureIntent())
                     },
                 )
-                RelayMode.Discover -> DiscoverTab(
+                AudioDirection.DesktopToMobile -> PcToPhoneCard(
                     state, viewModel,
-                    connectToPeer = { address ->
-                        runWithServicePermissions(clientNeedsMicrophone(state.settings.role), host = false, action = { viewModel.connectToPeer(address) })
+                    startHost = {
+                        runWithServicePermissions(requiresMicrophone = false, host = true, action = viewModel::startHost)
                     },
                 )
             }
+            AdvancedSettingsCard(state, viewModel)
+            DiscoverySection(
+                state,
+                viewModel,
+                canConnect = state.direction == AudioDirection.MobileToDesktop,
+                connectToPeer = { address ->
+                    if (state.direction == AudioDirection.MobileToDesktop) {
+                        runWithServicePermissions(requiresMicrophone = true, host = false, action = { viewModel.connectToPeer(address) })
+                    } else viewModel.connectToPeer(address)
+                },
+            )
             TrustedDevicesCard(state, viewModel)
             Spacer(Modifier.height(8.dp))
         }
@@ -289,19 +294,62 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
 }
 
 @Composable
-private fun RelayTabs(mode: RelayMode, onSelected: (RelayMode) -> Unit) {
+private fun DirectionTabs(direction: AudioDirection, onSelected: (AudioDirection) -> Unit) {
     val tabs = listOf(
-        Triple(stringResource(R.string.nav_receiver), RelayMode.Receiver, Icons.Outlined.Mic),
-        Triple(stringResource(R.string.nav_emitter), RelayMode.Emitter, Icons.Outlined.Speaker),
-        Triple(stringResource(R.string.nav_discover), RelayMode.Discover, Icons.Outlined.Search),
+        stringResource(R.string.direction_phone_to_pc) to AudioDirection.MobileToDesktop,
+        stringResource(R.string.direction_pc_to_phone) to AudioDirection.DesktopToMobile,
     )
-    TabRow(selectedTabIndex = tabs.indexOfFirst { it.second == mode }.coerceAtLeast(0)) {
-        tabs.forEach { (label, tabMode, icon) ->
+    TabRow(selectedTabIndex = tabs.indexOfFirst { it.second == direction }.coerceAtLeast(0)) {
+        tabs.forEach { (label, tabDirection) ->
             Tab(
-                selected = mode == tabMode,
-                onClick = { onSelected(tabMode) },
+                selected = direction == tabDirection,
+                onClick = { onSelected(tabDirection) },
                 text = { Text(label, style = MaterialTheme.typography.labelLarge) },
-                icon = { Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun DirectionHeader(state: RelayUiState) {
+    SectionCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (state.direction == AudioDirection.MobileToDesktop) {
+                        stringResource(R.string.direction_phone_to_pc_hint)
+                    } else {
+                        stringResource(R.string.direction_pc_to_phone_hint)
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                val peer = state.hostName.ifBlank { state.host.deviceName }
+                if (peer.isNotBlank()) {
+                    Text(peer, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            AssistChip(
+                onClick = {},
+                enabled = false,
+                label = {
+                    Text(
+                        if (state.switchingDirection) stringResource(R.string.direction_switching)
+                        else if (state.direction == AudioDirection.MobileToDesktop) stringResource(R.string.direction_sending)
+                        else stringResource(R.string.direction_receiving),
+                    )
+                },
+            )
+        }
+        if (state.link.isNotBlank()) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                stringResource(R.string.label_connected_via, state.link, state.transport.ifBlank { stringResource(R.string.label_unknown_link) }),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
@@ -377,17 +425,17 @@ private fun QrScannerDialog(onDetected: (String) -> Unit, onDismiss: () -> Unit)
 }
 
 // ------------------------------------------------------------------
-// Receiver
+// Phone → PC
 // ------------------------------------------------------------------
 
 @Composable
-private fun ReceiverTab(
+private fun PhoneToPcCard(
     state: RelayUiState,
     viewModel: RelayViewModel,
     connectWithPermission: () -> Unit,
     openScanner: () -> Unit,
+    requestPlaybackConsent: () -> Unit,
 ) {
-    val linkDisplay = linkDisplayMap()
     SectionCard(title = stringResource(R.string.receiver_host_address_label), tooltip = stringResource(R.string.receiver_host_address_tooltip)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Top) {
             OutlinedTextField(
@@ -415,66 +463,34 @@ private fun ReceiverTab(
             singleLine = true,
         )
         Spacer(Modifier.height(8.dp))
-        DropdownField(
-            label = stringResource(R.string.receiver_role_label),
-            value = state.settings.role,
-            options = listOf("emit", "receive", "both"),
-            display = mapOf(
-                "emit" to stringResource(R.string.receiver_role_emit),
-                "receive" to stringResource(R.string.receiver_role_receive),
-                "both" to stringResource(R.string.receiver_role_both),
-            ),
-            tooltip = stringResource(R.string.receiver_role_tooltip),
-            onSelected = { viewModel.update(state.settings.copy(role = it)) },
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            DropdownField(
-                label = stringResource(R.string.receiver_codec_label),
-                value = state.settings.codec,
-                options = listOf("opus", "pcm"),
-                tooltip = stringResource(R.string.receiver_codec_tooltip),
-                onSelected = { viewModel.update(state.settings.copy(codec = it)) },
-                modifier = Modifier.weight(1f),
-            )
-            DropdownField(
-                label = stringResource(R.string.receiver_link_label),
-                value = state.settings.transport,
-                options = LINK_OPTIONS,
-                display = linkDisplay,
-                tooltip = stringResource(R.string.receiver_link_tooltip),
-                onSelected = { viewModel.update(state.settings.copy(transport = it)) },
-                modifier = Modifier.weight(1f),
-            )
-        }
-    }
-
-    SectionCard(title = stringResource(R.string.receiver_trusted_auto_title), tooltip = stringResource(R.string.receiver_trusted_auto_tooltip)) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text(stringResource(R.string.receiver_trusted_auto_title), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(end = 12.dp))
-            Switch(checked = state.settings.autoConnectTrusted, onCheckedChange = { viewModel.update(state.settings.copy(autoConnectTrusted = it)) })
-        }
-        if (state.settings.autoConnectTrusted) {
-            Spacer(Modifier.height(8.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(stringResource(R.string.receiver_trusted_wifi_title), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(end = 12.dp))
-                InfoTooltip(tooltip = stringResource(R.string.receiver_trusted_wifi_tooltip))
-                Switch(checked = state.settings.autoConnectTrustedWifi, onCheckedChange = { viewModel.update(state.settings.copy(autoConnectTrustedWifi = it)) })
-            }
-            Spacer(Modifier.height(6.dp))
-            Text(stringResource(R.string.receiver_trusted_hint), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
         val isConnected = state.connection == RelayConnectionState.Connected || state.connection == RelayConnectionState.Connecting
-        if (isConnected) {
-            Button(onClick = viewModel::disconnect, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.action_disconnect)) }
-        } else {
-            Button(onClick = connectWithPermission, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.action_connect)) }
+        Button(
+            onClick = if (isConnected) viewModel::disconnect else connectWithPermission,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(if (isConnected) R.string.action_disconnect else R.string.action_connect))
         }
     }
-
+    SectionCard(title = stringResource(R.string.phone_source_title), tooltip = stringResource(R.string.phone_source_tooltip)) {
+        DropdownField(
+            label = stringResource(R.string.phone_source_title),
+            value = state.settings.captureSource.name.lowercase(),
+            options = listOf("microphone", "device_playback"),
+            display = mapOf(
+                "microphone" to stringResource(R.string.phone_source_microphone),
+                "device_playback" to stringResource(R.string.phone_source_playback),
+            ),
+            onSelected = { value -> viewModel.update(state.settings.copy(captureSource = captureSourceFromString(value))) },
+        )
+        if (state.settings.captureSource == CaptureSource.DEVICE_PLAYBACK) {
+            Spacer(Modifier.height(8.dp))
+            Text(stringResource(R.string.phone_source_playback_hint), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (!viewModel.hasMediaProjectionConsent()) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = requestPlaybackConsent) { Text(stringResource(R.string.emitter_grant_consent)) }
+            }
+        }
+    }
     SectionCard(title = stringResource(R.string.label_status)) {
         Text(
             state.connection.name.lowercase().replace('_', ' '),
@@ -500,6 +516,179 @@ private fun ReceiverTab(
         }
         Spacer(Modifier.height(10.dp))
         LevelIndicator(level = state.rms)
+    }
+}
+
+@Composable
+private fun PcToPhoneCard(
+    state: RelayUiState,
+    viewModel: RelayViewModel,
+    startHost: () -> Unit,
+) {
+    val hostEditable = state.hostState != RelayHostState.Starting && state.hostState != RelayHostState.Running
+
+    SectionCard(title = stringResource(R.string.emitter_device_name_label), tooltip = stringResource(R.string.emitter_device_name_tooltip)) {
+        OutlinedTextField(
+            value = state.host.deviceName,
+            onValueChange = { viewModel.updateHost(state.host.copy(deviceName = it)) },
+            enabled = hostEditable,
+            label = { Text(stringResource(R.string.emitter_device_name_label)) },
+            modifier = Modifier.fillMaxWidth(), singleLine = true,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = state.host.pin,
+                onValueChange = { viewModel.updateHost(state.host.copy(pin = it)) },
+                enabled = hostEditable,
+                label = { Text(stringResource(R.string.emitter_pin_label)) },
+                modifier = Modifier.weight(1f), singleLine = true,
+            )
+            AppTooltip(text = stringResource(R.string.emitter_regenerate_pin_desc)) {
+                FilledTonalButton(onClick = { viewModel.regenerateHostPin() }, enabled = hostEditable, modifier = Modifier.padding(top = 4.dp)) {
+                    Icon(Icons.Filled.Refresh, contentDescription = stringResource(R.string.emitter_regenerate_pin_desc), modifier = Modifier.size(18.dp))
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = state.host.port.toString(),
+            onValueChange = { value -> value.toIntOrNull()?.let { viewModel.updateHost(state.host.copy(port = it)) } },
+            enabled = hostEditable,
+            label = { Text(stringResource(R.string.emitter_port_label)) },
+            modifier = Modifier.fillMaxWidth(), singleLine = true,
+        )
+    }
+
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        if (state.hostState == RelayHostState.Running) {
+            Button(onClick = viewModel::stopHost, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
+                Text(stringResource(R.string.emitter_stop_host))
+            }
+        } else {
+            Button(onClick = startHost, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.emitter_start_host)) }
+        }
+    }
+
+    SectionCard(title = stringResource(R.string.label_status)) {
+        Text(stringResource(R.string.emitter_host_status, state.hostState.name.lowercase(), state.hostAudioState.name.lowercase()), style = MaterialTheme.typography.bodyMedium)
+        if (state.hostPort != null) Text(stringResource(R.string.emitter_listening_port, state.hostPort!!), style = MaterialTheme.typography.bodySmall)
+        if (state.hostMessage.isNotBlank() && state.hostState != RelayHostState.Error) {
+            Spacer(Modifier.height(6.dp)); Text(state.hostMessage, style = MaterialTheme.typography.bodySmall)
+        }
+        if (state.hostAudioMessage.isNotBlank() && state.hostAudioMessage != state.hostMessage) {
+            Spacer(Modifier.height(4.dp))
+            AppAlert(message = state.hostAudioMessage, severity = if (state.hostAudioState == RelayHostAudioState.Error) AlertSeverity.Error else AlertSeverity.Info)
+        }
+        Spacer(Modifier.height(10.dp))
+        LevelIndicator(level = state.hostRms)
+        Text(stringResource(R.string.direction_receiving), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+
+    val hostPort = state.hostPort
+    val hostAddress = state.hostAddress
+    if (state.hostState == RelayHostState.Running && hostPort != null && hostAddress != null) {
+        SectionCard(title = stringResource(R.string.emitter_reachable_title), tooltip = stringResource(R.string.emitter_reachable_tooltip)) {
+            Text("$hostAddress:$hostPort", style = MaterialTheme.typography.titleSmall)
+        }
+    }
+    if (state.sessions.isNotEmpty()) {
+        SectionCard(title = stringResource(R.string.emitter_active_sessions)) {
+            state.sessions.forEach { session ->
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("${session.name} — ${session.address}", style = MaterialTheme.typography.bodyMedium)
+                        if (session.transport.isNotBlank()) {
+                            Text(
+                                "${session.link.ifBlank { stringResource(R.string.label_unknown_link) }} / ${session.transport}" + if (session.audioChannelState == "reconnecting") " — ${stringResource(R.string.label_reconnecting_audio)}" else "",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    TextButton(onClick = { viewModel.disconnectSession(session.id) }) { Text(stringResource(R.string.action_disconnect)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AdvancedSettingsCard(state: RelayUiState, viewModel: RelayViewModel) {
+    val clientDirection = state.direction == AudioDirection.MobileToDesktop
+    val codec = if (clientDirection) state.settings.codec else state.host.codec
+    val transport = if (clientDirection) state.settings.transport else state.host.transport
+    val frameMs = if (clientDirection) state.settings.frameMs else state.host.frameMs
+    val linkDisplay = linkDisplayMap()
+
+    SectionCard(
+        title = stringResource(R.string.advanced_settings_title),
+        tooltip = stringResource(R.string.advanced_settings_tooltip),
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            DropdownField(
+                label = stringResource(R.string.receiver_codec_label),
+                value = codec,
+                options = listOf("opus", "pcm"),
+                tooltip = stringResource(R.string.receiver_codec_tooltip),
+                onSelected = { value ->
+                    if (clientDirection) viewModel.update(state.settings.copy(codec = value))
+                    else viewModel.updateHost(state.host.copy(codec = value))
+                },
+                modifier = Modifier.weight(1f),
+                enabled = if (clientDirection) {
+                    state.connection == RelayConnectionState.Disconnected || state.connection == RelayConnectionState.Error
+                } else {
+                    state.hostState == RelayHostState.Idle || state.hostState == RelayHostState.Error
+                },
+            )
+            DropdownField(
+                label = stringResource(R.string.receiver_link_label),
+                value = transport,
+                options = LINK_OPTIONS,
+                display = linkDisplay,
+                tooltip = stringResource(R.string.receiver_link_tooltip),
+                onSelected = { value ->
+                    if (clientDirection) viewModel.update(state.settings.copy(transport = value))
+                    else viewModel.updateHost(state.host.copy(transport = value))
+                },
+                modifier = Modifier.weight(1f),
+                enabled = if (clientDirection) {
+                    state.connection == RelayConnectionState.Disconnected || state.connection == RelayConnectionState.Error
+                } else {
+                    state.hostState == RelayHostState.Idle || state.hostState == RelayHostState.Error
+                },
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        DropdownField(
+            label = stringResource(R.string.advanced_frame_label),
+            value = frameMs.toString(),
+            options = FRAME_OPTIONS,
+            onSelected = { value ->
+                if (clientDirection) viewModel.update(state.settings.copy(frameMs = value.toInt()))
+                else viewModel.updateHost(state.host.copy(frameMs = value.toInt()))
+            },
+            enabled = if (clientDirection) {
+                state.connection == RelayConnectionState.Disconnected || state.connection == RelayConnectionState.Error
+            } else {
+                state.hostState == RelayHostState.Idle || state.hostState == RelayHostState.Error
+            },
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(stringResource(R.string.receiver_trusted_auto_title), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(end = 12.dp))
+            Switch(checked = state.settings.autoConnectTrusted, onCheckedChange = { viewModel.update(state.settings.copy(autoConnectTrusted = it)) })
+        }
+        if (state.settings.autoConnectTrusted) {
+            Spacer(Modifier.height(8.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(stringResource(R.string.receiver_trusted_wifi_title), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(end = 12.dp))
+                InfoTooltip(tooltip = stringResource(R.string.receiver_trusted_wifi_tooltip))
+                Switch(checked = state.settings.autoConnectTrustedWifi, onCheckedChange = { viewModel.update(state.settings.copy(autoConnectTrustedWifi = it)) })
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(stringResource(R.string.receiver_trusted_hint), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 
@@ -534,154 +723,14 @@ private fun TrustedDevicesCard(state: RelayUiState, viewModel: RelayViewModel) {
 }
 
 // ------------------------------------------------------------------
-// Emitter
-// ------------------------------------------------------------------
-
-@Composable
-private fun EmitterTab(
-    state: RelayUiState,
-    viewModel: RelayViewModel,
-    startHost: () -> Unit,
-    requestPlaybackConsent: () -> Unit,
-) {
-    val hostEditable = state.hostState != RelayHostState.Starting && state.hostState != RelayHostState.Running
-    val linkDisplay = linkDisplayMap()
-
-    SectionCard(title = stringResource(R.string.emitter_device_name_label), tooltip = stringResource(R.string.emitter_device_name_tooltip)) {
-        OutlinedTextField(
-            value = state.host.deviceName,
-            onValueChange = { viewModel.updateHost(state.host.copy(deviceName = it)) },
-            enabled = hostEditable,
-            label = { Text(stringResource(R.string.emitter_device_name_label)) },
-            modifier = Modifier.fillMaxWidth(), singleLine = true,
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
-                value = state.host.pin,
-                onValueChange = { viewModel.updateHost(state.host.copy(pin = it)) },
-                enabled = hostEditable,
-                label = { Text(stringResource(R.string.emitter_pin_label)) },
-                modifier = Modifier.weight(1f), singleLine = true,
-            )
-            AppTooltip(text = stringResource(R.string.emitter_regenerate_pin_desc)) {
-                FilledTonalButton(onClick = { viewModel.regenerateHostPin() }, enabled = hostEditable, modifier = Modifier.padding(top = 4.dp)) {
-                    Icon(Icons.Filled.Refresh, contentDescription = stringResource(R.string.emitter_regenerate_pin_desc), modifier = Modifier.size(18.dp))
-                }
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = state.host.port.toString(),
-            onValueChange = { value -> value.toIntOrNull()?.let { viewModel.updateHost(state.host.copy(port = it)) } },
-            enabled = hostEditable,
-            label = { Text(stringResource(R.string.emitter_port_label)) },
-            modifier = Modifier.fillMaxWidth(), singleLine = true,
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            DropdownField(
-                label = stringResource(R.string.emitter_codec_label),
-                value = state.host.codec,
-                options = listOf("opus", "pcm"),
-                onSelected = { viewModel.updateHost(state.host.copy(codec = it)) },
-                enabled = hostEditable, modifier = Modifier.weight(1f),
-            )
-            DropdownField(
-                label = stringResource(R.string.emitter_link_label),
-                value = state.host.transport,
-                options = LINK_OPTIONS,
-                display = linkDisplay,
-                onSelected = { viewModel.updateHost(state.host.copy(transport = it)) },
-                enabled = hostEditable, modifier = Modifier.weight(1f),
-            )
-        }
-        Spacer(Modifier.height(8.dp))
-        DropdownField(
-            label = stringResource(R.string.emitter_capture_source_label),
-            value = state.host.captureSource.name.lowercase(),
-            options = listOf("microphone", "device_playback"),
-            display = mapOf("microphone" to stringResource(R.string.emitter_capture_microphone), "device_playback" to stringResource(R.string.emitter_capture_playback)),
-            tooltip = stringResource(R.string.emitter_capture_tooltip),
-            onSelected = { viewModel.setHostCaptureSource(captureSourceFromString(it)) },
-            enabled = hostEditable,
-        )
-        if (state.host.captureSource == CaptureSource.DEVICE_PLAYBACK) {
-            Spacer(Modifier.height(8.dp))
-            AppAlert(message = stringResource(R.string.emitter_playback_hint), severity = AlertSeverity.Info)
-            Spacer(Modifier.height(8.dp))
-            AppAlert(
-                message = stringResource(R.string.emitter_playback_call_audio_hint),
-                severity = AlertSeverity.Warning,
-            )
-            if (!viewModel.hasMediaProjectionConsent() && hostEditable) {
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(onClick = requestPlaybackConsent) { Text(stringResource(R.string.emitter_grant_consent)) }
-            }
-        }
-    }
-
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-        if (state.hostState == RelayHostState.Running) {
-            Button(onClick = viewModel::stopHost, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
-                Text(stringResource(R.string.emitter_stop_host))
-            }
-        } else {
-            Button(onClick = startHost, modifier = Modifier.weight(1f)) { Text(stringResource(R.string.emitter_start_host)) }
-        }
-    }
-
-    SectionCard(title = stringResource(R.string.label_status)) {
-        Text(stringResource(R.string.emitter_host_status, state.hostState.name.lowercase(), state.hostAudioState.name.lowercase()), style = MaterialTheme.typography.bodyMedium)
-        if (state.hostPort != null) Text(stringResource(R.string.emitter_listening_port, state.hostPort!!), style = MaterialTheme.typography.bodySmall)
-        if (state.hostMessage.isNotBlank() && state.hostState != RelayHostState.Error) {
-            Spacer(Modifier.height(6.dp)); Text(state.hostMessage, style = MaterialTheme.typography.bodySmall)
-        }
-        if (state.hostAudioMessage.isNotBlank() && state.hostAudioMessage != state.hostMessage) {
-            Spacer(Modifier.height(4.dp))
-            AppAlert(message = state.hostAudioMessage, severity = if (state.hostAudioState == RelayHostAudioState.Error) AlertSeverity.Error else AlertSeverity.Info)
-        }
-        Spacer(Modifier.height(10.dp))
-        LevelIndicator(level = state.hostRms)
-        Spacer(Modifier.height(4.dp))
-        Text(stringResource(R.string.emitter_capture_label, state.host.captureSource.name.lowercase()), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-
-    val hostPort = state.hostPort
-    val hostAddress = state.hostAddress
-    if (state.hostState == RelayHostState.Running && hostPort != null && hostAddress != null) {
-        SectionCard(title = stringResource(R.string.emitter_reachable_title), tooltip = stringResource(R.string.emitter_reachable_tooltip)) {
-            Text("$hostAddress:$hostPort", style = MaterialTheme.typography.titleSmall)
-        }
-    }
-    if (state.sessions.isNotEmpty()) {
-        SectionCard(title = stringResource(R.string.emitter_active_sessions)) {
-            state.sessions.forEach { session ->
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("${session.name} — ${session.address}", style = MaterialTheme.typography.bodyMedium)
-                        if (session.transport.isNotBlank()) {
-                            Text(
-                                "${session.link.ifBlank { stringResource(R.string.label_unknown_link) }} / ${session.transport}" + if (session.audioChannelState == "reconnecting") " — ${stringResource(R.string.label_reconnecting_audio)}" else "",
-                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                    TextButton(onClick = { viewModel.disconnectSession(session.id) }) { Text(stringResource(R.string.action_disconnect)) }
-                }
-            }
-        }
-    }
-}
-
-// ------------------------------------------------------------------
 // Discover
 // ------------------------------------------------------------------
 
 @Composable
-private fun DiscoverTab(
+private fun DiscoverySection(
     state: RelayUiState,
     viewModel: RelayViewModel,
+    canConnect: Boolean,
     connectToPeer: (String) -> Unit,
 ) {
     AppTooltip(text = stringResource(R.string.discover_start_tooltip)) {
@@ -709,8 +758,15 @@ private fun DiscoverTab(
                     if (peer.link.isNotBlank()) Text(peer.link, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Spacer(Modifier.width(8.dp))
-                AppTooltip(text = stringResource(R.string.discover_connect_tooltip)) {
-                    Button(onClick = { connectToPeer(peer.address) }) { Text(stringResource(R.string.discover_connect)) }
+                AppTooltip(
+                    text = stringResource(
+                        if (canConnect) R.string.discover_connect_tooltip
+                        else R.string.discover_connect_direction_hint,
+                    ),
+                ) {
+                    Button(onClick = { connectToPeer(peer.address) }, enabled = canConnect) {
+                        Text(stringResource(R.string.discover_connect))
+                    }
                 }
             }
         }

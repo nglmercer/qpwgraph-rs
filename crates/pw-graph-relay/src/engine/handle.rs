@@ -182,6 +182,41 @@ impl RelayHandle {
         id
     }
 
+    /// Queue an authenticated direction offer for an established session.
+    ///
+    /// The control watcher sends it on its next tick and retains it until the
+    /// peer acknowledges or supersedes it. The embedding owns persistence of
+    /// `generation`; reusing a generation for a different direction is
+    /// rejected so an old offline request cannot reverse a newer choice.
+    pub fn offer_direction(
+        &self,
+        id: SessionId,
+        direction: RelayDirection,
+        generation: u64,
+    ) -> RelayResult<()> {
+        let config = self.inner.config();
+        if config.device_id.trim().is_empty() {
+            return Err(RelayError::Config(
+                "direction offers require a stable device id".into(),
+            ));
+        }
+        let record = self
+            .inner
+            .session(id)
+            .ok_or_else(|| RelayError::Engine(format!("unknown relay session {id}")))?;
+        let result = record
+            .direction
+            .lock()
+            .map_err(|_| RelayError::Engine("direction state is locked".into()))?
+            .queue(DirectionOffer {
+                generation,
+                direction,
+                device_id: config.device_id,
+            })
+            .map_err(RelayError::Config);
+        result
+    }
+
     /// Return the secret held by a pending host enrollment transaction. The
     /// embedding must durably commit this value before accepting the
     /// transaction. It is intentionally not carried in the request event.

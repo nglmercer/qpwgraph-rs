@@ -88,7 +88,9 @@ pw_graph_utils::enum_str! {
 
 /// Directions a client wants to carry in a session, from the client's point of
 /// view. `emit` sends the client's captured audio to the host; `receive`
-/// plays back audio the host sends. A session may carry both.
+/// plays back audio the host sends. Active sessions must contain exactly one
+/// of these bits; the `both` constructor remains only for discovery/capability
+/// compatibility and is rejected before audio workers start.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Roles {
@@ -97,21 +99,21 @@ pub struct Roles {
 }
 
 impl Roles {
-    pub fn emit_only() -> Self {
+    pub const fn emit_only() -> Self {
         Self {
             emit: true,
             receive: false,
         }
     }
 
-    pub fn receive_only() -> Self {
+    pub const fn receive_only() -> Self {
         Self {
             emit: false,
             receive: true,
         }
     }
 
-    pub fn both() -> Self {
+    pub const fn both() -> Self {
         Self {
             emit: true,
             receive: true,
@@ -120,6 +122,103 @@ impl Roles {
 
     pub fn is_empty(self) -> bool {
         !self.emit && !self.receive
+    }
+
+    /// Whether these roles describe exactly one audio direction.
+    pub const fn is_one_way(self) -> bool {
+        self.emit != self.receive
+    }
+
+    /// Convert a user-facing direction into the roles carried by a client
+    /// handshake. The host derives its opposite local role when it installs
+    /// the session.
+    pub const fn for_direction(direction: RelayDirection) -> Self {
+        match direction {
+            RelayDirection::MobileToDesktop => Self::emit_only(),
+            RelayDirection::DesktopToMobile => Self::receive_only(),
+        }
+    }
+
+    /// Infer the user-facing direction from a client's one-way role set.
+    pub const fn direction(self) -> Option<RelayDirection> {
+        match (self.emit, self.receive) {
+            (true, false) => Some(RelayDirection::MobileToDesktop),
+            (false, true) => Some(RelayDirection::DesktopToMobile),
+            (true, true) | (false, false) => None,
+        }
+    }
+}
+
+/// The direction negotiated by the direction-first relay surface.
+///
+/// This lives in the wire crate so the control protocol, the SDK, and the
+/// Android JNI boundary all use the same canonical strings without importing
+/// the desktop application's config crate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayDirection {
+    #[default]
+    MobileToDesktop,
+    DesktopToMobile,
+}
+
+impl RelayDirection {
+    pub const MOBILE_TO_DESKTOP: &'static str = "mobile_to_desktop";
+    pub const DESKTOP_TO_MOBILE: &'static str = "desktop_to_mobile";
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MobileToDesktop => Self::MOBILE_TO_DESKTOP,
+            Self::DesktopToMobile => Self::DESKTOP_TO_MOBILE,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            Self::MOBILE_TO_DESKTOP | "mobile_to_pc" => Some(Self::MobileToDesktop),
+            Self::DESKTOP_TO_MOBILE | "pc_to_mobile" => Some(Self::DesktopToMobile),
+            _ => None,
+        }
+    }
+}
+
+/// A trusted, monotonic direction proposal. The stable device ID is part of
+/// the tie-break so simultaneous switches converge without a coordinator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectionOffer {
+    pub generation: u64,
+    pub direction: RelayDirection,
+    pub device_id: String,
+}
+
+impl DirectionOffer {
+    pub fn is_valid(&self) -> bool {
+        !self.device_id.trim().is_empty()
+    }
+}
+
+/// Acknowledgement of the resolved generation/direction. The winning device
+/// ID is intentionally omitted from the wire acknowledgement; both peers
+/// already have the corresponding offer in their authenticated state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectionAck {
+    pub generation: u64,
+    pub direction: RelayDirection,
+}
+
+/// Resolve two authenticated proposals. Higher generations win; equal
+/// generations use the lexicographically greater stable device ID. The final
+/// direction comparison only handles the impossible-but-testable case where
+/// two installations share the same ID, and keeps that case deterministic.
+pub fn resolve_direction_offers(left: &DirectionOffer, right: &DirectionOffer) -> DirectionOffer {
+    match left
+        .generation
+        .cmp(&right.generation)
+        .then_with(|| left.device_id.cmp(&right.device_id))
+        .then_with(|| left.direction.cmp(&right.direction))
+    {
+        std::cmp::Ordering::Less => right.clone(),
+        _ => left.clone(),
     }
 }
 
@@ -244,6 +343,17 @@ pub enum ControlMessage {
     },
     /// H→C: negotiated session parameters accepted and audio may start.
     SessionReady {},
+    /// Bidirectional authenticated proposal for a new user-facing direction.
+    DirectionOffer {
+        generation: u64,
+        direction: RelayDirection,
+        device_id: String,
+    },
+    /// Acknowledgement of the deterministic direction winner.
+    DirectionAck {
+        generation: u64,
+        direction: RelayDirection,
+    },
     /// C→H enrollment of a credential generated after an explicit PIN
     /// pairing. The surrounding control channel is already authenticated.
     TrustEnroll {
@@ -327,6 +437,8 @@ impl fmt::Debug for ControlMessage {
             Self::TrustedOk { .. } => "TrustedOk",
             Self::SessionStart { .. } => "SessionStart",
             Self::SessionReady { .. } => "SessionReady",
+            Self::DirectionOffer { .. } => "DirectionOffer",
+            Self::DirectionAck { .. } => "DirectionAck",
             Self::TrustEnroll { .. } => "TrustEnroll",
             Self::TrustAccepted { .. } => "TrustAccepted",
             Self::TrustRejected { .. } => "TrustRejected",
@@ -527,6 +639,15 @@ mod tests {
                 channels: 1,
             },
             ControlMessage::SessionReady {},
+            ControlMessage::DirectionOffer {
+                generation: 4,
+                direction: RelayDirection::DesktopToMobile,
+                device_id: "desktop-installation".into(),
+            },
+            ControlMessage::DirectionAck {
+                generation: 4,
+                direction: RelayDirection::DesktopToMobile,
+            },
             ControlMessage::Keepalive {},
             ControlMessage::ResumeHello {
                 session_id: 42,
@@ -554,6 +675,50 @@ mod tests {
             let decoded = read_frame(&mut cursor).expect("frame decodes");
             assert_eq!(&decoded, message);
         }
+    }
+
+    #[test]
+    fn direction_resolution_prefers_generation_then_stable_device_id() {
+        let older = DirectionOffer {
+            generation: 3,
+            direction: RelayDirection::MobileToDesktop,
+            device_id: "z-device".into(),
+        };
+        let newer = DirectionOffer {
+            generation: 4,
+            direction: RelayDirection::DesktopToMobile,
+            device_id: "a-device".into(),
+        };
+        assert_eq!(resolve_direction_offers(&older, &newer), newer);
+
+        let left = DirectionOffer {
+            generation: 9,
+            direction: RelayDirection::MobileToDesktop,
+            device_id: "a-device".into(),
+        };
+        let right = DirectionOffer {
+            generation: 9,
+            direction: RelayDirection::DesktopToMobile,
+            device_id: "z-device".into(),
+        };
+        assert_eq!(resolve_direction_offers(&left, &right), right);
+    }
+
+    #[test]
+    fn direction_resolution_is_symmetric_even_for_duplicate_device_ids() {
+        let left = DirectionOffer {
+            generation: 12,
+            direction: RelayDirection::MobileToDesktop,
+            device_id: "duplicate".into(),
+        };
+        let right = DirectionOffer {
+            generation: 12,
+            direction: RelayDirection::DesktopToMobile,
+            device_id: "duplicate".into(),
+        };
+        let winner = resolve_direction_offers(&left, &right);
+        assert_eq!(winner, resolve_direction_offers(&right, &left));
+        assert_eq!(winner.direction, RelayDirection::DesktopToMobile);
     }
 
     #[test]

@@ -2,14 +2,13 @@
 //! audio relay.
 //!
 //! This crate is what third-party applications depend on. It wraps the
-//! [`pw_graph_relay`] engine with role-oriented builders:
+//! [`pw_graph_relay`] engine with direction-oriented builders:
 //!
-//! - [`RelayHost`] — run on a PC: accepts phone/peer connections, exposes
-//!   incoming peer audio via [`RelayHost::pull_playback`] and broadcasts
-//!   audio fed through [`RelayHost::push_capture`].
-//! - [`RelayClient`] — run anywhere (Linux desktop, Android via JNI): emit
-//!   captured microphone audio to a host and/or receive host audio for
-//!   playback.
+//! - [`RelayHost`] — run on a PC: accepts phone/peer connections for one
+//!   selected direction and exposes the matching audio queue.
+//! - [`RelayClient`] — run anywhere (Linux desktop, Android via JNI): carry
+//!   exactly one selected direction, either captured audio to a host or host
+//!   audio to playback.
 //!
 //! The SDK is audio-IO agnostic: you push captured PCM and pull playback PCM.
 //! That keeps it portable — PipeWire on Linux, AAudio/OpenSL ES on Android,
@@ -18,29 +17,29 @@
 //! ## Host example
 //!
 //! ```no_run
-//! use pw_graph_relay_sdk::RelayHostBuilder;
+//! use pw_graph_relay_sdk::{RelayDirection, RelayHostBuilder};
 //!
 //! let host = RelayHostBuilder::new()
 //!     .device_name("studio-pc")
 //!     .pin("123456")
+//!     .direction(RelayDirection::MobileToDesktop)
 //!     .build()
 //!     .expect("builder")
 //!     .start()
 //!     .expect("host starts");
 //! println!("listening on port {}", host.port());
-//! // In your audio loop:
+//! // In the Mobile → Desktop audio loop:
 //! //   let mut buffer = [0.0f32; 960];
 //! //   let n = host.pull_playback(&mut buffer); // peer mic audio
-//! //   host.push_capture(&pc_audio);            // sent to listening peers
 //! ```
 //!
 //! ## Client example (phone-as-microphone)
 //!
 //! ```no_run
-//! use pw_graph_relay_sdk::{RelayClientBuilder, Role};
+//! use pw_graph_relay_sdk::{RelayClientBuilder, RelayDirection};
 //!
 //! let client = RelayClientBuilder::new()
-//!     .role(Role::Emit)
+//!     .direction(RelayDirection::MobileToDesktop)
 //!     .build()
 //!     .expect("builder")
 //!     .connect("192.168.1.20:48123", "123456")
@@ -56,7 +55,8 @@ pub use pw_graph_relay::{
     generate_device_id,
     netlink::{display_links, listen_bind_addr, local_links, select_links},
     CodecKind, DeviceKind, EngineConfig, EngineStatus, LinkKind, LocalLink, PeerInfo, RelayError,
-    RelayEvent, RelayResult, Roles, SessionId, SessionStatus, TransportPreference, TrustedPeer,
+    RelayDirection, RelayEvent, RelayResult, Roles, SessionId, SessionStatus,
+    TransportPreference, TrustedPeer,
     FRAME_DURATIONS_MS, MAX_DISCOVERED_PEER_ADDRESSES, MAX_REALTIME_QUANTUM_SAMPLES,
     MAX_TRUSTED_PEERS, SAMPLE_RATES_HZ,
 };
@@ -96,27 +96,6 @@ fn validate_audio(sample_rate: u32, channels: u16, frame_ms: u16) -> RelayResult
     Ok(())
 }
 
-/// The role a client takes in a session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    /// Send captured audio to the host (phone-as-microphone).
-    Emit,
-    /// Receive host audio for playback (phone-as-speaker).
-    Receive,
-    /// Carry both directions at once.
-    Both,
-}
-
-impl Role {
-    fn to_roles(self) -> Roles {
-        match self {
-            Self::Emit => Roles::emit_only(),
-            Self::Receive => Roles::receive_only(),
-            Self::Both => Roles::both(),
-        }
-    }
-}
-
 /// Builder for [`RelayHost`].
 #[derive(Clone, Debug)]
 pub struct RelayHostBuilder {
@@ -150,6 +129,20 @@ impl RelayHostBuilder {
 
     pub fn trust_new_peers(mut self, enabled: bool) -> Self {
         self.config.trust_new_peers = enabled;
+        self
+    }
+
+    /// User-facing direction served by this host. Session roles are derived
+    /// internally from the direction; callers should configure connecting
+    /// peers with the same direction.
+    pub fn direction(mut self, direction: RelayDirection) -> Self {
+        self.config.direction = direction;
+        self
+    }
+
+    /// Monotonic persisted direction generation used during trusted resume.
+    pub fn direction_generation(mut self, generation: u64) -> Self {
+        self.config.direction_generation = generation;
         self
     }
 
@@ -292,7 +285,8 @@ impl RelayHost {
         self.handle.clone()
     }
 
-    /// Audio received from emitting peers (e.g. phone microphones).
+    /// Audio received from emitting peers (e.g. phone microphones). This is
+    /// the active host queue for `MobileToDesktop`.
     pub fn pull_playback(&self, out: &mut [f32]) -> usize {
         self.handle.pull_playback(out)
     }
@@ -307,6 +301,7 @@ impl RelayHost {
     }
 
     /// Audio to broadcast to receiving peers (e.g. the PC's relay sink tap).
+    /// This is the active host queue for `DesktopToMobile`.
     pub fn push_capture(&self, samples: &[f32]) {
         self.handle.push_capture(samples);
     }
@@ -333,6 +328,17 @@ impl RelayHost {
         self.handle.disconnect(session)
     }
 
+    /// Propose a new direction for an authenticated session. The embedding
+    /// must wait for `DirectionResolved` before replacing its audio worker.
+    pub fn offer_direction(
+        &self,
+        session: SessionId,
+        direction: RelayDirection,
+        generation: u64,
+    ) -> RelayResult<()> {
+        self.handle.offer_direction(session, direction, generation)
+    }
+
     pub fn remove_trusted_peer(&self, peer_id: &str) -> RelayResult<()> {
         self.handle.remove_trusted_peer(peer_id)
     }
@@ -346,14 +352,12 @@ impl RelayHost {
 #[derive(Clone, Debug)]
 pub struct RelayClientBuilder {
     config: EngineConfig,
-    role: Role,
 }
 
 impl RelayClientBuilder {
     pub fn new() -> Self {
         Self {
             config: EngineConfig::default(),
-            role: Role::Emit,
         }
     }
 
@@ -382,8 +386,15 @@ impl RelayClientBuilder {
         self
     }
 
-    pub fn role(mut self, role: Role) -> Self {
-        self.role = role;
+    /// Direction of this client's audio endpoint. Mobile → Desktop is
+    /// emit-only; Desktop → Mobile is receive-only.
+    pub fn direction(mut self, direction: RelayDirection) -> Self {
+        self.config.direction = direction;
+        self
+    }
+
+    pub fn direction_generation(mut self, generation: u64) -> Self {
+        self.config.direction_generation = generation;
         self
     }
 
@@ -442,7 +453,6 @@ impl RelayClientBuilder {
         )?;
         Ok(RelayClientPrepared {
             config: self.config,
-            role: self.role,
         })
     }
 }
@@ -460,7 +470,6 @@ impl Default for RelayClientBuilder {
 #[derive(Clone)]
 pub struct RelayClientPrepared {
     config: EngineConfig,
-    role: Role,
 }
 
 impl RelayClientPrepared {
@@ -468,9 +477,10 @@ impl RelayClientPrepared {
     /// caller owns the PIN lifetime; the SDK does not persist or regenerate it.
     pub fn connect(self, target: &str, pin: &str) -> RelayResult<RelayClient> {
         let addr = resolve(target)?;
+        let direction = self.config.direction;
         let engine = RelayEngine::start(self.config)?;
         let handle = engine.handle();
-        let session = handle.connect(addr, pin, self.role.to_roles());
+        let session = handle.connect(addr, pin, Roles::for_direction(direction));
 
         // Wait for the handshake outcome so callers get synchronous errors.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -516,9 +526,15 @@ impl RelayClientPrepared {
         secret: [u8; 32],
     ) -> RelayResult<RelayClient> {
         let addr = resolve(target)?;
+        let direction = self.config.direction;
         let engine = RelayEngine::start(self.config)?;
         let handle = engine.handle();
-        let session = handle.connect_trusted(addr, peer_id, secret, self.role.to_roles());
+        let session = handle.connect_trusted(
+            addr,
+            peer_id,
+            secret,
+            Roles::for_direction(direction),
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             for event in handle.events() {
@@ -577,7 +593,7 @@ impl RelayClient {
         self.handle.clone()
     }
 
-    /// Send captured microphone audio to the host (emit role).
+    /// Send captured microphone audio to the host in `MobileToDesktop`.
     pub fn send_capture(&self, samples: &[f32]) {
         self.handle.push_capture(samples);
     }
@@ -590,7 +606,7 @@ impl RelayClient {
         self.handle.try_push_capture(samples)
     }
 
-    /// Take host audio for playback (receive role).
+    /// Take host audio for playback in `DesktopToMobile`.
     pub fn pull_playback(&self, out: &mut [f32]) -> usize {
         self.handle.pull_playback(out)
     }
@@ -609,6 +625,16 @@ impl RelayClient {
     /// Disconnect from the host.
     pub fn disconnect(self) -> RelayResult<()> {
         self.handle.disconnect(self.session)
+    }
+
+    /// Propose a new direction for this authenticated session. The embedding
+    /// must wait for `DirectionResolved` before replacing its audio worker.
+    pub fn offer_direction(
+        &self,
+        direction: RelayDirection,
+        generation: u64,
+    ) -> RelayResult<()> {
+        self.handle.offer_direction(self.session, direction, generation)
     }
 
     pub fn remove_trusted_peer(&self, peer_id: &str) -> RelayResult<()> {
@@ -776,6 +802,32 @@ mod tests {
         assert_eq!(RelayHostBuilder::new().config.port, 0);
         assert_eq!(RelayHostBuilder::new().port(48123).config.port, 48123);
         assert_eq!(RelayHostBuilder::new().port(0).config.port, 0);
+    }
+
+    #[test]
+    fn direction_builders_keep_one_way_roles_and_the_generation_together() {
+        for direction in [
+            RelayDirection::MobileToDesktop,
+            RelayDirection::DesktopToMobile,
+        ] {
+            let host = RelayHostBuilder::new()
+                .direction(direction)
+                .direction_generation(7)
+                .build()
+                .expect("direction is always valid");
+            assert_eq!(host.config.direction, direction);
+            assert_eq!(host.config.direction_generation, 7);
+            assert!(Roles::for_direction(direction).is_one_way());
+            assert_eq!(Roles::for_direction(direction).direction(), Some(direction));
+
+            let client = RelayClientBuilder::new()
+                .direction(direction)
+                .direction_generation(7)
+                .build()
+                .expect("direction is always valid");
+            assert_eq!(client.config.direction, direction);
+            assert_eq!(client.config.direction_generation, 7);
+        }
     }
 
     #[test]

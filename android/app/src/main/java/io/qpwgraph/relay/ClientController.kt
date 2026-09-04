@@ -54,7 +54,8 @@ internal class ClientController(
                 settings.deviceName,
                 deviceId,
                 trustedCredentialsJson,
-                settings.role,
+                settings.direction.serialized(),
+                settings.directionGeneration,
                 settings.codec,
                 settings.transport,
                 settings.sampleRate,
@@ -70,6 +71,14 @@ internal class ClientController(
 
     fun connectTrusted(target: String, peer: TrustedRelayPeer): JSONObject =
         JSONObject(NativeBridge.connectTrusted(handle, target, peer.peerId, peer.secret))
+
+    fun offerDirection(
+        sessionId: Long,
+        direction: AudioDirection,
+        generation: Long,
+    ): JSONObject = JSONObject(
+        NativeBridge.offerDirection(handle, sessionId, direction.serialized(), generation),
+    )
 
     /**
      * Native told us the handle is unknown. Drop it without calling back into

@@ -1266,6 +1266,8 @@ impl RelayDriver for PipewireDriver {
                 transport: request.transport,
                 trusted_peers: request.trusted_peers,
                 trust_new_peers: request.trust_new_peers,
+                direction: request.direction,
+                direction_generation: request.direction_generation,
                 ..Default::default()
             };
             set.handle().update_config(config);
@@ -1288,7 +1290,8 @@ impl RelayDriver for PipewireDriver {
         &mut self,
         target: std::net::SocketAddr,
         pin: &str,
-        roles: RelayRoles,
+        direction: RelayDirection,
+        direction_generation: u64,
     ) -> BackendResult<RelaySessionId> {
         self.with_loop(|driver| {
             let device_name = driver
@@ -1297,7 +1300,15 @@ impl RelayDriver for PipewireDriver {
                 .map(|set| set.handle().config().device_name)
                 .unwrap_or_else(|| "qpwgraph-rs".into());
             let set = driver.ensure_relay_devices_locked(&device_name)?;
-            Ok(set.handle().connect(target, pin, roles))
+            let mut config = set.handle().config();
+            config.direction = direction;
+            config.direction_generation = direction_generation;
+            let roles = super::api::desktop_relay_client_roles(direction);
+            config.client_roles = roles;
+            set.handle().update_config(config);
+            Ok(set
+                .handle()
+                .connect(target, pin, roles))
         })
     }
 
@@ -1306,7 +1317,8 @@ impl RelayDriver for PipewireDriver {
         target: std::net::SocketAddr,
         peer_id: &str,
         secret: [u8; 32],
-        roles: RelayRoles,
+        direction: RelayDirection,
+        direction_generation: u64,
     ) -> BackendResult<RelaySessionId> {
         self.with_loop(|driver| {
             let device_name = driver
@@ -1315,7 +1327,18 @@ impl RelayDriver for PipewireDriver {
                 .map(|set| set.handle().config().device_name)
                 .unwrap_or_else(|| "qpwgraph-rs".into());
             let set = driver.ensure_relay_devices_locked(&device_name)?;
-            Ok(set.handle().connect_trusted(target, peer_id, secret, roles))
+            let mut config = set.handle().config();
+            config.direction = direction;
+            config.direction_generation = direction_generation;
+            let roles = super::api::desktop_relay_client_roles(direction);
+            config.client_roles = roles;
+            set.handle().update_config(config);
+            Ok(set.handle().connect_trusted(
+                target,
+                peer_id,
+                secret,
+                roles,
+            ))
         })
     }
 
@@ -1340,6 +1363,20 @@ impl RelayDriver for PipewireDriver {
             set.handle().update_config(config);
             Ok(())
         })
+    }
+
+    fn relay_offer_direction(
+        &mut self,
+        session: RelaySessionId,
+        direction: RelayDirection,
+        generation: u64,
+    ) -> BackendResult<()> {
+        let Some(set) = self.relay.as_ref() else {
+            return Err(BackendError::native("no relay session exists"));
+        };
+        set.handle()
+            .offer_direction(session, direction, generation)
+            .map_err(|error| BackendError::native(format!("relay direction offer failed: {error}")))
     }
 
     fn relay_disconnect(&mut self, session: RelaySessionId) -> BackendResult<()> {

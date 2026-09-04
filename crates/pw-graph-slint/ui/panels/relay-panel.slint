@@ -26,7 +26,6 @@ export component RelayPanel inherits Rectangle {
     in-out property <string> relay-client-target: "";
     in-out property <string> relay-client-pin: "";
     in-out property <bool> relay-auto-connect-trusted: true;
-    in-out property <int> relay-role-index: 2;
     in-out property <int> relay-codec-index: 0;
     in-out property <int> relay-frame-index: 0;
     in-out property <int> relay-transport-index: 0;
@@ -41,6 +40,7 @@ export component RelayPanel inherits Rectangle {
     in property <bool> relay-host-active: false;
     in property <string> relay-host-endpoint: "";
     in property <bool> relay-is-connecting: false;
+    in property <bool> relay-direction-switching: false;
     in property <string> relay-qr-payload: "";
     callback action(string);
     callback close();
@@ -71,8 +71,8 @@ export component RelayPanel inherits Rectangle {
     Rectangle { x: 16px; y: 49px; width: parent.width - 32px; height: 1px; background: #3d4a56; }
     TabStrip {
         x: 16px; y: 62px; width: parent.width - 32px;
-        first: UiI18n.localized("relay.tab_connections");
-        second: UiI18n.localized("relay.tab_host");
+        first: UiI18n.localized("relay.direction_mobile_to_desktop");
+        second: UiI18n.localized("relay.direction_desktop_to_mobile");
         third: UiI18n.localized("relay.tab_advanced");
         current-index <=> root.relay-tab;
     }
@@ -90,19 +90,33 @@ export component RelayPanel inherits Rectangle {
             spacing: 9px;
             alignment: start;
 
-            if root.relay-tab == 0: FormSection {
+            if root.relay-direction-switching: Text {
+                min-height: 24px;
+                text: UiI18n.localized("relay.direction_switching");
+                color: #e0b062;
+                font-size: 10px * UiTheme.panel-scale;
+                wrap: word-wrap;
+            }
+
+            if root.relay-tab == 1: FormSection {
                 VerticalLayout {
                     spacing: 8px;
+                    Text {
+                        text: UiI18n.localized("relay.effective_role_emitter");
+                        color: #aebdca;
+                        font-size: 10px * UiTheme.panel-scale;
+                        wrap: word-wrap;
+                    }
                     RelayLineEdit { height: 31px; placeholder-text: UiI18n.localized("relay.target"); text <=> root.relay-client-target; }
                     HorizontalLayout {
                         height: 31px; spacing: 8px;
                         RelayLineEdit { horizontal-stretch: 1; placeholder-text: UiI18n.localized("relay.pin"); text <=> root.relay-client-pin; }
-                        ActionButton { width: 92px; text: root.relay-is-connecting ? UiI18n.localized("relay.cancel_connect") : UiI18n.localized("relay.connect"); enabled: root.relay-available; clicked => { if (root.relay-is-connecting) { root.action("relay-cancel-connect"); } else { root.action("relay-connect-configured"); } } }
+                        ActionButton { width: 92px; text: root.relay-is-connecting ? UiI18n.localized("relay.cancel_connect") : UiI18n.localized("relay.connect"); enabled: root.relay-available && (!root.relay-direction-switching || root.relay-is-connecting); clicked => { if (root.relay-is-connecting) { root.action("relay-cancel-connect"); } else { root.action("relay-connect-configured"); } } }
                     }
                 }
             }
 
-            if root.relay-tab == 0: Text {
+            if root.relay-tab == 1: Text {
                 height: 22px;
                 text: UiI18n.localized("relay.group_available");
                 color: #aebdca;
@@ -113,7 +127,7 @@ export component RelayPanel inherits Rectangle {
             // This list is the desktop's discovery: without a word here an
             // empty section reads as a broken panel rather than as a search
             // still running.
-            if root.relay-tab == 0 && root.relay-rows.length == 0: Text {
+            if root.relay-tab == 1 && root.relay-rows.length == 0: Text {
                 min-height: 40px;
                 text: UiI18n.localized("relay.no_peers");
                 color: #8393a0;
@@ -121,7 +135,7 @@ export component RelayPanel inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            if root.relay-tab == 0: VerticalLayout {
+            if root.relay-tab == 1: VerticalLayout {
                 spacing: 7px;
                 for row in root.relay-rows: Rectangle {
                     // Two text lines plus a meter lane, with the actions in a
@@ -198,7 +212,7 @@ export component RelayPanel inherits Rectangle {
                         text: row.connected ? UiI18n.localized("relay.disconnect")
                             : row.connecting ? UiI18n.localized("relay.cancel_connect")
                             : UiI18n.localized("relay.connect");
-                        enabled: row.id != "" && (row.connected || row.connecting || root.relay-available);
+                        enabled: row.id != "" && (row.connected || row.connecting || (root.relay-available && !root.relay-direction-switching));
                         clicked => {
                             if (row.connected) { root.action("relay-disconnect:" + row.id); }
                             else if (row.connecting) { root.action("relay-cancel-connect"); }
@@ -217,9 +231,17 @@ export component RelayPanel inherits Rectangle {
                 }
             }
 
-            if root.relay-tab == 1: FormSection {
+            if root.relay-tab == 0: FormSection {
                 title: UiI18n.localized("relay.title");
-                summary: UiI18n.localized("relay.emitter_hint");
+                summary: UiI18n.localized("relay.mobile_to_desktop_hint");
+
+                Text {
+                    min-height: 22px;
+                    text: UiI18n.localized("relay.effective_role_host");
+                    color: #aebdca;
+                    font-size: 10px * UiTheme.panel-scale;
+                    wrap: word-wrap;
+                }
 
                 if root.relay-windows-endpoints: FormRow {
                     label: UiI18n.localized("relay.capture_endpoint");
@@ -253,8 +275,8 @@ export component RelayPanel inherits Rectangle {
                 FormRow { label: UiI18n.localized("relay.port"); RelayLineEdit { height: 31px; placeholder-text: UiI18n.localized("relay.port_help"); text <=> root.relay-host-port-text; } }
                 HorizontalLayout {
                     height: 31px; spacing: 8px;
-                    ActionButton { horizontal-stretch: 1; text: root.relay-host-active ? UiI18n.localized("relay.stop_host") : UiI18n.localized("relay.start_host"); enabled: root.relay-available; clicked => { root.action("relay-host-toggle"); } }
-                    ActionButton { horizontal-stretch: 1; text: UiI18n.localized("relay.show_qr"); enabled: root.relay-host-active && root.relay-qr-payload != ""; clicked => { root.action("relay-show-qr"); } }
+                    ActionButton { horizontal-stretch: 1; text: root.relay-host-active ? UiI18n.localized("relay.stop_host") : UiI18n.localized("relay.start_host"); enabled: root.relay-available && !root.relay-direction-switching; clicked => { root.action("relay-host-toggle"); } }
+                    ActionButton { horizontal-stretch: 1; text: UiI18n.localized("relay.show_qr"); enabled: root.relay-host-active && root.relay-qr-payload != "" && !root.relay-direction-switching; clicked => { root.action("relay-show-qr"); } }
                 }
                 Text {
                     min-height: 28px;
@@ -274,10 +296,6 @@ export component RelayPanel inherits Rectangle {
 
             if root.relay-tab == 2: FormSection {
                 title: UiI18n.localized("relay.advanced");
-                FormRow {
-                    label: UiI18n.localized("relay.role");
-                    RelayComboBox { height: 31px; model: [UiI18n.localized("relay.role_emit"), UiI18n.localized("relay.role_receive"), UiI18n.localized("relay.role_both")]; current-index <=> root.relay-role-index; }
-                }
                 FormRow { label: UiI18n.localized("relay.codec"); RelayComboBox { height: 31px; model: root.relay-codec-options; current-index <=> root.relay-codec-index; } }
                 FormRow { label: UiI18n.localized("relay.frame_ms"); RelayComboBox { height: 31px; model: root.relay-frame-options; current-index <=> root.relay-frame-index; } }
                 FormRow { label: UiI18n.localized("relay.transport"); RelayComboBox { height: 31px; model: root.relay-transport-options; current-index <=> root.relay-transport-index; } }

@@ -1,6 +1,6 @@
 <resources>
     <string name="relay_app_title">qpwgraph Relay</string>
-    <string name="relay_app_subtitle">Nutze dein Android-Gerät als Mikrofon, Lautsprecher oder beides.</string>
+    <string name="relay_app_subtitle">Wähle eine Audio-Richtung zwischen Telefon und PC.</string>
     <string name="nav_receiver">Empfänger</string>
     <string name="nav_emitter">Sender</string>
     <string name="nav_discover">Entdecken</string>
@@ -13,10 +13,6 @@
     <string name="receiver_host_address_label">Host-Adresse</string>
     <string name="receiver_host_address_hint">192.168.1.20:48123</string>
     <string name="receiver_pin_label">Kopplungs-PIN</string>
-    <string name="receiver_role_label">Rolle</string>
-    <string name="receiver_role_emit">Mikrofon senden</string>
-    <string name="receiver_role_receive">Wiedergabe empfangen</string>
-    <string name="receiver_role_both">Beides</string>
     <string name="receiver_codec_label">Codec</string>
     <string name="receiver_link_label">Link</string>
     <string name="receiver_trusted_auto_title">Vertraute Geräte automatisch erneut verbinden</string>

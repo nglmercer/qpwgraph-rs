@@ -68,6 +68,10 @@ pub(super) fn demo_application() -> Application {
         relay_pending_enrollment: None,
         #[cfg(feature = "relay")]
         relay_reconnect_pending: None,
+        #[cfg(feature = "relay")]
+        relay_direction_switch: None,
+        #[cfg(feature = "relay")]
+        relay_direction_ui_sync: None,
     }
 }
 
@@ -634,7 +638,9 @@ const READABLE_BUTTON_WIDTH: f32 = 60.0;
 fn relay_peer_rows_give_their_actions_a_readable_label() {
     let harness = CanvasHarness::new(ConnectMode::Advanced);
     harness.window.set_show_relay(true);
-    harness.window.set_relay_tab(0);
+    // Discovery and client connections live under the PC → Phone direction;
+    // tab 0 is now the Phone → PC host direction.
+    harness.window.set_relay_tab(1);
     harness
         .window
         .set_relay_rows(ModelRc::from(Rc::new(VecModel::from(vec![RelayRow {

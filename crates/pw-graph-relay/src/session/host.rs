@@ -629,6 +629,16 @@ pub(super) fn host_session_after_auth(
         );
         return;
     }
+    if !roles.is_one_way() {
+        let _ = cipher.send(
+            &mut stream,
+            &ControlMessage::PairFail {
+                reason: "bidirectional relay sessions are disabled; choose one audio direction"
+                    .into(),
+            },
+        );
+        return;
+    }
 
     let format = AudioFormat::new(sample_rate, channels, frame_ms);
     if let Err(error) =
@@ -676,6 +686,11 @@ pub(super) fn host_session_after_auth(
         capture_convert: Mutex::new(prepared_capture_converter(local, format)),
         audio_sealer: Mutex::new(audio_sealer),
         audio_opener: Mutex::new(audio_opener),
+        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
+            generation: inner.config().direction_generation,
+            direction: inner.config().direction,
+            device_id: inner.config().device_id,
+        })),
     });
     if !inner.insert_session(Arc::clone(&record)) {
         let _ = cipher.send(

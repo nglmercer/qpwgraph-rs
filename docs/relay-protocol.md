@@ -200,6 +200,7 @@ Frames larger than 64 KiB are refused; these are small JSON documents.
 
 Message types after pairing: `PairOk` (audio port and session id),
 `SessionStart` / `SessionReady` (negotiated codec and geometry),
+`DirectionOffer` / `DirectionAck` (authenticated hot-switch negotiation),
 `TrustEnroll` / `TrustAccepted` / `TrustRejected`, `Keepalive` (every 2 s, with a 6 s
 timeout), `ControlHint` (volume and mute hints), `ResumeHello` /
 `ResumeChallenge` / `ResumeProof` / `ResumeOk`, and `Bye`. Trusted handshakes
@@ -207,6 +208,55 @@ use the cleartext `TrustedHello` / `TrustedChallenge` / `TrustedProof` /
 `TrustedOk` sequence before starting the sealed session channel.
 An unrecognised `type` decodes as `Unknown` rather than killing the
 connection, so a newer peer can add messages.
+
+### Direction-first sessions
+
+The public configuration names one audio direction, not a client role:
+
+| Direction | Client-side wire role | Host-side wire role | Audio path |
+| --- | --- | --- | --- |
+| `mobile_to_desktop` | `emit` only | `receive` only | phone → desktop |
+| `desktop_to_mobile` | `receive` only | `emit` only | desktop → phone |
+
+The `roles` fields in `Hello`, `TrustedHello`, and `SessionStart` are the
+derived wire representation of that direction. An active session MUST contain
+exactly one of `emit` and `receive`; `both` and an empty role set are rejected
+before audio workers start. Discovery advertisements may describe capability,
+but they do not authorize a bidirectional audio session.
+
+After `SessionReady`, either authenticated peer may propose a direction change.
+The messages are sealed control frames and use these JSON shapes:
+
+```json
+{"type":"direction_offer","generation":42,"direction":"mobile_to_desktop","device_id":"phone-installation"}
+{"type":"direction_ack","generation":42,"direction":"mobile_to_desktop"}
+```
+
+An offer is valid only when its stable `device_id` is non-empty and its
+direction is one of the two canonical values. Peers resolve offers by comparing
+the generation first; at the same generation, the lexicographically greater
+stable device ID wins. A same-ID tie is resolved deterministically by the
+direction enum order. The loser adopts the winning direction and acknowledges
+the resolved generation/direction. Stale generations and a second direction
+for an already accepted generation are ignored or rejected; they cannot reverse
+a newer authenticated choice.
+
+Direction changes are two-phase. The initiator persists the desired direction
+and monotonically increasing generation, sends `DirectionOffer`, and keeps its
+current audio endpoint alive until the matching `DirectionAck` or a resolved
+winning offer arrives. Both embeddings then stop the old worker, rebuild the
+endpoint with the resolved one-way roles, and bring up the new host/client
+side. The UI remains in `Switching` until that handoff completes. A timeout
+tears down the old endpoint and retries the persisted direction safely rather
+than running two audio engines at once.
+
+The pending offer remains in the authenticated session record until its exact
+acknowledgement is received. If the control link is resumed or replaced, the
+offer is sent again on the new sealed channel before normal keepalive traffic;
+this makes a switch requested immediately before a network/process interruption
+survive reconnect. If the old session is gone entirely, the persisted direction
+and generation are included in the next trusted connection and the same
+deterministic resolution rules select one host and one emitter.
 
 ### Negotiated parameters
 

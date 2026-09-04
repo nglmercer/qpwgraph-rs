@@ -2,8 +2,8 @@
 //! connected over localhost. PCM codec keeps the payload deterministic.
 
 use pw_graph_relay::{
-    CodecKind, EngineConfig, RelayEngine, RelayEvent, RelayHandle, Roles, SessionId,
-    TransportPreference, TrustedPeer,
+    CodecKind, EngineConfig, RelayDirection, RelayEngine, RelayEvent, RelayHandle, Roles,
+    SessionId, TransportPreference, TrustedPeer,
 };
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -145,6 +145,93 @@ fn establish(
         "host session should establish"
     );
     session
+}
+
+#[test]
+fn bidirectional_sessions_are_rejected_before_audio_starts() {
+    let (_host, host_handle, port) = host_engine("123456");
+    let (_client, client_handle) = client_engine();
+    let target: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let session = client_handle.connect(target, "123456", Roles::both());
+
+    let event = await_event(
+        &client_handle,
+        |event| matches!(event, RelayEvent::SessionLost { id, .. } if *id == session),
+    );
+    match event {
+        Some(RelayEvent::SessionLost { reason, .. }) => assert!(
+            reason.contains("bidirectional relay sessions are disabled"),
+            "unexpected rejection: {reason}"
+        ),
+        other => panic!("expected one-way rejection, got {other:?}"),
+    }
+    assert!(host_handle.status().sessions.is_empty());
+}
+
+#[test]
+fn authenticated_direction_offers_resolve_and_reject_stale_reversals() {
+    let (_host, host_handle, port) = host_engine_with(EngineConfig {
+        device_id: "desktop".into(),
+        pin: "123456".into(),
+        direction: RelayDirection::MobileToDesktop,
+        ..EngineConfig::default()
+    });
+    let (_client, client_handle) = client_engine_with(EngineConfig {
+        device_id: "phone".into(),
+        direction: RelayDirection::MobileToDesktop,
+        ..EngineConfig::default()
+    });
+    let session = establish(
+        &host_handle,
+        &client_handle,
+        port,
+        "123456",
+        Roles::emit_only(),
+    );
+
+    client_handle
+        .offer_direction(session, RelayDirection::DesktopToMobile, 1)
+        .expect("the first direction offer should be queued");
+    let client_resolution = await_event(&client_handle, |event| {
+        matches!(
+            event,
+            RelayEvent::DirectionResolved {
+                id,
+                generation: 1,
+                direction: RelayDirection::DesktopToMobile,
+                ..
+            } if *id == session
+        )
+    });
+    assert!(client_resolution.is_some(), "client should observe the winner");
+    let host_resolution = await_event(&host_handle, |event| {
+        matches!(
+            event,
+            RelayEvent::DirectionResolved {
+                generation: 1,
+                direction: RelayDirection::DesktopToMobile,
+                ..
+            }
+        )
+    });
+    assert!(host_resolution.is_some(), "host should observe the winner");
+
+    assert!(client_handle
+        .offer_direction(session, RelayDirection::MobileToDesktop, 1)
+        .is_err());
+    client_handle
+        .offer_direction(session, RelayDirection::MobileToDesktop, 2)
+        .expect("a newer generation may switch back");
+    assert!(await_event(&client_handle, |event| matches!(
+        event,
+        RelayEvent::DirectionResolved {
+            id,
+            generation: 2,
+            direction: RelayDirection::MobileToDesktop,
+            ..
+        } if *id == session
+    ))
+    .is_some());
 }
 
 #[test]

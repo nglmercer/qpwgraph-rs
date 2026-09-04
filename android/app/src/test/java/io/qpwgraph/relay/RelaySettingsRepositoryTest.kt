@@ -61,12 +61,14 @@ class RelaySettingsRepositoryTest {
         val saved = RelaySettings(
             target = "192.168.1.20:48123",
             pin = "123456",
-            role = "receive",
+            direction = AudioDirection.DesktopToMobile,
+            directionGeneration = 41L,
             codec = "pcm",
             transport = "tcp",
             deviceName = "pixel",
             autoConnectTrusted = false,
             autoConnectTrustedWifi = true,
+            captureSource = CaptureSource.DEVICE_PLAYBACK,
         )
 
         repository.save(saved)
@@ -74,6 +76,9 @@ class RelaySettingsRepositoryTest {
 
         assertEquals(saved.copy(pin = ""), loaded)
         assertNull(preferences["pin"])
+        assertEquals("desktop_to_mobile", preferences["audio_direction"])
+        assertEquals(41L, preferences["audio_direction_generation"])
+        assertNull(preferences["role"])
     }
 
     @Test
@@ -113,13 +118,45 @@ class RelaySettingsRepositoryTest {
         val settings = repository.loadSettings()
 
         assertEquals("", settings.target)
-        assertEquals("emit", settings.role)
+        assertEquals(AudioDirection.MobileToDesktop, settings.direction)
         assertEquals("opus", settings.codec)
         assertEquals("auto", settings.transport)
         assertEquals("android-relay", settings.deviceName)
         assertTrue(settings.autoConnectTrusted)
         assertFalse(settings.autoConnectTrustedWifi)
+        assertEquals(CaptureSource.MICROPHONE, settings.captureSource)
         assertEquals(DEFAULT_HOST_PORT, repository.loadHostSettings().port)
+    }
+
+    @Test
+    fun legacy_roles_migrate_without_writing_the_legacy_key() {
+        for ((legacyRole, expected) in listOf(
+            "emit" to AudioDirection.MobileToDesktop,
+            "receive" to AudioDirection.DesktopToMobile,
+            "both" to AudioDirection.MobileToDesktop,
+        )) {
+            val preferences = FakePreferences(mutableMapOf("role" to legacyRole))
+            val repository = RelaySettingsRepository(preferences.proxy())
+            assertEquals(expected, repository.loadSettings().direction)
+            repository.saveDirection(expected)
+            assertEquals(expected.serialized(), preferences["audio_direction"])
+            assertEquals(legacyRole, preferences["role"])
+        }
+    }
+
+    @Test
+    fun a_stored_direction_generation_survives_reload() {
+        val preferences = FakePreferences(
+            mutableMapOf(
+                "audio_direction" to "desktop_to_mobile",
+                "audio_direction_generation" to 9L,
+            ),
+        )
+
+        val settings = RelaySettingsRepository(preferences.proxy()).loadSettings()
+
+        assertEquals(AudioDirection.DesktopToMobile, settings.direction)
+        assertEquals(9L, settings.directionGeneration)
     }
 
     @Test

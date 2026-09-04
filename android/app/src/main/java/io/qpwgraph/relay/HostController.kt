@@ -32,6 +32,8 @@ internal class HostController(
      */
     var preparedSettings: HostSettings? = null
         private set
+    private var preparedDirection: AudioDirection? = null
+    private var preparedGeneration: Long = 0L
 
     val nativeHandle: Long get() = handle
 
@@ -40,7 +42,12 @@ internal class HostController(
     fun owns(candidate: Long): Boolean = candidate != 0L && candidate == handle
 
     /** Whether a restart would have to rebuild the native host. */
-    fun preparedFor(host: HostSettings): Boolean = handle != 0L && preparedSettings == host
+    fun preparedFor(
+        host: HostSettings,
+        direction: AudioDirection,
+        generation: Long,
+    ): Boolean = handle != 0L && preparedSettings == host &&
+        preparedDirection == direction && preparedGeneration == generation
 
     /**
      * Create the native host if there is not one already, remembering the
@@ -48,7 +55,14 @@ internal class HostController(
      *
      * @throws IllegalStateException when native refused
      */
-    fun open(host: HostSettings, deviceId: String, trustedCredentialsJson: String, nullHandleMessage: () -> String) {
+    fun open(
+        host: HostSettings,
+        direction: AudioDirection,
+        generation: Long,
+        deviceId: String,
+        trustedCredentialsJson: String,
+        nullHandleMessage: () -> String,
+    ) {
         if (handle != 0L) return
         handle = RelayJson.createdHandle(
             NativeBridge.hostCreate(
@@ -59,6 +73,8 @@ internal class HostController(
                 host.port,
                 host.codec,
                 host.transport,
+                direction.serialized(),
+                generation,
                 host.sampleRate,
                 host.channels,
                 host.frameMs,
@@ -66,6 +82,8 @@ internal class HostController(
             nullHandleMessage,
         )
         preparedSettings = host
+        preparedDirection = direction
+        preparedGeneration = generation
     }
 
     fun start(): JSONObject = JSONObject(NativeBridge.hostStart(handle))
@@ -74,6 +92,14 @@ internal class HostController(
         if (handle == 0L) return
         NativeBridge.hostDisconnectSession(handle, sessionId)
     }
+
+    fun offerDirection(
+        sessionId: Long,
+        direction: AudioDirection,
+        generation: Long,
+    ): JSONObject = JSONObject(
+        NativeBridge.hostOfferDirection(handle, sessionId, direction.serialized(), generation),
+    )
 
     fun removeTrustedPeer(peerId: String): Boolean =
         runCatching { NativeBridge.hostRemoveTrustedPeer(handle, peerId) }.getOrDefault(false)
@@ -189,6 +215,8 @@ internal class HostController(
     private fun clear() {
         handle = 0L
         preparedSettings = null
+        preparedDirection = null
+        preparedGeneration = 0L
     }
 
     private companion object {

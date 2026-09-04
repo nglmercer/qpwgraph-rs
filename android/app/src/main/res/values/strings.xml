@@ -1,7 +1,7 @@
 <resources>
     <!-- App -->
     <string name="relay_app_title">qpwgraph Relay</string>
-    <string name="relay_app_subtitle">Use your Android device as a relay microphone, speaker, or both.</string>
+    <string name="relay_app_subtitle">Choose one direction for audio between your phone and PC.</string>
     <string name="relay_notification_channel">Relay audio</string>
     <string name="relay_notification_active">Relay audio is active</string>
 
@@ -28,17 +28,26 @@
     <string name="label_reconnecting_audio">Reconnecting audio</string>
     <string name="label_unknown_link">unknown link</string>
 
+    <!-- Direction-first surface -->
+    <string name="direction_phone_to_pc">Phone → PC</string>
+    <string name="direction_pc_to_phone">PC → Phone</string>
+    <string name="direction_sending">Sending</string>
+    <string name="direction_receiving">Receiving</string>
+    <string name="direction_switching">Switching…</string>
+    <string name="relay_direction_switch_timeout">Direction peer did not acknowledge; reconnecting safely.</string>
+    <string name="direction_phone_to_pc_hint">Send this phone’s microphone or device playback to the desktop.</string>
+    <string name="direction_pc_to_phone_hint">Receive desktop relay audio and play it through this phone.</string>
+    <string name="relay_direction_host_required">PC → Phone is active; this phone is hosting and cannot connect as a client.</string>
+    <string name="relay_direction_client_required">Phone → PC is active; switch direction before starting the host.</string>
+    <string name="advanced_settings_title">Advanced settings</string>
+    <string name="advanced_settings_tooltip">Codec, frame size, transport, and trusted reconnect settings for the active direction.</string>
+
     <!-- Receiver tab -->
     <string name="receiver_host_address_label">Host address</string>
     <string name="receiver_host_address_hint">192.168.1.20:48123</string>
     <string name="receiver_host_address_tooltip">IP and port of the desktop relay host. Use Scan QR to fill automatically.</string>
     <string name="receiver_pin_label">Pairing PIN</string>
     <string name="receiver_pin_tooltip">Six-digit PIN set on the relay host. Required for first pairing.</string>
-    <string name="receiver_role_label">Role</string>
-    <string name="receiver_role_tooltip">Direction of audio relative to this phone.</string>
-    <string name="receiver_role_emit">Emit microphone</string>
-    <string name="receiver_role_receive">Receive playback</string>
-    <string name="receiver_role_both">Both</string>
     <string name="receiver_codec_label">Codec</string>
     <string name="receiver_codec_tooltip">Opus is compressed and resilient; PCM is uncompressed.</string>
     <string name="receiver_link_label">Link</string>
@@ -50,6 +59,12 @@
     <string name="receiver_trusted_hint">USB tethering is enabled by default; LAN, Wi-Fi, and ADB remain opt-in.</string>
     <string name="receiver_scan_qr">Scan QR</string>
     <string name="receiver_scan_qr_tooltip">Open camera to scan the desktop host QR code.</string>
+    <string name="phone_source_title">Audio source</string>
+    <string name="phone_source_tooltip">Choose what the phone sends to the desktop.</string>
+    <string name="phone_source_microphone">Microphone</string>
+    <string name="phone_source_playback">Device playback</string>
+    <string name="phone_source_playback_hint">Device playback capture requires Android 10+ and screen/audio capture consent.</string>
+    <string name="advanced_frame_label">Frame size</string>
 
     <!-- Link options -->
     <string name="link_auto">Auto</string>
@@ -92,10 +107,11 @@
     <!-- Discover tab -->
     <string name="discover_start">Start discovery</string>
     <string name="discover_stop">Stop discovery</string>
-    <string name="discover_start_tooltip">Browse for hosts via mDNS and USB subnet probes.</string>
+    <string name="discover_start_tooltip">Browse for relay peers via mDNS and USB subnet probes.</string>
     <string name="discover_empty">No relay hosts found yet. Keep discovery running while the host advertises; USB tethers are scanned automatically.</string>
     <string name="discover_connect">Connect</string>
-    <string name="discover_connect_tooltip">Adopt this host address and switch to Receiver.</string>
+    <string name="discover_connect_tooltip">Use this desktop host for the Phone → PC direction.</string>
+    <string name="discover_connect_direction_hint">Switch to Phone → PC to connect to a discovered desktop host.</string>
 
     <!-- USB banner -->
     <string name="relay_usb_detected">USB tethering detected: %1$s · %2$s — preferred automatically</string>
@@ -122,13 +138,13 @@
     <string name="relay_error_native_create">Unable to create the native relay handle.</string>
     <string name="relay_connected">Connected</string>
     <string name="relay_error_connect_failed">Connection failed</string>
-    <string name="relay_error_microphone_permission">Microphone permission is required for Emit, Both, and Host. Audio was not started.</string>
+    <string name="relay_error_microphone_permission">Microphone permission is required to capture phone audio. Audio was not started.</string>
     <string name="relay_disconnected">Disconnected</string>
     <string name="relay_validation_missing_pin">Enter a pairing PIN.</string>
     <string name="relay_host_starting">Starting relay host…</string>
     <string name="relay_listening">Listening on port %1$d</string>
     <string name="relay_error_host_failed">Unable to start the relay host.</string>
-    <string name="relay_error_host_audio_failed">Audio capture initialization failed — host remains listening for trusted connections.</string>
+    <string name="relay_error_host_audio_failed">Audio playback initialization failed — host remains listening for trusted connections.</string>
     <string name="relay_error_media_projection_denied">MediaProjection permission denied — device playback capture not started.</string>
     <string name="relay_error_media_projection_revoked">Device playback capture stopped — projection was revoked.</string>
     <string name="relay_error_tcp_refused">TCP connection refused: host is not listening (check address/port and that host is Running).</string>
@@ -137,7 +153,7 @@
     <string name="relay_error_audio_init_failed">Audio capture initialization failed</string>
     <string name="relay_error_network_changed">Network interface changed — listener migrated</string>
     <string name="relay_host_stopped">Relay host stopped</string>
-    <string name="relay_host_audio_stopped">Audio capture stopped — host still listening</string>
+    <string name="relay_host_audio_stopped">Audio playback stopped — host still listening</string>
     <string name="relay_session_connected">Session connected: %1$s</string>
     <string name="relay_error_discovery_failed">Unable to start discovery.</string>
     <string name="relay_error_audio_service_stopped">The relay audio service stopped unexpectedly; reconnect to restart it.</string>

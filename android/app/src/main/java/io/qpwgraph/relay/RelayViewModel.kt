@@ -10,6 +10,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -23,13 +24,14 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Single state holder for both relay roles.
+ * Single state holder for both user-selectable audio directions.
  *
- * Receiver (client) and Emitter (host) each own a native handle, an audio
+ * The phone-to-PC client and PC-to-phone host each own a native handle, an audio
  * foreground service, and a 100 ms polling job that drains native events.
  * Discovery owns a third handle and polls on a slower cadence because the
  * peer snapshot replaces the whole list every tick.
@@ -45,8 +47,13 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private val trustedStore = TrustedPeerRepository(TrustedCredentialStore(preferences))
     private val service = RelayServiceController(application)
     private val deviceId = settings.deviceId
+    private val initialSettings = settings.loadSettings()
     private val mutableState = MutableStateFlow(
-        RelayUiState(settings = settings.loadSettings(), host = settings.loadHostSettings()),
+        RelayUiState(
+            direction = initialSettings.direction,
+            settings = initialSettings,
+            host = settings.loadHostSettings(),
+        ),
     )
     /** Pending MediaProjection consent for device-playback capture. */
     @Volatile private var pendingMediaProjectionResultCode: Int = Activity.RESULT_CANCELED
@@ -60,6 +67,12 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private var usbPolling: Job? = null
     private var serviceEvents: Job? = null
     private val operationMutex = Mutex()
+    private val directionRequestLock = Any()
+    private var directionSwitchJob: Job? = null
+    private var pendingDirection: AudioDirection? = null
+    @Volatile private var directionWaiter: CompletableDeferred<DirectionResolution>? = null
+    @Volatile private var directionWaitSessionId: Long? = null
+    @Volatile private var directionWaitGeneration: Long = -1L
     private var usbWasPresent = false
     private var lastTrustedAutoAttemptAt = 0L
     private val trustedCandidateBackoff = TrustedCandidateBackoff()
@@ -154,8 +167,250 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
             }
             .isSuccess
 
-    fun setMode(mode: RelayMode) {
-        setState { it.copy(mode = mode) }
+    /**
+     * Change the user-facing direction as one serialized lifecycle
+     * transaction. A second tap while a switch is in flight is coalesced to
+     * the newest requested direction, so a quick A → B → A gesture cannot
+     * leave the app running the stale middle direction.
+     */
+    fun setDirection(next: AudioDirection) {
+        synchronized(directionRequestLock) {
+            val current = mutableState.value
+            if (!current.switchingDirection && current.direction == next) return
+            pendingDirection = next
+            if (directionSwitchJob?.isActive == true) return
+            directionSwitchJob = viewModelScope.launch(Dispatchers.IO) {
+                setState { it.copy(switchingDirection = true) }
+                try {
+                    while (true) {
+                        val requested = synchronized(directionRequestLock) {
+                            pendingDirection.also { pendingDirection = null }
+                        } ?: break
+                        val plan = operationMutex.withLock {
+                            val old = mutableState.value.direction
+                            if (old == requested) {
+                                null
+                            } else {
+                                val wasClientLive = client.isOpen ||
+                                    mutableState.value.connection == RelayConnectionState.Connected ||
+                                    mutableState.value.connection == RelayConnectionState.Connecting
+                                val wasHostLive = host.isOpen ||
+                                    mutableState.value.hostState == RelayHostState.Running ||
+                                    mutableState.value.hostState == RelayHostState.Starting
+                                val generation = nextDirectionGeneration(
+                                    mutableState.value.settings.directionGeneration,
+                                )
+                                val updatedSettings = mutableState.value.settings.copy(
+                                    direction = requested,
+                                    directionGeneration = generation,
+                                )
+                                setState {
+                                    it.copy(
+                                        direction = requested,
+                                        settings = updatedSettings,
+                                        switchingDirection = true,
+                                    )
+                                }
+                                settings.save(updatedSettings)
+
+                                val activeSession = when (old) {
+                                    AudioDirection.MobileToDesktop ->
+                                        mutableState.value.sessionId?.takeIf { client.isOpen }
+                                    AudioDirection.DesktopToMobile ->
+                                        mutableState.value.sessions.firstOrNull()?.id
+                                            ?.takeIf { host.isOpen }
+                                }
+                                if (activeSession == null) {
+                                    when (old) {
+                                        AudioDirection.MobileToDesktop -> stopClientLocked()
+                                        AudioDirection.DesktopToMobile -> stopHostLocked()
+                                    }
+                                    DirectionResumePlan(
+                                        startNewSide = wasClientLive || wasHostLive,
+                                        previous = old,
+                                        direction = requested,
+                                        generation = generation,
+                                    )
+                                } else {
+                                    // Keep the old endpoint alive until the
+                                    // authenticated peer acknowledges the new
+                                    // direction. The resolved event is the
+                                    // commit point for the local teardown.
+                                    val waiter = CompletableDeferred<DirectionResolution>()
+                                    directionWaiter = waiter
+                                    directionWaitSessionId = activeSession
+                                    directionWaitGeneration = generation
+                                    val response = when (old) {
+                                        AudioDirection.MobileToDesktop ->
+                                            client.offerDirection(activeSession, requested, generation)
+                                        AudioDirection.DesktopToMobile ->
+                                            host.offerDirection(activeSession, requested, generation)
+                                    }
+                                    if (response.optString("type") == "error") {
+                                        directionWaiter = null
+                                        directionWaitSessionId = null
+                                        directionWaitGeneration = -1L
+                                        setState {
+                                            it.copy(message = response.optString("message"))
+                                        }
+                                        when (old) {
+                                            AudioDirection.MobileToDesktop -> stopClientLocked()
+                                            AudioDirection.DesktopToMobile -> stopHostLocked()
+                                        }
+                                        DirectionResumePlan(
+                                            startNewSide = wasClientLive || wasHostLive,
+                                            previous = old,
+                                            direction = requested,
+                                            generation = generation,
+                                        )
+                                    } else {
+                                        DirectionResumePlan(
+                                            startNewSide = wasClientLive || wasHostLive,
+                                            previous = old,
+                                            direction = requested,
+                                            generation = generation,
+                                            sessionId = activeSession,
+                                            waiter = waiter,
+                                            peer = mutableState.value.sessions.firstOrNull {
+                                                it.id == activeSession
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (plan != null) {
+                            val resolution = plan.waiter?.let { waiter ->
+                                awaitDirectionResolution(plan.sessionId!!, plan.generation, waiter)
+                            }
+                            val resolvedDirection = resolution?.direction ?: plan.direction
+                            val resolvedGeneration = resolution?.generation ?: plan.generation
+                            val resume = operationMutex.withLock {
+                                if (plan.waiter != null) {
+                                    when (plan.previous) {
+                                        AudioDirection.MobileToDesktop -> stopClientLocked()
+                                        AudioDirection.DesktopToMobile -> stopHostLocked()
+                                    }
+                                }
+                                val currentSettings = mutableState.value.settings
+                                val resolvedSettings = currentSettings.copy(
+                                    direction = resolvedDirection,
+                                    directionGeneration = maxOf(
+                                        currentSettings.directionGeneration,
+                                        resolvedGeneration,
+                                    ),
+                                )
+                                setState {
+                                    it.copy(
+                                        direction = resolvedDirection,
+                                        settings = resolvedSettings,
+                                        switchingDirection = true,
+                                    )
+                                }
+                                settings.save(resolvedSettings)
+                                plan.copy(
+                                    direction = resolvedDirection,
+                                    generation = resolvedGeneration,
+                                    peer = plan.peer,
+                                )
+                            }
+                            if (resume.startNewSide) {
+                                when (resume.direction) {
+                                    AudioDirection.MobileToDesktop -> {
+                                        val peer = resume.peer
+                                        if (resume.previous == AudioDirection.DesktopToMobile && peer != null) {
+                                            reconnectHostPeer(peer)
+                                        } else {
+                                            reconnectConfiguredOrTrusted()
+                                        }
+                                    }
+                                    AudioDirection.DesktopToMobile -> startHost()
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    setState { it.copy(switchingDirection = false) }
+                }
+            }
+        }
+    }
+
+    private data class DirectionResumePlan(
+        val startNewSide: Boolean,
+        val previous: AudioDirection,
+        val direction: AudioDirection,
+        val generation: Long,
+        val sessionId: Long? = null,
+        val waiter: CompletableDeferred<DirectionResolution>? = null,
+        val peer: RelaySessionInfo? = null,
+    )
+
+    private fun nextDirectionGeneration(current: Long): Long =
+        if (current == Long.MAX_VALUE) Long.MAX_VALUE else current + 1L
+
+    private suspend fun awaitDirectionResolution(
+        sessionId: Long,
+        generation: Long,
+        waiter: CompletableDeferred<DirectionResolution>,
+    ): DirectionResolution? {
+        val resolution = withTimeoutOrNull(DIRECTION_SWITCH_TIMEOUT_MS) {
+            waiter.await()
+        }?.takeIf { it.sessionId == sessionId && it.generation >= generation }
+        synchronized(directionRequestLock) {
+            if (directionWaiter === waiter) {
+                directionWaiter = null
+                directionWaitSessionId = null
+                directionWaitGeneration = -1L
+            }
+        }
+        if (resolution == null) {
+            setState { it.copy(message = text(R.string.relay_direction_switch_timeout)) }
+        }
+        return resolution
+    }
+
+    private fun completeDirectionResolution(event: JSONObject) {
+        val sessionId = event.optLong("session")
+        val generation = event.optLong("generation", -1L)
+        val direction = audioDirectionFromString(event.optString("direction"))
+        if (sessionId == directionWaitSessionId && generation >= directionWaitGeneration) {
+            directionWaiter?.let { waiter ->
+                if (!waiter.isCompleted) {
+                    waiter.complete(DirectionResolution(sessionId, direction, generation))
+                }
+            }
+            return
+        }
+
+        // The other peer may have initiated the switch. There is no local
+        // waiter in that case, but an authenticated resolution is still the
+        // commit point for adopting its direction. `setDirection` serializes
+        // the teardown/restart and coalesces it with any local tab gesture.
+        val current = mutableState.value
+        if (generation < current.settings.directionGeneration) return
+        if (direction != current.direction) {
+            setDirection(direction)
+        } else if (generation > current.settings.directionGeneration) {
+            val updated = current.settings.copy(directionGeneration = generation)
+            setState { it.copy(settings = updated) }
+            settings.save(updated)
+        }
+    }
+
+    private fun reconnectHostPeer(peer: RelaySessionInfo) {
+        val discovered = mutableState.value.peers.firstOrNull {
+            it.address == peer.address
+        }
+        if (discovered != null && trustedStore.peer(discovered.id) != null) {
+            connectToTrustedPeer(discovered)
+            return
+        }
+        val updated = mutableState.value.settings.copy(target = peer.address)
+        update(updated)
+        if (updated.pin.isNotBlank()) connectInternal(null)
+        else setState { it.copy(message = text(R.string.relay_validation_missing_pin)) }
     }
 
     /** Called by the Activity when a required runtime permission was denied. */
@@ -221,8 +476,12 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     // ------------------------------------------------------------------
 
     fun update(updated: RelaySettings) {
+        val previousDirection = mutableState.value.direction
         setState { it.copy(settings = updated) }
         settings.save(updated)
+        if (updated.direction != previousDirection) {
+            setDirection(updated.direction)
+        }
     }
 
     fun forgetTrustedPeer(peerId: String) {
@@ -246,7 +505,13 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connect() {
         val settings = mutableState.value.settings
-        if (clientNeedsMicrophone(settings.role) && !hasMicrophonePermission()) {
+        if (settings.direction != AudioDirection.MobileToDesktop) {
+            setState {
+                it.copy(message = text(R.string.relay_direction_host_required))
+            }
+            return
+        }
+        if (clientNeedsMicrophone(settings.direction) && !hasMicrophonePermission()) {
             permissionDenied(host = false)
             return
         }
@@ -273,18 +538,22 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Connect to a discovered peer with its previously enrolled credential. */
     fun connectToTrustedPeer(peer: DiscoveredPeer) {
+        if (mutableState.value.direction != AudioDirection.MobileToDesktop) {
+            setState { it.copy(message = text(R.string.relay_direction_host_required)) }
+            return
+        }
         // This is an explicit user action, so it may retry this candidate
         // immediately even while automatic reconnect has it backed off.
         val trusted = trustedStore.peer(peer.id) ?: return
         update(mutableState.value.settings.copy(target = peer.address))
-        setState { it.copy(mode = RelayMode.Receiver) }
         connectInternal(trusted)
     }
 
     private fun connectInternal(trusted: TrustedRelayPeer?) {
         if (mutableState.value.connection == RelayConnectionState.Connecting) return
         val settings = mutableState.value.settings
-        if (clientNeedsMicrophone(settings.role) && !hasMicrophonePermission()) {
+        if (settings.direction != AudioDirection.MobileToDesktop) return
+        if (clientNeedsMicrophone(settings.direction) && !hasMicrophonePermission()) {
             permissionDenied(host = false)
             return
         }
@@ -318,6 +587,9 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch(Dispatchers.IO) {
             operationMutex.withLock {
+                if (mutableState.value.direction != AudioDirection.MobileToDesktop) {
+                    return@withLock
+                }
                 var nativeConnected = false
                 try {
                     // RelayService has one audio-pump instance. Stop the host
@@ -368,12 +640,15 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     service.start(
                         RelayService.MODE_CLIENT,
                         client.nativeHandle,
-                        settings.role,
+                        settings.direction.androidClientRole(),
                         audioGeometryForHostMode(
                             hostMode = false,
                             client = settings,
                             host = mutableState.value.host,
                         ),
+                        captureSource = settings.captureSource,
+                        mediaProjectionResultCode = pendingMediaProjectionResultCode,
+                        mediaProjectionData = pendingMediaProjectionData,
                     )
                     setState {
                         it.copy(
@@ -403,15 +678,32 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Resume the client side after a direction switch when it was live. */
+    private fun reconnectConfiguredOrTrusted() {
+        if (mutableState.value.direction != AudioDirection.MobileToDesktop) return
+        val current = mutableState.value
+        if (current.settings.target.isNotBlank() && current.settings.pin.isNotBlank()) {
+            connectInternal(null)
+            return
+        }
+        val trustedPeer = current.peers.firstOrNull { peer ->
+            peer.id.isNotBlank() && trustedStore.peer(peer.id) != null
+        }
+        if (trustedPeer != null) connectToTrustedPeer(trustedPeer)
+    }
+
     /** Discovery tap-to-connect: adopt the peer address, then connect. */
     fun connectToPeer(address: String) {
+        if (mutableState.value.direction != AudioDirection.MobileToDesktop) {
+            setState { it.copy(message = text(R.string.relay_direction_host_required)) }
+            return
+        }
         val discovered = mutableState.value.peers.firstOrNull { it.address == address }
         if (discovered != null && trustedStore.peer(discovered.id) != null) {
             connectToTrustedPeer(discovered)
             return
         }
         update(mutableState.value.settings.copy(target = address))
-        setState { it.copy(mode = RelayMode.Receiver) }
         connect()
     }
 
@@ -492,6 +784,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
                 "trusted_peer" -> rememberTrustedPeerFromJson(event)
                 "trusted_peer_available" -> rememberTrustedPeerFromNative()
+                "direction_resolved" -> completeDirectionResolution(event)
                 "error" -> clientError(event.optString("message"))
             }
         }
@@ -575,27 +868,16 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startHost() {
+        if (mutableState.value.direction != AudioDirection.DesktopToMobile) {
+            setState { it.copy(message = text(R.string.relay_direction_client_required)) }
+            return
+        }
         if (mutableState.value.hostState == RelayHostState.Starting ||
             mutableState.value.hostState == RelayHostState.Running
         ) {
             return
         }
         var wanted = mutableState.value.host
-        if (!hasMicrophonePermission()) {
-            permissionDenied(host = true)
-            return
-        }
-        if (wanted.captureSource == CaptureSource.DEVICE_PLAYBACK && !hasMediaProjectionConsent()) {
-            setState {
-                it.copy(
-                    hostState = RelayHostState.Error,
-                    hostAudioState = RelayHostAudioState.Error,
-                    hostAudioMessage = text(R.string.relay_error_media_projection_denied),
-                    hostMessage = text(R.string.relay_error_media_projection_denied),
-                )
-            }
-            return
-        }
         if (wanted.pin.isBlank()) {
             val newPin = (100000..999999).random().toString()
             wanted = wanted.copy(pin = newPin)
@@ -613,6 +895,9 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         Log.i(TAG, "HOST START pin present, transport=${wanted.transport} captureSource=${wanted.captureSource} port=${wanted.port}")
         viewModelScope.launch(Dispatchers.IO) {
             operationMutex.withLock {
+                if (mutableState.value.direction != AudioDirection.DesktopToMobile) {
+                    return@withLock
+                }
                 var nativeStarted = false
                 var nativePort: Int? = null
                 var nativeAddress: String? = null
@@ -623,7 +908,11 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                         stopClientLocked()
                     }
                     if (host.isOpen &&
-                        (!host.preparedFor(wanted) ||
+                        (!host.preparedFor(
+                            wanted,
+                            mutableState.value.direction,
+                            mutableState.value.settings.directionGeneration,
+                        ) ||
                             mutableState.value.hostState == RelayHostState.Error)
                     ) {
                         service.stopAndWait()
@@ -633,6 +922,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     host.open(
                         wanted,
+                        mutableState.value.direction,
+                        mutableState.value.settings.directionGeneration,
                         deviceId,
                         trustedStore.credentialsJson(),
                     ) { text(R.string.relay_error_native_create) }
@@ -653,7 +944,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                         service.start(
                             RelayService.MODE_HOST,
                             host.nativeHandle,
-                            "both",
+                            AudioDirection.DesktopToMobile.androidClientRole(),
                             audioGeometryForHostMode(
                                 hostMode = true,
                                 client = mutableState.value.settings,
@@ -817,6 +1108,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(hostMessage = event.optString("message"))
                 }
 
+                "direction_resolved" -> completeDirectionResolution(event)
+
                 "level" -> setState {
                     it.copy(hostRms = event.optDouble("rms").toFloat().coerceIn(0f, 1f))
                 }
@@ -908,15 +1201,15 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun stopClientLocked() {
         client.quiesceAndRelease()
         setState {
-                it.copy(
-                    connection = RelayConnectionState.Disconnected,
-                    sessionId = null,
-                    hostName = "",
-                    rms = 0f,
-                    transport = "",
-                    link = "",
-                    audioChannelState = "",
-                )
+            it.copy(
+                connection = RelayConnectionState.Disconnected,
+                sessionId = null,
+                hostName = "",
+                rms = 0f,
+                transport = "",
+                link = "",
+                audioChannelState = "",
+            )
         }
     }
 
@@ -1111,7 +1404,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                 }.thenBy { it.address },
             )
             ?: return
-        val microphoneReady = !clientNeedsMicrophone(current.settings.role) ||
+        val microphoneReady = !clientNeedsMicrophone(current.settings.direction) ||
             hasMicrophonePermission()
         if (
             microphoneReady &&
@@ -1230,5 +1523,6 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         const val POLL_INTERVAL_MS = 100L
         const val USB_LINK_POLL_INTERVAL_MS = 1_000L
         const val TRUSTED_AUTO_RETRY_INTERVAL_MS = 5_000L
+        const val DIRECTION_SWITCH_TIMEOUT_MS = 5_000L
     }
 }

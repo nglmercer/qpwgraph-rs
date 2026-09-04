@@ -834,10 +834,22 @@ pub use pw_graph_relay::{
     },
     qr as relay_qr, CodecKind as RelayCodecKind, DeviceKind as RelayDeviceKind,
     EngineStatus as RelayEngineStatus, LinkKind as RelayLinkKind, LocalLink as RelayLocalLink,
-    PeerInfo as RelayPeerInfo, RelayEvent, Roles as RelayRoles, SessionId as RelaySessionId,
+    PeerInfo as RelayPeerInfo, RelayDirection, RelayEvent, Roles as RelayRoles,
+    SessionId as RelaySessionId,
     SessionStatus as RelaySessionStatus, TransportPreference as RelayTransportPreference,
     TrustedPeer as RelayTrustedPeer, FRAME_DURATIONS_MS as RELAY_FRAME_DURATIONS_MS,
 };
+
+/// Wire roles derived for the desktop endpoint selected by the direction-first
+/// UI. The desktop is the receiving host for `MobileToDesktop` and the
+/// emitting client for `DesktopToMobile`; callers never provide this bitmask.
+#[cfg(feature = "relay")]
+pub(crate) fn desktop_relay_client_roles(direction: RelayDirection) -> RelayRoles {
+    match direction {
+        RelayDirection::MobileToDesktop => RelayRoles::receive_only(),
+        RelayDirection::DesktopToMobile => RelayRoles::emit_only(),
+    }
+}
 
 /// Parameters for starting the relay host.
 #[cfg(feature = "relay")]
@@ -856,6 +868,10 @@ pub struct RelayHostRequest {
     pub frame_ms: u16,
     /// Preferred transport link for advertising and selection.
     pub transport: RelayTransportPreference,
+    /// User-facing direction; the backend derives its one-way host role.
+    pub direction: RelayDirection,
+    /// Monotonic direction generation retained across trusted reconnects.
+    pub direction_generation: u64,
 }
 
 #[cfg(feature = "relay")]
@@ -872,6 +888,8 @@ impl std::fmt::Debug for RelayHostRequest {
             .field("codec", &self.codec)
             .field("frame_ms", &self.frame_ms)
             .field("transport", &self.transport)
+            .field("direction", &self.direction)
+            .field("direction_generation", &self.direction_generation)
             .finish()
     }
 }
@@ -917,7 +935,8 @@ pub trait RelayDriver {
         &mut self,
         _target: std::net::SocketAddr,
         _pin: &str,
-        _roles: RelayRoles,
+        _direction: RelayDirection,
+        _direction_generation: u64,
     ) -> BackendResult<RelaySessionId> {
         Err(BackendError::Unsupported(
             "audio relay is not available for this backend".into(),
@@ -932,7 +951,8 @@ pub trait RelayDriver {
         _target: std::net::SocketAddr,
         _peer_id: &str,
         _secret: [u8; 32],
-        _roles: RelayRoles,
+        _direction: RelayDirection,
+        _direction_generation: u64,
     ) -> BackendResult<RelaySessionId> {
         Err(BackendError::Unsupported(
             "trusted relay auto-connect is not available for this backend".into(),
@@ -948,6 +968,19 @@ pub trait RelayDriver {
         _transport: RelayTransportPreference,
     ) -> BackendResult<()> {
         Ok(())
+    }
+
+    /// Queue a direction offer for an authenticated session. Implementations
+    /// keep the offer in the relay engine until the peer acknowledges it.
+    fn relay_offer_direction(
+        &mut self,
+        _session: RelaySessionId,
+        _direction: RelayDirection,
+        _generation: u64,
+    ) -> BackendResult<()> {
+        Err(BackendError::Unsupported(
+            "audio relay direction switching is not available for this backend".into(),
+        ))
     }
 
     fn relay_disconnect(&mut self, _session: RelaySessionId) -> BackendResult<()> {

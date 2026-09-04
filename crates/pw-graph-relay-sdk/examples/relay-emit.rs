@@ -3,7 +3,7 @@
 //!
 //! Usage: `cargo run -p pw-graph-relay-sdk --example relay-emit -- <host:port> [pin]`
 
-use pw_graph_relay_sdk::{RelayClientBuilder, Role};
+use pw_graph_relay_sdk::{RelayClientBuilder, RelayDirection};
 use std::time::Duration;
 
 fn main() {
@@ -16,7 +16,7 @@ fn main() {
 
     let client = RelayClientBuilder::new()
         .device_name("relay-emit-example")
-        .role(Role::Emit)
+        .direction(RelayDirection::MobileToDesktop)
         .build()
         .expect("valid client configuration")
         .connect(target, &pin)

@@ -45,23 +45,53 @@ class RelaySettingsRepository(private val preferences: SharedPreferences) {
     fun loadSettings(): RelaySettings = RelaySettings(
         target = preferences.getString("target", "") ?: "",
         pin = "",
-        role = preferences.getString("role", "emit") ?: "emit",
+        direction = audioDirectionFromString(
+            if (preferences.contains("audio_direction")) {
+                preferences.getString("audio_direction", null)
+            } else {
+                // One-release migration: old Android builds stored the
+                // client role. `both` is intentionally resolved by
+                // audioDirectionFromString to Mobile → Desktop.
+                preferences.getString("role", null)
+            },
+        ),
+        directionGeneration = preferences.getLong("audio_direction_generation", 0L),
         codec = preferences.getString("codec", "opus") ?: "opus",
         transport = migrateTransport(preferences.getString("transport", "auto") ?: "auto"),
         deviceName = preferences.getString("device_name", "android-relay") ?: "android-relay",
         autoConnectTrusted = preferences.getBoolean("auto_connect_trusted", true),
         autoConnectTrustedWifi = preferences.getBoolean("auto_connect_trusted_wifi", false),
+        captureSource = captureSourceFromString(
+            preferences.getString("capture_source", "microphone") ?: "microphone",
+        ),
     )
 
     fun save(settings: RelaySettings) {
         preferences.edit()
             .putString("target", settings.target)
-            .putString("role", settings.role)
+            .putString("audio_direction", settings.direction.serialized())
+            .putLong("audio_direction_generation", settings.directionGeneration)
             .putString("codec", settings.codec)
             .putString("transport", settings.transport)
             .putString("device_name", settings.deviceName)
             .putBoolean("auto_connect_trusted", settings.autoConnectTrusted)
             .putBoolean("auto_connect_trusted_wifi", settings.autoConnectTrustedWifi)
+            .putString("capture_source", settings.captureSource.name.lowercase())
+            .apply()
+    }
+
+    /** Persist a direction transition without rewriting unrelated UI fields. */
+    fun saveDirection(direction: AudioDirection) {
+        preferences.edit()
+            .putString("audio_direction", direction.serialized())
+            .apply()
+    }
+
+    /** Persist a direction offer and its monotonic negotiation generation. */
+    fun saveDirection(direction: AudioDirection, generation: Long) {
+        preferences.edit()
+            .putString("audio_direction", direction.serialized())
+            .putLong("audio_direction_generation", generation)
             .apply()
     }
 

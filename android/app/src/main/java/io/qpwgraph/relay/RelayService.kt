@@ -165,6 +165,17 @@ class RelayService : Service() {
             return START_NOT_STICKY
         }
 
+        if (!isOneWayAudioRole(request.role)) {
+            RelayServiceBridge.completeStart(
+                request.startToken,
+                RelayServiceStartResult(
+                    false,
+                    "relay audio role '${request.role}' is not supported; both directions are disabled",
+                ),
+            )
+            return START_NOT_STICKY
+        }
+
         val previous = activeRequest
         if (previous != null || running.get()) {
             RelayServiceBridge.completeStart(
@@ -219,8 +230,8 @@ class RelayService : Service() {
     }
 
     private fun workerCount(request: AudioRequest): Int {
-        val captureWanted = request.mode == MODE_HOST || clientRoleEmits(request.role)
-        val playbackWanted = request.mode == MODE_HOST || clientRoleReceives(request.role)
+        val captureWanted = clientRoleEmits(request.role)
+        val playbackWanted = clientRoleReceives(request.role)
         return (if (captureWanted) 1 else 0) + (if (playbackWanted) 1 else 0)
     }
 
@@ -242,8 +253,8 @@ class RelayService : Service() {
         }
         val frames = audioFrameCount(request.sampleRate, request.frameMs)
         val samples = frames * request.channels
-        val captureWanted = request.mode == MODE_HOST || clientRoleEmits(request.role)
-        val playbackWanted = request.mode == MODE_HOST || clientRoleReceives(request.role)
+        val captureWanted = clientRoleEmits(request.role)
+        val playbackWanted = clientRoleReceives(request.role)
 
         if (captureWanted && running.get() && activeRequest === request) {
             captureThread = Thread(
@@ -265,14 +276,14 @@ class RelayService : Service() {
             val captureSource = request.captureSource
             val isPlaybackCapture = captureSource == CaptureSource.DEVICE_PLAYBACK.name.lowercase() ||
                 captureSource == "device_playback"
-            if (request.mode == MODE_HOST || clientRoleEmits(request.role)) {
+            if (clientRoleEmits(request.role)) {
                 type = if (isPlaybackCapture && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                 } else {
                     type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 }
             }
-            if (request.mode == MODE_HOST || clientRoleReceives(request.role)) {
+            if (clientRoleReceives(request.role)) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
             }
             // Ensure mediaPlayback is always present for modern Android

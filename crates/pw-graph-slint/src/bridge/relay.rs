@@ -1,7 +1,8 @@
 #[cfg(feature = "relay")]
 use pw_graph_backend::{
     relay_build_qr_payload, relay_parse_qr_payload, relay_qr, RelayCodecKind, RelayEvent,
-    RelayHostRequest, RelayPeerInfo, RelayRoles, RelaySessionId, RelayTransportPreference,
+    RelayDirection, RelayHostRequest, RelayPeerInfo, RelaySessionId,
+    RelayTransportPreference,
     RelayTrustedPeer,
 };
 use slint::SharedString;
@@ -23,10 +24,11 @@ use pw_graph_i18n::I18n;
 
 use super::app::Application;
 #[cfg(feature = "relay")]
-use super::app::RelayAttempt;
+use super::app::{RelayAttempt, RelayDirectionSwitch};
 #[cfg(feature = "relay")]
 use super::config::save_config;
 use super::RelayRow;
+use pw_graph_config::AudioDirection;
 
 #[cfg(feature = "relay")]
 fn relay_device_id(application: &mut Application) -> String {
@@ -197,7 +199,8 @@ fn connect_trusted_peer(
         peer.addr,
         &peer.id,
         secret,
-        relay_roles(&application.config.relay_role),
+        backend_direction(application.config.relay_direction),
+        application.config.relay_direction_generation,
     ) {
         Ok(session) => {
             application.relay_connecting = Some(RelayAttempt {
@@ -587,12 +590,324 @@ pub(crate) fn host_pin_on_stop(_pin: &mut String) {
 }
 
 #[cfg(feature = "relay")]
+const DIRECTION_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Begin a desktop endpoint switch. Active sessions stay on their old
+/// one-way roles until the authenticated direction offer resolves; only then
+/// are the old sessions retired and the opposite endpoint started.
+pub(crate) fn handle_relay_direction_change(
+    application: &mut Application,
+    old: AudioDirection,
+    next: AudioDirection,
+) {
+    #[cfg(feature = "relay")]
+    {
+        if old == next {
+            return;
+        }
+        let status = application.source.relay_status();
+        let live_sessions = status
+            .sessions
+            .iter()
+            .map(|session| session.id.0)
+            .collect::<BTreeSet<_>>();
+        let live_peer = status.sessions.first().map(|session| session.peer.clone());
+
+        if live_sessions.is_empty() {
+            // There is no authenticated peer to negotiate with. A connecting
+            // attempt is cancelled, and an idle listener is simply replaced
+            // locally; the next connection will carry the persisted offer.
+            if let Some(attempt) = application.relay_connecting.take() {
+                let _ = application
+                    .source
+                    .relay_disconnect(RelaySessionId(attempt.session));
+            }
+            if old == AudioDirection::MobileToDesktop
+                && next == AudioDirection::DesktopToMobile
+                && status.host_active
+            {
+                let _ = application.source.relay_stop_host();
+            }
+            application.relay_direction_switch = None;
+            application.status = application.tf(
+                "relay.direction_changed",
+                &[("direction", direction_label(application, next))],
+            );
+            return;
+        }
+
+        let generation = application.config.relay_direction_generation;
+        let (session_ids, peer) = if let Some(switch) = application.relay_direction_switch.as_mut() {
+            // A rapid A → B → A gesture updates one pending transaction and
+            // keeps the original live endpoint in place until the newest
+            // offer resolves.
+            switch.target = next;
+            switch.generation = generation;
+            switch.sessions = live_sessions.clone();
+            switch.resolved_sessions.clear();
+            switch.resolved = false;
+            switch.peer = live_peer.clone().or_else(|| switch.peer.clone());
+            switch.started_at = Instant::now();
+            (switch.sessions.clone(), switch.peer.clone())
+        } else {
+            let switch = RelayDirectionSwitch {
+                from: old,
+                target: next,
+                generation,
+                sessions: live_sessions.clone(),
+                resolved_sessions: BTreeSet::new(),
+                resolved: false,
+                peer: live_peer,
+                started_at: Instant::now(),
+            };
+            let session_ids = switch.sessions.clone();
+            let peer = switch.peer.clone();
+            application.relay_direction_switch = Some(switch);
+            (session_ids, peer)
+        };
+
+        let direction = backend_direction(next);
+        let mut offered = false;
+        for session in session_ids {
+            match application.source.relay_offer_direction(
+                RelaySessionId(session),
+                direction,
+                generation,
+            ) {
+                Ok(()) => offered = true,
+                Err(error) => {
+                    application.status = application.tf("relay.error", &[("error", error)]);
+                }
+            }
+        }
+        if !offered {
+            if let Some(switch) = application.relay_direction_switch.as_mut() {
+                switch.resolved = true;
+            }
+            advance_relay_direction_switch(application);
+        } else {
+            let _ = peer;
+            application.status = application.t("relay.direction_switching");
+        }
+    }
+    #[cfg(not(feature = "relay"))]
+    {
+        let _ = (application, old, next);
+    }
+}
+
+#[cfg(feature = "relay")]
+fn direction_label(application: &Application, direction: AudioDirection) -> String {
+    application.t(match direction {
+        AudioDirection::MobileToDesktop => "relay.direction_mobile_to_desktop",
+        AudioDirection::DesktopToMobile => "relay.direction_desktop_to_mobile",
+    })
+}
+
+/// Adopt a direction resolved by a peer that initiated the switch. The local
+/// UI has no pending waiter in this case, but the authenticated resolution is
+/// still a commit point: every live session must leave the old endpoint before
+/// the desktop starts its new host/client side.
+#[cfg(feature = "relay")]
+fn adopt_remote_relay_direction(
+    application: &mut Application,
+    resolved_session: RelaySessionId,
+    generation: u64,
+    direction: AudioDirection,
+) {
+    let from = application.config.relay_direction;
+    if direction == from {
+        if generation > application.config.relay_direction_generation {
+            application.config.relay_direction_generation = generation;
+            application.config_dirty_since.get_or_insert_with(Instant::now);
+        }
+        return;
+    }
+
+    let status = application.source.relay_status();
+    let sessions = status
+        .sessions
+        .iter()
+        .map(|session| session.id.0)
+        .collect::<BTreeSet<_>>();
+    if sessions.is_empty() {
+        application.config.relay_direction = direction;
+        application.config.relay_direction_generation = application
+            .config
+            .relay_direction_generation
+            .max(generation);
+        application.config_dirty_since.get_or_insert_with(Instant::now);
+        application.relay_direction_ui_sync = Some(direction);
+        return;
+    }
+
+    application.config.relay_direction = direction;
+    application.config.relay_direction_generation = application
+        .config
+        .relay_direction_generation
+        .max(generation);
+    application.config_dirty_since.get_or_insert_with(Instant::now);
+
+    let peer = status
+        .sessions
+        .iter()
+        .find(|session| session.id == resolved_session)
+        .or_else(|| status.sessions.first())
+        .map(|session| session.peer.clone());
+    let mut resolved_sessions = BTreeSet::new();
+    resolved_sessions.insert(resolved_session.0);
+    let resolved = resolved_sessions.len() == sessions.len();
+    application.relay_direction_switch = Some(RelayDirectionSwitch {
+        from,
+        target: direction,
+        generation,
+        sessions: sessions.clone(),
+        resolved_sessions,
+        resolved,
+        peer,
+        started_at: Instant::now(),
+    });
+
+    for session in sessions {
+        if session == resolved_session.0 {
+            continue;
+        }
+        if let Err(error) = application.source.relay_offer_direction(
+            RelaySessionId(session),
+            backend_direction(direction),
+            generation,
+        ) {
+            application.status = application.tf("relay.error", &[("error", error)]);
+        }
+    }
+    application.status = application.t("relay.direction_switching");
+    advance_relay_direction_switch(application);
+}
+
+/// Apply the deterministic winner to the desktop's local lifecycle after the
+/// old session has actually disappeared. The peer address is retained so a
+/// host→client switch can reconnect to the same authenticated device.
+#[cfg(feature = "relay")]
+fn finish_relay_direction_switch(application: &mut Application, switch: RelayDirectionSwitch) {
+    let returned_to_original_direction = switch.from == switch.target;
+    let direction = switch.target;
+    application.config.relay_direction = direction;
+    application.config.relay_direction_generation = application
+        .config
+        .relay_direction_generation
+        .max(switch.generation);
+    application
+        .config_dirty_since
+        .get_or_insert_with(Instant::now);
+    application.relay_direction_ui_sync = Some(direction);
+
+    // A rapid A → B → A gesture can resolve back to the endpoint that has
+    // stayed alive throughout the transaction. Preserve it when it is still
+    // active; restarting it would only add an avoidable audio gap.
+    let endpoint_is_still_active = match direction {
+        AudioDirection::MobileToDesktop => application.source.relay_status().host_active,
+        AudioDirection::DesktopToMobile => {
+            !application.source.relay_status().sessions.is_empty()
+        }
+    };
+    if returned_to_original_direction && endpoint_is_still_active {
+        application.status = application.tf(
+            "relay.direction_changed",
+            &[("direction", direction_label(application, direction))],
+        );
+        return;
+    }
+
+    match direction {
+        AudioDirection::MobileToDesktop => {
+            // A DTM desktop host had the opposite local role. Recreate the
+            // listener so its virtual graph is built with receive-only roles.
+            if application.source.relay_status().host_active {
+                let _ = application.source.relay_stop_host();
+            }
+            start_relay_host(application);
+        }
+        AudioDirection::DesktopToMobile => {
+            if application.source.relay_status().host_active {
+                let _ = application.source.relay_stop_host();
+            }
+            if let Some(peer) = switch.peer {
+                application.config.relay_client_target = peer.addr.to_string();
+                if !connect_trusted_peer(application, &peer, false) {
+                    connect_relay(application, None);
+                }
+            } else {
+                application.status = application.t("relay.direction_changed");
+            }
+        }
+    }
+}
+
+/// Once a switch is resolved, request orderly shutdown of the old sessions.
+/// Keeping them in the switch record until their SessionLost events arrive
+/// prevents a new client/host from racing the old endpoint teardown.
+#[cfg(feature = "relay")]
+fn advance_relay_direction_switch(application: &mut Application) {
+    let live = application
+        .source
+        .relay_status()
+        .sessions
+        .into_iter()
+        .map(|session| session.id.0)
+        .collect::<BTreeSet<_>>();
+    let mut disconnect = Vec::new();
+    let mut finish = None;
+    if let Some(switch) = application.relay_direction_switch.as_mut() {
+        if !switch.resolved {
+            return;
+        }
+        switch.sessions.retain(|session| live.contains(session));
+        disconnect.extend(switch.sessions.iter().copied());
+        if switch.sessions.is_empty() {
+            finish = application.relay_direction_switch.take();
+        }
+    }
+    for session in disconnect {
+        let _ = application
+            .source
+            .relay_disconnect(RelaySessionId(session));
+    }
+    if let Some(switch) = finish {
+        finish_relay_direction_switch(application, switch);
+    } else if application.relay_direction_switch.is_some() {
+        application.status = application.t("relay.direction_switching");
+    }
+}
+
+#[cfg(feature = "relay")]
+fn poll_relay_direction_switch_timeout(application: &mut Application) {
+    let expired = application
+        .relay_direction_switch
+        .as_ref()
+        .is_some_and(|switch| switch.started_at.elapsed() >= DIRECTION_SWITCH_TIMEOUT);
+    if !expired {
+        return;
+    }
+    if let Some(switch) = application.relay_direction_switch.as_mut() {
+        switch.resolved = true;
+        switch.resolved_sessions = switch.sessions.clone();
+        application.status = application.t("relay.direction_switch_timeout");
+    }
+    advance_relay_direction_switch(application);
+}
+
+#[cfg(feature = "relay")]
 pub(crate) fn regenerate_host_pin(application: &mut Application) {
     application.config.relay_host_pin = pw_graph_backend::relay_generate_pin();
     application.status = application.tf(
         "relay.pin_regenerated",
         &[("pin", application.config.relay_host_pin.clone())],
     );
+}
+
+#[cfg(not(feature = "relay"))]
+pub(crate) fn regenerate_host_pin(application: &mut Application) {
+    application.status = application.t("relay.unavailable");
 }
 
 pub(crate) fn start_relay_host(application: &mut Application) {
@@ -617,6 +932,8 @@ pub(crate) fn start_relay_host(application: &mut Application) {
             // to the far end of a handshake before it was rejected.
             frame_ms: pw_graph_backend::relay_normalize_frame_ms(application.config.relay_frame_ms),
             transport: relay_transport(&application.config.relay_transport),
+            direction: backend_direction(application.config.relay_direction),
+            direction_generation: application.config.relay_direction_generation,
         };
         match application.source.relay_start_host(request) {
             Ok(port) => {
@@ -917,7 +1234,8 @@ pub(crate) fn connect_relay(application: &mut Application, requested_target: Opt
         match application.source.relay_connect(
             target,
             &pin,
-            relay_roles(&application.config.relay_role),
+            backend_direction(application.config.relay_direction),
+            application.config.relay_direction_generation,
         ) {
             Ok(session) => {
                 application.relay_connecting = Some(RelayAttempt {
@@ -1039,8 +1357,62 @@ pub(crate) fn poll_relay_events(application: &mut Application) {
                 application.status =
                     application.tf("relay.session_connected", &[("name", peer.name)]);
             }
+            RelayEvent::DirectionResolved {
+                id,
+                generation,
+                direction,
+                ..
+            } => {
+                let resolved_direction = config_direction(direction);
+                let mut ready = false;
+                if let Some(switch) = application.relay_direction_switch.as_mut() {
+                    if switch.sessions.contains(&id.0) && generation == switch.generation {
+                        switch.target = resolved_direction;
+                        switch.resolved_sessions.insert(id.0);
+                        if switch.resolved_sessions.len() >= switch.sessions.len() {
+                            switch.resolved = true;
+                            ready = true;
+                        }
+                    }
+                }
+                if ready {
+                    advance_relay_direction_switch(application);
+                } else if application.relay_direction_switch.is_none()
+                    && resolved_direction != application.config.relay_direction
+                {
+                    adopt_remote_relay_direction(application, id, generation, resolved_direction);
+                } else {
+                    if generation > application.config.relay_direction_generation
+                        && resolved_direction == application.config.relay_direction
+                    {
+                        application.config.relay_direction_generation = generation;
+                        application.config_dirty_since.get_or_insert_with(Instant::now);
+                    }
+                    application.status = application.tf(
+                        "relay.direction_resolved",
+                        &[
+                            ("session", id.0.to_string()),
+                            ("generation", generation.to_string()),
+                            ("direction", direction.as_str().to_owned()),
+                        ],
+                    );
+                }
+            }
             RelayEvent::SessionLost { id, reason } => {
                 application.relay_levels.remove(&id.0);
+                let mut advance_switch = false;
+                if let Some(switch) = application.relay_direction_switch.as_mut() {
+                    if switch.sessions.remove(&id.0) {
+                        if switch.sessions.is_empty() && !switch.resolved {
+                            // The peer disappeared before acknowledging. The
+                            // newest persisted direction is still safe to
+                            // apply locally; a later reconnect negotiates it
+                            // again from its generation.
+                            switch.resolved = true;
+                        }
+                        advance_switch = switch.resolved;
+                    }
+                }
                 if application
                     .relay_connecting
                     .as_ref()
@@ -1111,6 +1483,9 @@ pub(crate) fn poll_relay_events(application: &mut Application) {
                 };
                 application.status =
                     application.tf("relay.session_lost", &[("reason", display_reason)]);
+                if advance_switch {
+                    advance_relay_direction_switch(application);
+                }
             }
             RelayEvent::AudioLevel { id, rms } => {
                 application.relay_levels.insert(id.0, rms.clamp(0.0, 1.0));
@@ -1121,18 +1496,34 @@ pub(crate) fn poll_relay_events(application: &mut Application) {
             }
         }
     }
+    poll_relay_direction_switch_timeout(application);
     retry_trusted_auto_connect(application);
 }
 
 #[cfg(not(feature = "relay"))]
 pub(crate) fn poll_relay_events(_application: &mut Application) {}
 
+#[cfg(all(feature = "relay", test))]
+fn desktop_roles(direction: AudioDirection) -> pw_graph_backend::RelayRoles {
+    match direction {
+        AudioDirection::MobileToDesktop => pw_graph_backend::RelayRoles::receive_only(),
+        AudioDirection::DesktopToMobile => pw_graph_backend::RelayRoles::emit_only(),
+    }
+}
+
 #[cfg(feature = "relay")]
-fn relay_roles(value: &str) -> RelayRoles {
-    match value {
-        "emit" => RelayRoles::emit_only(),
-        "receive" => RelayRoles::receive_only(),
-        _ => RelayRoles::both(),
+fn backend_direction(direction: AudioDirection) -> RelayDirection {
+    match direction {
+        AudioDirection::MobileToDesktop => RelayDirection::MobileToDesktop,
+        AudioDirection::DesktopToMobile => RelayDirection::DesktopToMobile,
+    }
+}
+
+#[cfg(feature = "relay")]
+fn config_direction(direction: RelayDirection) -> AudioDirection {
+    match direction {
+        RelayDirection::MobileToDesktop => AudioDirection::MobileToDesktop,
+        RelayDirection::DesktopToMobile => AudioDirection::DesktopToMobile,
     }
 }
 
@@ -1211,7 +1602,10 @@ pub(crate) fn relay_rows(application: &Application, i18n: &I18n) -> Vec<RelayRow
             }
             connected.insert(address.clone());
             let direction = match (session.sending, session.receiving) {
-                (true, true) => i18n.text("relay.direction_both"),
+                // Accepted sessions are one-way. Keep a defensive diagnostic
+                // label for a stale/foreign status snapshot without exposing
+                // “both” as a valid direction.
+                (true, true) => i18n.text("relay.direction_invalid"),
                 (true, false) => i18n.text("relay.direction_send"),
                 (false, true) => i18n.text("relay.direction_receive"),
                 (false, false) => i18n.text("relay.direction_connected"),
@@ -1369,19 +1763,18 @@ pub(crate) fn relay_rows(application: &Application, i18n: &I18n) -> Vec<RelayRow
     }
 }
 
-pub(crate) fn relay_role_index(value: &str) -> i32 {
-    match value {
-        "emit" => 0,
-        "receive" => 1,
-        _ => 2,
+pub(crate) fn relay_direction_tab(direction: AudioDirection) -> i32 {
+    match direction {
+        AudioDirection::MobileToDesktop => 0,
+        AudioDirection::DesktopToMobile => 1,
     }
 }
 
-pub(crate) fn relay_role_from_index(index: i32) -> &'static str {
+pub(crate) fn relay_direction_from_tab(index: i32, fallback: AudioDirection) -> AudioDirection {
     match index {
-        0 => "emit",
-        1 => "receive",
-        _ => "both",
+        0 => AudioDirection::MobileToDesktop,
+        1 => AudioDirection::DesktopToMobile,
+        _ => fallback,
     }
 }
 
@@ -1524,6 +1917,49 @@ mod tests {
         for (stored, expected) in [(0u16, 5u16), (7, 5), (13, 10), (35, 40), (9_000, 60)] {
             assert_eq!(relay_frame_from_index(relay_frame_index(stored)), expected);
         }
+    }
+
+    #[cfg(feature = "relay")]
+    #[test]
+    fn directions_derive_only_one_way_desktop_roles() {
+        assert_eq!(
+            desktop_roles(AudioDirection::MobileToDesktop),
+            pw_graph_backend::RelayRoles::receive_only()
+        );
+        assert_eq!(
+            desktop_roles(AudioDirection::DesktopToMobile),
+            pw_graph_backend::RelayRoles::emit_only()
+        );
+        for roles in [
+            desktop_roles(AudioDirection::MobileToDesktop),
+            desktop_roles(AudioDirection::DesktopToMobile),
+        ] {
+            assert!(!(roles.emit && roles.receive));
+        }
+    }
+
+    #[test]
+    fn direction_tabs_round_trip_without_an_advanced_role() {
+        assert_eq!(
+            relay_direction_tab(AudioDirection::MobileToDesktop),
+            0
+        );
+        assert_eq!(
+            relay_direction_tab(AudioDirection::DesktopToMobile),
+            1
+        );
+        assert_eq!(
+            relay_direction_from_tab(0, AudioDirection::DesktopToMobile),
+            AudioDirection::MobileToDesktop
+        );
+        assert_eq!(
+            relay_direction_from_tab(1, AudioDirection::MobileToDesktop),
+            AudioDirection::DesktopToMobile
+        );
+        assert_eq!(
+            relay_direction_from_tab(2, AudioDirection::DesktopToMobile),
+            AudioDirection::DesktopToMobile
+        );
     }
 }
 

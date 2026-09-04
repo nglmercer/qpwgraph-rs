@@ -23,6 +23,63 @@ impl ControlCipher {
     }
 }
 
+/// Send the currently queued direction offer, keeping it queued until the
+/// sealed write succeeds. This is also called by the short trusted-enrollment
+/// wait, which temporarily owns the control stream before the normal watcher
+/// starts.
+pub(super) fn flush_pending_direction_offer(
+    record: &Arc<SessionRecord>,
+    stream: &mut TcpStream,
+    cipher: &mut ControlCipher,
+) -> std::io::Result<()> {
+    if let Some(offer) = record.pending_direction_offer() {
+        cipher.send(
+            stream,
+            &ControlMessage::DirectionOffer {
+                generation: offer.generation,
+                direction: offer.direction,
+                device_id: offer.device_id.clone(),
+            },
+        )?;
+        record.mark_direction_offer_sent(&offer);
+    }
+    Ok(())
+}
+
+/// Apply a remote offer and send the deterministic acknowledgement while the
+/// caller still owns the control cipher.
+pub(super) fn apply_direction_offer(
+    record: &Arc<SessionRecord>,
+    stream: &mut TcpStream,
+    cipher: &mut ControlCipher,
+    offer: DirectionOffer,
+) -> Result<Option<DirectionResolution>, String> {
+    let (ack, resolution) = record.receive_direction_offer(offer)?;
+    cipher
+        .send(
+            stream,
+            &ControlMessage::DirectionAck {
+                generation: ack.generation,
+                direction: ack.direction,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(resolution)
+}
+
+pub(super) fn emit_direction_resolution(
+    inner: &Arc<EngineInner>,
+    id: SessionId,
+    resolution: DirectionResolution,
+) {
+    inner.emit(RelayEvent::DirectionResolved {
+        id,
+        generation: resolution.winner.generation,
+        direction: resolution.winner.direction,
+        winner_device_id: resolution.winner.device_id,
+    });
+}
+
 /// Ask a session's control thread to send `bye` and tear down. Only the
 /// bye flag is set: the control thread checks it before its stop condition
 /// so the farewell frame actually goes out.
@@ -219,6 +276,10 @@ pub(super) fn watch_control(
     mut cipher: ControlCipher,
 ) -> ControlExit {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    // A control owner may be a resumed TCP stream. Any offer that was written
+    // just before the previous stream dropped remains authoritative, but it
+    // must be sent again on this authenticated replacement channel.
+    record.reset_direction_offer_send();
     let mut last_seen = Instant::now();
     let mut last_keepalive = Instant::now();
 
@@ -234,6 +295,9 @@ pub(super) fn watch_control(
                 },
             );
             return ControlExit::Stopped;
+        }
+        if let Err(error) = flush_pending_direction_offer(&record, &mut stream, &mut cipher) {
+            return ControlExit::Dropped(format!("direction offer could not be sent: {error}"));
         }
         if let Some(resolution) = inner.take_trusted_enrollment(record.id) {
             if resolution.accepted {
@@ -299,6 +363,42 @@ pub(super) fn watch_control(
                 };
                 if let Some(reason) = rejected {
                     let _ = cipher.send(&mut stream, &ControlMessage::TrustRejected { reason });
+                }
+                last_seen = Instant::now();
+            }
+            Ok(ControlMessage::DirectionOffer {
+                generation,
+                direction,
+                device_id,
+            }) => {
+                let offer = DirectionOffer {
+                    generation,
+                    direction,
+                    device_id,
+                };
+                match apply_direction_offer(&record, &mut stream, &mut cipher, offer) {
+                    Ok(Some(resolution)) => {
+                        emit_direction_resolution(&inner, record.id, resolution)
+                    }
+                    Ok(None) => {}
+                    Err(reason) => {
+                        return ControlExit::Dropped(format!(
+                            "invalid direction negotiation message: {reason}"
+                        ));
+                    }
+                }
+                last_seen = Instant::now();
+            }
+            Ok(ControlMessage::DirectionAck {
+                generation,
+                direction,
+            }) => {
+                let resolution = record.receive_direction_ack(DirectionAck {
+                    generation,
+                    direction,
+                });
+                if let Some(resolution) = resolution {
+                    emit_direction_resolution(&inner, record.id, resolution);
                 }
                 last_seen = Instant::now();
             }

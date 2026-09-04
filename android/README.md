@@ -29,21 +29,23 @@ the Android SDK configured:
 ./gradlew :app:installDebug
 ```
 
-The app requests microphone permission only when the selected operation
-captures audio: client Emit/Both and Android Host require it, while client
-Receive is playback-only. Android 13+ notification permission is requested for
-the foreground audio service. Pairing PINs are entered for the current client
-or host lifetime and are not persisted; there is no insecure app-wide default.
+The app requests microphone permission only for the **Phone → PC** direction,
+where the phone captures a microphone or device-playback source. **PC → Phone**
+is playback-only on Android. Android 13+ notification permission is requested
+for the foreground audio service. Pairing PINs are entered for the current
+client or host lifetime and are not persisted; there is no insecure app-wide
+default.
 
-The app mirrors the desktop relay panel with three tabs:
+The app mirrors the desktop relay panel with two direction tabs:
 
-- **Receiver** — connect to a relay host (phone as microphone/speaker).
-- **Emitter** — run a relay host so the desktop can connect to the phone.
-  The default control port is `48123`, which the desktop probes for when it
-  scans USB tether subnets, so keep it unless you have a conflict.
-- **Discover** — browse for relay hosts. While discovery runs the app probes
-  USB tether subnets directly in addition to mDNS, because mDNS often does
-  not cross a USB tether.
+- **Phone → PC** — connect to a desktop host and send phone audio.
+- **PC → Phone** — run a receive-only Android host so the desktop can send
+  audio to the phone. The default control port is `48123`, which the desktop
+  probes for when it scans USB tether subnets, so keep it unless you have a
+  conflict.
+
+Discovery and trusted devices are secondary sections below the active
+direction; they are not audio roles.
 
 USB is not a manual link option: the app (like the desktop) auto-detects an
 active USB tether, shows it under the tab bar, and `Auto` prefers it. After a
@@ -51,17 +53,17 @@ successful PIN pairing, the app stores a per-host credential encrypted with a
 non-exportable Android Keystore AES-256-GCM key. Only ciphertext and peer
 metadata are kept in `relay.xml`, and the file is excluded from backup/device
 transfer. A later discovery result with the same stable peer ID can connect
-without another PIN; unknown peers are never auto-connected. Receiver settings
-provide global trusted auto-connect and a separate Wi-Fi opt-in; USB is the
-default background candidate. Use Forget in Trusted devices to revoke a
+without another PIN; unknown peers are never auto-connected. Phone → PC
+settings provide global trusted auto-connect and a separate Wi-Fi opt-in; USB
+is the default background candidate. Use Forget in Trusted devices to revoke a
 credential immediately.
 
 ## Pair by QR code
 
-The desktop Host tab renders the host's addresses and port and offers a
-**Show QR** button while the host runs. The QR carries a
-`qpw-relay://host:port?pin=123456` payload. In the Android Receiver tab, tap
-**Scan QR** (camera permission required) to fill in the address and PIN
+The desktop **Phone → PC** tab renders the host's addresses and port and offers
+a **Show QR** button while the host runs. The QR carries a
+`qpw-relay://host:port?pin=123456` payload. In the Android **Phone → PC** tab,
+tap **Scan QR** (camera permission required) to fill in the address and PIN
 automatically, then press **Connect**. Plain `host:port` QR codes work too.
 
 ## Test over USB tethering
@@ -80,11 +82,11 @@ host:
 4. Keep the preferred link on **Auto**: the relay panel auto-detects the USB
    tether and shows its address (for example `usb0 · 192.168.42.129`), and
    prefers the USB link automatically.
-5. In Android, open the **Discover** tab and start discovery — the desktop
-   host is probed over the USB tether directly. For the first connection, tap
-   **Connect**, enter the same PIN used by the desktop host, and choose
-   Emit/Receive/Both. The successful pairing is remembered; later USB
-   appearances for that same host connect automatically.
+5. In Android, open the **Phone → PC** direction and start discovery from the
+   Discovery section — the desktop host is probed over the USB tether directly.
+   For the first connection, tap **Connect** and enter the same PIN used by the
+   desktop host. The successful pairing is remembered; later USB appearances
+   for that same host connect automatically.
 6. Confirm the desktop shows a relay session and that the Relay Microphone or
    Relay Speaker node carries audio.
 
@@ -99,22 +101,25 @@ length-framed encrypted audio stream), so it does not need UDP or USB
 tethering. It is explicit rather than discoverable: set the target to
 `127.0.0.1:48123` and create the matching ADB tunnel before connecting.
 
-For an Android client connecting to a desktop host, run on the desktop:
+For **Phone → PC**, where the Android client connects to a desktop host, run on
+the desktop:
 
 ```bash
 adb reverse tcp:48123 tcp:48123
 ```
 
-For a desktop client connecting to an Android host, run on the desktop:
+For **PC → Phone**, where the desktop client connects to an Android host, run
+on the desktop:
 
 ```bash
 adb forward tcp:48123 tcp:48123
 ```
 
-Select **ADB forwarding** on the client, use `127.0.0.1:48123`, and pair
-once with the host PIN. Keep the host on port `48123` or use the same explicit
-port in the ADB command and target. ADB forwarding does not provide peer
-discovery; QR and automatic USB discovery still require a network link.
+Select **ADB forwarding** in the active direction's advanced settings, use
+`127.0.0.1:48123`, and pair once with the host PIN. Keep the host on port
+`48123` or use the same explicit port in the ADB command and target. ADB
+forwarding does not provide peer discovery; QR and automatic USB discovery
+still require a network link.
 
 If ADB is selected but `127.0.0.1:48123` refuses the connection, create the
 matching rule and retry. The app reports this as an ADB forwarding diagnostic,
@@ -126,11 +131,12 @@ PIN pairing.
 ## Use
 
 1. Start the desktop qpwgraph-rs application with the default `relay` feature.
-2. Open the relay panel from the navigation rail, set a six-digit PIN, and
-   start the host.
-3. Enter the desktop `host:port` and PIN in the Android app, scan the host's
-   QR code, or find the host in the **Discover** tab.
-4. Choose Emit, Receive, or Both and press **Connect**.
+2. For Phone → PC, open the desktop relay panel, select the direction, set a
+   six-digit PIN, and start the host.
+3. In Android's **Phone → PC** tab, enter the desktop `host:port` and PIN, scan
+   the host's QR code, or find it in the Discovery section.
+4. Press **Connect**. For PC → Phone, select that direction on both devices,
+   start the Android host, then connect from the desktop's PC → Phone tab.
 
 Manual address entry remains supported as a fallback. The relay protocol uses
 TCP control and UDP audio, so both devices must be able to reach each other
@@ -145,7 +151,7 @@ explicit TCP audio mode described above.
 
 ### Physical-device validation checklist
 
-For Android client → desktop host over USB tether: start the host, pair once,
+For Phone → PC over USB tether: start the host, pair once,
 confirm trusted credential creation, enable USB tethering, confirm the same
 stable peer is discovered and reconnects without a PIN, verify audio, disable
 USB, and verify the intended Wi-Fi resume/failover behavior.
@@ -156,10 +162,11 @@ authenticated migration path moves immediately, and confirm the status reports
 the actual link.
 
 For ADB: enable USB debugging, create the correct reverse/forward rule, select
-ADB and connect to `127.0.0.1:48123`, pair, verify bidirectional audio, delete
-the forwarding rule, observe `Reconnecting audio`, recreate it, and verify
-audio returns without PIN pairing. Also exercise service death, process death,
-restart, retained trusted credentials, and mode switching for stale handles.
+ADB in the chosen direction, connect to `127.0.0.1:48123`, pair, verify
+one-way audio, delete the forwarding rule, observe `Reconnecting audio`,
+recreate it, and verify audio returns without PIN pairing. Also exercise
+service death, process death, restart, retained trusted credentials, and
+direction switching for stale handles.
 
 The stable installation ID and encrypted trusted bearer credentials live in
 Android's private `relay` preferences. The file is excluded from cloud backup
@@ -172,7 +179,7 @@ installation. Deleting a trusted credential does not regenerate the stable ID.
   route and verify the app is not muted by system privacy controls.
 - **No connection:** use the host's actual TCP port, verify the PIN, and test
   LAN reachability without guest-network isolation.
-- **Connected but silent:** ensure the selected role matches the direction,
+- **Connected but silent:** ensure the selected direction matches the peer,
   keep the app's foreground notification active, and check the desktop graph's
   Relay Microphone/Relay Speaker virtual nodes.
 - **Discovery:** mDNS is optional; while discovery runs, the desktop also

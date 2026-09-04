@@ -242,6 +242,9 @@ pub(super) fn enroll_trusted_peer(
     {
         return;
     }
+    if flush_pending_direction_offer(record, stream, cipher).is_err() {
+        return;
+    }
     // The handshake's 5s read timeout would let keepalive sends drift to the
     // edge of the host's 6s session timeout; poll finely so they keep the
     // cadence the control loop normally maintains. The control loop sets its
@@ -259,6 +262,12 @@ pub(super) fn enroll_trusted_peer(
         {
             return;
         }
+        // A direction switch may be requested while the embedding is still
+        // deciding whether to persist the freshly enrolled credential. Keep
+        // the same queued-offer/retry contract as the normal control watcher.
+        if flush_pending_direction_offer(record, stream, cipher).is_err() {
+            return;
+        }
         match cipher.receive(stream) {
             Ok(ControlMessage::TrustAccepted {}) => {
                 inner.emit(RelayEvent::TrustedPeerAvailable {
@@ -269,6 +278,33 @@ pub(super) fn enroll_trusted_peer(
                 return;
             }
             Ok(ControlMessage::TrustRejected { .. }) => return,
+            Ok(ControlMessage::DirectionOffer {
+                generation,
+                direction,
+                device_id,
+            }) => {
+                let offer = DirectionOffer {
+                    generation,
+                    direction,
+                    device_id,
+                };
+                match apply_direction_offer(record, stream, cipher, offer) {
+                    Ok(Some(resolution)) => emit_direction_resolution(inner, record.id, resolution),
+                    Ok(None) => {}
+                    Err(_) => return,
+                }
+            }
+            Ok(ControlMessage::DirectionAck {
+                generation,
+                direction,
+            }) => {
+                if let Some(resolution) = record.receive_direction_ack(DirectionAck {
+                    generation,
+                    direction,
+                }) {
+                    emit_direction_resolution(inner, record.id, resolution);
+                }
+            }
             // Keepalive is legal immediately after SessionReady. It is a
             // one-way liveness hint, so consuming it while waiting for the
             // enrollment acknowledgement does not require a response.

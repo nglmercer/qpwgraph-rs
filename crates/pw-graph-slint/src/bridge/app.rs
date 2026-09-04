@@ -5,9 +5,14 @@ use pw_graph_config::AppConfig;
 use pw_graph_core::PortKey;
 use pw_graph_i18n::I18n;
 use pw_graph_patchbay::Patchbay;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(feature = "relay")]
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+#[cfg(feature = "relay")]
+use pw_graph_backend::RelayPeerInfo;
 
 pub(crate) enum UiEvent {
     Action(String),
@@ -43,6 +48,23 @@ pub(crate) struct RelayAttempt {
     /// it separate from the socket address prevents a Wi-Fi/USB address
     /// change from looking like a second unrelated connection attempt.
     pub(crate) peer_id: Option<String>,
+}
+
+/// The desktop endpoint switch waits for every active authenticated session
+/// to agree on the new direction before replacing the local audio endpoint.
+/// Keeping this state in the bridge makes rapid tab changes coalesce without
+/// exposing a second, role-shaped state machine to the UI.
+#[cfg(feature = "relay")]
+#[derive(Clone, Debug)]
+pub(crate) struct RelayDirectionSwitch {
+    pub(crate) from: pw_graph_config::AudioDirection,
+    pub(crate) target: pw_graph_config::AudioDirection,
+    pub(crate) generation: u64,
+    pub(crate) sessions: BTreeSet<u64>,
+    pub(crate) resolved_sessions: BTreeSet<u64>,
+    pub(crate) resolved: bool,
+    pub(crate) peer: Option<RelayPeerInfo>,
+    pub(crate) started_at: Instant,
 }
 
 pub(crate) struct Application {
@@ -115,6 +137,13 @@ pub(crate) struct Application {
     pub(crate) relay_pending_enrollment: Option<PendingEnrollment>,
     #[cfg(feature = "relay")]
     pub(crate) relay_reconnect_pending: Option<ReconnectPending>,
+    #[cfg(feature = "relay")]
+    pub(crate) relay_direction_switch: Option<RelayDirectionSwitch>,
+    #[cfg(feature = "relay")]
+    /// A conflict winner can differ from the tab that initiated a switch.
+    /// The next window-state read consumes this one-shot UI correction before
+    /// interpreting the tab as a new user request.
+    pub(crate) relay_direction_ui_sync: Option<pw_graph_config::AudioDirection>,
 }
 
 #[cfg(feature = "relay")]

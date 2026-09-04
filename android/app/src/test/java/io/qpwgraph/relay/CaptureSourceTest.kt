@@ -82,8 +82,8 @@ class CaptureSourceTest {
         assertEquals(2, HostSettings(captureSource = CaptureSource.DEVICE_PLAYBACK).channels)
         assertEquals(2, HostSettings(captureSource = CaptureSource.MICROPHONE).channels)
         assertEquals(2, ANDROID_AUDIO_CHANNELS)
-        assertEquals(1, pcm16BufferBytes(480, 1))
-        assertEquals(960, pcm16BufferBytes(480, 2))
+        assertEquals(960, pcm16BufferBytes(480, 1))
+        assertEquals(1920, pcm16BufferBytes(480, 2))
     }
 
     @Test

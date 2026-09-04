@@ -396,6 +396,11 @@ fn mixing_session(id: u64, receiving: bool) -> Arc<SessionRecord> {
         capture_convert: Mutex::new((capture_converter, capture_destination)),
         audio_sealer: Mutex::new(sealer),
         audio_opener: Mutex::new(opener),
+        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
+            generation: 1,
+            direction: RelayDirection::MobileToDesktop,
+            device_id: format!("peer-{id}"),
+        })),
     })
 }
 

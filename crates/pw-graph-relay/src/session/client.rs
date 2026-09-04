@@ -77,6 +77,14 @@ pub(super) fn trusted_client_thread(
         fail_attempt(&inner, id, "no audio direction requested".into());
         return;
     }
+    if !roles.is_one_way() {
+        fail_attempt(
+            &inner,
+            id,
+            "bidirectional relay sessions are disabled; choose one audio direction".into(),
+        );
+        return;
+    }
     let config = inner.config();
     let bind = netlink::outbound_bind_addr(&netlink::local_links(), target, config.transport);
     let mut stream = match connect_control_tcp(target, bind, config.transport) {
@@ -263,6 +271,14 @@ pub(super) fn client_thread(
 ) {
     if roles.is_empty() {
         fail_attempt(&inner, id, "no audio direction requested".into());
+        return;
+    }
+    if !roles.is_one_way() {
+        fail_attempt(
+            &inner,
+            id,
+            "bidirectional relay sessions are disabled; choose one audio direction".into(),
+        );
         return;
     }
     let config = inner.config();
@@ -502,6 +518,11 @@ pub(super) fn client_thread(
         capture_convert: Mutex::new(prepared_capture_converter(local, format)),
         audio_sealer: Mutex::new(audio_sealer),
         audio_opener: Mutex::new(audio_opener),
+        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
+            generation: config.direction_generation,
+            direction: roles.direction().unwrap_or(config.direction),
+            device_id: config.device_id.clone(),
+        })),
     });
     if !inner.insert_session(Arc::clone(&record)) {
         let reason = "the local session limit was reached".to_string();
@@ -761,6 +782,11 @@ pub(super) fn client_session_after_auth(
         capture_convert: Mutex::new(prepared_capture_converter(local, format)),
         audio_sealer: Mutex::new(audio_sealer),
         audio_opener: Mutex::new(audio_opener),
+        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
+            generation: config.direction_generation,
+            direction: roles.direction().unwrap_or(config.direction),
+            device_id: config.device_id.clone(),
+        })),
     });
     if !inner.insert_session(Arc::clone(&record)) {
         let reason = "the local session limit was reached".to_string();
