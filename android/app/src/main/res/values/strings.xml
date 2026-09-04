@@ -1,15 +1,15 @@
 <resources>
     <!-- App -->
     <string name="relay_app_title">qpwgraph Relay</string>
-    <string name="relay_app_subtitle">Choose one direction for audio between your phone and PC.</string>
+    <string name="relay_app_subtitle">Choose whether this device emits or receives audio.</string>
     <string name="relay_notification_channel">Relay audio</string>
     <string name="relay_notification_active">Relay audio is active</string>
 
     <!-- Navigation -->
     <string name="nav_receiver">Receiver</string>
-    <string name="nav_receiver_desc">Receive audio — connect to a relay host</string>
+    <string name="nav_receiver_desc">Receive audio — run a relay host</string>
     <string name="nav_emitter">Emitter</string>
-    <string name="nav_emitter_desc">Emit audio — run a relay host</string>
+    <string name="nav_emitter_desc">Emit audio — connect to a relay peer</string>
     <string name="nav_discover">Discover</string>
     <string name="nav_discover_desc">Find relay hosts on the local network</string>
 
@@ -29,23 +29,29 @@
     <string name="label_unknown_link">unknown link</string>
 
     <!-- Direction-first surface -->
-    <string name="direction_phone_to_pc">Phone → PC</string>
-    <string name="direction_pc_to_phone">PC → Phone</string>
+    <string name="direction_phone_to_pc">Emitter</string>
+    <string name="direction_pc_to_phone">Receiver</string>
     <string name="direction_sending">Sending</string>
     <string name="direction_receiving">Receiving</string>
     <string name="direction_switching">Switching…</string>
-    <string name="relay_direction_switch_timeout">Direction peer did not acknowledge; reconnecting safely.</string>
-    <string name="direction_phone_to_pc_hint">Send this phone’s microphone or device playback to the desktop.</string>
-    <string name="direction_pc_to_phone_hint">Receive desktop relay audio and play it through this phone.</string>
-    <string name="relay_direction_host_required">PC → Phone is active; this phone is hosting and cannot connect as a client.</string>
-    <string name="relay_direction_client_required">Phone → PC is active; switch direction before starting the host.</string>
+    <string name="relay_mode_emitter">Emitter</string>
+    <string name="relay_mode_receiver">Receiver</string>
+    <string name="relay_mode_advanced">Advanced</string>
+    <string name="relay_mode_emitter_hint">This device sends audio to the peer.</string>
+    <string name="relay_mode_receiver_hint">This device receives audio from the peer.</string>
+    <string name="relay_mode_switching">Switching mode…</string>
+    <string name="relay_direction_switch_timeout">Flow peer did not acknowledge; reconnecting safely.</string>
+    <string name="direction_phone_to_pc_hint">Send the selected local source to the relay peer.</string>
+    <string name="direction_pc_to_phone_hint">Receive peer audio and play it through this device.</string>
+    <string name="relay_direction_host_required">Emitter mode is required to connect to a relay peer.</string>
+    <string name="relay_direction_client_required">Receiver mode is required to start the relay host.</string>
     <string name="advanced_settings_title">Advanced settings</string>
-    <string name="advanced_settings_tooltip">Codec, frame size, transport, and trusted reconnect settings for the active direction.</string>
+    <string name="advanced_settings_tooltip">Codec, frame size, transport, and trusted reconnect settings for the active mode.</string>
 
     <!-- Receiver tab -->
-    <string name="receiver_host_address_label">Host address</string>
+    <string name="receiver_host_address_label">Peer address</string>
     <string name="receiver_host_address_hint">192.168.1.20:48123</string>
-    <string name="receiver_host_address_tooltip">IP and port of the desktop relay host. Use Scan QR to fill automatically.</string>
+    <string name="receiver_host_address_tooltip">IP and port of the relay peer. Use Scan QR to fill automatically.</string>
     <string name="receiver_pin_label">Pairing PIN</string>
     <string name="receiver_pin_tooltip">Six-digit PIN set on the relay host. Required for first pairing.</string>
     <string name="receiver_codec_label">Codec</string>
@@ -58,9 +64,9 @@
     <string name="receiver_trusted_wifi_tooltip">USB tethering is always allowed. Enable this to also auto-reconnect over Wi-Fi.</string>
     <string name="receiver_trusted_hint">USB tethering is enabled by default; LAN, Wi-Fi, and ADB remain opt-in.</string>
     <string name="receiver_scan_qr">Scan QR</string>
-    <string name="receiver_scan_qr_tooltip">Open camera to scan the desktop host QR code.</string>
-    <string name="phone_source_title">Audio source</string>
-    <string name="phone_source_tooltip">Choose what the phone sends to the desktop.</string>
+    <string name="receiver_scan_qr_tooltip">Open camera to scan the relay peer QR code.</string>
+    <string name="phone_source_title">Send source</string>
+    <string name="phone_source_tooltip">Choose what this device sends to the relay peer.</string>
     <string name="phone_source_microphone">Microphone</string>
     <string name="phone_source_playback">Device playback</string>
     <string name="phone_source_playback_hint">Device playback capture requires Android 10+ and screen/audio capture consent.</string>
@@ -93,14 +99,14 @@
     <string name="emitter_playback_hint">Device playback capture requires audio-recording permission but captures system audio instead of the microphone. You will be asked to allow screen/audio capture.</string>
     <string name="emitter_playback_call_audio_hint">Call and voice-chat audio (Discord, WhatsApp, Meet, phone calls) cannot be captured on Android: those apps play through the protected voice-communication channel, which the OS does not let any app record. Media, games, and browser audio work. To carry a call, emit this device\'s microphone instead, or run the call on the desktop.</string>
     <string name="emitter_grant_consent">Grant capture consent</string>
-    <string name="emitter_start_host">Start host</string>
-    <string name="emitter_stop_host">Stop host</string>
-    <string name="emitter_host_status">Host: %1$s  •  Audio: %2$s</string>
+    <string name="emitter_start_host">Start Receiver</string>
+    <string name="emitter_stop_host">Stop Receiver</string>
+    <string name="emitter_host_status">Receiver: %1$s  •  Audio: %2$s</string>
     <string name="emitter_listening_port">Listening on port %1$d</string>
     <string name="emitter_level">Level: %1$d%%</string>
     <string name="emitter_capture_label">Capture: %1$s</string>
     <string name="emitter_reachable_title">Reachable at</string>
-    <string name="emitter_reachable_tooltip">Address clients should connect to. Share via QR on desktop.</string>
+    <string name="emitter_reachable_tooltip">Address emitters should connect to. Share via QR.</string>
     <string name="emitter_active_sessions">Active sessions</string>
     <string name="emitter_regenerate_pin_desc">Generate a new random PIN</string>
 
@@ -108,10 +114,10 @@
     <string name="discover_start">Start discovery</string>
     <string name="discover_stop">Stop discovery</string>
     <string name="discover_start_tooltip">Browse for relay peers via mDNS and USB subnet probes.</string>
-    <string name="discover_empty">No relay hosts found yet. Keep discovery running while the host advertises; USB tethers are scanned automatically.</string>
+    <string name="discover_empty">No relay peers found yet. Keep discovery running while a receiver advertises; USB tethers are scanned automatically.</string>
     <string name="discover_connect">Connect</string>
-    <string name="discover_connect_tooltip">Use this desktop host for the Phone → PC direction.</string>
-    <string name="discover_connect_direction_hint">Switch to Phone → PC to connect to a discovered desktop host.</string>
+    <string name="discover_connect_tooltip">Connect to this trusted or discovered relay peer as an Emitter.</string>
+    <string name="discover_connect_direction_hint">Switch to Emitter mode to connect to a relay peer.</string>
 
     <!-- USB banner -->
     <string name="relay_usb_detected">USB tethering detected: %1$s · %2$s — preferred automatically</string>
@@ -138,7 +144,7 @@
     <string name="relay_error_native_create">Unable to create the native relay handle.</string>
     <string name="relay_connected">Connected</string>
     <string name="relay_error_connect_failed">Connection failed</string>
-    <string name="relay_error_microphone_permission">Microphone permission is required to capture phone audio. Audio was not started.</string>
+    <string name="relay_error_microphone_permission">Microphone permission is required for the selected capture source. Audio was not started.</string>
     <string name="relay_disconnected">Disconnected</string>
     <string name="relay_validation_missing_pin">Enter a pairing PIN.</string>
     <string name="relay_host_starting">Starting relay host…</string>

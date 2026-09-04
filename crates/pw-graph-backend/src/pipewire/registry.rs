@@ -1,4 +1,6 @@
 use super::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Mirror the daemon's registry into [`RegistryState`].
 ///
@@ -102,6 +104,110 @@ pub(super) fn install_registry_listener(
         .register()
 }
 
+/// A PipeWire metadata object and its listener must live together. The
+/// listener callback is invoked on the same thread loop as the registry, so an
+/// Rc-backed collection is sufficient and avoids putting raw PipeWire
+/// proxies behind a cross-thread mutex.
+pub(super) struct MetadataBinding {
+    /// Drop the listener before its metadata proxy.
+    pub(super) listener: pw::metadata::MetadataListener,
+    pub(super) metadata: pw::metadata::Metadata,
+}
+
+pub(super) type MetadataBindings = Rc<RefCell<Vec<(u32, MetadataBinding)>>>;
+
+/// Subscribe to WirePlumber's `default` metadata object. The registry
+/// listener is deliberately separate from the graph listener because binding
+/// a metadata proxy is a PipeWire operation and the graph callback must stay
+/// a small state mirror.
+pub(super) fn install_default_metadata_listener(
+    registry: &pw::registry::Registry,
+    state: &Arc<Mutex<RegistryState>>,
+    registry_dirty: &Arc<AtomicBool>,
+) -> (pw::registry::Listener, MetadataBindings) {
+    let bindings = Rc::new(RefCell::new(Vec::new()));
+    // Registry callbacks require a `'static` closure, while the registry is
+    // owned by PipewireDriver and outlives this listener. Store its address as
+    // an integer so the callback does not acquire a misleading Send/Sync
+    // bound; it is only dereferenced on the PipeWire loop thread.
+    let registry_address = registry as *const pw::registry::Registry as usize;
+    let bindings_for_global = bindings.clone();
+    let state_for_global = state.clone();
+    let dirty_for_global = registry_dirty.clone();
+    let bindings_for_remove = bindings.clone();
+    let state_for_remove = state.clone();
+    let dirty_for_remove = registry_dirty.clone();
+    let listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if !matches!(global.type_, pw::types::ObjectType::Metadata) {
+                return;
+            }
+            let is_default = global
+                .props
+                .and_then(|props| props.get("metadata.name"))
+                .map_or(true, |name| name == "default");
+            if !is_default {
+                return;
+            }
+            let metadata = unsafe {
+                (&*(registry_address as *const pw::registry::Registry))
+                    .bind::<pw::metadata::Metadata, _>(global)
+            };
+            let Ok(metadata) = metadata else {
+                return;
+            };
+            let state_for_property = state_for_global.clone();
+            let dirty_for_property = dirty_for_global.clone();
+            let metadata_listener = metadata
+                .add_listener_local()
+                .property(move |_subject, key, _type, value| {
+                    let Some(key) = key else {
+                        return 0;
+                    };
+                    let Ok(mut state) = state_for_property.lock() else {
+                        return 0;
+                    };
+                    match key {
+                        "default.audio.source" => {
+                            state.default_source = parse_default_device(value);
+                        }
+                        "default.audio.sink" => {
+                            state.default_sink = parse_default_device(value);
+                        }
+                        _ => return 0,
+                    }
+                    dirty_for_property.store(true, Ordering::Relaxed);
+                    0
+                })
+                .register();
+            bindings_for_global.borrow_mut().push((
+                global.id,
+                MetadataBinding {
+                    listener: metadata_listener,
+                    metadata,
+                },
+            ));
+        })
+        .global_remove(move |id| {
+            let removed = {
+                let mut bindings = bindings_for_remove.borrow_mut();
+                let before = bindings.len();
+                bindings.retain(|(binding_id, _)| *binding_id != id);
+                bindings.len() != before
+            };
+            if removed {
+                if let Ok(mut state) = state_for_remove.lock() {
+                    state.default_source = None;
+                    state.default_sink = None;
+                    dirty_for_remove.store(true, Ordering::Relaxed);
+                }
+            }
+        })
+        .register();
+    (listener, bindings)
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct NodeRecord {
     pub(super) name: String,
@@ -127,11 +233,56 @@ pub(super) struct LinkRecord {
     pub(super) input_port: u32,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct DefaultDevice {
+    pub(super) name: String,
+    pub(super) serial: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct RegistryState {
     pub(super) nodes: BTreeMap<u32, NodeRecord>,
     pub(super) ports: BTreeMap<u32, PortRecord>,
     pub(super) links: BTreeMap<u32, LinkRecord>,
+    pub(super) default_source: Option<DefaultDevice>,
+    pub(super) default_sink: Option<DefaultDevice>,
+}
+
+/// Parse WirePlumber's `Spa:String:JSON` default-device value. A few older
+/// metadata providers send the node name as a plain string, so that form is
+/// accepted too; an absent value means the default was cleared.
+pub(super) fn parse_default_device(value: Option<&str>) -> Option<DefaultDevice> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(object) = serde_json::from_str::<serde_json::Value>(value) {
+        if let Some(object) = object.as_object() {
+            let name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| object.get("node.name").and_then(serde_json::Value::as_str))?;
+            let serial = object.get("serial").and_then(|serial| {
+                serial
+                    .as_u64()
+                    .or_else(|| serial.as_str().and_then(|value| value.parse().ok()))
+            });
+            return Some(DefaultDevice {
+                name: name.to_owned(),
+                serial,
+            });
+        }
+        if let Some(name) = object.as_str() {
+            return Some(DefaultDevice {
+                name: name.to_owned(),
+                serial: None,
+            });
+        }
+    }
+    Some(DefaultDevice {
+        name: value.trim_matches('"').to_owned(),
+        serial: None,
+    })
 }
 
 pub(super) fn classify_port_type(media_type: &str, node_media_class: Option<&str>) -> PortType {

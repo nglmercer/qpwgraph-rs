@@ -198,11 +198,11 @@ class RelayService : Service() {
             if (workers == 0) {
                 throw IllegalArgumentException("no audio direction was requested")
             }
-            Log.i(TAG, "HOST AUDIO START mode=${request.mode} handle=${request.handle} captureSource=${request.captureSource} sampleRate=${request.sampleRate} channels=${request.channels} frameMs=${request.frameMs}")
+            Log.i(TAG, "RELAY AUDIO START mode=${request.mode} handle=${request.handle} role=${request.role} source=${request.captureSource} sampleRate=${request.sampleRate} channels=${request.channels} frameMs=${request.frameMs}")
             startForegroundForRequest(request)
             startAudio(request)
         } catch (error: Throwable) {
-            Log.e(TAG, "HOST AUDIO FAILURE during start: ${error.message}", error)
+            Log.e(TAG, "RELAY AUDIO FAILURE during start: ${error.message}", error)
             failAudio(request, "could not start relay audio: ${error.message ?: error.javaClass.simpleName}")
         }
         return START_NOT_STICKY
@@ -288,7 +288,7 @@ class RelayService : Service() {
             }
             // Ensure mediaPlayback is always present for modern Android
             if (type == 0) type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-            Log.i(TAG, "HOST LISTENING? starting foreground type=$type mode=${request.mode}")
+            Log.i(TAG, "RELAY FOREGROUND type=$type mode=${request.mode} role=${request.role}")
             startForeground(NOTIFICATION_ID, notification(), type)
         } else {
             startForeground(NOTIFICATION_ID, notification())
@@ -302,13 +302,16 @@ class RelayService : Service() {
             check(running.get() && activeRequest === request) { "relay audio service is stopping" }
             val captureSource = request.captureSource.lowercase()
             val isDevicePlayback = captureSource == "device_playback" || captureSource == "playback" || captureSource == "media"
-            Log.i(TAG, "Capture starting source=$captureSource isDevicePlayback=$isDevicePlayback mode=${request.mode}")
+            Log.i(TAG, "Emitter capture starting source=$captureSource isDevicePlayback=$isDevicePlayback mode=${request.mode}")
 
-            // RECORD_AUDIO is required for both MIC and playback capture
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
-                PackageManager.PERMISSION_GRANTED
+            // MediaProjection consent authorizes device-playback capture.
+            // RECORD_AUDIO is required only for a microphone source; asking
+            // for it for playback capture unnecessarily blocks Emitter mode.
+            if (!isDevicePlayback &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+                    PackageManager.PERMISSION_GRANTED
             ) {
-                throw SecurityException("the audio recording permission has not been granted")
+                throw SecurityException("the microphone permission has not been granted")
             }
 
             recorder = if (isDevicePlayback) {
@@ -336,7 +339,7 @@ class RelayService : Service() {
             var captureSamplesSubmitted = 0L
             var captureSamplesAccepted = 0L
             var captureSamplesDropped = 0L
-            Log.i(TAG, "HOST AUDIO RUNNING capture source=$captureSource quantum=$quantum")
+            Log.i(TAG, "Emitter audio running source=$captureSource quantum=$quantum")
             workerReady(request)
             while (running.get() && activeRequest === request) {
                 val count = recorder.read(pcm, 0, pcm.size)
@@ -377,7 +380,7 @@ class RelayService : Service() {
         } catch (error: Throwable) {
             if (running.get()) {
                 val prefix = if (request.captureSource.lowercase().contains("playback")) "device playback audio failed" else "microphone audio failed"
-                Log.e(TAG, "HOST AUDIO FAILURE $prefix: ${error.message}", error)
+                Log.e(TAG, "Emitter audio failure $prefix: ${error.message}", error)
                 failAudio(request, "$prefix: ${error.message ?: error.javaClass.simpleName}")
             }
         } finally {
@@ -430,7 +433,7 @@ class RelayService : Service() {
         // Handle revocation
         projection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
-                Log.w(TAG, "HOST AUDIO STOP Device playback capture stopped: projection revoked (bind=$projection)")
+                Log.w(TAG, "Emitter capture stopped: projection revoked (bind=$projection)")
                 if (activeRequest === request && running.get()) {
                     failAudio(request, "Device playback capture stopped: projection revoked")
                 }

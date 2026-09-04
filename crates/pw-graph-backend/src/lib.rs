@@ -303,6 +303,8 @@ mod tests {
                 transport: Default::default(),
                 direction: RelayDirection::MobileToDesktop,
                 direction_generation: 0,
+                mode: RelayMode::Receiver,
+                mode_generation: 0,
             })
             .expect("relay host should start");
         assert!(port > 0, "an ephemeral control port should be bound");
@@ -395,6 +397,8 @@ mod tests {
                 transport: Default::default(),
                 direction: RelayDirection::MobileToDesktop,
                 direction_generation: 0,
+                mode: RelayMode::Receiver,
+                mode_generation: 0,
             })
             .expect("hosting works on a non-default endpoint");
         assert!(port > 0);
@@ -669,6 +673,8 @@ mod tests {
                 transport: Default::default(),
                 direction: RelayDirection::MobileToDesktop,
                 direction_generation: 0,
+                mode: RelayMode::Receiver,
+                mode_generation: 0,
             })
             .expect("relay host should start");
         assert!(port > 0);

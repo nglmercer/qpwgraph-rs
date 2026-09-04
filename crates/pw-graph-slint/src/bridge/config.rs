@@ -3,21 +3,24 @@ use std::time::{Duration, Instant};
 
 use super::app::Application;
 use super::patchbay::activate_patchbay;
-use super::relay::{
-    handle_relay_direction_change, relay_codec_from_index, relay_direction_from_tab,
-    relay_frame_from_index,
-    relay_transport_from_index,
-};
 #[cfg(feature = "relay")]
-use super::relay::relay_direction_tab;
+use super::relay::relay_mode_tab;
+use super::relay::{
+    handle_relay_direction_change, relay_codec_from_index, relay_frame_from_index,
+    relay_mode_from_tab, relay_transport_from_index,
+};
 use super::utils::{language_code, localized_meter_policy, meter_policy_from_index};
 use super::MainWindow;
+#[cfg(feature = "relay")]
+use pw_graph_backend::{RelayEndpointInfo, RelayReceiveSink, RelaySendSource};
 
 pub(crate) fn read_window_state(window: &MainWindow, application: &mut Application) {
     #[cfg(feature = "relay")]
     if let Some(direction) = application.relay_direction_ui_sync.take() {
         if window.get_relay_tab() < 2 {
-            window.set_relay_tab(relay_direction_tab(direction));
+            window.set_relay_tab(relay_mode_tab(
+                pw_graph_config::RelayMode::from_audio_direction(direction),
+            ));
         }
     }
     let patchbay_was_activated = application.config.patchbay_activated;
@@ -58,36 +61,61 @@ pub(crate) fn read_window_state(window: &MainWindow, application: &mut Applicati
     application.config.relay_client_target = window.get_relay_client_target().to_string();
     application.config.relay_client_pin = window.get_relay_client_pin().to_string();
     application.config.relay_auto_connect_trusted = window.get_relay_auto_connect_trusted();
-    let old_direction = application.config.relay_direction;
-    let next_direction =
-        relay_direction_from_tab(window.get_relay_tab(), application.config.relay_direction);
-    if next_direction != old_direction {
-        application.config.relay_direction = next_direction;
-        application.config.relay_direction_generation = application
-            .config
-            .relay_direction_generation
-            .saturating_add(1);
-        handle_relay_direction_change(application, old_direction, next_direction);
+    let old_mode = application.config.relay_mode;
+    let next_mode = relay_mode_from_tab(window.get_relay_tab(), old_mode);
+    if next_mode != old_mode {
+        application.config.set_relay_mode(
+            next_mode,
+            application.config.relay_mode_generation.saturating_add(1),
+        );
+        handle_relay_direction_change(application, old_mode, next_mode);
     }
     application.config.relay_codec = relay_codec_from_index(window.get_relay_codec_index()).into();
     application.config.relay_frame_ms = relay_frame_from_index(window.get_relay_frame_index());
     application.config.relay_transport =
         relay_transport_from_index(window.get_relay_transport_index()).into();
-    #[cfg(all(feature = "relay", target_os = "windows"))]
+    #[cfg(feature = "relay")]
     {
-        let choices = application.source.windows_relay_endpoint_choices();
-        if !choices.is_empty() {
-            application.config.relay_capture_endpoint_id = relay_endpoint_id(
-                window.get_relay_capture_endpoint_index(),
-                &choices,
-                application.config.relay_capture_endpoint_id.as_deref(),
+        let send_options = application.source.relay_send_sources();
+        let receive_options = application.source.relay_receive_sinks();
+        let mut send_changed = false;
+        let mut receive_changed = false;
+        if !send_options.is_empty() {
+            let selected = relay_selector_id(
+                window.get_relay_send_source_index(),
+                &send_options,
+                &application.config.relay_send_source,
             );
-            application.config.relay_playback_endpoint_id = relay_endpoint_id(
-                window.get_relay_playback_endpoint_index(),
-                &choices,
-                application.config.relay_playback_endpoint_id.as_deref(),
-            );
+            send_changed = selected != application.config.relay_send_source;
+            application.config.relay_send_source = selected;
         }
+        if !receive_options.is_empty() {
+            let selected = relay_selector_id(
+                window.get_relay_receive_sink_index(),
+                &receive_options,
+                &application.config.relay_receive_sink,
+            );
+            receive_changed = selected != application.config.relay_receive_sink;
+            application.config.relay_receive_sink = selected;
+        }
+
+        if application.source.relay_available()
+            && (!application.relay_route_preferences_applied || send_changed || receive_changed)
+        {
+            if let Err(error) = application
+                .source
+                .relay_set_send_source(relay_send_source(&application.config.relay_send_source))
+            {
+                application.status = application.tf("relay.error", &[("error", error)]);
+            }
+            if let Err(error) = application
+                .source
+                .relay_set_receive_sink(relay_receive_sink(&application.config.relay_receive_sink))
+            {
+                application.status = application.tf("relay.error", &[("error", error)]);
+            }
+        }
+        application.relay_route_preferences_applied = true;
     }
 
     let meter_policy = meter_policy_from_index(window.get_meter_policy_index());
@@ -112,20 +140,44 @@ pub(crate) fn read_window_state(window: &MainWindow, application: &mut Applicati
     }
 }
 
-#[cfg(all(feature = "relay", target_os = "windows"))]
-fn relay_endpoint_id(
-    index: i32,
-    choices: &[(String, String)],
-    current: Option<&str>,
-) -> Option<String> {
-    if index <= 0 {
-        return None;
-    }
+#[cfg(feature = "relay")]
+fn relay_selector_id(index: i32, choices: &[RelayEndpointInfo], current: &str) -> String {
     choices
-        .get((index - 1) as usize)
-        .map(|(id, _)| id.clone())
-        .filter(|id| !id.is_empty())
-        .or_else(|| current.map(str::to_owned))
+        .get(index.max(0) as usize)
+        .map(|endpoint| endpoint.id.clone())
+        .unwrap_or_else(|| current.to_owned())
+}
+
+#[cfg(feature = "relay")]
+fn relay_send_source(selector: &str) -> RelaySendSource {
+    match selector {
+        "default-input" | "" => RelaySendSource::DefaultInput,
+        "default-output-monitor" => RelaySendSource::DefaultOutputMonitor,
+        "manual" => RelaySendSource::ManualGraph,
+        selector => selector
+            .strip_prefix("input:")
+            .map(|id| RelaySendSource::InputDevice(id.to_owned()))
+            .or_else(|| {
+                selector
+                    .strip_prefix("monitor:")
+                    .map(|id| RelaySendSource::OutputMonitor(id.to_owned()))
+            })
+            .unwrap_or_else(|| RelaySendSource::InputDevice(selector.to_owned())),
+    }
+}
+
+#[cfg(feature = "relay")]
+fn relay_receive_sink(selector: &str) -> RelayReceiveSink {
+    match selector {
+        "default-output" | "" => RelayReceiveSink::DefaultOutput,
+        "manual" => RelayReceiveSink::ManualGraph,
+        selector => RelayReceiveSink::OutputDevice(
+            selector
+                .strip_prefix("output:")
+                .unwrap_or(selector)
+                .to_owned(),
+        ),
+    }
 }
 
 fn sync_config(application: &mut Application) {

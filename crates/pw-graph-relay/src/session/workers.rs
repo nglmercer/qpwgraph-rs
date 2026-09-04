@@ -79,7 +79,13 @@ pub(super) fn spawn_session_workers_with(
     host_side: bool,
     mut spawn: impl FnMut(String, Worker) -> std::io::Result<std::thread::JoinHandle<()>>,
 ) -> Result<(), String> {
-    if host_side || record.receiving {
+    // Keep both transport workers alive for the lifetime of an authenticated
+    // session. Flow switches update `active_roles` atomically; starting and
+    // stopping threads from the control watcher would race teardown and can
+    // briefly leave two paths active. The workers themselves gate their audio
+    // work on that state, so a switch is a one-path transition without a new
+    // socket or a new cipher timeline.
+    {
         let inner = Arc::clone(inner);
         let record = Arc::clone(record);
         let socket = socket.clone();
@@ -109,7 +115,7 @@ pub(super) fn spawn_session_workers_with(
         )?;
         wait_for_worker_startup(ready_rx, &stop, id, "RX")?;
     }
-    if record.sending {
+    {
         let inner = Arc::clone(inner);
         let record = Arc::clone(record);
         let socket = socket.clone();

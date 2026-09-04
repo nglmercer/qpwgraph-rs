@@ -6,6 +6,144 @@
 
 use super::*;
 
+/// Canonical emitter negotiation state. The legacy direction state below is
+/// kept beside it for one compatibility period so an upgraded peer can still
+/// resume a session established by the previous protocol surface.
+#[derive(Clone, Debug)]
+pub(crate) struct FlowNegotiation {
+    pub local: FlowOffer,
+    pub resolved: FlowOffer,
+    pub remote: Option<FlowOffer>,
+    pub pending: Option<FlowOffer>,
+    pub sent: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowResolution {
+    pub winner: FlowOffer,
+    pub changed: bool,
+}
+
+impl FlowNegotiation {
+    fn new(local: FlowOffer, pending: bool) -> Self {
+        Self {
+            resolved: local.clone(),
+            local: local.clone(),
+            remote: None,
+            pending: pending.then_some(local),
+            sent: false,
+        }
+    }
+
+    fn queue(&mut self, offer: FlowOffer) -> Result<(), String> {
+        if !offer.is_valid() {
+            return Err("flow offer requires stable emitter and proposer ids".into());
+        }
+        if offer.proposer_id != self.local.proposer_id {
+            return Err("flow offer identity does not match the session owner".into());
+        }
+        if offer.generation < self.local.generation {
+            return Err("flow offer generation is older than the local offer".into());
+        }
+        if offer.generation == self.local.generation && offer.emitter_id != self.local.emitter_id {
+            return Err("flow changes must increment the offer generation".into());
+        }
+        if offer == self.local {
+            if self.pending.is_none() && self.resolved != offer {
+                self.pending = Some(offer);
+                self.sent = false;
+            }
+            return Ok(());
+        }
+        self.local = offer.clone();
+        self.pending = Some(offer);
+        self.sent = false;
+        Ok(())
+    }
+
+    fn pending(&self) -> Option<FlowOffer> {
+        (!self.sent).then(|| self.pending.clone()).flatten()
+    }
+
+    fn mark_sent(&mut self, offer: &FlowOffer) {
+        if self.pending.as_ref() == Some(offer) {
+            self.sent = true;
+        }
+    }
+
+    fn reset_send(&mut self) {
+        if self.pending.is_some() {
+            self.sent = false;
+        }
+    }
+
+    fn receive_offer(
+        &mut self,
+        remote: FlowOffer,
+    ) -> Result<(FlowAck, Option<FlowResolution>), String> {
+        if !remote.is_valid() {
+            return Err("flow offer requires stable emitter and proposer ids".into());
+        }
+        self.remote = Some(match self.remote.take() {
+            Some(previous) => resolve_flow_offers(&previous, &remote),
+            None => remote.clone(),
+        });
+        let candidate = resolve_flow_offers(&self.local, &remote);
+        let winner = resolve_flow_offers(&self.resolved, &candidate);
+        let changed = winner != self.resolved;
+        self.resolved = winner.clone();
+        if winner != self.local {
+            self.pending = None;
+            self.sent = false;
+        }
+        Ok((
+            FlowAck {
+                generation: winner.generation,
+                emitter_id: winner.emitter_id.clone(),
+            },
+            changed.then_some(FlowResolution { winner, changed }),
+        ))
+    }
+
+    fn receive_ack(&mut self, ack: FlowAck, authenticated_peer_id: &str) -> Option<FlowResolution> {
+        if !ack.is_valid() {
+            return None;
+        }
+        let pending = self.pending.clone()?;
+        let matches_local =
+            ack.generation == pending.generation && ack.emitter_id == pending.emitter_id;
+        let remote = FlowOffer {
+            generation: ack.generation,
+            emitter_id: ack.emitter_id,
+            proposer_id: authenticated_peer_id.to_owned(),
+        };
+        let remote_is_current = match self.remote.as_ref() {
+            Some(known) if known.generation > remote.generation => false,
+            Some(known) if known.generation == remote.generation => {
+                known.emitter_id == remote.emitter_id
+            }
+            _ => true,
+        };
+        let matches_remote =
+            !matches_local && remote_is_current && resolve_flow_offers(&pending, &remote) == remote;
+        if !matches_local && !matches_remote {
+            return None;
+        }
+        let previous = self.resolved.clone();
+        let winner = if matches_remote {
+            resolve_flow_offers(&pending, &remote)
+        } else {
+            pending
+        };
+        let winner = resolve_flow_offers(&previous, &winner);
+        let changed = winner != previous;
+        self.resolved = winner.clone();
+        self.pending = None;
+        self.sent = false;
+        Some(FlowResolution { winner, changed })
+    }
+}
+
 /// Per-session state for the authenticated direction control plane.
 ///
 /// `resolved` is the last deterministic winner. `local` is this installation's
@@ -22,6 +160,9 @@ pub(crate) struct DirectionNegotiation {
     /// channel. It stays retained until its matching acknowledgement arrives
     /// so a reconnect can resend it without losing an offline choice.
     pub sent: bool,
+    /// Canonical emitter negotiation. `None` means this record has only
+    /// spoken to a legacy peer so far.
+    pub flow: Option<FlowNegotiation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +179,57 @@ impl DirectionNegotiation {
             remote: None,
             pending: Some(local),
             sent: false,
+            flow: None,
         }
+    }
+
+    pub(crate) fn with_initial_flow(
+        local: DirectionOffer,
+        local_device_id: &str,
+        peer_id: &str,
+        local_is_emitter: bool,
+        generation: u64,
+    ) -> Self {
+        let mut state = Self::new(local);
+        let emitter_id = if local_is_emitter {
+            local_device_id
+        } else {
+            peer_id
+        };
+        let offer = FlowOffer {
+            generation,
+            emitter_id: emitter_id.to_owned(),
+            proposer_id: local_device_id.to_owned(),
+        };
+        // The initial flow is derived from the authenticated session roles;
+        // it does not need a second control round trip. Later user changes
+        // set `pending` and use the authenticated FlowOffer/FlowAck exchange.
+        state.flow = Some(FlowNegotiation::new(offer, false));
+        state
+    }
+
+    fn ensure_flow(
+        &mut self,
+        local_device_id: &str,
+        peer_id: &str,
+        local_is_emitter: bool,
+        generation: u64,
+    ) -> &mut FlowNegotiation {
+        self.flow.get_or_insert_with(|| {
+            let emitter_id = if local_is_emitter {
+                local_device_id
+            } else {
+                peer_id
+            };
+            FlowNegotiation::new(
+                FlowOffer {
+                    generation,
+                    emitter_id: emitter_id.to_owned(),
+                    proposer_id: local_device_id.to_owned(),
+                },
+                false,
+            )
+        })
     }
 
     pub(crate) fn queue(&mut self, offer: DirectionOffer) -> Result<(), String> {
@@ -119,7 +310,8 @@ impl DirectionNegotiation {
         authenticated_peer_id: &str,
     ) -> Option<DirectionResolution> {
         let pending = self.pending.clone()?;
-        let matches_local = ack.generation == pending.generation && ack.direction == pending.direction;
+        let matches_local =
+            ack.generation == pending.generation && ack.direction == pending.direction;
         let remote = DirectionOffer {
             generation: ack.generation,
             direction: ack.direction,
@@ -167,6 +359,11 @@ pub(crate) struct SessionRecord {
     pub sending: bool,
     /// This side receives audio (peer sends).
     pub receiving: bool,
+    /// Current local one-way role. The legacy booleans above describe the
+    /// handshake that created the record; this atomic is updated after an
+    /// authenticated flow switch so realtime audio paths change without
+    /// taking the session-table lock.
+    pub active_roles: AtomicU8,
     pub stop: Arc<AtomicBool>,
     /// Set by `disconnect`; the control thread sends `bye` and tears down.
     pub bye_requested: AtomicBool,
@@ -219,6 +416,157 @@ pub(crate) struct SessionRecord {
 }
 
 impl SessionRecord {
+    pub(crate) fn role_bits(roles: Roles) -> u8 {
+        (roles.emit as u8) | ((roles.receive as u8) << 1)
+    }
+
+    pub(crate) fn local_roles(&self) -> Roles {
+        match self.active_roles.load(Ordering::Acquire) {
+            1 => Roles::emit_only(),
+            2 => Roles::receive_only(),
+            3 => Roles::both(),
+            _ => Roles::default(),
+        }
+    }
+
+    pub(crate) fn set_local_roles(&self, roles: Roles) {
+        // Never publish a bidirectional active state, even if a future caller
+        // accidentally supplies one. A session is always exactly one-way.
+        let roles = if roles.is_one_way() {
+            roles
+        } else {
+            Roles::default()
+        };
+        self.active_roles
+            .store(Self::role_bits(roles), Ordering::Release);
+    }
+
+    pub(crate) fn local_device_id(&self) -> Option<String> {
+        self.direction
+            .lock()
+            .ok()
+            .map(|direction| direction.local.device_id.clone())
+    }
+
+    pub(crate) fn flow(&self) -> Option<RelayFlow> {
+        self.direction
+            .lock()
+            .ok()
+            .and_then(|direction| direction.flow.as_ref().map(|flow| flow.resolved.flow()))
+    }
+
+    pub(crate) fn local_mode(&self) -> Option<RelayMode> {
+        let local_id = self.local_device_id()?;
+        self.flow()?.mode_for(&local_id)
+    }
+
+    pub(crate) fn queue_flow_offer(&self, offer: FlowOffer) -> Result<(), String> {
+        let local_id = self
+            .local_device_id()
+            .ok_or_else(|| "flow state is locked".to_string())?;
+        let mut direction = self
+            .direction
+            .lock()
+            .map_err(|_| "flow state is locked".to_string())?;
+        let current_generation = direction
+            .flow
+            .as_ref()
+            .map(|flow| flow.local.generation)
+            .unwrap_or(direction.local.generation);
+        let local_is_emitter = self.local_roles().emit;
+        direction
+            .ensure_flow(
+                &local_id,
+                &self.peer.id,
+                local_is_emitter,
+                current_generation,
+            )
+            .queue(offer)
+    }
+
+    pub(crate) fn pending_flow_offer(&self) -> Option<FlowOffer> {
+        let local_id = self.local_device_id()?;
+        let mut direction = self.direction.lock().ok()?;
+        let current_generation = direction
+            .flow
+            .as_ref()
+            .map(|flow| flow.local.generation)
+            .unwrap_or(direction.local.generation);
+        let local_is_emitter = self.local_roles().emit;
+        direction
+            .ensure_flow(
+                &local_id,
+                &self.peer.id,
+                local_is_emitter,
+                current_generation,
+            )
+            .pending()
+    }
+
+    pub(crate) fn mark_flow_offer_sent(&self, offer: &FlowOffer) {
+        if let Ok(mut direction) = self.direction.lock() {
+            if let Some(flow) = direction.flow.as_mut() {
+                flow.mark_sent(offer);
+            }
+        }
+    }
+
+    pub(crate) fn reset_flow_offer_send(&self) {
+        if let Ok(mut direction) = self.direction.lock() {
+            if let Some(flow) = direction.flow.as_mut() {
+                flow.reset_send();
+            }
+        }
+    }
+
+    pub(crate) fn receive_flow_offer(
+        &self,
+        offer: FlowOffer,
+    ) -> Result<(FlowAck, Option<FlowResolution>), String> {
+        if offer.proposer_id != self.peer.id {
+            return Err("flow offer identity does not match the authenticated peer".into());
+        }
+        let local_id = self
+            .local_device_id()
+            .ok_or_else(|| "flow state is locked".to_string())?;
+        let mut direction = self
+            .direction
+            .lock()
+            .map_err(|_| "flow state is locked".to_string())?;
+        let current_generation = direction
+            .flow
+            .as_ref()
+            .map(|flow| flow.local.generation)
+            .unwrap_or(direction.local.generation);
+        let local_is_emitter = self.local_roles().emit;
+        direction
+            .ensure_flow(
+                &local_id,
+                &self.peer.id,
+                local_is_emitter,
+                current_generation,
+            )
+            .receive_offer(offer)
+    }
+
+    pub(crate) fn receive_flow_ack(&self, ack: FlowAck) -> Option<FlowResolution> {
+        self.direction
+            .lock()
+            .ok()?
+            .flow
+            .as_mut()?
+            .receive_ack(ack, &self.peer.id)
+    }
+
+    pub(crate) fn apply_flow(&self, flow: &RelayFlow) {
+        let Some(local_id) = self.local_device_id() else {
+            return;
+        };
+        if let Some(mode) = flow.mode_for(&local_id) {
+            self.set_local_roles(mode.roles());
+        }
+    }
+
     pub(crate) fn pending_direction_offer(&self) -> Option<DirectionOffer> {
         self.direction.lock().ok()?.pending()
     }
@@ -248,14 +596,8 @@ impl SessionRecord {
             .receive_offer(offer)
     }
 
-    pub(crate) fn receive_direction_ack(
-        &self,
-        ack: DirectionAck,
-    ) -> Option<DirectionResolution> {
-        self.direction
-            .lock()
-            .ok()?
-            .receive_ack(ack, &self.peer.id)
+    pub(crate) fn receive_direction_ack(&self, ack: DirectionAck) -> Option<DirectionResolution> {
+        self.direction.lock().ok()?.receive_ack(ack, &self.peer.id)
     }
 
     /// Mark the current control owner as gone. Calling this more than once is
@@ -403,11 +745,8 @@ mod direction_tests {
 
     #[test]
     fn a_losing_local_offer_adopts_the_authenticated_remote_ack() {
-        let mut state = DirectionNegotiation::new(offer(
-            4,
-            RelayDirection::MobileToDesktop,
-            "phone",
-        ));
+        let mut state =
+            DirectionNegotiation::new(offer(4, RelayDirection::MobileToDesktop, "phone"));
         let resolution = state.receive_ack(
             DirectionAck {
                 generation: 5,
@@ -425,11 +764,8 @@ mod direction_tests {
 
     #[test]
     fn stale_and_same_generation_direction_reversals_are_rejected() {
-        let mut state = DirectionNegotiation::new(offer(
-            3,
-            RelayDirection::DesktopToMobile,
-            "phone",
-        ));
+        let mut state =
+            DirectionNegotiation::new(offer(3, RelayDirection::DesktopToMobile, "phone"));
         assert!(state
             .queue(offer(2, RelayDirection::MobileToDesktop, "phone"))
             .is_err());
@@ -440,11 +776,8 @@ mod direction_tests {
 
     #[test]
     fn a_newer_remote_offer_cannot_be_reversed_by_an_older_message() {
-        let mut state = DirectionNegotiation::new(offer(
-            2,
-            RelayDirection::DesktopToMobile,
-            "phone",
-        ));
+        let mut state =
+            DirectionNegotiation::new(offer(2, RelayDirection::DesktopToMobile, "phone"));
         let (ack, resolution) = state
             .receive_offer(offer(1, RelayDirection::MobileToDesktop, "desktop"))
             .unwrap();

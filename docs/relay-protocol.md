@@ -1,7 +1,7 @@
 # Relay wire protocol, version 3
 
-The relay carries audio between this machine and a peer (typically a phone)
-over the local network. It uses two channels:
+The relay carries audio between this installation and a peer over the local
+network. It uses two channels:
 
 - a **control channel** over TCP, carrying length-prefixed JSON frames,
 - an **audio channel** over UDP, carrying one encoded codec frame per
@@ -46,9 +46,9 @@ probe and must be shared through mDNS or a manual address.
 ADB/USB debugging is separate from USB tether networking, but protocol v3 also
 has an explicit `adb` transport. It uses the normal TCP listener for control
 and a second authenticated TCP connection for length-framed encrypted audio,
-so it does not depend on UDP. Android-client-to-desktop-host uses
-`adb reverse`; desktop-client-to-Android-host uses `adb forward`. ADB mode is
-explicit and has no mDNS/USB peer discovery.
+so it does not depend on UDP. The connecting endpoint uses `adb reverse` when
+the remote host is the desktop and `adb forward` when the remote host is
+Android. ADB mode is explicit and has no mDNS/USB peer discovery.
 
 Normal UDP sockets are bound to the selected local interface. A wildcard
 (`0.0.0.0`) is used only by `Auto` when no classified relay-capable interface
@@ -200,7 +200,7 @@ Frames larger than 64 KiB are refused; these are small JSON documents.
 
 Message types after pairing: `PairOk` (audio port and session id),
 `SessionStart` / `SessionReady` (negotiated codec and geometry),
-`DirectionOffer` / `DirectionAck` (authenticated hot-switch negotiation),
+`FlowOffer` / `FlowAck` (authenticated hot-switch negotiation),
 `TrustEnroll` / `TrustAccepted` / `TrustRejected`, `Keepalive` (every 2 s, with a 6 s
 timeout), `ControlHint` (volume and mute hints), `ResumeHello` /
 `ResumeChallenge` / `ResumeProof` / `ResumeOk`, and `Bye`. Trusted handshakes
@@ -209,54 +209,66 @@ use the cleartext `TrustedHello` / `TrustedChallenge` / `TrustedProof` /
 An unrecognised `type` decodes as `Unknown` rather than killing the
 connection, so a newer peer can add messages.
 
-### Direction-first sessions
+### Emitter/Receiver sessions
 
-The public configuration names one audio direction, not a client role:
+The public configuration has exactly two local modes:
 
-| Direction | Client-side wire role | Host-side wire role | Audio path |
-| --- | --- | --- | --- |
-| `mobile_to_desktop` | `emit` only | `receive` only | phone → desktop |
-| `desktop_to_mobile` | `receive` only | `emit` only | desktop → phone |
+| Mode | Local operation | Typical connection shape |
+| --- | --- | --- |
+| `emitter` | obtain PCM from a selected local source and send it | connect to a `receiver` host |
+| `receiver` | receive peer PCM and deliver it to a selected local output | host for an `emitter` client |
 
 The `roles` fields in `Hello`, `TrustedHello`, and `SessionStart` are the
-derived wire representation of that direction. An active session MUST contain
-exactly one of `emit` and `receive`; `both` and an empty role set are rejected
-before audio workers start. Discovery advertisements may describe capability,
-but they do not authorize a bidirectional audio session.
+derived wire representation of that mode. An active session MUST contain
+exactly one emitter and one receiver. `both` and an empty role set are rejected
+before audio workers start; discovery advertisements may describe capability,
+but they never authorize a bidirectional audio session.
 
-After `SessionReady`, either authenticated peer may propose a direction change.
+The canonical flow is identified by the stable installation ID of the emitter.
+After `SessionReady`, either authenticated peer may propose a new flow.
 The messages are sealed control frames and use these JSON shapes:
 
 ```json
-{"type":"direction_offer","generation":42,"direction":"mobile_to_desktop","device_id":"phone-installation"}
-{"type":"direction_ack","generation":42,"direction":"mobile_to_desktop"}
+{"type":"flow_offer","generation":42,"emitter_id":"installation-a","proposer_id":"installation-a"}
+{"type":"flow_ack","generation":42,"emitter_id":"installation-a"}
 ```
 
-An offer is valid only when its stable `device_id` is non-empty and its
-direction is one of the two canonical values. Peers resolve offers by comparing
-the generation first; at the same generation, the lexicographically greater
-stable device ID wins. A same-ID tie is resolved deterministically by the
-direction enum order. The loser adopts the winning direction and acknowledges
-the resolved generation/direction. Stale generations and a second direction
-for an already accepted generation are ignored or rejected; they cannot reverse
-a newer authenticated choice.
+An offer is valid only when both IDs are non-empty. Peers resolve offers by
+comparing the generation first; at the same generation, the lexicographically
+greater stable proposer ID wins. The emitter ID is a final deterministic
+fallback for duplicated or malformed proposals. The winner's emitter is
+authoritative, the loser adopts it, and the resulting local modes are derived
+from that one emitter ID. No resolution can activate both directions.
 
-Direction changes are two-phase. The initiator persists the desired direction
-and monotonically increasing generation, sends `DirectionOffer`, and keeps its
-current audio endpoint alive until the matching `DirectionAck` or a resolved
-winning offer arrives. Both embeddings then stop the old worker, rebuild the
-endpoint with the resolved one-way roles, and bring up the new host/client
-side. The UI remains in `Switching` until that handoff completes. A timeout
-tears down the old endpoint and retries the persisted direction safely rather
-than running two audio engines at once.
+Flow changes are two-phase. The initiator persists the desired mode and a
+monotonically increasing generation, sends `FlowOffer`, and keeps its current
+audio endpoint alive until the matching `FlowAck` or a resolved winning offer
+arrives. Both embeddings then stop the old worker/route/endpoint and start the
+new one-way path. The UI remains in `Switching` until that handoff completes;
+a timeout tears down the old path safely rather than running two audio engines.
 
 The pending offer remains in the authenticated session record until its exact
 acknowledgement is received. If the control link is resumed or replaced, the
 offer is sent again on the new sealed channel before normal keepalive traffic;
 this makes a switch requested immediately before a network/process interruption
-survive reconnect. If the old session is gone entirely, the persisted direction
-and generation are included in the next trusted connection and the same
-deterministic resolution rules select one host and one emitter.
+survive reconnect. If the old session is gone entirely, the persisted mode and
+generation are included in the next trusted connection, and the same
+deterministic rules select one emitter and one receiver.
+
+### Legacy direction compatibility
+
+`DirectionOffer` / `DirectionAck` and the old `mobile_to_desktop` /
+`desktop_to_mobile` values remain readable for one migration period. They are
+translated at the platform boundary only:
+
+| Legacy value | Desktop local mode | Android local mode |
+| --- | --- | --- |
+| `mobile_to_desktop` | `receiver` | `emitter` |
+| `desktop_to_mobile` | `emitter` | `receiver` |
+
+New integrations MUST use `RelayMode`, `RelayFlow`, `FlowOffer`, and `FlowAck`.
+Legacy direction fields are never used to create a bidirectional session and
+are not written back to new configuration files.
 
 ### Negotiated parameters
 

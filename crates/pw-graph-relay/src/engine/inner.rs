@@ -579,7 +579,7 @@ impl EngineInner {
         };
         let mut accepted = true;
         let mut found = false;
-        for record in snapshot.iter().filter(|record| record.sending) {
+        for record in snapshot.iter().filter(|record| record.local_roles().emit) {
             found = true;
             let converted = if realtime {
                 record.capture_convert.try_lock().ok()
@@ -634,7 +634,10 @@ impl EngineInner {
         };
         let mut depth = 0usize;
         let mut target = 0usize;
-        for record in sessions.values().filter(|record| record.receiving) {
+        for record in sessions
+            .values()
+            .filter(|record| record.local_roles().receive)
+        {
             depth += record.incoming.len();
             target += record.incoming.target_depth();
         }
@@ -675,7 +678,9 @@ impl EngineInner {
         // Iterate the snapshot directly. Collecting the receiving sessions into a
         // `Vec` first — as this used to — allocated on the PipeWire process
         // callback, on a path whose entire contract is that it does not.
-        let mut receiving = snapshot.iter().filter(|record| record.receiving);
+        let mut receiving = snapshot
+            .iter()
+            .filter(|record| record.local_roles().receive);
         let Some(first) = receiving.next() else {
             return 0;
         };
@@ -823,8 +828,8 @@ impl EngineInner {
                             peer: record.peer.clone(),
                             roles: record.roles,
                             codec: record.codec,
-                            sending: record.sending,
-                            receiving: record.receiving,
+                            sending: record.local_roles().emit,
+                            receiving: record.local_roles().receive,
                             transport: if audio_over_tcp { "adb-tcp" } else { "udp" }.into(),
                             link: link.into(),
                             local_addr,
@@ -832,6 +837,8 @@ impl EngineInner {
                             control_state,
                             audio_channel_state: audio_channel_state.into(),
                             trusted,
+                            mode: record.local_mode(),
+                            flow: record.flow(),
                         }
                     })
                     .collect()

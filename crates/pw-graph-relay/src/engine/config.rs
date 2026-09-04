@@ -27,10 +27,17 @@ pub struct EngineConfig {
     /// Direction this installation proposes when a session is established or
     /// switched. Hosts use this directly; clients normally keep it aligned
     /// with [`Roles::direction`].
+    #[deprecated(note = "use `mode` and `mode_generation` for new integrations")]
     pub direction: RelayDirection,
     /// Monotonic generation persisted by the embedding application. It lets a
     /// trusted reconnect carry a direction choice made while offline.
     pub direction_generation: u64,
+    /// Platform-neutral local role. This is the canonical configuration value
+    /// for new integrations; `direction` remains synchronized as a wire and
+    /// trusted-peer compatibility shim.
+    pub mode: RelayMode,
+    /// Monotonic generation associated with [`Self::mode`].
+    pub mode_generation: u64,
     /// Preferred transport link (`auto` picks the best available).
     pub transport: TransportPreference,
     /// Sample rate of this machine's own audio endpoints. Sessions are
@@ -74,6 +81,8 @@ impl fmt::Debug for EngineConfig {
             .field("client_roles", &self.client_roles)
             .field("direction", &self.direction)
             .field("direction_generation", &self.direction_generation)
+            .field("mode", &self.mode)
+            .field("mode_generation", &self.mode_generation)
             .field("transport", &self.transport)
             .field("local_sample_rate", &self.local_sample_rate)
             .field("local_channels", &self.local_channels)
@@ -101,6 +110,8 @@ impl Default for EngineConfig {
             client_roles: Roles::emit_only(),
             direction: RelayDirection::MobileToDesktop,
             direction_generation: 0,
+            mode: RelayMode::Emitter,
+            mode_generation: 0,
             transport: TransportPreference::Auto,
             local_sample_rate: 48_000,
             local_channels: 1,

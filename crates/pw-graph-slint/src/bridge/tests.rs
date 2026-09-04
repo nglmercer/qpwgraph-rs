@@ -72,6 +72,8 @@ pub(super) fn demo_application() -> Application {
         relay_direction_switch: None,
         #[cfg(feature = "relay")]
         relay_direction_ui_sync: None,
+        #[cfg(feature = "relay")]
+        relay_route_preferences_applied: false,
     }
 }
 
@@ -638,9 +640,9 @@ const READABLE_BUTTON_WIDTH: f32 = 60.0;
 fn relay_peer_rows_give_their_actions_a_readable_label() {
     let harness = CanvasHarness::new(ConnectMode::Advanced);
     harness.window.set_show_relay(true);
-    // Discovery and client connections live under the PC → Phone direction;
-    // tab 0 is now the Phone → PC host direction.
-    harness.window.set_relay_tab(1);
+    // Discovery and client connections live under the Emitter tab; the
+    // Receiver tab is reserved for hosting.
+    harness.window.set_relay_tab(0);
     harness
         .window
         .set_relay_rows(ModelRc::from(Rc::new(VecModel::from(vec![RelayRow {
@@ -1485,6 +1487,7 @@ fn refused_trusted_candidate_is_skipped_until_rediscovered() {
             secret: hex_encode(&[7u8; 32]),
             name: "phone".into(),
             address: "192.0.2.10:48123".into(),
+            preferred_mode: None,
         });
     let peer = RelayPeerInfo {
         id: "phone-id".into(),
@@ -1499,22 +1502,14 @@ fn refused_trusted_candidate_is_skipped_until_rediscovered() {
 
     // A refused dial marks the address; without a re-announce the retry
     // loop must stop chasing it.
-    super::relay::note_trusted_candidate_refused(
-        &mut application,
-        "phone-id",
-        "192.0.2.10:48123",
-    );
+    super::relay::note_trusted_candidate_refused(&mut application, "phone-id", "192.0.2.10:48123");
     assert!(!super::relay::trusted_candidate_allowed(
         &mut application,
         &peer
     ));
 
     // Discovery re-announcing (or a successful session) revives it.
-    super::relay::clear_trusted_candidate_refused(
-        &mut application,
-        "phone-id",
-        "192.0.2.10:48123",
-    );
+    super::relay::clear_trusted_candidate_refused(&mut application, "phone-id", "192.0.2.10:48123");
     assert!(super::relay::trusted_candidate_allowed(
         &mut application,
         &peer
@@ -1537,11 +1532,7 @@ fn trust_marks_are_scoped_per_peer_and_address() {
         addr: "192.0.2.99:48123".parse().unwrap(),
         ..refused.clone()
     };
-    super::relay::note_trusted_candidate_refused(
-        &mut application,
-        "phone-id",
-        "192.0.2.10:48123",
-    );
+    super::relay::note_trusted_candidate_refused(&mut application, "phone-id", "192.0.2.10:48123");
     assert!(!super::relay::trusted_candidate_allowed(
         &mut application,
         &refused
@@ -1571,6 +1562,7 @@ fn reenrollment_dialog_applies_only_to_first_contact() {
             secret: hex_encode(&[7u8; 32]),
             name: "phone".into(),
             address: "192.0.2.10:48123".into(),
+            preferred_mode: None,
         });
     // An already-stored peer rotating its secret re-accepts silently; the
     // dialog is reserved for first contact.

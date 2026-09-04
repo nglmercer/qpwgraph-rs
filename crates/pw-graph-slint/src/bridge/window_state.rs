@@ -118,7 +118,7 @@ pub(super) fn apply_window_state(
     ));
     window.set_relay_auto_connect_trusted(application.config.relay_auto_connect_trusted);
     if window.get_relay_tab() < 2 {
-        window.set_relay_tab(relay_direction_tab(application.config.relay_direction));
+        window.set_relay_tab(relay_mode_tab(application.config.relay_mode));
     }
     window.set_relay_codec_index(relay_codec_index(&application.config.relay_codec));
     window.set_relay_frame_index(relay_frame_index(application.config.relay_frame_ms));

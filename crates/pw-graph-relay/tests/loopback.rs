@@ -45,7 +45,13 @@ fn host_engine(pin: &str) -> (RelayEngine, RelayHandle, u16) {
     })
 }
 
-fn host_engine_with(config: EngineConfig) -> (RelayEngine, RelayHandle, u16) {
+fn host_engine_with(mut config: EngineConfig) -> (RelayEngine, RelayHandle, u16) {
+    // The generic API makes the host a Receiver endpoint. Keep this helper's
+    // old call sites focused on transport/pairing behavior while making that
+    // role explicit instead of relying on the client-oriented EngineConfig
+    // default.
+    config.mode = pw_graph_relay::RelayMode::Receiver;
+    config.client_roles = Roles::receive_only();
     let engine = RelayEngine::start(config).expect("host engine starts");
     let handle = engine.handle();
     let port = handle.host_start().expect("host listens");
@@ -203,7 +209,10 @@ fn authenticated_direction_offers_resolve_and_reject_stale_reversals() {
             } if *id == session
         )
     });
-    assert!(client_resolution.is_some(), "client should observe the winner");
+    assert!(
+        client_resolution.is_some(),
+        "client should observe the winner"
+    );
     let host_resolution = await_event(&host_handle, |event| {
         matches!(
             event,
@@ -272,7 +281,7 @@ fn client_emit_delivers_audio_to_host() {
 }
 
 #[test]
-fn host_sends_audio_to_receiving_client() {
+fn receiver_host_plays_audio_emitted_by_a_client() {
     let (_host, host_handle, port) = host_engine("123456");
     let (_client, client_handle) = client_engine();
     establish(
@@ -280,25 +289,25 @@ fn host_sends_audio_to_receiving_client() {
         &client_handle,
         port,
         "123456",
-        Roles::receive_only(),
+        Roles::emit_only(),
     );
 
     let signal = ramp(FRAME * 8);
     let received = stream_frames(
-        |frame| host_handle.push_capture(frame),
-        &client_handle,
+        |frame| client_handle.push_capture(frame),
+        &host_handle,
         &signal,
     );
     assert!(
         received.len() >= signal.len(),
-        "client should receive all host samples, got {}",
+        "receiver host should play all emitted samples, got {}",
         received.len()
     );
     assert_eq!(&received[..signal.len()], &signal[..]);
 }
 
 #[test]
-fn host_capture_fans_out_to_multiple_receivers() {
+fn receiver_host_mixes_multiple_emitters() {
     let (_host, host_handle, port) = host_engine("123456");
     let (_client_a, client_a_handle) = client_engine();
     let (_client_b, client_b_handle) = client_engine();
@@ -307,35 +316,33 @@ fn host_capture_fans_out_to_multiple_receivers() {
         &client_a_handle,
         port,
         "123456",
-        Roles::receive_only(),
+        Roles::emit_only(),
     );
     establish(
         &host_handle,
         &client_b_handle,
         port,
         "123456",
-        Roles::receive_only(),
+        Roles::emit_only(),
     );
 
-    let signal = ramp(FRAME * 4);
-    let mut received_a = Vec::new();
-    let mut received_b = Vec::new();
-    for (index, chunk) in signal.chunks(FRAME).enumerate() {
-        host_handle.push_capture(chunk);
+    let mut received = Vec::new();
+    for index in 0..8usize {
+        client_a_handle.push_capture(&[0.25f32; FRAME]);
+        client_b_handle.push_capture(&[0.5f32; FRAME]);
         let settled = index.saturating_sub(PIPELINE_SLACK) * FRAME;
         wait_until(|| {
-            drain_playback(&client_a_handle, &mut received_a);
-            drain_playback(&client_b_handle, &mut received_b);
-            received_a.len() >= settled && received_b.len() >= settled
+            drain_playback(&host_handle, &mut received);
+            received.len() >= settled
         });
     }
     assert!(wait_until(|| {
-        drain_playback(&client_a_handle, &mut received_a);
-        drain_playback(&client_b_handle, &mut received_b);
-        received_a.len() >= signal.len() && received_b.len() >= signal.len()
+        drain_playback(&host_handle, &mut received);
+        received.len() >= FRAME * 8
     }));
-    assert_eq!(&received_a[..signal.len()], &signal[..]);
-    assert_eq!(&received_b[..signal.len()], &signal[..]);
+    assert!(received[..FRAME * 8]
+        .iter()
+        .all(|sample| (*sample - 0.75).abs() < 0.01));
 }
 
 #[test]

@@ -33,7 +33,8 @@ pub use crypto::{Opener, Sealer};
 pub use netlink::{LinkKind, LocalLink, TransportPreference};
 pub use protocol::{
     is_supported_channels, is_supported_frame_ms, is_supported_sample_rate, normalize_frame_ms,
-    resolve_direction_offers, CodecKind, DeviceKind, DirectionAck, DirectionOffer, RelayDirection,
+    resolve_direction_offers, resolve_flow_offers, CodecKind, DeviceKind, DirectionAck,
+    DirectionOffer, FlowAck, FlowOffer, LocalRelayMode, RelayDirection, RelayFlow, RelayMode,
     Roles, FRAME_DURATIONS_MS, MAX_CHANNELS, MAX_SAMPLE_RATE_HZ, SAMPLE_RATES_HZ,
 };
 pub use queue::{PcmQueue, CAPTURE_DEPTH_FRAMES, DEFAULT_QUEUE_CAPACITY, PLAYBACK_DEPTH_FRAMES};

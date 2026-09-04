@@ -15,8 +15,9 @@ use pw_graph_backend::{
 };
 #[cfg(feature = "relay")]
 use pw_graph_backend::{
-    RelayDriver, RelayEngineStatus, RelayEvent, RelayHostRequest, RelayLocalLink, RelayPeerInfo,
-    RelayDirection, RelaySessionId, RelayTrustedPeer,
+    RelayDirection, RelayDriver, RelayEndpointInfo, RelayEngineStatus, RelayEvent, RelayFlow,
+    RelayHostRequest, RelayLocalLink, RelayLocalRouteState, RelayMode, RelayPeerInfo,
+    RelayReceiveSink, RelaySendSource, RelaySessionId, RelayTrustedPeer,
 };
 use pw_graph_core::{Graph, Node, NodeId, PortKey, PortType};
 use pw_graph_effects::EffectDescriptor;
@@ -331,6 +332,18 @@ impl ApplicationDriver {
     }
 
     #[cfg(feature = "relay")]
+    pub(crate) fn relay_connect_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        pin: &str,
+        mode: RelayMode,
+        generation: u64,
+    ) -> Result<RelaySessionId, String> {
+        RelayDriver::relay_connect_mode(self, target, pin, mode, generation)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
     pub(crate) fn relay_connect_trusted(
         &mut self,
         target: std::net::SocketAddr,
@@ -347,6 +360,19 @@ impl ApplicationDriver {
             direction,
             direction_generation,
         )
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_connect_trusted_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        peer_id: &str,
+        secret: [u8; 32],
+        mode: RelayMode,
+        generation: u64,
+    ) -> Result<RelaySessionId, String> {
+        RelayDriver::relay_connect_trusted_mode(self, target, peer_id, secret, mode, generation)
             .map_err(|error| error.to_string())
     }
 
@@ -359,6 +385,56 @@ impl ApplicationDriver {
     ) -> Result<(), String> {
         RelayDriver::relay_offer_direction(self, session, direction, generation)
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_offer_flow(
+        &mut self,
+        session: RelaySessionId,
+        flow: RelayFlow,
+        generation: u64,
+    ) -> Result<(), String> {
+        RelayDriver::relay_offer_flow(self, session, flow, generation)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_offer_mode(
+        &mut self,
+        session: RelaySessionId,
+        mode: RelayMode,
+        generation: u64,
+    ) -> Result<(), String> {
+        RelayDriver::relay_offer_mode(self, session, mode, generation)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_send_sources(&self) -> Vec<RelayEndpointInfo> {
+        RelayDriver::relay_send_sources(self)
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_receive_sinks(&self) -> Vec<RelayEndpointInfo> {
+        RelayDriver::relay_receive_sinks(self)
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_set_send_source(&mut self, source: RelaySendSource) -> Result<(), String> {
+        RelayDriver::relay_set_send_source(self, source).map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_set_receive_sink(&mut self, sink: RelayReceiveSink) -> Result<(), String> {
+        RelayDriver::relay_set_receive_sink(self, sink).map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn relay_ensure_local_route(
+        &mut self,
+        mode: RelayMode,
+    ) -> Result<RelayLocalRouteState, String> {
+        RelayDriver::relay_ensure_local_route(self, mode).map_err(|error| error.to_string())
     }
 
     #[cfg(feature = "relay")]
@@ -760,6 +836,19 @@ impl RelayDriver for ApplicationDriver {
         }
     }
 
+    fn relay_connect_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        pin: &str,
+        mode: RelayMode,
+        generation: u64,
+    ) -> pw_graph_backend::BackendResult<RelaySessionId> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_connect_mode(target, pin, mode, generation),
+            BackendKind::Live(driver) => driver.relay_connect_mode(target, pin, mode, generation),
+        }
+    }
+
     fn relay_connect_trusted(
         &mut self,
         target: std::net::SocketAddr,
@@ -769,23 +858,37 @@ impl RelayDriver for ApplicationDriver {
         direction_generation: u64,
     ) -> pw_graph_backend::BackendResult<RelaySessionId> {
         match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_connect_trusted(
+                target,
+                peer_id,
+                secret,
+                direction,
+                direction_generation,
+            ),
+            BackendKind::Live(driver) => driver.relay_connect_trusted(
+                target,
+                peer_id,
+                secret,
+                direction,
+                direction_generation,
+            ),
+        }
+    }
+
+    fn relay_connect_trusted_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        peer_id: &str,
+        secret: [u8; 32],
+        mode: RelayMode,
+        generation: u64,
+    ) -> pw_graph_backend::BackendResult<RelaySessionId> {
+        match &mut self.backend {
             BackendKind::Demo(driver) => {
-                driver.relay_connect_trusted(
-                    target,
-                    peer_id,
-                    secret,
-                    direction,
-                    direction_generation,
-                )
+                driver.relay_connect_trusted_mode(target, peer_id, secret, mode, generation)
             }
             BackendKind::Live(driver) => {
-                driver.relay_connect_trusted(
-                    target,
-                    peer_id,
-                    secret,
-                    direction,
-                    direction_generation,
-                )
+                driver.relay_connect_trusted_mode(target, peer_id, secret, mode, generation)
             }
         }
     }
@@ -820,8 +923,36 @@ impl RelayDriver for ApplicationDriver {
         generation: u64,
     ) -> pw_graph_backend::BackendResult<()> {
         match &mut self.backend {
-            BackendKind::Demo(driver) => driver.relay_offer_direction(session, direction, generation),
-            BackendKind::Live(driver) => driver.relay_offer_direction(session, direction, generation),
+            BackendKind::Demo(driver) => {
+                driver.relay_offer_direction(session, direction, generation)
+            }
+            BackendKind::Live(driver) => {
+                driver.relay_offer_direction(session, direction, generation)
+            }
+        }
+    }
+
+    fn relay_offer_flow(
+        &mut self,
+        session: RelaySessionId,
+        flow: RelayFlow,
+        generation: u64,
+    ) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_offer_flow(session, flow, generation),
+            BackendKind::Live(driver) => driver.relay_offer_flow(session, flow, generation),
+        }
+    }
+
+    fn relay_offer_mode(
+        &mut self,
+        session: RelaySessionId,
+        mode: RelayMode,
+        generation: u64,
+    ) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_offer_mode(session, mode, generation),
+            BackendKind::Live(driver) => driver.relay_offer_mode(session, mode, generation),
         }
     }
 
@@ -913,6 +1044,50 @@ impl RelayDriver for ApplicationDriver {
         match &self.backend {
             BackendKind::Demo(driver) => driver.relay_local_links(),
             BackendKind::Live(driver) => driver.relay_local_links(),
+        }
+    }
+
+    fn relay_send_sources(&self) -> Vec<RelayEndpointInfo> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.relay_send_sources(),
+            BackendKind::Live(driver) => driver.relay_send_sources(),
+        }
+    }
+
+    fn relay_receive_sinks(&self) -> Vec<RelayEndpointInfo> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.relay_receive_sinks(),
+            BackendKind::Live(driver) => driver.relay_receive_sinks(),
+        }
+    }
+
+    fn relay_set_send_source(
+        &mut self,
+        source: RelaySendSource,
+    ) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_set_send_source(source),
+            BackendKind::Live(driver) => driver.relay_set_send_source(source),
+        }
+    }
+
+    fn relay_set_receive_sink(
+        &mut self,
+        sink: RelayReceiveSink,
+    ) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_set_receive_sink(sink),
+            BackendKind::Live(driver) => driver.relay_set_receive_sink(sink),
+        }
+    }
+
+    fn relay_ensure_local_route(
+        &mut self,
+        mode: RelayMode,
+    ) -> pw_graph_backend::BackendResult<RelayLocalRouteState> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.relay_ensure_local_route(mode),
+            BackendKind::Live(driver) => driver.relay_ensure_local_route(mode),
         }
     }
 }

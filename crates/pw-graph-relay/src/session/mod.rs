@@ -38,18 +38,19 @@ use crate::crypto::{
 use crate::netlink;
 use crate::protocol::{
     is_supported_frame_ms, read_frame, read_sealed_frame, write_frame, write_sealed_frame,
-    CodecKind, ControlMessage, DeviceKind, DirectionAck, DirectionOffer, Roles, PROTOCOL_VERSION,
+    CodecKind, ControlMessage, DeviceKind, DirectionAck, DirectionOffer, FlowAck, FlowOffer, Roles,
+    PROTOCOL_VERSION,
 };
 use crate::realtime::{request_realtime_thread, tune_audio_socket};
 use crate::{
-    ControlState, DirectionNegotiation, DirectionResolution, EngineInner, PeerInfo, RelayError,
-    RelayEvent, RelayResult, ResumeGraceResult, SessionId, SessionRecord,
+    ControlState, DirectionNegotiation, DirectionResolution, EngineInner, FlowResolution, PeerInfo,
+    RelayError, RelayEvent, RelayResult, ResumeGraceResult, SessionId, SessionRecord,
 };
 use pw_graph_utils::hex::{hex_decode, hex_encode};
 use rand::RngCore;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};

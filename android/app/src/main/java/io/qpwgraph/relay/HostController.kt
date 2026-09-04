@@ -33,6 +33,7 @@ internal class HostController(
     var preparedSettings: HostSettings? = null
         private set
     private var preparedDirection: AudioDirection? = null
+    private var preparedMode: RelayMode? = null
     private var preparedGeneration: Long = 0L
 
     val nativeHandle: Long get() = handle
@@ -83,10 +84,49 @@ internal class HostController(
         )
         preparedSettings = host
         preparedDirection = direction
+        preparedMode = direction.relayMode()
+        preparedGeneration = generation
+    }
+
+    fun openMode(
+        host: HostSettings,
+        mode: RelayMode,
+        generation: Long,
+        deviceId: String,
+        trustedCredentialsJson: String,
+        nullHandleMessage: () -> String,
+    ) {
+        require(mode == RelayMode.Receiver) {
+            "Android hosts are Receiver endpoints; use the client for Emitter"
+        }
+        if (handle != 0L) return
+        handle = RelayJson.createdHandle(
+            NativeBridge.hostCreateMode(
+                host.deviceName,
+                deviceId,
+                trustedCredentialsJson,
+                host.pin,
+                host.port,
+                host.codec,
+                host.transport,
+                mode.serialized(),
+                generation,
+                host.sampleRate,
+                host.channels,
+                host.frameMs,
+            ),
+            nullHandleMessage,
+        )
+        preparedSettings = host
+        preparedDirection = mode.audioDirection()
+        preparedMode = mode
         preparedGeneration = generation
     }
 
     fun start(): JSONObject = JSONObject(NativeBridge.hostStart(handle))
+
+    fun offerMode(sessionId: Long, mode: RelayMode, generation: Long): JSONObject =
+        JSONObject(NativeBridge.hostOfferMode(handle, sessionId, mode.serialized(), generation))
 
     fun disconnectSession(sessionId: Long) {
         if (handle == 0L) return
@@ -216,6 +256,7 @@ internal class HostController(
         handle = 0L
         preparedSettings = null
         preparedDirection = null
+        preparedMode = null
         preparedGeneration = 0L
     }
 

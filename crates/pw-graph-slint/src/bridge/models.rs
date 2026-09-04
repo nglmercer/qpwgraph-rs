@@ -22,7 +22,7 @@ use super::relay::relay_qr_payload;
 #[cfg(feature = "relay")]
 use super::relay::{qr_image, relay_host_endpoint};
 use super::relay::{
-    relay_codec_index, relay_direction_tab, relay_frame_index, relay_nodes_visible, relay_rows,
+    relay_codec_index, relay_frame_index, relay_mode_tab, relay_nodes_visible, relay_rows,
     relay_transport_index,
 };
 use super::utils::{
@@ -33,9 +33,6 @@ use super::{
     HistoryRow, LinkRow, MainWindow, MinimapNode, NodeRow, PortRow, RuleRow, ShortcutRow, UiI18n,
 };
 use crate::names::{compact_label, display_node_name, display_port_name};
-#[cfg(all(feature = "relay", target_os = "windows"))]
-use pw_graph_backend::RelayEndpoints;
-
 pub(crate) fn sync_models(
     window: &MainWindow,
     application: &mut Application,
@@ -187,7 +184,7 @@ pub(crate) fn sync_models(
     ));
     window.set_relay_auto_connect_trusted(application.config.relay_auto_connect_trusted);
     if window.get_relay_tab() < 2 {
-        window.set_relay_tab(relay_direction_tab(application.config.relay_direction));
+        window.set_relay_tab(relay_mode_tab(application.config.relay_mode));
     }
     window.set_relay_codec_index(relay_codec_index(&application.config.relay_codec));
     window.set_relay_frame_index(relay_frame_index(application.config.relay_frame_ms));
@@ -213,40 +210,31 @@ pub(crate) fn sync_models(
         application.i18n.text("relay.transport_lan"),
         application.i18n.text("relay.transport_adb"),
     ]));
-    #[cfg(all(feature = "relay", target_os = "windows"))]
+    #[cfg(feature = "relay")]
     {
-        let endpoint_options = windows_relay_endpoint_options(application);
-        let option_names = endpoint_options
-            .iter()
-            .map(|(_, name)| name.clone())
-            .collect::<Vec<_>>();
-        window.set_relay_endpoint_options(string_model(option_names));
-        window.set_relay_windows_endpoints(application.source.relay_available());
-        window.set_relay_capture_endpoint_index(relay_endpoint_index(
-            application.config.relay_capture_endpoint_id.as_deref(),
-            &endpoint_options,
+        let send_options = relay_send_source_options(application);
+        let receive_options = relay_receive_sink_options(application);
+        window.set_relay_send_source_options(string_model(
+            send_options.iter().map(|(_, name)| name.clone()),
         ));
-        window.set_relay_playback_endpoint_index(relay_endpoint_index(
-            application.config.relay_playback_endpoint_id.as_deref(),
-            &endpoint_options,
+        window.set_relay_receive_sink_options(string_model(
+            receive_options.iter().map(|(_, name)| name.clone()),
         ));
-
-        let wanted = RelayEndpoints {
-            capture: application.config.relay_capture_endpoint_id.clone(),
-            playback: application.config.relay_playback_endpoint_id.clone(),
-        };
-        if application.source.windows_relay_endpoints() != wanted {
-            if let Err(error) = application.source.set_windows_relay_endpoints(wanted) {
-                application.status = application.tf("relay.error", &[("error", error)]);
-            }
-        }
+        window.set_relay_send_source_index(relay_selector_index(
+            &application.config.relay_send_source,
+            &send_options,
+        ));
+        window.set_relay_receive_sink_index(relay_selector_index(
+            &application.config.relay_receive_sink,
+            &receive_options,
+        ));
     }
-    #[cfg(not(all(feature = "relay", target_os = "windows")))]
+    #[cfg(not(feature = "relay"))]
     {
-        window.set_relay_endpoint_options(string_model(Vec::<String>::new()));
-        window.set_relay_windows_endpoints(false);
-        window.set_relay_capture_endpoint_index(0);
-        window.set_relay_playback_endpoint_index(0);
+        window.set_relay_send_source_options(string_model(Vec::<String>::new()));
+        window.set_relay_receive_sink_options(string_model(Vec::<String>::new()));
+        window.set_relay_send_source_index(0);
+        window.set_relay_receive_sink_index(0);
     }
     window.set_effects(ModelRc::from(Rc::new(VecModel::from(effect_rows(
         &application.source,
@@ -606,38 +594,71 @@ pub(crate) fn string_model(values: impl IntoIterator<Item = String>) -> ModelRc<
     )))
 }
 
-#[cfg(all(feature = "relay", target_os = "windows"))]
-fn windows_relay_endpoint_options(application: &Application) -> Vec<(String, String)> {
-    let mut options = vec![(
-        String::new(),
-        application.i18n.text("relay.default_endpoint"),
-    )];
-    options.extend(application.source.windows_relay_endpoint_choices());
-    let configured_ids = [
-        application.config.relay_capture_endpoint_id.as_deref(),
-        application.config.relay_playback_endpoint_id.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
-    for id in configured_ids {
-        if !options.iter().any(|(known, _)| known == &id) {
-            options.push((
-                id.clone(),
-                application
-                    .i18n
-                    .format("relay.endpoint_unavailable", &[("id", id)]),
-            ));
-        }
+#[cfg(feature = "relay")]
+fn relay_send_source_options(application: &Application) -> Vec<(String, String)> {
+    let mut options = application
+        .source
+        .relay_send_sources()
+        .into_iter()
+        .map(|endpoint| (endpoint.id, endpoint.name))
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        options.push((
+            "default-input".into(),
+            application.i18n.text("relay.default_input"),
+        ));
     }
+    append_unavailable_selector(
+        &mut options,
+        &application.config.relay_send_source,
+        application,
+    );
     options
 }
 
-#[cfg(all(feature = "relay", target_os = "windows"))]
-fn relay_endpoint_index(id: Option<&str>, options: &[(String, String)]) -> i32 {
+#[cfg(feature = "relay")]
+fn relay_receive_sink_options(application: &Application) -> Vec<(String, String)> {
+    let mut options = application
+        .source
+        .relay_receive_sinks()
+        .into_iter()
+        .map(|endpoint| (endpoint.id, endpoint.name))
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        options.push((
+            "default-output".into(),
+            application.i18n.text("relay.default_output"),
+        ));
+    }
+    append_unavailable_selector(
+        &mut options,
+        &application.config.relay_receive_sink,
+        application,
+    );
+    options
+}
+
+#[cfg(feature = "relay")]
+fn append_unavailable_selector(
+    options: &mut Vec<(String, String)>,
+    configured: &str,
+    application: &Application,
+) {
+    if !configured.is_empty() && !options.iter().any(|(id, _)| id == configured) {
+        options.push((
+            configured.to_owned(),
+            application.i18n.format(
+                "relay.endpoint_unavailable",
+                &[("id", configured.to_owned())],
+            ),
+        ));
+    }
+}
+
+#[cfg(feature = "relay")]
+fn relay_selector_index(current: &str, options: &[(String, String)]) -> i32 {
     options
         .iter()
-        .position(|(option_id, _)| id == (!option_id.is_empty()).then_some(option_id.as_str()))
+        .position(|(id, _)| id == current)
         .unwrap_or(0) as i32
 }

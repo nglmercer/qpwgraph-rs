@@ -29,9 +29,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Single state holder for both user-selectable audio directions.
+ * Single state holder for the generic Emitter/Receiver modes. The
+ * direction-named fields below are compatibility storage for older Android
+ * callers; all new lifecycle decisions are made from [RelayMode].
  *
- * The phone-to-PC client and PC-to-phone host each own a native handle, an audio
+ * The Emitter connection and Receiver host each own a native handle, an audio
  * foreground service, and a 100 ms polling job that drains native events.
  * Discovery owns a third handle and polls on a slower cadence because the
  * peer snapshot replaces the whole list every tick.
@@ -167,11 +169,17 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
             }
             .isSuccess
 
-    /**
-     * Change the user-facing direction as one serialized lifecycle
+    /** Change the user-facing mode as one serialized lifecycle
      * transaction. A second tap while a switch is in flight is coalesced to
-     * the newest requested direction, so a quick A → B → A gesture cannot
-     * leave the app running the stale middle direction.
+     * the newest requested mode, so a quick Emitter → Receiver → Emitter
+     * gesture cannot leave the app running the stale middle mode.
+     */
+    fun setMode(next: RelayMode) {
+        setDirection(next.audioDirection())
+    }
+
+    /**
+     * Compatibility entry point for the direction-first Android client.
      */
     fun setDirection(next: AudioDirection) {
         synchronized(directionRequestLock) {
@@ -242,9 +250,9 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                                     directionWaitGeneration = generation
                                     val response = when (old) {
                                         AudioDirection.MobileToDesktop ->
-                                            client.offerDirection(activeSession, requested, generation)
+                                            client.offerMode(activeSession, requested.relayMode(), generation)
                                         AudioDirection.DesktopToMobile ->
-                                            host.offerDirection(activeSession, requested, generation)
+                                            host.offerMode(activeSession, requested.relayMode(), generation)
                                     }
                                     if (response.optString("type") == "error") {
                                         directionWaiter = null
@@ -374,7 +382,11 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private fun completeDirectionResolution(event: JSONObject) {
         val sessionId = event.optLong("session")
         val generation = event.optLong("generation", -1L)
-        val direction = audioDirectionFromString(event.optString("direction"))
+        val direction = if (event.optString("type") == "mode_resolved") {
+            relayModeFromString(event.optString("mode")).audioDirection()
+        } else {
+            audioDirectionFromString(event.optString("direction"))
+        }
         if (sessionId == directionWaitSessionId && generation >= directionWaitGeneration) {
             directionWaiter?.let { waiter ->
                 if (!waiter.isCompleted) {
@@ -472,7 +484,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         pendingMediaProjectionResultCode == Activity.RESULT_OK && pendingMediaProjectionData != null
 
     // ------------------------------------------------------------------
-    // Receiver (client)
+    // Emitter client
     // ------------------------------------------------------------------
 
     fun update(updated: RelaySettings) {
@@ -505,13 +517,13 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connect() {
         val settings = mutableState.value.settings
-        if (settings.direction != AudioDirection.MobileToDesktop) {
+        if (settings.mode != RelayMode.Emitter) {
             setState {
                 it.copy(message = text(R.string.relay_direction_host_required))
             }
             return
         }
-        if (clientNeedsMicrophone(settings.direction) && !hasMicrophonePermission()) {
+        if (clientNeedsMicrophone(settings.mode, settings.captureSource) && !hasMicrophonePermission()) {
             permissionDenied(host = false)
             return
         }
@@ -538,7 +550,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Connect to a discovered peer with its previously enrolled credential. */
     fun connectToTrustedPeer(peer: DiscoveredPeer) {
-        if (mutableState.value.direction != AudioDirection.MobileToDesktop) {
+        if (mutableState.value.mode != RelayMode.Emitter) {
             setState { it.copy(message = text(R.string.relay_direction_host_required)) }
             return
         }
@@ -552,8 +564,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private fun connectInternal(trusted: TrustedRelayPeer?) {
         if (mutableState.value.connection == RelayConnectionState.Connecting) return
         val settings = mutableState.value.settings
-        if (settings.direction != AudioDirection.MobileToDesktop) return
-        if (clientNeedsMicrophone(settings.direction) && !hasMicrophonePermission()) {
+        if (settings.mode != RelayMode.Emitter) return
+        if (clientNeedsMicrophone(settings.mode, settings.captureSource) && !hasMicrophonePermission()) {
             permissionDenied(host = false)
             return
         }
@@ -587,7 +599,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch(Dispatchers.IO) {
             operationMutex.withLock {
-                if (mutableState.value.direction != AudioDirection.MobileToDesktop) {
+                if (mutableState.value.mode != RelayMode.Emitter) {
                     return@withLock
                 }
                 var nativeConnected = false
@@ -600,7 +612,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     ) {
                         stopHostLocked()
                     }
-                    client.open(settings, deviceId, trustedStore.credentialsJson()) {
+                    client.openMode(settings, deviceId, trustedStore.credentialsJson()) {
                         text(R.string.relay_error_native_create)
                     }
                     val response = if (trusted == null) {
@@ -640,7 +652,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     service.start(
                         RelayService.MODE_CLIENT,
                         client.nativeHandle,
-                        settings.direction.androidClientRole(),
+                        settings.mode.androidClientRole(),
                         audioGeometryForHostMode(
                             hostMode = false,
                             client = settings,
@@ -680,7 +692,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Resume the client side after a direction switch when it was live. */
     private fun reconnectConfiguredOrTrusted() {
-        if (mutableState.value.direction != AudioDirection.MobileToDesktop) return
+        if (mutableState.value.mode != RelayMode.Emitter) return
         val current = mutableState.value
         if (current.settings.target.isNotBlank() && current.settings.pin.isNotBlank()) {
             connectInternal(null)
@@ -694,7 +706,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Discovery tap-to-connect: adopt the peer address, then connect. */
     fun connectToPeer(address: String) {
-        if (mutableState.value.direction != AudioDirection.MobileToDesktop) {
+        if (mutableState.value.mode != RelayMode.Emitter) {
             setState { it.copy(message = text(R.string.relay_direction_host_required)) }
             return
         }
@@ -784,7 +796,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
                 "trusted_peer" -> rememberTrustedPeerFromJson(event)
                 "trusted_peer_available" -> rememberTrustedPeerFromNative()
-                "direction_resolved" -> completeDirectionResolution(event)
+                "direction_resolved", "mode_resolved" -> completeDirectionResolution(event)
                 "error" -> clientError(event.optString("message"))
             }
         }
@@ -851,7 +863,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ------------------------------------------------------------------
-    // Emitter (host)
+    // Receiver host
     // ------------------------------------------------------------------
 
     fun updateHost(host: HostSettings) {
@@ -868,7 +880,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startHost() {
-        if (mutableState.value.direction != AudioDirection.DesktopToMobile) {
+        if (mutableState.value.mode != RelayMode.Receiver) {
             setState { it.copy(message = text(R.string.relay_direction_client_required)) }
             return
         }
@@ -895,7 +907,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         Log.i(TAG, "HOST START pin present, transport=${wanted.transport} captureSource=${wanted.captureSource} port=${wanted.port}")
         viewModelScope.launch(Dispatchers.IO) {
             operationMutex.withLock {
-                if (mutableState.value.direction != AudioDirection.DesktopToMobile) {
+                if (mutableState.value.mode != RelayMode.Receiver) {
                     return@withLock
                 }
                 var nativeStarted = false
@@ -910,7 +922,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     if (host.isOpen &&
                         (!host.preparedFor(
                             wanted,
-                            mutableState.value.direction,
+                            RelayMode.Receiver.audioDirection(),
                             mutableState.value.settings.directionGeneration,
                         ) ||
                             mutableState.value.hostState == RelayHostState.Error)
@@ -920,9 +932,9 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                             throw IllegalStateException("previous relay host is still running")
                         }
                     }
-                    host.open(
+                    host.openMode(
                         wanted,
-                        mutableState.value.direction,
+                        RelayMode.Receiver,
                         mutableState.value.settings.directionGeneration,
                         deviceId,
                         trustedStore.credentialsJson(),
@@ -944,7 +956,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                         service.start(
                             RelayService.MODE_HOST,
                             host.nativeHandle,
-                            AudioDirection.DesktopToMobile.androidClientRole(),
+                            RelayMode.Receiver.androidClientRole(),
                             audioGeometryForHostMode(
                                 hostMode = true,
                                 client = mutableState.value.settings,
@@ -1108,7 +1120,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(hostMessage = event.optString("message"))
                 }
 
-                "direction_resolved" -> completeDirectionResolution(event)
+                "direction_resolved", "mode_resolved" -> completeDirectionResolution(event)
 
                 "level" -> setState {
                     it.copy(hostRms = event.optDouble("rms").toFloat().coerceIn(0f, 1f))
@@ -1404,7 +1416,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                 }.thenBy { it.address },
             )
             ?: return
-        val microphoneReady = !clientNeedsMicrophone(current.settings.direction) ||
+        val microphoneReady = !clientNeedsMicrophone(current.settings.mode, current.settings.captureSource) ||
             hasMicrophonePermission()
         if (
             microphoneReady &&

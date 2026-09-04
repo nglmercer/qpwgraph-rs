@@ -286,6 +286,14 @@ pub(super) fn run_rx_source(
         if !inner.session_alive(record.id) {
             break;
         }
+        if !record.local_roles().receive {
+            // A flow switch can turn a receive path off while the worker is
+            // blocked in a transport read. The transport functions all have
+            // bounded waits, so this gate becomes visible promptly without
+            // consuming packets into the old route.
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         let Some((len, addr)) = (match receive(&mut datagram) {
             Ok(result) => result,
             Err(error) => {
@@ -527,7 +535,6 @@ pub(super) fn run_tx_source(
     // receive path whenever this session also receives: both directions share
     // one `AudioLevel` per session and the incoming level is the one the UI
     // documents.
-    let meter_outgoing = !record.receiving;
     let mut frames_since_level = 0u32;
     let mut sumsq = 0f64;
     let mut level_samples = 0usize;
@@ -535,6 +542,14 @@ pub(super) fn run_tx_source(
     loop {
         if !inner.session_alive(record.id) {
             break;
+        }
+        if !record.local_roles().emit {
+            // Leave the sender worker installed so a later authenticated
+            // flow switch can enable it immediately. Do not drain the
+            // capture queue while this side is receive-only: the queue is
+            // session-owned and must not turn a role switch into stale audio.
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
         }
         // The host learns the peer address from an authenticated announce;
         // TCP audio waits for the authenticated secondary stream. Either
@@ -549,7 +564,7 @@ pub(super) fn run_tx_source(
         else {
             continue;
         };
-        if meter_outgoing {
+        if !record.local_roles().receive {
             for sample in &samples {
                 sumsq += (*sample as f64) * (*sample as f64);
             }

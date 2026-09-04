@@ -1,8 +1,8 @@
 use super::*;
 use crate::audio::{seal_datagram, AudioHeader};
 use crate::crypto::{pake_start, Side};
-use crate::PAIRING_ATTEMPT_LIMIT;
 use crate::RelayDirection;
+use crate::PAIRING_ATTEMPT_LIMIT;
 use std::net::{IpAddr, TcpListener, TcpStream};
 
 fn reject_worker_spawn(
@@ -119,6 +119,7 @@ fn resumable_session_with_udp(id: u64, udp_audio: Option<Arc<UdpAudioSlot>>) -> 
         format,
         sending: true,
         receiving: true,
+        active_roles: AtomicU8::new(SessionRecord::role_bits(Roles::both())),
         stop: Arc::new(AtomicBool::new(false)),
         bye_requested: AtomicBool::new(false),
         control_generation: AtomicU64::new(1),

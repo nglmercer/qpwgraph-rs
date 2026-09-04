@@ -69,6 +69,30 @@ internal class ClientController(
     fun connect(target: String, pin: String): JSONObject =
         JSONObject(NativeBridge.connect(handle, target, pin))
 
+    fun openMode(
+        settings: RelaySettings,
+        deviceId: String,
+        trustedCredentialsJson: String,
+        nullHandleMessage: () -> String,
+    ) {
+        if (handle != 0L) return
+        handle = RelayJson.createdHandle(
+            NativeBridge.createMode(
+                settings.deviceName,
+                deviceId,
+                trustedCredentialsJson,
+                settings.mode.serialized(),
+                settings.modeGeneration,
+                settings.codec,
+                settings.transport,
+                settings.sampleRate,
+                settings.channels,
+                settings.frameMs,
+            ),
+            nullHandleMessage,
+        )
+    }
+
     fun connectTrusted(target: String, peer: TrustedRelayPeer): JSONObject =
         JSONObject(NativeBridge.connectTrusted(handle, target, peer.peerId, peer.secret))
 
@@ -79,6 +103,9 @@ internal class ClientController(
     ): JSONObject = JSONObject(
         NativeBridge.offerDirection(handle, sessionId, direction.serialized(), generation),
     )
+
+    fun offerMode(sessionId: Long, mode: RelayMode, generation: Long): JSONObject =
+        JSONObject(NativeBridge.offerMode(handle, sessionId, mode.serialized(), generation))
 
     /**
      * Native told us the handle is unknown. Drop it without calling back into

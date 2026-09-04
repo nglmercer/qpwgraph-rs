@@ -657,6 +657,8 @@ pub(super) fn host_session_after_auth(
     };
     let local = inner.config().local_format();
     let tcp_audio = audio_over_tcp.then(TcpAudioSlot::new);
+    let local_config = inner.config();
+    let peer_id_for_flow = peer_id.clone();
     let record = Arc::new(SessionRecord {
         id,
         wire_id: id.0,
@@ -671,6 +673,10 @@ pub(super) fn host_session_after_auth(
         format,
         sending: roles.receive,
         receiving: roles.emit,
+        active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
+            emit: roles.receive,
+            receive: roles.emit,
+        })),
         stop: Arc::new(AtomicBool::new(false)),
         bye_requested: AtomicBool::new(false),
         control_generation: AtomicU64::new(1),
@@ -686,11 +692,17 @@ pub(super) fn host_session_after_auth(
         capture_convert: Mutex::new(prepared_capture_converter(local, format)),
         audio_sealer: Mutex::new(audio_sealer),
         audio_opener: Mutex::new(audio_opener),
-        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
-            generation: inner.config().direction_generation,
-            direction: inner.config().direction,
-            device_id: inner.config().device_id,
-        })),
+        direction: Mutex::new(DirectionNegotiation::with_initial_flow(
+            DirectionOffer {
+                generation: local_config.direction_generation,
+                direction: local_config.direction,
+                device_id: local_config.device_id.clone(),
+            },
+            &local_config.device_id,
+            &peer_id_for_flow,
+            roles.receive,
+            local_config.direction_generation,
+        )),
     });
     if !inner.insert_session(Arc::clone(&record)) {
         let _ = cipher.send(

@@ -1,6 +1,6 @@
 <resources>
     <string name="relay_app_title">qpwgraph Relay</string>
-    <string name="relay_app_subtitle">Elige una dirección de audio entre tu teléfono y tu PC.</string>
+    <string name="relay_app_subtitle">Elige si este dispositivo emite o recibe audio.</string>
     <string name="nav_receiver">Receptor</string>
     <string name="nav_emitter">Emisor</string>
     <string name="nav_discover">Descubrir</string>
@@ -10,7 +10,7 @@
     <string name="action_forget">Olvidar</string>
     <string name="label_status">Estado</string>
     <string name="label_level">Nivel: %1$d%%</string>
-    <string name="receiver_host_address_label">Dirección del host</string>
+    <string name="receiver_host_address_label">Dirección del peer</string>
     <string name="receiver_host_address_hint">192.168.1.20:48123</string>
     <string name="receiver_pin_label">PIN de emparejamiento</string>
     <string name="receiver_codec_label">Códec</string>
@@ -29,8 +29,8 @@
     <string name="emitter_capture_source_label">Fuente de captura</string>
     <string name="emitter_capture_microphone">Micrófono</string>
     <string name="emitter_capture_playback">Reproducción del dispositivo</string>
-    <string name="emitter_start_host">Iniciar host</string>
-    <string name="emitter_stop_host">Detener host</string>
+    <string name="emitter_start_host">Iniciar receptor</string>
+    <string name="emitter_stop_host">Detener receptor</string>
     <string name="emitter_reachable_title">Accesible en</string>
     <string name="emitter_active_sessions">Sesiones activas</string>
     <string name="discover_start">Iniciar descubrimiento</string>

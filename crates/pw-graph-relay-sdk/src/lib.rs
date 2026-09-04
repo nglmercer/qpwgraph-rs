@@ -54,9 +54,9 @@
 pub use pw_graph_relay::{
     generate_device_id,
     netlink::{display_links, listen_bind_addr, local_links, select_links},
-    CodecKind, DeviceKind, EngineConfig, EngineStatus, LinkKind, LocalLink, PeerInfo, RelayError,
-    RelayDirection, RelayEvent, RelayResult, Roles, SessionId, SessionStatus,
-    TransportPreference, TrustedPeer,
+    CodecKind, DeviceKind, EngineConfig, EngineStatus, FlowAck, FlowOffer, LinkKind, LocalLink,
+    LocalRelayMode, PeerInfo, RelayDirection, RelayError, RelayEvent, RelayFlow, RelayMode,
+    RelayResult, Roles, SessionId, SessionStatus, TransportPreference, TrustedPeer,
     FRAME_DURATIONS_MS, MAX_DISCOVERED_PEER_ADDRESSES, MAX_REALTIME_QUANTUM_SAMPLES,
     MAX_TRUSTED_PEERS, SAMPLE_RATES_HZ,
 };
@@ -96,6 +96,20 @@ fn validate_audio(sample_rate: u32, channels: u16, frame_ms: u16) -> RelayResult
     Ok(())
 }
 
+fn legacy_direction_for_client_mode(mode: RelayMode) -> RelayDirection {
+    match mode {
+        RelayMode::Emitter => RelayDirection::MobileToDesktop,
+        RelayMode::Receiver => RelayDirection::DesktopToMobile,
+    }
+}
+
+fn legacy_direction_for_host_mode(mode: RelayMode) -> RelayDirection {
+    match mode {
+        RelayMode::Emitter => RelayDirection::DesktopToMobile,
+        RelayMode::Receiver => RelayDirection::MobileToDesktop,
+    }
+}
+
 /// Builder for [`RelayHost`].
 #[derive(Clone, Debug)]
 pub struct RelayHostBuilder {
@@ -104,9 +118,11 @@ pub struct RelayHostBuilder {
 
 impl RelayHostBuilder {
     pub fn new() -> Self {
-        Self {
-            config: EngineConfig::default(),
-        }
+        let mut config = EngineConfig::default();
+        config.mode = RelayMode::Receiver;
+        config.direction = legacy_direction_for_host_mode(RelayMode::Receiver);
+        config.client_roles = Roles::receive_only();
+        Self { config }
     }
 
     pub fn device_name(mut self, name: impl Into<String>) -> Self {
@@ -137,12 +153,27 @@ impl RelayHostBuilder {
     /// peers with the same direction.
     pub fn direction(mut self, direction: RelayDirection) -> Self {
         self.config.direction = direction;
+        self.config.client_roles = Roles::for_direction(direction);
+        self.config.mode = match direction {
+            RelayDirection::MobileToDesktop => RelayMode::Receiver,
+            RelayDirection::DesktopToMobile => RelayMode::Emitter,
+        };
+        self
+    }
+
+    /// Select the host's local generic role. The host exposes one-way audio
+    /// through `receive_audio` or `send_audio` accordingly.
+    pub fn mode(mut self, mode: RelayMode) -> Self {
+        self.config.direction = legacy_direction_for_host_mode(mode);
+        self.config.client_roles = mode.roles();
+        self.config.mode = mode;
         self
     }
 
     /// Monotonic persisted direction generation used during trusted resume.
     pub fn direction_generation(mut self, generation: u64) -> Self {
         self.config.direction_generation = generation;
+        self.config.mode_generation = generation;
         self
     }
 
@@ -257,6 +288,11 @@ pub struct RelayHostPrepared {
 impl RelayHostPrepared {
     /// Start listening. Returns the running host.
     pub fn start(self) -> RelayResult<RelayHost> {
+        if self.config.mode != RelayMode::Receiver {
+            return Err(RelayError::Config(
+                "a relay host must use Receiver mode".into(),
+            ));
+        }
         let engine = RelayEngine::start(self.config)?;
         let handle = engine.handle();
         let port = handle.host_start()?;
@@ -291,6 +327,11 @@ impl RelayHost {
         self.handle.pull_playback(out)
     }
 
+    /// Receive peer PCM while this host is configured as a Receiver.
+    pub fn receive_audio(&self, out: &mut [f32]) -> usize {
+        self.pull_playback(out)
+    }
+
     /// Realtime-safe variant of [`Self::pull_playback`]. It returns zero when
     /// an engine lock is busy or no audio is available, may return a partial
     /// quantum, and never produces more than
@@ -304,6 +345,11 @@ impl RelayHost {
     /// This is the active host queue for `DesktopToMobile`.
     pub fn push_capture(&self, samples: &[f32]) {
         self.handle.push_capture(samples);
+    }
+
+    /// Provide local PCM while this host is configured as an Emitter.
+    pub fn send_audio(&self, samples: &[f32]) {
+        self.push_capture(samples);
     }
 
     /// Realtime-safe variant of [`Self::push_capture`]. It returns `false`
@@ -390,11 +436,26 @@ impl RelayClientBuilder {
     /// emit-only; Desktop → Mobile is receive-only.
     pub fn direction(mut self, direction: RelayDirection) -> Self {
         self.config.direction = direction;
+        self.config.client_roles = Roles::for_direction(direction);
+        self.config.mode = match direction {
+            RelayDirection::MobileToDesktop => RelayMode::Emitter,
+            RelayDirection::DesktopToMobile => RelayMode::Receiver,
+        };
+        self
+    }
+
+    /// Select this client's local generic role. The resulting handshake is
+    /// always `emit_only` or `receive_only`.
+    pub fn mode(mut self, mode: RelayMode) -> Self {
+        self.config.direction = legacy_direction_for_client_mode(mode);
+        self.config.client_roles = mode.roles();
+        self.config.mode = mode;
         self
     }
 
     pub fn direction_generation(mut self, generation: u64) -> Self {
         self.config.direction_generation = generation;
+        self.config.mode_generation = generation;
         self
     }
 
@@ -477,10 +538,10 @@ impl RelayClientPrepared {
     /// caller owns the PIN lifetime; the SDK does not persist or regenerate it.
     pub fn connect(self, target: &str, pin: &str) -> RelayResult<RelayClient> {
         let addr = resolve(target)?;
-        let direction = self.config.direction;
+        let roles = self.config.client_roles;
         let engine = RelayEngine::start(self.config)?;
         let handle = engine.handle();
-        let session = handle.connect(addr, pin, Roles::for_direction(direction));
+        let session = handle.connect(addr, pin, roles);
 
         // Wait for the handshake outcome so callers get synchronous errors.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -526,15 +587,10 @@ impl RelayClientPrepared {
         secret: [u8; 32],
     ) -> RelayResult<RelayClient> {
         let addr = resolve(target)?;
-        let direction = self.config.direction;
+        let roles = self.config.client_roles;
         let engine = RelayEngine::start(self.config)?;
         let handle = engine.handle();
-        let session = handle.connect_trusted(
-            addr,
-            peer_id,
-            secret,
-            Roles::for_direction(direction),
-        );
+        let session = handle.connect_trusted(addr, peer_id, secret, roles);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             for event in handle.events() {
@@ -598,6 +654,12 @@ impl RelayClient {
         self.handle.push_capture(samples);
     }
 
+    /// Emit local PCM to the peer. The client must have been built with
+    /// [`RelayMode::Emitter`].
+    pub fn emit(&self, samples: &[f32]) {
+        self.send_capture(samples);
+    }
+
     /// Realtime-safe variant of [`Self::send_capture`]. It returns `false`
     /// when the input exceeds [`MAX_REALTIME_QUANTUM_SAMPLES`], a realtime
     /// lock is busy, or no accepting session is available; it never reports a
@@ -609,6 +671,12 @@ impl RelayClient {
     /// Take host audio for playback in `DesktopToMobile`.
     pub fn pull_playback(&self, out: &mut [f32]) -> usize {
         self.handle.pull_playback(out)
+    }
+
+    /// Receive peer PCM into `out`. The client must have been built with
+    /// [`RelayMode::Receiver`].
+    pub fn receive(&self, out: &mut [f32]) -> usize {
+        self.pull_playback(out)
     }
 
     /// Realtime-safe variant of [`Self::pull_playback`]. It returns zero on a
@@ -629,12 +697,20 @@ impl RelayClient {
 
     /// Propose a new direction for this authenticated session. The embedding
     /// must wait for `DirectionResolved` before replacing its audio worker.
-    pub fn offer_direction(
-        &self,
-        direction: RelayDirection,
-        generation: u64,
-    ) -> RelayResult<()> {
-        self.handle.offer_direction(self.session, direction, generation)
+    pub fn offer_direction(&self, direction: RelayDirection, generation: u64) -> RelayResult<()> {
+        self.handle
+            .offer_direction(self.session, direction, generation)
+    }
+
+    /// Propose the authoritative emitter identity for the authenticated
+    /// session.
+    pub fn offer_flow(&self, flow: RelayFlow, generation: u64) -> RelayResult<()> {
+        self.handle.offer_flow(self.session, flow, generation)
+    }
+
+    /// Propose an Emitter/Receiver role for this local endpoint.
+    pub fn offer_mode(&self, mode: RelayMode, generation: u64) -> RelayResult<()> {
+        self.handle.offer_mode(self.session, mode, generation)
     }
 
     pub fn remove_trusted_peer(&self, peer_id: &str) -> RelayResult<()> {

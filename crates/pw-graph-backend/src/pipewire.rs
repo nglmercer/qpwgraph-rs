@@ -33,7 +33,10 @@ mod relay;
 
 use effects::NativeEffect;
 use metering::{process_meter_buffer, MeterCallbackState, MeterHandle, MeterReadingState};
-use registry::{classify_port_type, install_registry_listener, NodeRecord, RegistryState};
+use registry::{
+    classify_port_type, install_default_metadata_listener, install_registry_listener,
+    MetadataBindings, NodeRecord, RegistryState,
+};
 
 const NODE_NAME: &str = "node.name";
 const NODE_DESCRIPTION: &str = "node.description";
@@ -103,6 +106,10 @@ pub struct PipewireDriver {
     core: Option<pw::core::Core>,
     registry: Option<pw::registry::Registry>,
     registry_listener: Option<pw::registry::Listener>,
+    /// Listener for WirePlumber's `default` metadata object plus the bound
+    /// proxy/listener pairs it creates when the metadata global appears.
+    metadata_listener: Option<pw::registry::Listener>,
+    metadata_bindings: MetadataBindings,
     state: Arc<Mutex<RegistryState>>,
     registry_dirty: Arc<AtomicBool>,
     meters: BTreeMap<NodeId, MeterHandle>,
@@ -128,6 +135,13 @@ pub struct PipewireDriver {
     /// and kept until the driver drops so reconnects stay cheap.
     #[cfg(all(target_os = "linux", feature = "relay"))]
     relay: Option<relay::RelayRuntimeSet>,
+    /// Keep generic endpoint selections even before the relay runtime is
+    /// created. The UI applies persisted preferences during startup, while
+    /// discovery or a first connection may create the runtime later.
+    #[cfg(all(target_os = "linux", feature = "relay"))]
+    relay_send_source: RelaySendSource,
+    #[cfg(all(target_os = "linux", feature = "relay"))]
+    relay_receive_sink: RelayReceiveSink,
 }
 
 impl PipewireDriver {
@@ -148,6 +162,8 @@ impl PipewireDriver {
         let registry_dirty = Arc::new(AtomicBool::new(true));
 
         let registry_listener = install_registry_listener(&registry, &state, &registry_dirty);
+        let (metadata_listener, metadata_bindings) =
+            install_default_metadata_listener(&registry, &state, &registry_dirty);
 
         thread_loop.start();
 
@@ -157,6 +173,8 @@ impl PipewireDriver {
             core: Some(core),
             registry: Some(registry),
             registry_listener: Some(registry_listener),
+            metadata_listener: Some(metadata_listener),
+            metadata_bindings,
             state,
             registry_dirty,
             meters: BTreeMap::new(),
@@ -171,6 +189,10 @@ impl PipewireDriver {
             blocked_connections: Vec::new(),
             #[cfg(all(target_os = "linux", feature = "relay"))]
             relay: None,
+            #[cfg(all(target_os = "linux", feature = "relay"))]
+            relay_send_source: RelaySendSource::DefaultInput,
+            #[cfg(all(target_os = "linux", feature = "relay"))]
+            relay_receive_sink: RelayReceiveSink::DefaultOutput,
         };
 
         let loop_for_initial_sync = driver.thread_loop.clone();
@@ -905,6 +927,8 @@ impl Drop for PipewireDriver {
         self.relay.take();
         self.effects.clear();
         self.registry_listener.take();
+        self.metadata_listener.take();
+        self.metadata_bindings.borrow_mut().clear();
         self.registry.take();
         self.core.take();
         self.context.take();
@@ -930,6 +954,14 @@ impl GraphDriver for PipewireDriver {
     fn refresh(&mut self) -> BackendResult<Vec<Node>> {
         self.with_loop(|driver| {
             driver.sync()?;
+            #[cfg(all(target_os = "linux", feature = "relay"))]
+            if let Some(mode) = driver.relay.as_ref().and_then(|set| set.local_router.mode) {
+                // Default-device metadata and endpoint topology share the
+                // registry dirty bit. Reconcile here so a WirePlumber
+                // default change moves only the qpwgraph-owned automatic
+                // route; ordinary user links remain untouched.
+                driver.ensure_relay_local_route_locked(mode)?;
+            }
             driver.registry_dirty.store(false, Ordering::Relaxed);
             Ok(driver.graph.nodes.values().cloned().collect())
         })
@@ -1254,8 +1286,14 @@ impl RelayDriver for PipewireDriver {
     }
 
     fn relay_start_host(&mut self, request: RelayHostRequest) -> BackendResult<u16> {
+        if request.mode != RelayMode::Receiver {
+            return Err(BackendError::unsupported(
+                "a local relay host must run in Receiver mode",
+            ));
+        }
         self.with_loop(|driver| {
             let set = driver.ensure_relay_devices_locked(&request.device_name)?;
+            set.local_router.set_mode(request.mode);
             let config = pw_graph_relay::EngineConfig {
                 device_id: request.device_id,
                 device_name: request.device_name,
@@ -1268,6 +1306,8 @@ impl RelayDriver for PipewireDriver {
                 trust_new_peers: request.trust_new_peers,
                 direction: request.direction,
                 direction_generation: request.direction_generation,
+                mode: request.mode,
+                mode_generation: request.mode_generation,
                 ..Default::default()
             };
             set.handle().update_config(config);
@@ -1303,12 +1343,48 @@ impl RelayDriver for PipewireDriver {
             let mut config = set.handle().config();
             config.direction = direction;
             config.direction_generation = direction_generation;
+            config.mode = match direction {
+                RelayDirection::MobileToDesktop => RelayMode::Receiver,
+                RelayDirection::DesktopToMobile => RelayMode::Emitter,
+            };
+            config.mode_generation = direction_generation;
             let roles = super::api::desktop_relay_client_roles(direction);
             config.client_roles = roles;
+            set.local_router.set_mode(match direction {
+                RelayDirection::MobileToDesktop => RelayMode::Receiver,
+                RelayDirection::DesktopToMobile => RelayMode::Emitter,
+            });
             set.handle().update_config(config);
-            Ok(set
-                .handle()
-                .connect(target, pin, roles))
+            Ok(set.handle().connect(target, pin, roles))
+        })
+    }
+
+    fn relay_connect_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        pin: &str,
+        mode: RelayMode,
+        generation: u64,
+    ) -> BackendResult<RelaySessionId> {
+        self.with_loop(|driver| {
+            let device_name = driver
+                .relay
+                .as_ref()
+                .map(|set| set.handle().config().device_name)
+                .unwrap_or_else(|| "qpwgraph-rs".into());
+            let set = driver.ensure_relay_devices_locked(&device_name)?;
+            set.local_router.set_mode(mode);
+            let mut config = set.handle().config();
+            config.client_roles = mode.roles();
+            config.direction = match mode {
+                RelayMode::Emitter => RelayDirection::DesktopToMobile,
+                RelayMode::Receiver => RelayDirection::MobileToDesktop,
+            };
+            config.direction_generation = generation;
+            config.mode = mode;
+            config.mode_generation = generation;
+            set.handle().update_config(config);
+            Ok(set.handle().connect_mode(target, pin, mode))
         })
     }
 
@@ -1330,15 +1406,19 @@ impl RelayDriver for PipewireDriver {
             let mut config = set.handle().config();
             config.direction = direction;
             config.direction_generation = direction_generation;
+            config.mode = match direction {
+                RelayDirection::MobileToDesktop => RelayMode::Receiver,
+                RelayDirection::DesktopToMobile => RelayMode::Emitter,
+            };
+            config.mode_generation = direction_generation;
             let roles = super::api::desktop_relay_client_roles(direction);
             config.client_roles = roles;
+            set.local_router.set_mode(match direction {
+                RelayDirection::MobileToDesktop => RelayMode::Receiver,
+                RelayDirection::DesktopToMobile => RelayMode::Emitter,
+            });
             set.handle().update_config(config);
-            Ok(set.handle().connect_trusted(
-                target,
-                peer_id,
-                secret,
-                roles,
-            ))
+            Ok(set.handle().connect_trusted(target, peer_id, secret, roles))
         })
     }
 
@@ -1377,6 +1457,34 @@ impl RelayDriver for PipewireDriver {
         set.handle()
             .offer_direction(session, direction, generation)
             .map_err(|error| BackendError::native(format!("relay direction offer failed: {error}")))
+    }
+
+    fn relay_offer_flow(
+        &mut self,
+        session: RelaySessionId,
+        flow: RelayFlow,
+        generation: u64,
+    ) -> BackendResult<()> {
+        let Some(set) = self.relay.as_ref() else {
+            return Err(BackendError::native("no relay session exists"));
+        };
+        set.handle()
+            .offer_flow(session, flow, generation)
+            .map_err(|error| BackendError::native(format!("relay flow offer failed: {error}")))
+    }
+
+    fn relay_offer_mode(
+        &mut self,
+        session: RelaySessionId,
+        mode: RelayMode,
+        generation: u64,
+    ) -> BackendResult<()> {
+        let Some(set) = self.relay.as_ref() else {
+            return Err(BackendError::native("no relay session exists"));
+        };
+        set.handle()
+            .offer_mode(session, mode, generation)
+            .map_err(|error| BackendError::native(format!("relay mode offer failed: {error}")))
     }
 
     fn relay_disconnect(&mut self, session: RelaySessionId) -> BackendResult<()> {
@@ -1445,13 +1553,28 @@ impl RelayDriver for PipewireDriver {
         // are ready. When it arrives, the graph must be refreshed and the
         // relay route reconciled/verified before the UI reports Connected.
         // This makes the first connect work without requiring disconnect/reconnect.
-        if events
-            .iter()
-            .any(|e| matches!(e, RelayEvent::SessionEstablished { .. }))
-        {
+        let resolved_mode = events.iter().find_map(|event| match event {
+            RelayEvent::FlowResolved { mode, .. } => Some(*mode),
+            _ => None,
+        });
+        if events.iter().any(|e| {
+            matches!(
+                e,
+                RelayEvent::SessionEstablished { .. } | RelayEvent::FlowResolved { .. }
+            )
+        }) {
             let _ = self.with_loop(|driver| {
                 driver.rebuild_graph_locked()?;
-                driver.ensure_relay_playback_route_locked()?;
+                if let Some(mode) = resolved_mode {
+                    if let Some(set) = driver.relay.as_mut() {
+                        set.local_router.set_mode(mode);
+                    }
+                    let _ = driver.ensure_relay_local_route_locked(mode)?;
+                } else if let Some(mode) =
+                    driver.relay.as_ref().and_then(|set| set.local_router.mode)
+                {
+                    let _ = driver.ensure_relay_local_route_locked(mode)?;
+                }
                 Ok(())
             });
         }
@@ -1534,6 +1657,7 @@ impl RelayDriver for PipewireDriver {
         if let Some(set) = self.relay.as_mut() {
             set.playback_shared.set_enabled(enabled);
             set.router.set_enabled(enabled);
+            set.local_router.enabled = enabled;
             // Log major state transitions only, not per frame
             if enabled {
                 eprintln!("Relay playback starting");
@@ -1543,7 +1667,14 @@ impl RelayDriver for PipewireDriver {
         }
         // Propagate routing failures so the UI does not show a healthy state
         // while the PipeWire link could not be created.
-        self.with_loop(|driver| driver.ensure_relay_playback_route_locked())?;
+        self.with_loop(|driver| {
+            let mode = driver
+                .relay
+                .as_ref()
+                .and_then(|set| set.local_router.mode)
+                .unwrap_or(RelayMode::Receiver);
+            driver.ensure_relay_local_route_locked(mode).map(|_| ())
+        })?;
         Ok(())
     }
 
@@ -1573,6 +1704,11 @@ impl RelayDriver for PipewireDriver {
     }
 
     fn relay_set_playback_sink(&mut self, sink: Option<String>) -> BackendResult<()> {
+        let receive_sink = sink
+            .clone()
+            .map(RelayReceiveSink::OutputDevice)
+            .unwrap_or(RelayReceiveSink::DefaultOutput);
+        self.relay_receive_sink = receive_sink.clone();
         if let Some(set) = self.relay.as_mut() {
             // Persist stable identifier: node.name
             let serial = sink.as_ref().and_then(|name| {
@@ -1583,13 +1719,21 @@ impl RelayDriver for PipewireDriver {
                     .and_then(|n| n.serial)
             });
             set.router.set_preferred_sink(sink.clone(), serial);
+            set.local_router.set_receive_sink(receive_sink);
             if let Some(name) = &sink {
                 eprintln!("Relay playback sink selected: {name}");
             } else {
                 eprintln!("Relay playback sink selected: Default");
             }
         }
-        self.with_loop(|driver| driver.ensure_relay_playback_route_locked())?;
+        self.with_loop(|driver| {
+            let mode = driver
+                .relay
+                .as_ref()
+                .and_then(|set| set.local_router.mode)
+                .unwrap_or(RelayMode::Receiver);
+            driver.ensure_relay_local_route_locked(mode).map(|_| ())
+        })?;
         Ok(())
     }
 
@@ -1616,15 +1760,144 @@ impl RelayDriver for PipewireDriver {
 
     fn relay_ensure_playback_route(&mut self) -> BackendResult<crate::RelayPlaybackState> {
         self.with_loop(|driver| {
-            driver.ensure_relay_playback_route_locked()?;
+            let mode = driver
+                .relay
+                .as_ref()
+                .and_then(|set| set.local_router.mode)
+                .unwrap_or(RelayMode::Receiver);
+            driver.ensure_relay_local_route_locked(mode)?;
             let status = driver.relay_playback_status();
             Ok(status.state)
+        })
+    }
+
+    fn relay_send_sources(&self) -> Vec<RelayEndpointInfo> {
+        let mut sources = vec![RelayEndpointInfo {
+            id: "default-input".into(),
+            name: "Default input".into(),
+            description: "PipeWire/WirePlumber default.audio.source".into(),
+        }];
+        sources.push(RelayEndpointInfo {
+            id: "manual".into(),
+            name: "Manual graph".into(),
+            description: "Leave Emitter routing to the PipeWire graph".into(),
+        });
+        sources.extend(self.pipewire_relay_endpoint_infos(true, false));
+        sources.extend(self.pipewire_relay_endpoint_infos(false, true));
+        sources
+    }
+
+    fn relay_receive_sinks(&self) -> Vec<RelayEndpointInfo> {
+        let mut sinks = vec![RelayEndpointInfo {
+            id: "default-output".into(),
+            name: "Default output".into(),
+            description: "PipeWire/WirePlumber default.audio.sink".into(),
+        }];
+        sinks.push(RelayEndpointInfo {
+            id: "manual".into(),
+            name: "Manual graph".into(),
+            description: "Leave Receiver routing to the PipeWire graph".into(),
+        });
+        sinks.extend(self.pipewire_relay_endpoint_infos(false, false));
+        sinks
+    }
+
+    fn relay_set_send_source(&mut self, source: RelaySendSource) -> BackendResult<()> {
+        self.relay_send_source = source.clone();
+        self.with_loop(|driver| {
+            if let Some(set) = driver.relay.as_mut() {
+                set.local_router.set_send_source(source);
+                if let Some(mode) = set.local_router.mode {
+                    driver.ensure_relay_local_route_locked(mode)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn relay_set_receive_sink(&mut self, sink: RelayReceiveSink) -> BackendResult<()> {
+        self.relay_receive_sink = sink.clone();
+        self.with_loop(|driver| {
+            if let Some(set) = driver.relay.as_mut() {
+                set.local_router.set_receive_sink(sink);
+                if let Some(mode) = set.local_router.mode {
+                    driver.ensure_relay_local_route_locked(mode)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn relay_ensure_local_route(&mut self, mode: RelayMode) -> BackendResult<RelayLocalRouteState> {
+        self.with_loop(|driver| {
+            let Some(set) = driver.relay.as_mut() else {
+                return Ok(RelayLocalRouteState::default());
+            };
+            set.local_router.set_mode(mode);
+            driver.ensure_relay_local_route_locked(mode)
         })
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "relay"))]
 impl PipewireDriver {
+    fn pipewire_relay_endpoint_infos(
+        &self,
+        input_source: bool,
+        output_monitor: bool,
+    ) -> Vec<RelayEndpointInfo> {
+        let registry = self.state.lock().unwrap().clone();
+        self.graph
+            .nodes
+            .values()
+            .filter_map(|node| {
+                if node.name == relay::RELAY_SOURCE_NAME || node.name == relay::RELAY_SINK_NAME {
+                    return None;
+                }
+                let record = registry.nodes.get(&native_node_id(node.id))?;
+                let media_class = record.media_class.to_ascii_lowercase();
+                let has_source = node.ports.iter().any(|port_id| {
+                    self.graph.port(*port_id).is_some_and(|port| {
+                        port.direction.is_source()
+                            && (port.port_type == PortType::Audio
+                                || port.port_type == PortType::Unknown)
+                    })
+                });
+                let has_sink = node.ports.iter().any(|port_id| {
+                    self.graph.port(*port_id).is_some_and(|port| {
+                        port.direction.is_sink()
+                            && (port.port_type == PortType::Audio
+                                || port.port_type == PortType::Unknown)
+                    })
+                });
+                let matches = if input_source {
+                    // Physical sources and application playback streams both
+                    // expose source ports. The latter are commonly classified
+                    // as Stream/Output/Audio rather than Audio/Source.
+                    (media_class.contains("source")
+                        || media_class.contains("stream/output")
+                        || media_class.contains("audio/output"))
+                        && has_source
+                } else if output_monitor {
+                    media_class.contains("sink") && has_source
+                } else {
+                    media_class.contains("sink") && has_sink
+                };
+                matches.then(|| RelayEndpointInfo {
+                    id: if input_source {
+                        format!("input:{}", node.name)
+                    } else if output_monitor {
+                        format!("monitor:{}", node.name)
+                    } else {
+                        format!("output:{}", node.name)
+                    },
+                    name: record.name.clone(),
+                    description: format!("{} ({})", record.name, node.name),
+                })
+            })
+            .collect()
+    }
+
     /// Create the relay engine and virtual devices on first use. The caller
     /// must hold the ThreadLoop lock.
     fn ensure_relay_devices_locked(
@@ -1632,7 +1905,11 @@ impl PipewireDriver {
         device_name: &str,
     ) -> BackendResult<&mut relay::RelayRuntimeSet> {
         if self.relay.is_none() {
-            let set = relay::RelayRuntimeSet::create(&self.thread_loop, device_name)?;
+            let mut set = relay::RelayRuntimeSet::create(&self.thread_loop, device_name)?;
+            set.local_router
+                .set_send_source(self.relay_send_source.clone());
+            set.local_router
+                .set_receive_sink(self.relay_receive_sink.clone());
             self.relay = Some(set);
             // `pw_filter_new_simple` owns a small client connection of its
             // own, so the new virtual devices are published across clients.
@@ -1645,6 +1922,205 @@ impl PipewireDriver {
             .relay
             .as_mut()
             .expect("relay set was just created above"))
+    }
+
+    /// Reconcile exactly one qpwgraph-owned local route. The route is
+    /// destroyed before a mode/endpoint change is created, so a rapid
+    /// Emitter ↔ Receiver transition can never leave both automatic paths
+    /// connected at once.
+    fn ensure_relay_local_route_locked(
+        &mut self,
+        mode: RelayMode,
+    ) -> BackendResult<RelayLocalRouteState> {
+        if self.relay.is_none() {
+            return Ok(RelayLocalRouteState::default());
+        }
+        self.rebuild_graph_locked()?;
+        let registry = self.state.lock().unwrap().clone();
+        let (default_source, default_sink, enabled, manual, previous_ids, desired) = {
+            let set = self.relay.as_mut().expect("relay set exists");
+            set.local_router.set_mode(mode);
+            set.local_router
+                .set_send_source(self.relay_send_source.clone());
+            set.local_router
+                .set_receive_sink(self.relay_receive_sink.clone());
+            let manual = match mode {
+                RelayMode::Emitter => {
+                    matches!(set.local_router.send_source, RelaySendSource::ManualGraph)
+                }
+                RelayMode::Receiver => {
+                    matches!(set.local_router.receive_sink, RelayReceiveSink::ManualGraph)
+                }
+            };
+            let mut previous_ids = set.local_router.link_ids.clone();
+            previous_ids.extend(set.router.link_ids.iter().copied());
+            previous_ids.sort_unstable();
+            previous_ids.dedup();
+            let desired = set.local_router.desired_links(
+                &self.graph,
+                &registry.nodes,
+                registry.default_source.as_ref(),
+                registry.default_sink.as_ref(),
+            );
+            (
+                registry.default_source,
+                registry.default_sink,
+                set.local_router.enabled,
+                manual,
+                previous_ids,
+                desired,
+            )
+        };
+        let _ = (default_source, default_sink);
+
+        let existing_owned_pairs: std::collections::BTreeSet<(PortId, PortId)> = previous_ids
+            .iter()
+            .filter_map(|id| self.graph.link(LinkId(*id)))
+            .map(|link| (link.output_port, link.input_port))
+            .collect();
+        let desired_pairs = desired.as_ref().map(|(pairs, _, _, _)| {
+            pairs
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        });
+
+        // Idempotent fast path: the exact owned route is already connected.
+        if enabled
+            && desired_pairs.as_ref().is_some_and(|pairs| {
+                *pairs == existing_owned_pairs
+                    && previous_ids.len() == pairs.len()
+                    && self
+                        .relay
+                        .as_ref()
+                        .is_some_and(|set| set.local_router.mode == Some(mode))
+            })
+        {
+            let state = desired.as_ref().map_or_else(
+                RelayLocalRouteState::default,
+                |(_, source, sink, description)| RelayLocalRouteState {
+                    mode: Some(mode),
+                    active: true,
+                    source_id: Some(source.clone()),
+                    sink_id: Some(sink.clone()),
+                    description: description.clone(),
+                },
+            );
+            if let Some(set) = self.relay.as_mut() {
+                set.local_router.state = state.clone();
+            }
+            return Ok(state);
+        }
+
+        // Tear down only links this router created (the old playback router
+        // is included for one-release compatibility). Ordinary user links
+        // remain untouched.
+        for id in previous_ids {
+            let link_id = LinkId(id);
+            if self.graph.link(link_id).is_some() {
+                let _ = self.disconnect_locked(link_id);
+            }
+        }
+        if let Some(set) = self.relay.as_mut() {
+            set.local_router.link_ids.clear();
+            set.router.link_ids.clear();
+            set.router.current_sink_name = None;
+            set.router.current_sink_serial = None;
+        }
+
+        let Some((pairs, source_id, sink_id, description)) = desired else {
+            let legacy_state = if enabled {
+                match mode {
+                    RelayMode::Emitter => relay::RelayPlaybackState::Disabled,
+                    RelayMode::Receiver => relay::RelayPlaybackState::WaitingForSink,
+                }
+            } else {
+                relay::RelayPlaybackState::Disabled
+            };
+            let state = RelayLocalRouteState {
+                mode: Some(mode),
+                active: false,
+                source_id: None,
+                sink_id: None,
+                description: if !enabled {
+                    "local relay route disabled".into()
+                } else {
+                    if manual {
+                        "manual graph routing".into()
+                    } else {
+                        match mode {
+                            RelayMode::Emitter => "waiting for an input source".into(),
+                            RelayMode::Receiver => "waiting for an output sink".into(),
+                        }
+                    }
+                },
+            };
+            if let Some(set) = self.relay.as_mut() {
+                set.local_router.state = state.clone();
+                set.router.state = legacy_state;
+            }
+            return Ok(state);
+        };
+
+        let mut owned_ids = Vec::new();
+        for (output, input) in pairs.iter().copied() {
+            if let Some(existing) = self
+                .graph
+                .links
+                .values()
+                .find(|link| link.output_port == output && link.input_port == input)
+            {
+                // A pre-existing user link is valid, but it is not ours to
+                // remove on a later mode switch.
+                if existing_owned_pairs.contains(&(output, input)) {
+                    owned_ids.push(existing.id.0);
+                }
+                continue;
+            }
+            match self.connect_locked(output, input) {
+                Ok(link) => owned_ids.push(link.id.0),
+                Err(error) => {
+                    for id in owned_ids.iter().copied() {
+                        if self.graph.link(LinkId(id)).is_some() {
+                            let _ = self.disconnect_locked(LinkId(id));
+                        }
+                    }
+                    let state = RelayLocalRouteState {
+                        mode: Some(mode),
+                        active: false,
+                        source_id: None,
+                        sink_id: None,
+                        description: format!("local relay route failed: {error}"),
+                    };
+                    if let Some(set) = self.relay.as_mut() {
+                        set.local_router.state = state;
+                    }
+                    return Err(BackendError::native(format!(
+                        "could not create local relay route: {error}"
+                    )));
+                }
+            }
+        }
+        let state = RelayLocalRouteState {
+            mode: Some(mode),
+            active: true,
+            source_id: Some(source_id),
+            sink_id: Some(sink_id),
+            description,
+        };
+        if let Some(set) = self.relay.as_mut() {
+            set.local_router.link_ids = owned_ids.clone();
+            set.local_router.state = state.clone();
+            if mode == RelayMode::Receiver {
+                set.router.link_ids = owned_ids;
+                set.router.state = relay::RelayPlaybackState::Connected;
+                set.router.current_sink_name = state.sink_id.clone();
+            } else {
+                set.router.state = relay::RelayPlaybackState::Disabled;
+                set.router.current_sink_name = None;
+            }
+        }
+        Ok(state)
     }
 
     /// Whether both relay virtual devices are present in the current graph.

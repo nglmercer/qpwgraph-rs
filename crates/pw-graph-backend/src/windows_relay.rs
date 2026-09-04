@@ -6,30 +6,27 @@
 //! requires a kernel-mode driver — so the relay is wired to fixed endpoints
 //! instead:
 //!
-//! * **Capture** loopback-records the selected playback endpoint, so whatever
-//!   that endpoint is playing is what peers receive.
-//! * **Render** plays audio received from peers on the selected playback
-//!   endpoint.
+//! Emitter mode can either capture a physical input with `eCapture` or
+//! loopback-record a selected playback endpoint with `eRender`. Receiver mode
+//! renders peer audio to an `eRender` endpoint. Exactly one WASAPI worker is
+//! active for a relay instance; changing the mode or selector stops that
+//! worker before starting its replacement.
 //!
-//! That covers "use my phone as a speaker" and "play the phone's audio here".
-//! It cannot cover "use my phone as a microphone for other Windows apps",
-//! because the received audio would have to appear as a capture device, which
-//! is exactly the thing user-mode code cannot create. The relay protocol can
-//! still receive and render peer audio locally; only microphone emulation is
-//! unavailable.
-//!
-//! Both loops poll rather than waiting on an event handle: loopback capture
-//! does not raise the WASAPI event, so a single polling shape keeps the two
-//! threads symmetrical.
+//! Direct mode does not create a virtual capture endpoint for other Windows
+//! applications. That optional system-wide integration belongs to a separate
+//! driver. Both loops poll rather than waiting on an event handle: loopback
+//! capture does not raise the WASAPI event, so a single polling shape keeps the
+//! two paths symmetrical.
 
-use crate::api::{BackendError, BackendResult};
-use pw_graph_relay::{EngineConfig, RelayEngine, RelayHandle};
+use crate::api::{BackendError, BackendResult, RelayReceiveSink, RelaySendSource};
+use pw_graph_relay::{EngineConfig, RelayEngine, RelayHandle, RelayMode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use windows::core::PWSTR;
 use windows::Win32::Media::Audio;
 use windows::Win32::System::Com::{self, CLSCTX_ALL, COINIT_MULTITHREADED};
 
@@ -48,7 +45,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// How long `start` waits for each endpoint to report that WASAPI accepted it.
 const ENDPOINT_START_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Which endpoints the relay uses, by Core Audio device id.
+/// Legacy endpoint pair retained for compatibility with older callers.
 ///
 /// `None` means the current default playback endpoint, which is also what a
 /// removed or unplugged device falls back to. Ids come straight from the
@@ -62,15 +59,23 @@ pub struct RelayEndpoints {
     pub playback: Option<String>,
 }
 
-/// The relay engine plus the two WASAPI threads that feed and drain it.
+/// The relay engine plus the single active WASAPI worker.
 ///
-/// Dropping this stops both threads and the engine. The struct is deliberately
-/// the only owner of the `RelayEngine`, so the endpoints cannot outlive it.
+/// Dropping this stops the worker and the engine. The struct is deliberately
+/// the only owner of the `RelayEngine`, so the endpoint cannot outlive it.
 pub(crate) struct WindowsRelayDevices {
     engine: RelayEngine,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     endpoints: RelayEndpoints,
+    mode: RelayMode,
+    send_source: RelaySendSource,
+    receive_sink: RelayReceiveSink,
+    /// The device id WASAPI actually opened. This differs from the requested
+    /// id when a configured endpoint disappeared and the current default was
+    /// used as the documented fallback.
+    resolved_endpoint: Option<String>,
+    default_generation: u64,
 }
 
 impl WindowsRelayDevices {
@@ -80,65 +85,171 @@ impl WindowsRelayDevices {
         &self.endpoints
     }
 
+    pub(crate) fn mode(&self) -> RelayMode {
+        self.mode
+    }
+
+    pub(crate) fn resolved_endpoint(&self) -> Option<&str> {
+        self.resolved_endpoint.as_deref()
+    }
+
+    pub(crate) fn default_generation(&self) -> u64 {
+        self.default_generation
+    }
+
+    pub(crate) fn needs_restart(
+        &self,
+        mode: RelayMode,
+        send_source: &RelaySendSource,
+        receive_sink: &RelayReceiveSink,
+        default_generation: u64,
+    ) -> bool {
+        let follows_default = match mode {
+            RelayMode::Emitter => matches!(
+                send_source,
+                RelaySendSource::DefaultInput | RelaySendSource::DefaultOutputMonitor
+            ),
+            RelayMode::Receiver => matches!(receive_sink, RelayReceiveSink::DefaultOutput),
+        };
+        self.threads.is_empty()
+            || self.threads.iter().any(JoinHandle::is_finished)
+            || self.mode != mode
+            || (mode == RelayMode::Emitter && &self.send_source != send_source)
+            || (mode == RelayMode::Receiver && &self.receive_sink != receive_sink)
+            || (follows_default && self.default_generation != default_generation)
+    }
+
     pub(crate) fn start(config: EngineConfig, endpoints: RelayEndpoints) -> BackendResult<Self> {
+        // Keep the old constructor source-compatible, but route it through the
+        // one-way implementation so a legacy caller cannot start both paths.
+        let mode = config.mode;
+        let send_source = endpoints
+            .capture
+            .clone()
+            .map(RelaySendSource::OutputMonitor)
+            .unwrap_or(RelaySendSource::DefaultOutputMonitor);
+        let receive_sink = endpoints
+            .playback
+            .clone()
+            .map(RelayReceiveSink::OutputDevice)
+            .unwrap_or(RelayReceiveSink::DefaultOutput);
+        Self::start_mode(config, endpoints, mode, send_source, receive_sink, 0)
+    }
+
+    /// Start the direct Windows implementation for exactly one local mode.
+    ///
+    /// Emitter opens one source worker: either a physical eCapture device or
+    /// an eRender loopback monitor. Receiver opens one eRender destination.
+    /// Keeping the inactive direction out of the process is important on
+    /// Windows: there is no virtual endpoint to hide a second active path
+    /// behind, and starting both would violate the one-way flow invariant.
+    pub(crate) fn start_mode(
+        config: EngineConfig,
+        endpoints: RelayEndpoints,
+        mode: RelayMode,
+        send_source: RelaySendSource,
+        receive_sink: RelayReceiveSink,
+        default_generation: u64,
+    ) -> BackendResult<Self> {
+        let (direction, device_id) = endpoint_for_mode(mode, &send_source, &receive_sink)?;
+
         let engine = RelayEngine::start(config)
             .map_err(|error| BackendError::native(format!("relay engine start failed: {error}")))?;
         let stop = Arc::new(AtomicBool::new(false));
-
-        let mut threads = Vec::with_capacity(2);
-        let mut ready = Vec::with_capacity(2);
-        for (name, direction, device) in [
-            (
-                "qpwgraph-relay-capture",
-                Direction::Capture,
-                endpoints.capture.clone(),
-            ),
-            (
-                "qpwgraph-relay-render",
-                Direction::Render,
-                endpoints.playback.clone(),
-            ),
-        ] {
-            let (thread, started) = match spawn_endpoint_thread(
-                name,
-                engine.handle(),
-                Arc::clone(&stop),
-                direction,
-                device,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    stop_threads(&stop, &mut threads);
-                    engine.shutdown();
-                    return Err(error);
-                }
-            };
-            threads.push(thread);
-            ready.push(started);
-        }
-
-        // Wait for both endpoints to report that WASAPI accepted them. Without
-        // this a failure inside a thread would leave a host that looks started
-        // but never carries audio, with nothing to explain why.
-        for started in ready {
-            let result = match started.recv_timeout(ENDPOINT_START_TIMEOUT) {
-                Ok(result) => result,
-                Err(_) => Err(BackendError::native(
-                    "Windows relay endpoint did not start in time",
-                )),
-            };
-            if let Err(error) = result {
-                stop_threads(&stop, &mut threads);
+        let (thread, started) = match spawn_endpoint_thread(
+            match direction {
+                Direction::Input => "qpwgraph-relay-input",
+                Direction::Monitor => "qpwgraph-relay-monitor",
+                Direction::Render => "qpwgraph-relay-render",
+            },
+            engine.handle(),
+            Arc::clone(&stop),
+            direction,
+            device_id,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
                 engine.shutdown();
                 return Err(error);
             }
-        }
+        };
+        let start = match started.recv_timeout(ENDPOINT_START_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err(BackendError::native(
+                "Windows relay endpoint did not start in time",
+            )),
+        };
+        let resolved_endpoint = match start {
+            Ok(start) => start.resolved_id,
+            Err(error) => {
+                stop_threads(&stop, &mut vec![thread]);
+                engine.shutdown();
+                return Err(error);
+            }
+        };
         Ok(Self {
             engine,
             stop,
-            threads,
+            threads: vec![thread],
             endpoints,
+            mode,
+            send_source,
+            receive_sink,
+            resolved_endpoint: Some(resolved_endpoint),
+            default_generation,
         })
+    }
+
+    /// Replace only the active WASAPI worker while retaining the relay engine
+    /// and its authenticated sessions. Device-default changes and mode
+    /// switches therefore do not need to tear down the control connection.
+    pub(crate) fn restart_endpoint(
+        &mut self,
+        mode: RelayMode,
+        send_source: RelaySendSource,
+        receive_sink: RelayReceiveSink,
+        default_generation: u64,
+    ) -> BackendResult<()> {
+        let (direction, device_id) = endpoint_for_mode(mode, &send_source, &receive_sink)?;
+        self.stop.store(true, Ordering::Release);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (thread, started) = spawn_endpoint_thread(
+            match direction {
+                Direction::Input => "qpwgraph-relay-input",
+                Direction::Monitor => "qpwgraph-relay-monitor",
+                Direction::Render => "qpwgraph-relay-render",
+            },
+            self.engine.handle(),
+            Arc::clone(&stop),
+            direction,
+            device_id,
+        )?;
+        let start = match started.recv_timeout(ENDPOINT_START_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err(BackendError::native(
+                "Windows relay endpoint did not start in time",
+            )),
+        };
+        let resolved_endpoint = match start {
+            Ok(start) => start.resolved_id,
+            Err(error) => {
+                stop_threads(&stop, &mut vec![thread]);
+                self.stop = stop;
+                return Err(error);
+            }
+        };
+        self.stop = stop;
+        self.threads.push(thread);
+        self.mode = mode;
+        self.send_source = send_source;
+        self.receive_sink = receive_sink;
+        self.resolved_endpoint = Some(resolved_endpoint);
+        self.default_generation = default_generation;
+        Ok(())
     }
 
     pub(crate) fn handle(&self) -> RelayHandle {
@@ -160,6 +271,9 @@ impl std::fmt::Debug for WindowsRelayDevices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WindowsRelayDevices")
             .field("endpoint_threads", &self.threads.len())
+            .field("mode", &self.mode)
+            .field("resolved_endpoint", &self.resolved_endpoint)
+            .field("default_generation", &self.default_generation)
             .field("stopping", &self.stop.load(Ordering::Acquire))
             .finish()
     }
@@ -167,13 +281,44 @@ impl std::fmt::Debug for WindowsRelayDevices {
 
 #[derive(Clone, Copy)]
 enum Direction {
-    /// Loopback-record the selected playback endpoint into the engine.
-    Capture,
+    /// Record a physical eCapture input device.
+    Input,
+    /// Loopback-record an eRender playback endpoint.
+    Monitor,
     /// Play what the engine received on the selected playback endpoint.
     Render,
 }
 
-type StartResult = Receiver<BackendResult<()>>;
+struct EndpointStart {
+    resolved_id: String,
+}
+
+type StartResult = Receiver<BackendResult<EndpointStart>>;
+
+fn endpoint_for_mode(
+    mode: RelayMode,
+    send_source: &RelaySendSource,
+    receive_sink: &RelayReceiveSink,
+) -> BackendResult<(Direction, Option<String>)> {
+    match mode {
+        RelayMode::Emitter => match send_source {
+            RelaySendSource::DefaultInput => Ok((Direction::Input, None)),
+            RelaySendSource::InputDevice(id) => Ok((Direction::Input, Some(id.clone()))),
+            RelaySendSource::DefaultOutputMonitor => Ok((Direction::Monitor, None)),
+            RelaySendSource::OutputMonitor(id) => Ok((Direction::Monitor, Some(id.clone()))),
+            RelaySendSource::ManualGraph => Err(BackendError::unsupported(
+                "Windows direct relay cannot use a manual graph source",
+            )),
+        },
+        RelayMode::Receiver => match receive_sink {
+            RelayReceiveSink::DefaultOutput => Ok((Direction::Render, None)),
+            RelayReceiveSink::OutputDevice(id) => Ok((Direction::Render, Some(id.clone()))),
+            RelayReceiveSink::ManualGraph => Err(BackendError::unsupported(
+                "Windows direct relay cannot use a manual graph sink",
+            )),
+        },
+    }
+}
 
 fn spawn_endpoint_thread(
     name: &str,
@@ -235,27 +380,32 @@ fn run_endpoint(
     stop: &Arc<AtomicBool>,
     direction: Direction,
     device_id: Option<&str>,
-    started: Sender<BackendResult<()>>,
+    started: Sender<BackendResult<EndpointStart>>,
 ) {
     // The service is acquired here, before the endpoint reports success.
     // Doing it inside the loop hid a real failure: `GetService` was being
     // called as `cast`, which returns E_NOINTERFACE, so both loops exited
     // immediately and the relay carried no audio while still looking started.
-    let opened = open_endpoint(direction, device_id).and_then(|client| match direction {
-        Direction::Capture => unsafe { client.GetService::<Audio::IAudioCaptureClient>() }
-            .map(|service| (client, Service::Capture(service)))
-            .map_err(|error| native("get capture service", error)),
-        Direction::Render => unsafe { client.GetService::<Audio::IAudioRenderClient>() }
-            .map(|service| (client, Service::Render(service)))
-            .map_err(|error| native("get render service", error)),
-    });
+    let opened =
+        open_endpoint(direction, device_id).and_then(|(client, resolved_id)| match direction {
+            Direction::Input | Direction::Monitor => {
+                unsafe { client.GetService::<Audio::IAudioCaptureClient>() }
+                    .map(|service| (client, Service::Capture(service)))
+                    .map(|(client, service)| (client, service, resolved_id))
+                    .map_err(|error| native("get capture service", error))
+            }
+            Direction::Render => unsafe { client.GetService::<Audio::IAudioRenderClient>() }
+                .map(|service| (client, Service::Render(service)))
+                .map(|(client, service)| (client, service, resolved_id))
+                .map_err(|error| native("get render service", error)),
+        });
     match opened {
-        Ok((client, service)) => {
+        Ok((client, service, resolved_id)) => {
             if let Err(error) = unsafe { client.Start() } {
                 let _ = started.send(Err(native("start audio client", error)));
                 return;
             }
-            let _ = started.send(Ok(()));
+            let _ = started.send(Ok(EndpointStart { resolved_id }));
             match service {
                 Service::Capture(capture) => capture_loop(&capture, handle, stop),
                 Service::Render(render) => render_loop(&client, &render, handle, stop),
@@ -278,13 +428,16 @@ enum Service {
 fn open_endpoint(
     direction: Direction,
     device_id: Option<&str>,
-) -> BackendResult<Audio::IAudioClient> {
+) -> BackendResult<(Audio::IAudioClient, String)> {
     let enumerator: Audio::IMMDeviceEnumerator =
         unsafe { Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|error| native("create MMDeviceEnumerator", error))?;
-    // Both directions target a render endpoint: capture reads its loopback.
-    // A named device that has since been unplugged falls back to the default
-    // rather than failing the whole relay.
+    let flow = match direction {
+        Direction::Input => Audio::eCapture,
+        Direction::Monitor | Direction::Render => Audio::eRender,
+    };
+    // A named device that has since been unplugged falls back to the current
+    // default of the required data flow rather than failing the whole relay.
     let device = match device_id {
         Some(id) => {
             let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
@@ -294,9 +447,12 @@ fn open_endpoint(
     };
     let device = match device {
         Some(device) => device,
-        None => unsafe { enumerator.GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole) }
-            .map_err(|error| native("open default playback endpoint", error))?,
+        None => unsafe { enumerator.GetDefaultAudioEndpoint(flow, Audio::eConsole) }
+            .map_err(|error| native("open default audio endpoint", error))?,
     };
+    let resolved_id = unsafe { device.GetId() }
+        .map(take_pwstr)
+        .map_err(|error| native("read resolved audio endpoint id", error))?;
     let client: Audio::IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
         .map_err(|error| native("activate audio client", error))?;
 
@@ -306,7 +462,7 @@ fn open_endpoint(
     // no resampler is needed here.
     let mut flags =
         Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | Audio::AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    if matches!(direction, Direction::Capture) {
+    if matches!(direction, Direction::Monitor) {
         flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
     }
     unsafe {
@@ -321,7 +477,13 @@ fn open_endpoint(
     }
     .map_err(|error| native("initialize audio client", error))?;
 
-    Ok(client)
+    Ok((client, resolved_id))
+}
+
+fn take_pwstr(value: PWSTR) -> String {
+    let text = unsafe { value.to_string() }.unwrap_or_default();
+    unsafe { Com::CoTaskMemFree(Some(value.0 as *mut _)) };
+    text
 }
 
 /// Loopback-record the playback endpoint and hand every frame to the engine.
@@ -489,12 +651,11 @@ impl DriftAdapter {
         // Keep a little more on hand than one output's worth: interpolation
         // always needs one lookahead frame, and the grid may run up to one
         // `rate` step past the last producible point before the next pull.
-        let want_frames = (((out_frames as f64) * self.rate).ceil() as usize + 4)
-            .min(self.fifo.len() / channels);
+        let want_frames =
+            (((out_frames as f64) * self.rate).ceil() as usize + 4).min(self.fifo.len() / channels);
         if self.filled < want_frames {
             let room = want_frames - self.filled;
-            let got =
-                pull(&mut self.fifo[self.filled * channels..(self.filled + room) * channels]);
+            let got = pull(&mut self.fifo[self.filled * channels..(self.filled + room) * channels]);
             self.filled += got / channels;
         }
 
@@ -660,10 +821,7 @@ mod tests {
         let pcm: Vec<f32> = (0..256 * channels)
             .map(|i| ((i % 7) as f32 / 7.0) - 0.5)
             .collect();
-        let mut source = ScriptedSource {
-            pcm,
-            offset: 0,
-        };
+        let mut source = ScriptedSource { pcm, offset: 0 };
         let mut played = Vec::new();
         for _ in 0..12 {
             let mut out = vec![0.0f32; 8 * channels];
@@ -714,10 +872,7 @@ mod tests {
         let pcm: Vec<f32> = (0..16 * channels)
             .map(|i| (i as f32 * 0.125).fract())
             .collect();
-        let mut source = ScriptedSource {
-            pcm,
-            offset: 0,
-        };
+        let mut source = ScriptedSource { pcm, offset: 0 };
         let mut out = vec![-1.0f32; 8 * channels];
         adapter.render(&mut out, |buf| source.pull(buf));
         // The first rendered frame is the first frame of the stream, not a

@@ -15,12 +15,26 @@ internal object NativeBridge {
         System.loadLibrary("pw_graph_relay_android")
     }
 
-    // Receiver (client) --------------------------------------------------
+    // Emitter client ------------------------------------------------------
     external fun create(
         deviceName: String,
         deviceId: String,
         trustedPeersJson: String,
         direction: String,
+        generation: Long,
+        codec: String,
+        transport: String,
+        sampleRate: Int,
+        channels: Int,
+        frameMs: Int,
+    ): String
+
+    /** Canonical Emitter/Receiver constructor. */
+    external fun createMode(
+        deviceName: String,
+        deviceId: String,
+        trustedPeersJson: String,
+        mode: String,
         generation: Long,
         codec: String,
         transport: String,
@@ -52,6 +66,12 @@ internal object NativeBridge {
         direction: String,
         generation: Long,
     ): String
+    external fun offerMode(
+        handle: Long,
+        sessionId: Long,
+        mode: String,
+        generation: Long,
+    ): String
 
     /**
      * Offer `length` samples from the prefix of `samples` to the realtime
@@ -75,7 +95,7 @@ internal object NativeBridge {
     external fun pullPlayback(handle: Long, output: FloatArray): Int
     external fun release(handle: Long)
 
-    // Emitter (host) -----------------------------------------------------
+    // Receiver host -------------------------------------------------------
     external fun hostCreate(
         deviceName: String,
         deviceId: String,
@@ -85,6 +105,22 @@ internal object NativeBridge {
         codec: String,
         transport: String,
         direction: String,
+        generation: Long,
+        sampleRate: Int,
+        channels: Int,
+        frameMs: Int,
+    ): String
+
+    /** Canonical Receiver host constructor. */
+    external fun hostCreateMode(
+        deviceName: String,
+        deviceId: String,
+        trustedPeersJson: String,
+        pin: String,
+        port: Int,
+        codec: String,
+        transport: String,
+        mode: String,
         generation: Long,
         sampleRate: Int,
         channels: Int,
@@ -106,6 +142,12 @@ internal object NativeBridge {
         handle: Long,
         sessionId: Long,
         direction: String,
+        generation: Long,
+    ): String
+    external fun hostOfferMode(
+        handle: Long,
+        sessionId: Long,
+        mode: String,
         generation: Long,
     ): String
 

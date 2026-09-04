@@ -30,6 +30,7 @@ pub(super) fn take_session_dirty_endpoints(
 pub(super) struct EndpointNotificationClient {
     pub(super) dirty: Arc<AtomicBool>,
     pub(super) topology_dirty: Arc<AtomicBool>,
+    pub(super) default_generation: Arc<AtomicU64>,
 }
 
 impl EndpointNotificationClient {
@@ -65,6 +66,7 @@ impl Audio::IMMNotificationClient_Impl for EndpointNotificationClient_Impl {
         _role: Audio::ERole,
         _device_id: &PCWSTR,
     ) -> windows::core::Result<()> {
+        self.default_generation.fetch_add(1, Ordering::AcqRel);
         self.mark_topology_dirty();
         Ok(())
     }

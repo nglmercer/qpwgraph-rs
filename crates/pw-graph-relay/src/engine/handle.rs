@@ -108,6 +108,11 @@ impl RelayHandle {
     /// Start listening for clients. Returns the bound TCP control port.
     pub fn host_start(&self) -> RelayResult<u16> {
         let config = self.inner.config();
+        if config.mode != RelayMode::Receiver {
+            return Err(RelayError::Engine(
+                "a relay host must run in Receiver mode; use a client for Emitter mode".into(),
+            ));
+        }
         let pin = config.pin.trim();
         if pin.is_empty() {
             return Err(RelayError::Engine(
@@ -167,6 +172,13 @@ impl RelayHandle {
         id
     }
 
+    /// Connect as a generic emitter or receiver. The selected mode is
+    /// converted to exactly one wire role; callers never need to construct a
+    /// role bitmask or accidentally request `both`.
+    pub fn connect_mode(&self, target: SocketAddr, pin: &str, mode: RelayMode) -> SessionId {
+        self.connect(target, pin, mode.roles())
+    }
+
     /// Connect using a credential created by a previous explicit PIN pairing.
     /// The stable peer id is part of the authenticated transcript, so a
     /// credential cannot be replayed against an unrelated discovered host.
@@ -180,6 +192,56 @@ impl RelayHandle {
         let id = self.inner.next_session_id();
         session::connect_trusted_peer(&self.inner, id, target, peer_id.to_owned(), secret, roles);
         id
+    }
+
+    /// Trusted reconnect using the platform-neutral local mode.
+    pub fn connect_trusted_mode(
+        &self,
+        target: SocketAddr,
+        peer_id: &str,
+        secret: [u8; 32],
+        mode: RelayMode,
+    ) -> SessionId {
+        self.connect_trusted(target, peer_id, secret, mode.roles())
+    }
+
+    /// Queue a canonical emitter proposal for an authenticated session.
+    /// Higher generations and the stable proposer tie-break are resolved by
+    /// both peers in the control plane.
+    pub fn offer_flow(&self, id: SessionId, flow: RelayFlow, generation: u64) -> RelayResult<()> {
+        let config = self.inner.config();
+        if config.device_id.trim().is_empty() || !flow.is_valid() {
+            return Err(RelayError::Config(
+                "flow offers require stable device and emitter ids".into(),
+            ));
+        }
+        let record = self
+            .inner
+            .session(id)
+            .ok_or_else(|| RelayError::Engine(format!("unknown relay session {id}")))?;
+        record
+            .queue_flow_offer(FlowOffer {
+                generation,
+                emitter_id: flow.emitter_id,
+                proposer_id: config.device_id,
+            })
+            .map_err(RelayError::Config)
+    }
+
+    /// Queue a local Emitter/Receiver choice. Receiver means that the
+    /// authenticated peer is the emitter, so the offer still carries one
+    /// authoritative `emitter_id` rather than a local direction label.
+    pub fn offer_mode(&self, id: SessionId, mode: RelayMode, generation: u64) -> RelayResult<()> {
+        let config = self.inner.config();
+        let record = self
+            .inner
+            .session(id)
+            .ok_or_else(|| RelayError::Engine(format!("unknown relay session {id}")))?;
+        let emitter_id = match mode {
+            RelayMode::Emitter => config.device_id,
+            RelayMode::Receiver => record.peer.id.clone(),
+        };
+        self.offer_flow(id, RelayFlow { emitter_id }, generation)
     }
 
     /// Queue an authenticated direction offer for an established session.

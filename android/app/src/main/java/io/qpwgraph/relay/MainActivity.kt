@@ -156,8 +156,7 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         viewModel.onMediaProjectionResult(result.resultCode, result.data)
-        val hasAudio = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        if (result.resultCode == Activity.RESULT_OK && hasAudio && state.direction == AudioDirection.MobileToDesktop) {
+        if (result.resultCode == Activity.RESULT_OK && state.mode == RelayMode.Emitter) {
             viewModel.connect()
         }
     }
@@ -221,31 +220,37 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            DirectionTabs(direction = state.direction, onSelected = viewModel::setDirection)
-            DirectionHeader(state)
+            var showAdvanced by remember { mutableStateOf(false) }
+            ModeTabs(
+                mode = state.mode,
+                advanced = showAdvanced,
+                onSelected = { mode -> showAdvanced = false; viewModel.setMode(mode) },
+                onAdvanced = { showAdvanced = true },
+            )
+            ModeHeader(state)
             UsbStatusBanner(link = state.usbLink)
 
-            // Global inline alert for the currently selected direction.
-            val globalError = when (state.direction) {
-                AudioDirection.MobileToDesktop -> if (state.connection == RelayConnectionState.Error) state.message else ""
-                AudioDirection.DesktopToMobile -> if (state.hostState == RelayHostState.Error) state.hostMessage else ""
+            // Global inline alert for the currently selected mode.
+            val globalError = when (state.mode) {
+                RelayMode.Emitter -> if (state.connection == RelayConnectionState.Error) state.message else ""
+                RelayMode.Receiver -> if (state.hostState == RelayHostState.Error) state.hostMessage else ""
             }
-            val globalSeverity = when (state.direction) {
-                AudioDirection.MobileToDesktop -> if (state.connection == RelayConnectionState.Error) AlertSeverity.Error else AlertSeverity.Info
-                AudioDirection.DesktopToMobile -> if (state.hostState == RelayHostState.Error) AlertSeverity.Error else AlertSeverity.Info
+            val globalSeverity = when (state.mode) {
+                RelayMode.Emitter -> if (state.connection == RelayConnectionState.Error) AlertSeverity.Error else AlertSeverity.Info
+                RelayMode.Receiver -> if (state.hostState == RelayHostState.Error) AlertSeverity.Error else AlertSeverity.Info
             }
             if (state.switchingDirection) {
-                AppAlert(message = stringResource(R.string.direction_switching), severity = AlertSeverity.Info)
+                AppAlert(message = stringResource(R.string.relay_mode_switching), severity = AlertSeverity.Info)
             } else if (globalError.isNotBlank()) {
                 AppAlert(message = globalError, severity = globalSeverity)
             }
 
-            when (state.direction) {
-                AudioDirection.MobileToDesktop -> PhoneToPcCard(
+            if (!showAdvanced) when (state.mode) {
+                RelayMode.Emitter -> EmitterCard(
                     state, viewModel,
                     connectWithPermission = {
                         runWithServicePermissions(
-                            requiresMicrophone = true,
+                            requiresMicrophone = clientNeedsMicrophone(state.mode, state.settings.captureSource),
                             host = false,
                             action = {
                                 if (state.settings.captureSource == CaptureSource.DEVICE_PLAYBACK &&
@@ -263,21 +268,25 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                         mediaProjectionLauncher.launch(mgr.createScreenCaptureIntent())
                     },
                 )
-                AudioDirection.DesktopToMobile -> PcToPhoneCard(
+                RelayMode.Receiver -> ReceiverCard(
                     state, viewModel,
                     startHost = {
                         runWithServicePermissions(requiresMicrophone = false, host = true, action = viewModel::startHost)
                     },
                 )
             }
-            AdvancedSettingsCard(state, viewModel)
+            if (showAdvanced) AdvancedSettingsCard(state, viewModel)
             DiscoverySection(
                 state,
                 viewModel,
-                canConnect = state.direction == AudioDirection.MobileToDesktop,
+                canConnect = state.mode == RelayMode.Emitter,
                 connectToPeer = { address ->
-                    if (state.direction == AudioDirection.MobileToDesktop) {
-                        runWithServicePermissions(requiresMicrophone = true, host = false, action = { viewModel.connectToPeer(address) })
+                    if (state.mode == RelayMode.Emitter) {
+                        runWithServicePermissions(
+                            requiresMicrophone = clientNeedsMicrophone(state.mode, state.settings.captureSource),
+                            host = false,
+                            action = { viewModel.connectToPeer(address) },
+                        )
                     } else viewModel.connectToPeer(address)
                 },
             )
@@ -294,24 +303,34 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
 }
 
 @Composable
-private fun DirectionTabs(direction: AudioDirection, onSelected: (AudioDirection) -> Unit) {
+private fun ModeTabs(
+    mode: RelayMode,
+    advanced: Boolean,
+    onSelected: (RelayMode) -> Unit,
+    onAdvanced: () -> Unit,
+) {
     val tabs = listOf(
-        stringResource(R.string.direction_phone_to_pc) to AudioDirection.MobileToDesktop,
-        stringResource(R.string.direction_pc_to_phone) to AudioDirection.DesktopToMobile,
+        stringResource(R.string.relay_mode_emitter) to RelayMode.Emitter,
+        stringResource(R.string.relay_mode_receiver) to RelayMode.Receiver,
     )
-    TabRow(selectedTabIndex = tabs.indexOfFirst { it.second == direction }.coerceAtLeast(0)) {
+    TabRow(selectedTabIndex = if (advanced) 2 else tabs.indexOfFirst { it.second == mode }.coerceAtLeast(0)) {
         tabs.forEach { (label, tabDirection) ->
             Tab(
-                selected = direction == tabDirection,
+                selected = !advanced && mode == tabDirection,
                 onClick = { onSelected(tabDirection) },
                 text = { Text(label, style = MaterialTheme.typography.labelLarge) },
             )
         }
+        Tab(
+            selected = advanced,
+            onClick = onAdvanced,
+            text = { Text(stringResource(R.string.relay_mode_advanced), style = MaterialTheme.typography.labelLarge) },
+        )
     }
 }
 
 @Composable
-private fun DirectionHeader(state: RelayUiState) {
+private fun ModeHeader(state: RelayUiState) {
     SectionCard {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -320,11 +339,9 @@ private fun DirectionHeader(state: RelayUiState) {
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (state.direction == AudioDirection.MobileToDesktop) {
-                        stringResource(R.string.direction_phone_to_pc_hint)
-                    } else {
-                        stringResource(R.string.direction_pc_to_phone_hint)
-                    },
+                    text = if (state.mode == RelayMode.Emitter) {
+                        stringResource(R.string.relay_mode_emitter_hint)
+                    } else stringResource(R.string.relay_mode_receiver_hint),
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 val peer = state.hostName.ifBlank { state.host.deviceName }
@@ -337,9 +354,9 @@ private fun DirectionHeader(state: RelayUiState) {
                 enabled = false,
                 label = {
                     Text(
-                        if (state.switchingDirection) stringResource(R.string.direction_switching)
-                        else if (state.direction == AudioDirection.MobileToDesktop) stringResource(R.string.direction_sending)
-                        else stringResource(R.string.direction_receiving),
+                        if (state.switchingDirection) stringResource(R.string.relay_mode_switching)
+                        else if (state.mode == RelayMode.Emitter) stringResource(R.string.relay_mode_emitter)
+                        else stringResource(R.string.relay_mode_receiver),
                     )
                 },
             )
@@ -425,11 +442,11 @@ private fun QrScannerDialog(onDetected: (String) -> Unit, onDismiss: () -> Unit)
 }
 
 // ------------------------------------------------------------------
-// Phone → PC
+// Emitter
 // ------------------------------------------------------------------
 
 @Composable
-private fun PhoneToPcCard(
+private fun EmitterCard(
     state: RelayUiState,
     viewModel: RelayViewModel,
     connectWithPermission: () -> Unit,
@@ -520,7 +537,7 @@ private fun PhoneToPcCard(
 }
 
 @Composable
-private fun PcToPhoneCard(
+private fun ReceiverCard(
     state: RelayUiState,
     viewModel: RelayViewModel,
     startHost: () -> Unit,
@@ -582,7 +599,7 @@ private fun PcToPhoneCard(
         }
         Spacer(Modifier.height(10.dp))
         LevelIndicator(level = state.hostRms)
-        Text(stringResource(R.string.direction_receiving), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(stringResource(R.string.relay_mode_receiver), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 
     val hostPort = state.hostPort
@@ -614,7 +631,7 @@ private fun PcToPhoneCard(
 
 @Composable
 private fun AdvancedSettingsCard(state: RelayUiState, viewModel: RelayViewModel) {
-    val clientDirection = state.direction == AudioDirection.MobileToDesktop
+    val clientDirection = state.mode == RelayMode.Emitter
     val codec = if (clientDirection) state.settings.codec else state.host.codec
     val transport = if (clientDirection) state.settings.transport else state.host.transport
     val frameMs = if (clientDirection) state.settings.frameMs else state.host.frameMs

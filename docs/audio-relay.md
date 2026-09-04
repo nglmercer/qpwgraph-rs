@@ -1,16 +1,22 @@
 # Audio relay
 
-Carrying audio between this machine and a peer — typically a phone — over the
-local network. This page covers the feature as the desktop application exposes
-it; the wire format is documented separately in
+Carrying audio between this installation and a peer over the local network.
+This page covers the feature as the desktop application exposes it; the wire
+format is documented separately in
 [Relay wire protocol, version 3](relay-protocol.md).
 
 ## The panel
 
-The relay panel supports host start/stop, discovery, peer connection and
-disconnection, configurable role/codec/frame/transport, QR payload generation
-and parsing, local endpoint discovery, level updates, and virtual relay graph
-nodes on Linux.
+The relay panel exposes two generic modes. **Emitter** selects a local source
+(the default input, a physical input, or a playback monitor) and connects to a
+peer. **Receiver** starts a local host, accepts a peer, and selects the output
+that should play the received audio. Advanced settings cover codec, frame
+duration, transport, pairing, trusted peers, and QR endpoint information.
+Linux also exposes the relay's virtual graph nodes.
+
+An active session is always one-way: one Emitter sends and one Receiver plays.
+There is no `both` mode and switching modes stops the old worker and route
+before starting the new one.
 
 A host generates a fresh random pairing PIN for each hosting session. It is
 shown in the panel and encoded in the QR payload, is never written to disk, and
@@ -49,14 +55,13 @@ with that stable ID and can try newly discovered addresses when a host moves
 from Wi-Fi to USB.
 
 ADB-only cables are supported through the explicit **ADB** transport. The
-client uses the normal TCP listener for control and opens a second authenticated
-TCP connection for encrypted, length-framed audio. Android client → desktop
-host uses `adb reverse tcp:48123 tcp:48123`; desktop client → Android host uses
-`adb forward tcp:48123 tcp:48123`. Select ADB, target `127.0.0.1:48123`, and
-create the tunnel first. ADB forwarding is not peer discovery; USB tethering
-remains the zero-configuration network workflow. The ADB audio stream has its
-own supervisor: loss of the audio TCP connection leaves a healthy control
-session alive while the client retries with a fresh authenticated nonce/proof.
+connecting endpoint uses `adb reverse tcp:48123 tcp:48123` when the receiver
+host is the desktop and `adb forward tcp:48123 tcp:48123` when the receiver
+host is Android. Select ADB, target `127.0.0.1:48123`, and create the tunnel
+first. ADB forwarding is not peer discovery; USB tethering remains the
+zero-configuration network workflow. The ADB audio stream has its own
+supervisor: loss of the TCP audio connection leaves a healthy control session
+alive while the client retries with a fresh authenticated nonce/proof.
 If localhost is unreachable, the UI reports that the ADB reverse/forward rule
 must be created rather than presenting the failure as a PIN error.
 
@@ -69,27 +74,40 @@ switch and keeps the old path available if rebinding fails.
 Android platform audio endpoints run stereo PCM16 by default; the mono
 geometry stays accepted for callers that explicitly ask for it. Stereo keeps
 left/right separation when capturing device playback instead of folding the
-mix to one channel. The microphone permission is requested only for Emit,
-Both, and Host modes; receive-only playback uses no microphone permission.
+mix to one channel. `RECORD_AUDIO` is requested only when an Emitter selects
+the microphone. Device-playback Emitter mode uses the system capture consent;
+Receiver mode uses no microphone permission.
 
 ## Voice-call audio is not capturable
 
-Device-playback capture cannot pick up call audio — Discord, WhatsApp, Meet,
-ordinary phone calls — on any Android version. Those apps play through the
+Device-playback capture cannot pick up protected call audio — Discord,
+WhatsApp, Meet, and ordinary phone calls — on any Android version. Those apps play through the
 protected voice-communication channel, and Android's playback-capture API is
 not allowed to record it: its usage filter accepts only media, game, and
 unknown usages, and everything else is excluded by OS privacy policy. This is
 a platform rule, not a relay defect, and no app without privileged access can
-work around it. To carry a call, emit the phone's microphone to the desktop,
-or run the call on the desktop itself.
+work around it. To carry a call, select an available local source or run the
+call on the other endpoint itself.
 
 ## Windows
 
-On Windows, the relay uses WASAPI loopback and render streams; the panel
-exposes independent capture and playback endpoint choices by stable Core Audio
-ID, with system-default fallback when a saved device disappears. Windows cannot
-create a microphone endpoint for peer audio, and Windows relay capture is
-whole-endpoint rather than per-application.
+On Windows, Emitter mode can capture a physical input with WASAPI `eCapture` or
+the selected output monitor with `eRender` loopback. Receiver mode renders
+peer audio to a selected `eRender` output. Choices use stable Core Audio IDs,
+follow the system default when requested, and restart only the active worker
+when the resolved device or default generation changes. Direct mode is
+whole-endpoint; an optional virtual-audio driver is required only when other
+applications must see received audio as a capture device.
+
+## Local endpoint routing
+
+Linux keeps a virtual **Relay Speaker** source and **Relay Microphone** sink
+in the PipeWire graph. An Emitter routes its selected local source to Relay
+Speaker; a Receiver routes the network stream from Relay Microphone to the
+selected real output. `default-input` and `default-output` resolve through
+WirePlumber's current default metadata, while explicit selectors stay attached
+to their chosen node. A default-device change therefore moves only
+qpwgraph-owned automatic links; manual graph routing is left untouched.
 
 ## Enabling it
 

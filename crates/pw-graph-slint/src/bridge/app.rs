@@ -57,8 +57,8 @@ pub(crate) struct RelayAttempt {
 #[cfg(feature = "relay")]
 #[derive(Clone, Debug)]
 pub(crate) struct RelayDirectionSwitch {
-    pub(crate) from: pw_graph_config::AudioDirection,
-    pub(crate) target: pw_graph_config::AudioDirection,
+    pub(crate) from: pw_graph_config::RelayMode,
+    pub(crate) target: pw_graph_config::RelayMode,
     pub(crate) generation: u64,
     pub(crate) sessions: BTreeSet<u64>,
     pub(crate) resolved_sessions: BTreeSet<u64>,
@@ -144,6 +144,10 @@ pub(crate) struct Application {
     /// The next window-state read consumes this one-shot UI correction before
     /// interpreting the tab as a new user request.
     pub(crate) relay_direction_ui_sync: Option<pw_graph_config::AudioDirection>,
+    #[cfg(feature = "relay")]
+    /// Ensures persisted local source/sink selections are applied once after
+    /// startup, without re-running PipeWire route reconciliation every frame.
+    pub(crate) relay_route_preferences_applied: bool,
 }
 
 #[cfg(feature = "relay")]

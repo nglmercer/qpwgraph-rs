@@ -23,6 +23,18 @@ pub(super) struct WorkerSnapshot {
     /// Render endpoints as `(device id, display name)`, for relay selection.
     #[cfg(feature = "relay")]
     pub(super) playback_endpoints: Vec<(String, String)>,
+    /// Capture endpoints as `(device id, display name)`, for relay selection.
+    #[cfg(feature = "relay")]
+    pub(super) capture_endpoints: Vec<(String, String)>,
+    /// Current defaults and a monotonically changing notification generation.
+    /// The relay uses the generation even when both requested ids are `None`,
+    /// because `None` means "follow default", not "nothing changed".
+    #[cfg(feature = "relay")]
+    pub(super) default_input: Option<String>,
+    #[cfg(feature = "relay")]
+    pub(super) default_output: Option<String>,
+    #[cfg(feature = "relay")]
+    pub(super) default_generation: u64,
 }
 
 /// What a port means to the router: which Core Audio device, and which way
@@ -193,6 +205,9 @@ pub(super) struct CoreAudioWorker {
         IAudioEndpointVolume,
         Audio::Endpoints::IAudioEndpointVolumeCallback,
     )>,
+    /// Incremented by `OnDefaultDeviceChanged`; read into each public
+    /// snapshot so the driver can restart only default-following relay paths.
+    pub(super) default_generation: Arc<AtomicU64>,
 }
 
 impl CoreAudioWorker {
@@ -205,9 +220,11 @@ impl CoreAudioWorker {
         let enumerator: Audio::IMMDeviceEnumerator =
             unsafe { Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .map_err(|error| native_error("create MMDeviceEnumerator", error))?;
+        let default_generation = Arc::new(AtomicU64::new(0));
         let endpoint_notification: Audio::IMMNotificationClient = EndpointNotificationClient {
             dirty: Arc::clone(&dirty),
             topology_dirty: Arc::clone(&topology_dirty),
+            default_generation: Arc::clone(&default_generation),
         }
         .into();
         unsafe {
@@ -226,6 +243,7 @@ impl CoreAudioWorker {
             session_events: Vec::new(),
             audio_states,
             endpoint_volume_events: Vec::new(),
+            default_generation,
             endpoints: Vec::new(),
             sessions: Vec::new(),
             meter_policy: MeterPolicy::OnDemand,
@@ -489,7 +507,34 @@ impl CoreAudioWorker {
                     (endpoint.id.clone(), name)
                 })
                 .collect(),
+            capture_endpoints: self
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.flow == Audio::eCapture)
+                .map(|endpoint| {
+                    let name = self
+                        .graph
+                        .nodes
+                        .get(&endpoint.node_id)
+                        .map(|node| node.name.clone())
+                        .unwrap_or_else(|| endpoint.id.clone());
+                    (endpoint.id.clone(), name)
+                })
+                .collect(),
+            default_input: self.default_endpoint_id(Audio::eCapture),
+            default_output: self.default_endpoint_id(Audio::eRender),
+            default_generation: self.default_generation.load(Ordering::Acquire),
         }
+    }
+
+    #[cfg(feature = "relay")]
+    fn default_endpoint_id(&self, flow: Audio::EDataFlow) -> Option<String> {
+        let device = unsafe {
+            self.enumerator
+                .GetDefaultAudioEndpoint(flow, Audio::eConsole)
+        }
+        .ok()?;
+        unsafe { device.GetId() }.ok().map(take_pwstr)
     }
 
     /// Subscribe to endpoint volume/mute changes so the hardware keys and the

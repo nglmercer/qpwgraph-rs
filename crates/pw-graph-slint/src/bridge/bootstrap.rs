@@ -105,6 +105,8 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         relay_direction_switch: None,
         #[cfg(feature = "relay")]
         relay_direction_ui_sync: None,
+        #[cfg(feature = "relay")]
+        relay_route_preferences_applied: false,
     }));
 
     (app, meter_policy)

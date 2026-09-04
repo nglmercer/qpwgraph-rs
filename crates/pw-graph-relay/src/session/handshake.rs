@@ -245,6 +245,9 @@ pub(super) fn enroll_trusted_peer(
     if flush_pending_direction_offer(record, stream, cipher).is_err() {
         return;
     }
+    if flush_pending_flow_offer(record, stream, cipher).is_err() {
+        return;
+    }
     // The handshake's 5s read timeout would let keepalive sends drift to the
     // edge of the host's 6s session timeout; poll finely so they keep the
     // cadence the control loop normally maintains. The control loop sets its
@@ -266,6 +269,9 @@ pub(super) fn enroll_trusted_peer(
         // deciding whether to persist the freshly enrolled credential. Keep
         // the same queued-offer/retry contract as the normal control watcher.
         if flush_pending_direction_offer(record, stream, cipher).is_err() {
+            return;
+        }
+        if flush_pending_flow_offer(record, stream, cipher).is_err() {
             return;
         }
         match cipher.receive(stream) {
@@ -305,6 +311,35 @@ pub(super) fn enroll_trusted_peer(
                     emit_direction_resolution(inner, record.id, resolution);
                 }
             }
+            Ok(ControlMessage::FlowOffer {
+                generation,
+                emitter_id,
+                proposer_id,
+            }) => {
+                if let Ok(Some(resolution)) = apply_flow_offer(
+                    record,
+                    stream,
+                    cipher,
+                    FlowOffer {
+                        generation,
+                        emitter_id,
+                        proposer_id,
+                    },
+                ) {
+                    emit_flow_resolution(inner, record, resolution);
+                }
+            }
+            Ok(ControlMessage::FlowAck {
+                generation,
+                emitter_id,
+            }) => {
+                if let Some(resolution) = record.receive_flow_ack(FlowAck {
+                    generation,
+                    emitter_id,
+                }) {
+                    emit_flow_resolution(inner, record, resolution);
+                }
+            }
             // Keepalive is legal immediately after SessionReady. It is a
             // one-way liveness hint, so consuming it while waiting for the
             // enrollment acknowledgement does not require a response.
@@ -314,10 +349,7 @@ pub(super) fn enroll_trusted_peer(
         }
         let now = Instant::now();
         if now.duration_since(last_keepalive) >= KEEPALIVE_INTERVAL {
-            if cipher
-                .send(stream, &ControlMessage::Keepalive {})
-                .is_err()
-            {
+            if cipher.send(stream, &ControlMessage::Keepalive {}).is_err() {
                 return;
             }
             last_keepalive = now;

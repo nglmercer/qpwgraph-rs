@@ -76,8 +76,10 @@ class RelaySettingsRepositoryTest {
 
         assertEquals(saved.copy(pin = ""), loaded)
         assertNull(preferences["pin"])
-        assertEquals("desktop_to_mobile", preferences["audio_direction"])
-        assertEquals(41L, preferences["audio_direction_generation"])
+        assertEquals("receiver", preferences["relay_mode"])
+        assertEquals(41L, preferences["relay_mode_generation"])
+        assertNull(preferences["audio_direction"])
+        assertNull(preferences["audio_direction_generation"])
         assertNull(preferences["role"])
     }
 
@@ -139,7 +141,8 @@ class RelaySettingsRepositoryTest {
             val repository = RelaySettingsRepository(preferences.proxy())
             assertEquals(expected, repository.loadSettings().direction)
             repository.saveDirection(expected)
-            assertEquals(expected.serialized(), preferences["audio_direction"])
+            assertEquals(expected.relayMode().serialized(), preferences["relay_mode"])
+            assertNull(preferences["audio_direction"])
             assertEquals(legacyRole, preferences["role"])
         }
     }

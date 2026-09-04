@@ -834,10 +834,10 @@ pub use pw_graph_relay::{
     },
     qr as relay_qr, CodecKind as RelayCodecKind, DeviceKind as RelayDeviceKind,
     EngineStatus as RelayEngineStatus, LinkKind as RelayLinkKind, LocalLink as RelayLocalLink,
-    PeerInfo as RelayPeerInfo, RelayDirection, RelayEvent, Roles as RelayRoles,
-    SessionId as RelaySessionId,
-    SessionStatus as RelaySessionStatus, TransportPreference as RelayTransportPreference,
-    TrustedPeer as RelayTrustedPeer, FRAME_DURATIONS_MS as RELAY_FRAME_DURATIONS_MS,
+    PeerInfo as RelayPeerInfo, RelayDirection, RelayEvent, RelayFlow, RelayMode,
+    Roles as RelayRoles, SessionId as RelaySessionId, SessionStatus as RelaySessionStatus,
+    TransportPreference as RelayTransportPreference, TrustedPeer as RelayTrustedPeer,
+    FRAME_DURATIONS_MS as RELAY_FRAME_DURATIONS_MS,
 };
 
 /// Wire roles derived for the desktop endpoint selected by the direction-first
@@ -872,6 +872,10 @@ pub struct RelayHostRequest {
     pub direction: RelayDirection,
     /// Monotonic direction generation retained across trusted reconnects.
     pub direction_generation: u64,
+    /// Generic local role for this host. New callers should set this field;
+    /// the legacy direction pair remains accepted for one migration period.
+    pub mode: RelayMode,
+    pub mode_generation: u64,
 }
 
 #[cfg(feature = "relay")]
@@ -890,6 +894,8 @@ impl std::fmt::Debug for RelayHostRequest {
             .field("transport", &self.transport)
             .field("direction", &self.direction)
             .field("direction_generation", &self.direction_generation)
+            .field("mode", &self.mode)
+            .field("mode_generation", &self.mode_generation)
             .finish()
     }
 }
@@ -943,6 +949,22 @@ pub trait RelayDriver {
         ))
     }
 
+    /// Connect with the platform-neutral local role. Emitter maps to the
+    /// client `emit_only` wire role and Receiver maps to `receive_only`.
+    fn relay_connect_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        pin: &str,
+        mode: RelayMode,
+        generation: u64,
+    ) -> BackendResult<RelaySessionId> {
+        let direction = match mode {
+            RelayMode::Emitter => RelayDirection::DesktopToMobile,
+            RelayMode::Receiver => RelayDirection::MobileToDesktop,
+        };
+        self.relay_connect(target, pin, direction, generation)
+    }
+
     /// Connect to a discovered peer with a credential obtained from a prior
     /// explicit pairing. Implementations that support relay should override
     /// this; the default preserves the backend capability contract.
@@ -957,6 +979,21 @@ pub trait RelayDriver {
         Err(BackendError::Unsupported(
             "trusted relay auto-connect is not available for this backend".into(),
         ))
+    }
+
+    fn relay_connect_trusted_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        peer_id: &str,
+        secret: [u8; 32],
+        mode: RelayMode,
+        generation: u64,
+    ) -> BackendResult<RelaySessionId> {
+        let direction = match mode {
+            RelayMode::Emitter => RelayDirection::DesktopToMobile,
+            RelayMode::Receiver => RelayDirection::MobileToDesktop,
+        };
+        self.relay_connect_trusted(target, peer_id, secret, direction, generation)
     }
 
     /// Update the stable client identity and imported credentials before a
@@ -980,6 +1017,30 @@ pub trait RelayDriver {
     ) -> BackendResult<()> {
         Err(BackendError::Unsupported(
             "audio relay direction switching is not available for this backend".into(),
+        ))
+    }
+
+    /// Queue a canonical emitter proposal for an authenticated session.
+    fn relay_offer_flow(
+        &mut self,
+        _session: RelaySessionId,
+        _flow: RelayFlow,
+        _generation: u64,
+    ) -> BackendResult<()> {
+        Err(BackendError::Unsupported(
+            "audio relay flow switching is not available for this backend".into(),
+        ))
+    }
+
+    fn relay_offer_mode(
+        &mut self,
+        session: RelaySessionId,
+        mode: RelayMode,
+        generation: u64,
+    ) -> BackendResult<()> {
+        let _ = (session, mode, generation);
+        Err(BackendError::Unsupported(
+            "audio relay mode switching is not available for this backend".into(),
         ))
     }
 
@@ -1086,6 +1147,88 @@ pub trait RelayDriver {
 
     fn relay_ensure_playback_route(&mut self) -> BackendResult<RelayPlaybackState> {
         Ok(RelayPlaybackState::Disabled)
+    }
+
+    // ---- Generic local Emitter/Receiver routing ----
+
+    fn relay_send_sources(&self) -> Vec<RelayEndpointInfo> {
+        Vec::new()
+    }
+
+    fn relay_receive_sinks(&self) -> Vec<RelayEndpointInfo> {
+        Vec::new()
+    }
+
+    fn relay_set_send_source(&mut self, _source: RelaySendSource) -> BackendResult<()> {
+        Err(BackendError::Unsupported(
+            "relay send-source selection is not available for this backend".into(),
+        ))
+    }
+
+    fn relay_set_receive_sink(&mut self, _sink: RelayReceiveSink) -> BackendResult<()> {
+        Err(BackendError::Unsupported(
+            "relay receive-sink selection is not available for this backend".into(),
+        ))
+    }
+
+    fn relay_ensure_local_route(
+        &mut self,
+        _mode: RelayMode,
+    ) -> BackendResult<RelayLocalRouteState> {
+        Ok(RelayLocalRouteState::default())
+    }
+}
+
+/// A local source that can feed an Emitter endpoint.
+#[cfg(feature = "relay")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelaySendSource {
+    DefaultInput,
+    InputDevice(String),
+    DefaultOutputMonitor,
+    OutputMonitor(String),
+    ManualGraph,
+}
+
+/// A local sink that can receive PCM from a Receiver endpoint.
+#[cfg(feature = "relay")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelayReceiveSink {
+    DefaultOutput,
+    OutputDevice(String),
+    ManualGraph,
+}
+
+/// An endpoint choice shown by the platform UI.
+#[cfg(feature = "relay")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayEndpointInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Result of reconciling the qpwgraph-owned local route for one mode.
+#[cfg(feature = "relay")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayLocalRouteState {
+    pub mode: Option<RelayMode>,
+    pub active: bool,
+    pub source_id: Option<String>,
+    pub sink_id: Option<String>,
+    pub description: String,
+}
+
+#[cfg(feature = "relay")]
+impl Default for RelayLocalRouteState {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            active: false,
+            source_id: None,
+            sink_id: None,
+            description: String::new(),
+        }
     }
 }
 

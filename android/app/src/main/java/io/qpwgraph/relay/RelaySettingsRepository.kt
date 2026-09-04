@@ -45,17 +45,25 @@ class RelaySettingsRepository(private val preferences: SharedPreferences) {
     fun loadSettings(): RelaySettings = RelaySettings(
         target = preferences.getString("target", "") ?: "",
         pin = "",
-        direction = audioDirectionFromString(
-            if (preferences.contains("audio_direction")) {
-                preferences.getString("audio_direction", null)
-            } else {
-                // One-release migration: old Android builds stored the
-                // client role. `both` is intentionally resolved by
-                // audioDirectionFromString to Mobile → Desktop.
-                preferences.getString("role", null)
-            },
-        ),
-        directionGeneration = preferences.getLong("audio_direction_generation", 0L),
+        direction = if (preferences.contains("relay_mode")) {
+            relayModeFromString(preferences.getString("relay_mode", null)).audioDirection()
+        } else {
+            audioDirectionFromString(
+                if (preferences.contains("audio_direction")) {
+                    preferences.getString("audio_direction", null)
+                } else {
+                    // One-release migration: old Android builds stored the
+                    // client role. `both` is intentionally resolved by
+                    // audioDirectionFromString to Mobile → Desktop.
+                    preferences.getString("role", null)
+                },
+            )
+        },
+        directionGeneration = if (preferences.contains("relay_mode_generation")) {
+            preferences.getLong("relay_mode_generation", 0L)
+        } else {
+            preferences.getLong("audio_direction_generation", 0L)
+        },
         codec = preferences.getString("codec", "opus") ?: "opus",
         transport = migrateTransport(preferences.getString("transport", "auto") ?: "auto"),
         deviceName = preferences.getString("device_name", "android-relay") ?: "android-relay",
@@ -69,8 +77,8 @@ class RelaySettingsRepository(private val preferences: SharedPreferences) {
     fun save(settings: RelaySettings) {
         preferences.edit()
             .putString("target", settings.target)
-            .putString("audio_direction", settings.direction.serialized())
-            .putLong("audio_direction_generation", settings.directionGeneration)
+            .putString("relay_mode", settings.mode.serialized())
+            .putLong("relay_mode_generation", settings.modeGeneration)
             .putString("codec", settings.codec)
             .putString("transport", settings.transport)
             .putString("device_name", settings.deviceName)
@@ -83,15 +91,15 @@ class RelaySettingsRepository(private val preferences: SharedPreferences) {
     /** Persist a direction transition without rewriting unrelated UI fields. */
     fun saveDirection(direction: AudioDirection) {
         preferences.edit()
-            .putString("audio_direction", direction.serialized())
+            .putString("relay_mode", direction.relayMode().serialized())
             .apply()
     }
 
     /** Persist a direction offer and its monotonic negotiation generation. */
     fun saveDirection(direction: AudioDirection, generation: Long) {
         preferences.edit()
-            .putString("audio_direction", direction.serialized())
-            .putLong("audio_direction_generation", generation)
+            .putString("relay_mode", direction.relayMode().serialized())
+            .putLong("relay_mode_generation", generation)
             .apply()
     }
 

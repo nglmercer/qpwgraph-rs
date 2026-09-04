@@ -46,6 +46,28 @@ pub(super) fn flush_pending_direction_offer(
     Ok(())
 }
 
+/// Send the canonical emitter offer, retaining it until the peer's
+/// authenticated acknowledgement arrives so a control reconnect can resend
+/// the request safely.
+pub(super) fn flush_pending_flow_offer(
+    record: &Arc<SessionRecord>,
+    stream: &mut TcpStream,
+    cipher: &mut ControlCipher,
+) -> std::io::Result<()> {
+    if let Some(offer) = record.pending_flow_offer() {
+        cipher.send(
+            stream,
+            &ControlMessage::FlowOffer {
+                generation: offer.generation,
+                emitter_id: offer.emitter_id.clone(),
+                proposer_id: offer.proposer_id.clone(),
+            },
+        )?;
+        record.mark_flow_offer_sent(&offer);
+    }
+    Ok(())
+}
+
 /// Apply a remote offer and send the deterministic acknowledgement while the
 /// caller still owns the control cipher.
 pub(super) fn apply_direction_offer(
@@ -77,6 +99,44 @@ pub(super) fn emit_direction_resolution(
         generation: resolution.winner.generation,
         direction: resolution.winner.direction,
         winner_device_id: resolution.winner.device_id,
+    });
+}
+
+pub(super) fn apply_flow_offer(
+    record: &Arc<SessionRecord>,
+    stream: &mut TcpStream,
+    cipher: &mut ControlCipher,
+    offer: FlowOffer,
+) -> Result<Option<FlowResolution>, String> {
+    let (ack, resolution) = record.receive_flow_offer(offer)?;
+    cipher
+        .send(
+            stream,
+            &ControlMessage::FlowAck {
+                generation: ack.generation,
+                emitter_id: ack.emitter_id,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(resolution)
+}
+
+pub(super) fn emit_flow_resolution(
+    inner: &Arc<EngineInner>,
+    record: &Arc<SessionRecord>,
+    resolution: FlowResolution,
+) {
+    let flow = resolution.winner.flow();
+    record.apply_flow(&flow);
+    let local_id = record.local_device_id().unwrap_or_default();
+    let Some(mode) = flow.mode_for(&local_id) else {
+        return;
+    };
+    inner.emit(RelayEvent::FlowResolved {
+        id: record.id,
+        generation: resolution.winner.generation,
+        flow,
+        mode,
     });
 }
 
@@ -280,6 +340,7 @@ pub(super) fn watch_control(
     // just before the previous stream dropped remains authoritative, but it
     // must be sent again on this authenticated replacement channel.
     record.reset_direction_offer_send();
+    record.reset_flow_offer_send();
     let mut last_seen = Instant::now();
     let mut last_keepalive = Instant::now();
 
@@ -298,6 +359,9 @@ pub(super) fn watch_control(
         }
         if let Err(error) = flush_pending_direction_offer(&record, &mut stream, &mut cipher) {
             return ControlExit::Dropped(format!("direction offer could not be sent: {error}"));
+        }
+        if let Err(error) = flush_pending_flow_offer(&record, &mut stream, &mut cipher) {
+            return ControlExit::Dropped(format!("flow offer could not be sent: {error}"));
         }
         if let Some(resolution) = inner.take_trusted_enrollment(record.id) {
             if resolution.accepted {
@@ -399,6 +463,39 @@ pub(super) fn watch_control(
                 });
                 if let Some(resolution) = resolution {
                     emit_direction_resolution(&inner, record.id, resolution);
+                }
+                last_seen = Instant::now();
+            }
+            Ok(ControlMessage::FlowOffer {
+                generation,
+                emitter_id,
+                proposer_id,
+            }) => {
+                let offer = FlowOffer {
+                    generation,
+                    emitter_id,
+                    proposer_id,
+                };
+                match apply_flow_offer(&record, &mut stream, &mut cipher, offer) {
+                    Ok(Some(resolution)) => emit_flow_resolution(&inner, &record, resolution),
+                    Ok(None) => {}
+                    Err(reason) => {
+                        return ControlExit::Dropped(format!(
+                            "invalid flow negotiation message: {reason}"
+                        ));
+                    }
+                }
+                last_seen = Instant::now();
+            }
+            Ok(ControlMessage::FlowAck {
+                generation,
+                emitter_id,
+            }) => {
+                if let Some(resolution) = record.receive_flow_ack(FlowAck {
+                    generation,
+                    emitter_id,
+                }) {
+                    emit_flow_resolution(&inner, &record, resolution);
                 }
                 last_seen = Instant::now();
             }

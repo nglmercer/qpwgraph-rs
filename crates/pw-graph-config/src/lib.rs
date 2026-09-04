@@ -37,6 +37,81 @@ pub enum AudioDirection {
     DesktopToMobile,
 }
 
+/// Platform-neutral local relay role. The desktop uses this field for its
+/// own role; Android has the same two-value model at its JNI boundary.
+/// `AudioDirection` remains as a serde/API compatibility shim for configs
+/// written by the direction-first release.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RelayMode {
+    Emitter,
+    /// A desktop installation historically defaulted to receiving phone
+    /// audio, so preserve that default while the generic key is introduced.
+    #[default]
+    Receiver,
+}
+
+impl RelayMode {
+    pub const EMITTER: &'static str = "emitter";
+    pub const RECEIVER: &'static str = "receiver";
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Emitter => Self::EMITTER,
+            Self::Receiver => Self::RECEIVER,
+        }
+    }
+
+    /// Parse canonical values and the desktop's one-release legacy role
+    /// values. Legacy `both` is intentionally collapsed to Receiver rather
+    /// than being allowed to create a bidirectional session.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "emitter" | "emit" | "desktop_to_mobile" | "pc_to_mobile" => Some(Self::Emitter),
+            "receiver" | "receive" | "both" | "mobile_to_desktop" | "mobile_to_pc" => {
+                Some(Self::Receiver)
+            }
+            _ => None,
+        }
+    }
+
+    pub const fn from_audio_direction(direction: AudioDirection) -> Self {
+        match direction {
+            AudioDirection::MobileToDesktop => Self::Receiver,
+            AudioDirection::DesktopToMobile => Self::Emitter,
+        }
+    }
+
+    pub const fn audio_direction(self) -> AudioDirection {
+        match self {
+            Self::Emitter => AudioDirection::DesktopToMobile,
+            Self::Receiver => AudioDirection::MobileToDesktop,
+        }
+    }
+}
+
+impl Serialize for RelayMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            D::Error::custom(format!(
+                "invalid relay mode '{value}'; expected emitter or receiver"
+            ))
+        })
+    }
+}
+
 impl AudioDirection {
     pub const MOBILE_TO_DESKTOP: &'static str = "mobile_to_desktop";
     pub const DESKTOP_TO_MOBILE: &'static str = "desktop_to_mobile";
@@ -168,24 +243,40 @@ pub struct AppConfig {
     /// leaving a working credential in a world-readable file.
     #[serde(skip)]
     pub relay_client_pin: String,
-    /// Direction-first relay setting. `relay_role` is accepted as a serde
-    /// alias for one release so older config files migrate on read, but saves
-    /// always emit only this canonical key.
-    #[serde(default, alias = "relay_role")]
+    /// Deprecated direction-first relay setting. It is still deserialized
+    /// from old files, but is never written again; new files use
+    /// `relay_mode` below.
+    #[serde(default, alias = "relay_role", skip_serializing)]
     pub relay_direction: AudioDirection,
     /// Monotonic generation used by the authenticated direction negotiation.
     /// It is persisted with the desired direction so a reconnect cannot
     /// resurrect an older offline choice.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub relay_direction_generation: u64,
+    /// Canonical generic role and generation. The deprecated direction fields
+    /// above are kept readable for older callers and are synchronized by the
+    /// application when a mode is changed.
+    #[serde(default)]
+    pub relay_mode: RelayMode,
+    #[serde(default)]
+    pub relay_mode_generation: u64,
+    /// Canonical local Emitter source selector. The value is an opaque
+    /// backend id such as `default-input`, `default-output-monitor`,
+    /// `input:<id>`, or `monitor:<id>`.
+    #[serde(default = "default_relay_send_source")]
+    pub relay_send_source: String,
+    /// Canonical local Receiver sink selector. The value is an opaque backend
+    /// id such as `default-output` or `output:<id>`.
+    #[serde(default = "default_relay_receive_sink")]
+    pub relay_receive_sink: String,
     pub relay_codec: String,
     pub relay_frame_ms: u16,
     pub relay_transport: String,
     /// Windows relay endpoint selections. `None` follows the current default
     /// playback endpoint; the values are opaque Core Audio device IDs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub relay_capture_endpoint_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub relay_playback_endpoint_id: Option<String>,
     /// Relay playback: whether received Android audio is routed to local speakers.
     #[serde(default = "default_true")]
@@ -228,6 +319,10 @@ impl fmt::Debug for AppConfig {
                 "relay_direction_generation",
                 &self.relay_direction_generation,
             )
+            .field("relay_mode", &self.relay_mode)
+            .field("relay_mode_generation", &self.relay_mode_generation)
+            .field("relay_send_source", &self.relay_send_source)
+            .field("relay_receive_sink", &self.relay_receive_sink)
             .field("relay_codec", &self.relay_codec)
             .field("relay_frame_ms", &self.relay_frame_ms)
             .field("relay_transport", &self.relay_transport)
@@ -243,6 +338,10 @@ pub struct PersistedRelayPeer {
     pub name: String,
     #[serde(default)]
     pub address: String,
+    /// Optional per-peer role preference. `None` preserves the global mode
+    /// for older trusted-peer records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_mode: Option<RelayMode>,
 }
 
 impl fmt::Debug for PersistedRelayPeer {
@@ -253,12 +352,19 @@ impl fmt::Debug for PersistedRelayPeer {
             .field("secret", &"<redacted>")
             .field("name", &self.name)
             .field("address", &self.address)
+            .field("preferred_mode", &self.preferred_mode)
             .finish()
     }
 }
 
 fn default_relay_auto_connect() -> bool {
     true
+}
+fn default_relay_send_source() -> String {
+    "default-input".into()
+}
+fn default_relay_receive_sink() -> String {
+    "default-output".into()
 }
 fn default_true() -> bool {
     true
@@ -336,6 +442,10 @@ impl Default for AppConfig {
             relay_client_pin: String::new(),
             relay_direction: AudioDirection::MobileToDesktop,
             relay_direction_generation: 0,
+            relay_mode: RelayMode::Receiver,
+            relay_mode_generation: 0,
+            relay_send_source: default_relay_send_source(),
+            relay_receive_sink: default_relay_receive_sink(),
             relay_codec: "opus".into(),
             // Ten milliseconds halves the codec-side latency floor of the
             // previous 20 ms default at the cost of doubling the packet rate
@@ -357,9 +467,61 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Set the canonical role and keep the legacy in-memory compatibility
+    /// fields aligned for older embedders.
+    pub fn set_relay_mode(&mut self, mode: RelayMode, generation: u64) {
+        self.relay_mode = mode;
+        self.relay_mode_generation = generation;
+        self.relay_direction = mode.audio_direction();
+        self.relay_direction_generation = generation;
+    }
+
+    /// Normalize a config loaded from a pre-generic direction key. This is
+    /// intentionally explicit so callers that deserialize through TOML
+    /// directly can opt into the same migration as [`Self::load_from`].
+    pub fn migrate_relay_mode(&mut self) {
+        // A non-zero legacy generation is an unambiguous signal that this
+        // document predates the generic key. Copy both pieces of the old
+        // preference before synchronizing the compatibility fields. For a
+        // generation-zero document, preserve the historical default unless
+        // its direction is the only available preference.
+        if self.relay_mode_generation == 0 {
+            if self.relay_direction_generation != 0 {
+                self.relay_mode = RelayMode::from_audio_direction(self.relay_direction);
+                self.relay_mode_generation = self.relay_direction_generation;
+            } else if self.relay_mode == RelayMode::Receiver {
+                self.relay_mode = RelayMode::from_audio_direction(self.relay_direction);
+            }
+        }
+        self.relay_direction = self.relay_mode.audio_direction();
+        self.relay_direction_generation = self.relay_mode_generation;
+        self.migrate_relay_routes();
+    }
+
+    /// Convert endpoint preferences written by the old Windows playback pair
+    /// into the platform-neutral source/sink selectors. New code only writes
+    /// the generic fields, while old fields remain readable for one migration
+    /// period.
+    pub fn migrate_relay_routes(&mut self) {
+        if self.relay_send_source == default_relay_send_source() {
+            if let Some(endpoint) = self.relay_capture_endpoint_id.as_deref() {
+                self.relay_send_source = format!("monitor:{endpoint}");
+            }
+        }
+        if self.relay_receive_sink == default_relay_receive_sink() {
+            if let Some(endpoint) = self.relay_playback_endpoint_id.as_deref() {
+                self.relay_receive_sink = format!("output:{endpoint}");
+            } else if let Some(sink) = self.relay_playback_sink.as_deref() {
+                self.relay_receive_sink = sink.to_owned();
+            }
+        }
+    }
+
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Read)?;
-        Ok(toml::from_str(&text)?)
+        let mut config: Self = toml::from_str(&text)?;
+        config.migrate_relay_mode();
+        Ok(config)
     }
 
     /// Save the configuration.
@@ -368,7 +530,13 @@ impl AppConfig {
     /// full disk cannot destroy the only copy of the user's settings, and the
     /// file is created owner-only.
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
-        let text = toml::to_string_pretty(self)?;
+        // Callers that deserialize through `toml` directly may not have run
+        // the migration hook. Normalize a clone here so every persisted file
+        // uses the canonical generic keys, without mutating the live UI state
+        // while it is being saved.
+        let mut config = self.clone();
+        config.migrate_relay_mode();
+        let text = toml::to_string_pretty(&config)?;
         pw_graph_utils::atomic_write(path.as_ref(), text.as_bytes(), true)
             .map_err(ConfigError::Write)
     }
@@ -419,14 +587,15 @@ mod tests {
                 secret: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
                 name: "phone".into(),
                 address: "192.168.42.2:48123".into(),
+                preferred_mode: None,
             }],
             relay_auto_connect_trusted: false,
             relay_device_name: "studio-pc".into(),
             relay_host_pin: String::new(),
             relay_host_port: 0,
             relay_client_target: "192.168.1.20:48123".into(),
-            relay_capture_endpoint_id: Some("capture-endpoint".into()),
-            relay_playback_endpoint_id: Some("playback-endpoint".into()),
+            relay_send_source: "monitor:capture-endpoint".into(),
+            relay_receive_sink: "output:playback-endpoint".into(),
             ..AppConfig::default()
         };
         expected.save_to(&path).unwrap();
@@ -435,19 +604,21 @@ mod tests {
     }
 
     #[test]
-    fn relay_direction_migrates_legacy_desktop_roles_and_writes_only_the_new_key() {
+    fn relay_direction_migrates_legacy_desktop_roles_and_writes_only_the_generic_key() {
         let cases = [
             ("emit", AudioDirection::DesktopToMobile),
             ("receive", AudioDirection::MobileToDesktop),
             ("both", AudioDirection::MobileToDesktop),
         ];
         for (legacy_role, expected) in cases {
-            let config: AppConfig =
+            let mut config: AppConfig =
                 toml::from_str(&format!("language = 'en'\nrelay_role = '{legacy_role}'\n"))
                     .unwrap();
+            config.migrate_relay_mode();
             assert_eq!(config.relay_direction, expected);
             let serialized = toml::to_string(&config).unwrap();
-            assert!(serialized.contains("relay_direction ="));
+            assert!(serialized.contains("relay_mode ="));
+            assert!(!serialized.contains("relay_direction ="));
             assert!(!serialized.contains("relay_role ="));
         }
     }
@@ -461,33 +632,34 @@ mod tests {
             AudioDirection::MobileToDesktop
         );
 
-        let desktop_to_mobile: AppConfig =
+        let mut desktop_to_mobile: AppConfig =
             toml::from_str("language = 'en'\nrelay_direction = 'pc_to_mobile'\n").unwrap();
         assert_eq!(
             desktop_to_mobile.relay_direction,
             AudioDirection::DesktopToMobile
         );
-        assert_eq!(
-            toml::to_string(&desktop_to_mobile)
-                .unwrap()
-                .lines()
-                .find(|line| line.starts_with("relay_direction")),
-            Some("relay_direction = \"desktop_to_mobile\"")
-        );
+        desktop_to_mobile.migrate_relay_mode();
+        assert_eq!(desktop_to_mobile.relay_mode, RelayMode::Emitter);
+        let serialized = toml::to_string(&desktop_to_mobile).unwrap();
+        assert!(serialized.contains("relay_mode = \"emitter\""));
+        assert!(!serialized.contains("relay_direction ="));
     }
 
     #[test]
     fn relay_direction_generation_is_persisted_with_the_canonical_direction() {
-        let config: AppConfig = toml::from_str(
+        let mut config: AppConfig = toml::from_str(
             "language = 'en'\nrelay_direction = 'desktop_to_mobile'\nrelay_direction_generation = 17\n",
         )
         .unwrap();
+        config.migrate_relay_mode();
         assert_eq!(config.relay_direction, AudioDirection::DesktopToMobile);
         assert_eq!(config.relay_direction_generation, 17);
 
         let serialized = toml::to_string(&config).unwrap();
-        assert!(serialized.contains("relay_direction = \"desktop_to_mobile\""));
-        assert!(serialized.contains("relay_direction_generation = 17"));
+        assert!(serialized.contains("relay_mode = \"emitter\""));
+        assert!(serialized.contains("relay_mode_generation = 17"));
+        assert!(!serialized.contains("relay_direction ="));
+        assert!(!serialized.contains("relay_direction_generation ="));
         assert!(!serialized.contains("relay_role ="));
     }
 
@@ -526,6 +698,7 @@ mod tests {
                 secret: "ab".repeat(32),
                 name: "phone".into(),
                 address: "192.168.42.2:48123".into(),
+                preferred_mode: None,
             }],
             ..AppConfig::default()
         };
@@ -554,6 +727,22 @@ mod tests {
         let config: AppConfig = toml::from_str("language = 'en'\n").unwrap();
         assert_eq!(config.relay_capture_endpoint_id, None);
         assert_eq!(config.relay_playback_endpoint_id, None);
+        assert_eq!(config.relay_send_source, "default-input");
+        assert_eq!(config.relay_receive_sink, "default-output");
+    }
+
+    #[test]
+    fn old_windows_endpoint_choices_migrate_to_generic_route_selectors() {
+        let mut config: AppConfig = toml::from_str(
+            "language = 'en'\nrelay_capture_endpoint_id = 'capture-id'\nrelay_playback_endpoint_id = 'output-id'\n",
+        )
+        .unwrap();
+        config.migrate_relay_mode();
+        assert_eq!(config.relay_send_source, "monitor:capture-id");
+        assert_eq!(config.relay_receive_sink, "output:output-id");
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("relay_capture_endpoint_id"));
+        assert!(!serialized.contains("relay_playback_endpoint_id"));
     }
 
     #[test]

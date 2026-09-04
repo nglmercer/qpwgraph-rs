@@ -129,6 +129,25 @@ impl Roles {
         self.emit != self.receive
     }
 
+    /// Wire roles for a local, user-facing relay mode. `RelayMode` is the
+    /// only role vocabulary exposed by the generic API; the legacy direction
+    /// conversion below remains for old trusted peers and embedders.
+    pub const fn for_mode(mode: RelayMode) -> Self {
+        match mode {
+            RelayMode::Emitter => Self::emit_only(),
+            RelayMode::Receiver => Self::receive_only(),
+        }
+    }
+
+    /// Infer the local generic mode from a one-way role set.
+    pub const fn mode(self) -> Option<RelayMode> {
+        match (self.emit, self.receive) {
+            (true, false) => Some(RelayMode::Emitter),
+            (false, true) => Some(RelayMode::Receiver),
+            (true, true) | (false, false) => None,
+        }
+    }
+
     /// Convert a user-facing direction into the roles carried by a client
     /// handshake. The host derives its opposite local role when it installs
     /// the session.
@@ -146,6 +165,122 @@ impl Roles {
             (false, true) => Some(RelayDirection::DesktopToMobile),
             (true, true) | (false, false) => None,
         }
+    }
+}
+
+/// The platform-neutral public relay mode.
+///
+/// A relay endpoint either obtains PCM and emits it to its peer, or receives
+/// PCM from its peer and delivers it locally. There is intentionally no
+/// `Both` variant: a session always has exactly one emitter and one receiver.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RelayMode {
+    #[default]
+    Emitter,
+    Receiver,
+}
+
+impl RelayMode {
+    pub const EMITTER: &'static str = "emitter";
+    pub const RECEIVER: &'static str = "receiver";
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Emitter => Self::EMITTER,
+            Self::Receiver => Self::RECEIVER,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            Self::EMITTER | "emit" => Some(Self::Emitter),
+            Self::RECEIVER | "receive" => Some(Self::Receiver),
+            // `both` is deliberately not accepted by the generic model.
+            _ => None,
+        }
+    }
+
+    pub const fn roles(self) -> Roles {
+        Roles::for_mode(self)
+    }
+}
+
+/// Backwards-compatible name used by a few platform integrations while they
+/// migrate their local state to [`RelayMode`].
+pub type LocalRelayMode = RelayMode;
+
+/// Canonical authenticated flow state. The stable emitter identity is the
+/// only relationship that has to be agreed by two peers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayFlow {
+    pub emitter_id: String,
+}
+
+impl RelayFlow {
+    pub fn is_valid(&self) -> bool {
+        !self.emitter_id.trim().is_empty()
+    }
+
+    pub fn mode_for(&self, local_device_id: &str) -> Option<RelayMode> {
+        if !self.is_valid() || local_device_id.trim().is_empty() {
+            return None;
+        }
+        Some(if local_device_id == self.emitter_id {
+            RelayMode::Emitter
+        } else {
+            RelayMode::Receiver
+        })
+    }
+}
+
+/// Authenticated proposal for a new emitter. The proposer identity makes
+/// simultaneous same-generation choices converge even when the choices
+/// name different emitters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowOffer {
+    pub generation: u64,
+    pub emitter_id: String,
+    pub proposer_id: String,
+}
+
+impl FlowOffer {
+    pub fn is_valid(&self) -> bool {
+        !self.emitter_id.trim().is_empty() && !self.proposer_id.trim().is_empty()
+    }
+
+    pub fn flow(&self) -> RelayFlow {
+        RelayFlow {
+            emitter_id: self.emitter_id.clone(),
+        }
+    }
+}
+
+/// Acknowledgement of the authoritative flow at a generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowAck {
+    pub generation: u64,
+    pub emitter_id: String,
+}
+
+impl FlowAck {
+    pub fn is_valid(&self) -> bool {
+        !self.emitter_id.trim().is_empty()
+    }
+}
+
+/// Resolve authenticated flow proposals. Higher generations win; equal
+/// generations use the stable proposer identity, and the emitter identity is
+/// a final deterministic fallback for malformed/duplicated installations.
+pub fn resolve_flow_offers(left: &FlowOffer, right: &FlowOffer) -> FlowOffer {
+    match left
+        .generation
+        .cmp(&right.generation)
+        .then_with(|| left.proposer_id.cmp(&right.proposer_id))
+        .then_with(|| left.emitter_id.cmp(&right.emitter_id))
+    {
+        std::cmp::Ordering::Less => right.clone(),
+        _ => left.clone(),
     }
 }
 
@@ -343,7 +478,22 @@ pub enum ControlMessage {
     },
     /// H→C: negotiated session parameters accepted and audio may start.
     SessionReady {},
+    /// Canonical authenticated flow proposal. `emitter_id` is the stable
+    /// installation identity that should obtain local PCM; it is not a
+    /// phone/desktop or client/host direction.
+    FlowOffer {
+        generation: u64,
+        emitter_id: String,
+        proposer_id: String,
+    },
+    /// Canonical authenticated acknowledgement of the resolved emitter.
+    FlowAck {
+        generation: u64,
+        emitter_id: String,
+    },
     /// Bidirectional authenticated proposal for a new user-facing direction.
+    ///
+    /// Deprecated compatibility message. New peers use [`Self::FlowOffer`].
     DirectionOffer {
         generation: u64,
         direction: RelayDirection,
@@ -437,6 +587,8 @@ impl fmt::Debug for ControlMessage {
             Self::TrustedOk { .. } => "TrustedOk",
             Self::SessionStart { .. } => "SessionStart",
             Self::SessionReady { .. } => "SessionReady",
+            Self::FlowOffer { .. } => "FlowOffer",
+            Self::FlowAck { .. } => "FlowAck",
             Self::DirectionOffer { .. } => "DirectionOffer",
             Self::DirectionAck { .. } => "DirectionAck",
             Self::TrustEnroll { .. } => "TrustEnroll",
@@ -639,6 +791,15 @@ mod tests {
                 channels: 1,
             },
             ControlMessage::SessionReady {},
+            ControlMessage::FlowOffer {
+                generation: 5,
+                emitter_id: "emitter-installation".into(),
+                proposer_id: "peer-installation".into(),
+            },
+            ControlMessage::FlowAck {
+                generation: 5,
+                emitter_id: "emitter-installation".into(),
+            },
             ControlMessage::DirectionOffer {
                 generation: 4,
                 direction: RelayDirection::DesktopToMobile,
@@ -675,6 +836,64 @@ mod tests {
             let decoded = read_frame(&mut cursor).expect("frame decodes");
             assert_eq!(&decoded, message);
         }
+    }
+
+    #[test]
+    fn generic_mode_is_one_way_and_uses_canonical_wire_names() {
+        assert_eq!(RelayMode::Emitter.roles(), Roles::emit_only());
+        assert_eq!(RelayMode::Receiver.roles(), Roles::receive_only());
+        assert_eq!(Roles::both().mode(), None);
+        assert_eq!(Roles::default().mode(), None);
+        assert_eq!(
+            serde_json::to_string(&RelayMode::Emitter).unwrap(),
+            "\"emitter\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RelayMode::Receiver).unwrap(),
+            "\"receiver\""
+        );
+        assert!(RelayMode::parse("both").is_none());
+    }
+
+    #[test]
+    fn flow_resolution_prefers_generation_then_stable_proposer_id() {
+        let old = FlowOffer {
+            generation: 2,
+            emitter_id: "old-emitter".into(),
+            proposer_id: "z-peer".into(),
+        };
+        let new = FlowOffer {
+            generation: 3,
+            emitter_id: "new-emitter".into(),
+            proposer_id: "a-peer".into(),
+        };
+        assert_eq!(resolve_flow_offers(&old, &new), new);
+
+        let left = FlowOffer {
+            generation: 7,
+            emitter_id: "left-emitter".into(),
+            proposer_id: "a-peer".into(),
+        };
+        let right = FlowOffer {
+            generation: 7,
+            emitter_id: "right-emitter".into(),
+            proposer_id: "z-peer".into(),
+        };
+        assert_eq!(resolve_flow_offers(&left, &right), right);
+        assert_eq!(
+            resolve_flow_offers(&left, &right),
+            resolve_flow_offers(&right, &left)
+        );
+    }
+
+    #[test]
+    fn flow_maps_the_authoritative_emitter_to_local_mode() {
+        let flow = RelayFlow {
+            emitter_id: "emitter-id".into(),
+        };
+        assert_eq!(flow.mode_for("emitter-id"), Some(RelayMode::Emitter));
+        assert_eq!(flow.mode_for("receiver-id"), Some(RelayMode::Receiver));
+        assert_eq!(RelayFlow::default().mode_for("receiver-id"), None);
     }
 
     #[test]

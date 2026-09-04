@@ -72,6 +72,14 @@ pub enum RelayEvent {
         direction: RelayDirection,
         winner_device_id: String,
     },
+    /// Canonical authenticated flow winner. `flow.emitter_id` is authoritative
+    /// and `mode` is this installation's derived local role.
+    FlowResolved {
+        id: SessionId,
+        generation: u64,
+        flow: RelayFlow,
+        mode: RelayMode,
+    },
     SessionLost {
         id: SessionId,
         reason: String,
@@ -143,6 +151,18 @@ impl fmt::Debug for RelayEvent {
                 .field("direction", direction)
                 .field("winner_device_id", winner_device_id)
                 .finish(),
+            Self::FlowResolved {
+                id,
+                generation,
+                flow,
+                mode,
+            } => formatter
+                .debug_struct("FlowResolved")
+                .field("id", id)
+                .field("generation", generation)
+                .field("flow", flow)
+                .field("mode", mode)
+                .finish(),
             Self::SessionLost { id, reason } => formatter
                 .debug_struct("SessionLost")
                 .field("id", id)
@@ -184,6 +204,11 @@ pub struct SessionStatus {
     pub control_state: String,
     pub audio_channel_state: String,
     pub trusted: bool,
+    /// Canonical local role derived from the authenticated emitter identity.
+    pub mode: Option<RelayMode>,
+    /// Authoritative flow, when this session has completed generic
+    /// negotiation. Legacy sessions expose `None` until they migrate.
+    pub flow: Option<RelayFlow>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

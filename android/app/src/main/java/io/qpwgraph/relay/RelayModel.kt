@@ -2,10 +2,42 @@ package io.qpwgraph.relay
 
 import java.util.LinkedHashMap
 
-/** The only user-selectable relay state: which endpoint should carry audio. */
+/** The only user-selectable relay state: the local end of the audio flow. */
+enum class RelayMode {
+    Emitter,
+    Receiver,
+}
+
+fun RelayMode.serialized(): String = when (this) {
+    RelayMode.Emitter -> "emitter"
+    RelayMode.Receiver -> "receiver"
+}
+
+fun RelayMode.audioDirection(): AudioDirection = when (this) {
+    // Android's legacy direction values were Android-relative.
+    RelayMode.Emitter -> AudioDirection.MobileToDesktop
+    RelayMode.Receiver -> AudioDirection.DesktopToMobile
+}
+
+fun RelayMode.androidClientRole(): String = when (this) {
+    RelayMode.Emitter -> "emit"
+    RelayMode.Receiver -> "receive"
+}
+
+fun relayModeFromString(value: String?): RelayMode = when (value?.trim()?.lowercase()) {
+    "receiver", "receive", "desktop_to_mobile", "pc_to_mobile" -> RelayMode.Receiver
+    else -> RelayMode.Emitter
+}
+
+/** Compatibility view for code written against the direction-first release. */
 enum class AudioDirection {
     MobileToDesktop,
     DesktopToMobile,
+}
+
+fun AudioDirection.relayMode(): RelayMode = when (this) {
+    AudioDirection.MobileToDesktop -> RelayMode.Emitter
+    AudioDirection.DesktopToMobile -> RelayMode.Receiver
 }
 
 /** Internal role derived from [AudioDirection]. It is never persisted. */
@@ -38,7 +70,7 @@ fun audioDirectionFromString(value: String?): AudioDirection = when (value?.trim
     else -> AudioDirection.MobileToDesktop
 }
 
-/** Settings for the phone-to-desktop client direction. */
+/** Settings for the local Emitter connection to a relay peer. */
 data class RelaySettings(
     val target: String = "",
     // Pairing credentials are entered for the current session and are not
@@ -58,8 +90,13 @@ data class RelaySettings(
     val frameMs: Int = 20,
     val captureSource: CaptureSource = CaptureSource.MICROPHONE,
 ) {
+    /** Canonical role exposed to new callers; legacy [direction] stays the
+     * serialized compatibility view for old Android integrations. */
+    val mode: RelayMode get() = direction.relayMode()
+    val modeGeneration: Long get() = directionGeneration
+
     override fun toString(): String =
-        "RelaySettings(target=$target, direction=$direction, directionGeneration=$directionGeneration, " +
+        "RelaySettings(target=$target, mode=$mode, modeGeneration=$modeGeneration, " +
             "codec=$codec, transport=$transport, " +
             "autoConnectTrusted=$autoConnectTrusted, autoConnectTrustedWifi=$autoConnectTrustedWifi, " +
             "deviceName=$deviceName, sampleRate=$sampleRate, channels=$channels, frameMs=$frameMs, " +
@@ -83,8 +120,8 @@ data class HostSettings(
     val deviceName: String = "android-relay",
     // The Android API requires an explicit caller-owned pairing PIN.
     val pin: String = "",
-    // Fixed default port: desktop USB probing scans for hosts on 48123, so
-    // an ephemeral port would make this host undiscoverable over USB.
+    // Fixed default port: USB peer discovery scans for receivers on 48123, so
+    // an ephemeral port would make this receiver undiscoverable over USB.
     val port: Int = DEFAULT_HOST_PORT,
     val codec: String = "opus",
     val transport: String = "auto",
@@ -93,6 +130,9 @@ data class HostSettings(
     val frameMs: Int = 20,
     val captureSource: CaptureSource = CaptureSource.MICROPHONE,
 ) {
+    /** Android Receiver is the host role; hosting as an Emitter is disabled. */
+    val mode: RelayMode get() = RelayMode.Receiver
+
     override fun toString(): String =
         "HostSettings(deviceName=$deviceName, port=$port, codec=$codec, transport=$transport, " +
             "sampleRate=$sampleRate, channels=$channels, frameMs=$frameMs, captureSource=$captureSource)"
@@ -142,6 +182,12 @@ fun clientNeedsMicrophone(role: String): Boolean = clientRoleEmits(role)
 
 fun clientNeedsMicrophone(direction: AudioDirection): Boolean =
     direction == AudioDirection.MobileToDesktop
+
+fun clientNeedsMicrophone(mode: RelayMode, source: CaptureSource): Boolean =
+    mode == RelayMode.Emitter && source == CaptureSource.MICROPHONE
+
+fun clientNeedsMicrophone(role: String, source: String): Boolean =
+    clientRoleEmits(role) && source.lowercase() in setOf("microphone", "mic")
 
 /** Number of interleaved PCM frames in one configured relay quantum. */
 fun audioFrameCount(sampleRate: Int, frameMs: Int): Int {
@@ -348,14 +394,14 @@ data class RelayUiState(
     /** Direction is the authority for which local engine may run. */
     val direction: AudioDirection = AudioDirection.MobileToDesktop,
     val switchingDirection: Boolean = false,
-    // Phone → PC client section.
+    // Emitter connection section.
     val settings: RelaySettings = RelaySettings(),
     val connection: RelayConnectionState = RelayConnectionState.Disconnected,
     val hostName: String = "",
     val sessionId: Long? = null,
     val message: String = "",
     val rms: Float = 0f,
-    // PC → Phone host section.
+    // Receiver host section.
     val host: HostSettings = HostSettings(),
     val hostState: RelayHostState = RelayHostState.Idle,
     val hostAudioState: RelayHostAudioState = RelayHostAudioState.Stopped,
@@ -378,4 +424,7 @@ data class RelayUiState(
     // All usable local links, best-first; shown with the host port.
     val localLinks: List<LocalLinkInfo> = emptyList(),
     val trustedPeers: List<TrustedRelayPeerSummary> = emptyList(),
-)
+) {
+    /** Canonical mode for the generic UI. */
+    val mode: RelayMode get() = direction.relayMode()
+}

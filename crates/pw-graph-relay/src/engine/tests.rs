@@ -53,6 +53,8 @@ fn host_start_reports_a_port_conflict_without_falling_back_to_another_port() {
         pin: "123456".into(),
         port,
         bind_addr: Some(Ipv4Addr::LOCALHOST),
+        mode: RelayMode::Receiver,
+        client_roles: Roles::receive_only(),
         ..EngineConfig::default()
     })
     .unwrap();
@@ -76,6 +78,8 @@ fn host_stop_releases_an_explicit_port_before_returning() {
         pin: "123456".into(),
         port,
         bind_addr: Some(Ipv4Addr::LOCALHOST),
+        mode: RelayMode::Receiver,
+        client_roles: Roles::receive_only(),
         ..EngineConfig::default()
     })
     .unwrap();
@@ -381,6 +385,10 @@ fn mixing_session(id: u64, receiving: bool) -> Arc<SessionRecord> {
         format,
         sending: true,
         receiving,
+        active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
+            emit: true,
+            receive: receiving,
+        })),
         stop: Arc::new(AtomicBool::new(false)),
         bye_requested: AtomicBool::new(false),
         control_generation: AtomicU64::new(1),

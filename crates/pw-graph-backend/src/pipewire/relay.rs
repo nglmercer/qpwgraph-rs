@@ -546,6 +546,274 @@ impl RelayPlaybackRouter {
 }
 
 // ---------------------------------------------------------------------------
+// Generic Emitter / Receiver routing
+// ---------------------------------------------------------------------------
+
+/// qpwgraph-owned automatic links for the currently selected local mode.
+/// The older `RelayPlaybackRouter` remains below the public compatibility
+/// surface, but new callers use this controller so an Emitter route and a
+/// Receiver route cannot coexist.
+#[derive(Clone, Debug)]
+pub struct RelayLocalRouter {
+    pub mode: Option<RelayMode>,
+    pub send_source: RelaySendSource,
+    pub receive_sink: RelayReceiveSink,
+    pub enabled: bool,
+    pub link_ids: Vec<u64>,
+    pub state: RelayLocalRouteState,
+}
+
+impl Default for RelayLocalRouter {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            send_source: RelaySendSource::DefaultInput,
+            receive_sink: RelayReceiveSink::DefaultOutput,
+            enabled: true,
+            link_ids: Vec::new(),
+            state: RelayLocalRouteState::default(),
+        }
+    }
+}
+
+impl RelayLocalRouter {
+    pub fn set_mode(&mut self, mode: RelayMode) {
+        self.mode = Some(mode);
+    }
+
+    pub fn set_send_source(&mut self, source: RelaySendSource) {
+        self.send_source = source;
+    }
+
+    pub fn set_receive_sink(&mut self, sink: RelayReceiveSink) {
+        self.receive_sink = sink;
+    }
+
+    fn node_has_audio_direction(graph: &Graph, node_id: NodeId, source: bool) -> bool {
+        graph.node(node_id).is_some_and(|node| {
+            node.ports.iter().any(|port_id| {
+                graph.port(*port_id).is_some_and(|port| {
+                    (source && port.direction.is_source() || !source && port.direction.is_sink())
+                        && (port.port_type == PortType::Audio
+                            || port.port_type == PortType::Unknown)
+                })
+            })
+        })
+    }
+
+    fn find_node(
+        graph: &Graph,
+        registry: &std::collections::BTreeMap<u32, crate::pipewire::registry::NodeRecord>,
+        selector: &str,
+        source: bool,
+    ) -> Option<(NodeId, String, Option<u64>)> {
+        // Endpoint ids are kind-qualified (`input:`, `monitor:`, or
+        // `output:`) so the UI cannot accidentally feed a receive selector
+        // into the send list. The graph lookup still targets the underlying
+        // PipeWire node name/serial.
+        let selector = selector
+            .strip_prefix("input:")
+            .or_else(|| selector.strip_prefix("monitor:"))
+            .or_else(|| selector.strip_prefix("output:"))
+            .unwrap_or(selector);
+        let serial = selector
+            .strip_prefix("serial:")
+            .and_then(|id| id.parse().ok());
+        graph
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.name != RELAY_SOURCE_NAME
+                    && node.name != RELAY_SINK_NAME
+                    && Self::node_has_audio_direction(graph, node.id, source)
+            })
+            .find(|(_, node)| {
+                let registry_name = registry
+                    .get(&native_node_id(node.id))
+                    .map(|record| record.name.as_str());
+                node.name == selector
+                    || registry_name == Some(selector)
+                    || serial.is_some_and(|serial| node.serial == Some(serial))
+            })
+            .map(|(id, node)| (*id, node.name.clone(), node.serial))
+    }
+
+    fn find_default_node(
+        graph: &Graph,
+        registry: &std::collections::BTreeMap<u32, crate::pipewire::registry::NodeRecord>,
+        default: Option<&crate::pipewire::registry::DefaultDevice>,
+        source: bool,
+    ) -> Option<(NodeId, String, Option<u64>)> {
+        let default = default?;
+        graph
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.name != RELAY_SOURCE_NAME
+                    && node.name != RELAY_SINK_NAME
+                    && Self::node_has_audio_direction(graph, node.id, source)
+            })
+            .find(|(_, node)| {
+                let registry_name = registry
+                    .get(&native_node_id(node.id))
+                    .map(|record| record.name.as_str());
+                default
+                    .serial
+                    .is_some_and(|serial| node.serial == Some(serial))
+                    || node.name == default.name
+                    || registry_name == Some(default.name.as_str())
+            })
+            .map(|(id, node)| (*id, node.name.clone(), node.serial))
+    }
+
+    fn find_audio_ports(
+        graph: &Graph,
+        node_id: NodeId,
+        source: bool,
+        monitor: bool,
+    ) -> Option<(PortId, PortId)> {
+        let node = graph.node(node_id)?;
+        let all: Vec<(PortId, Option<String>, String)> = node
+            .ports
+            .iter()
+            .filter_map(|port_id| {
+                let port = graph.port(*port_id)?;
+                let correct_direction = if source {
+                    port.direction.is_source()
+                } else {
+                    port.direction.is_sink()
+                };
+                if !correct_direction
+                    || (port.port_type != PortType::Audio && port.port_type != PortType::Unknown)
+                {
+                    return None;
+                }
+                if monitor && !port.name.to_ascii_lowercase().contains("monitor") {
+                    return None;
+                }
+                Some((*port_id, port.channel.clone(), port.name.clone()))
+            })
+            .collect();
+        if all.is_empty() && monitor {
+            // Some PipeWire versions omit "monitor" from the port name but
+            // expose monitor output ports on the sink node. The node was
+            // selected from default sink metadata, so a source port here is
+            // still the monitor rather than an unrelated physical input.
+            return Self::find_audio_ports(graph, node_id, source, false);
+        }
+        if all.is_empty() {
+            return None;
+        }
+        if all.len() == 1 {
+            return Some((all[0].0, all[0].0));
+        }
+        let fl = all
+            .iter()
+            .find(|(_, channel, name)| channel.as_deref() == Some("FL") || name.contains("FL"))
+            .map(|(id, _, _)| *id)?;
+        let fr = all
+            .iter()
+            .find(|(_, channel, name)| channel.as_deref() == Some("FR") || name.contains("FR"))
+            .map(|(id, _, _)| *id)?;
+        (fl != fr).then_some((fl, fr))
+    }
+
+    fn relay_sink_ports(graph: &Graph) -> Option<(PortId, PortId)> {
+        let node_id = graph
+            .nodes
+            .values()
+            .find(|node| node.name == RELAY_SINK_NAME)
+            .map(|node| node.id)?;
+        Self::find_audio_ports(graph, node_id, false, false)
+    }
+
+    fn relay_source_ports(graph: &Graph) -> Option<(PortId, PortId)> {
+        let node_id = graph
+            .nodes
+            .values()
+            .find(|node| node.name == RELAY_SOURCE_NAME)
+            .map(|node| node.id)?;
+        Self::find_audio_ports(graph, node_id, true, false)
+    }
+
+    /// Calculate the only automatic route allowed for [self]. Manual graph
+    /// choices intentionally return `None`, leaving ordinary patchbay links
+    /// under user control.
+    pub fn desired_links(
+        &self,
+        graph: &Graph,
+        registry: &std::collections::BTreeMap<u32, crate::pipewire::registry::NodeRecord>,
+        default_source: Option<&crate::pipewire::registry::DefaultDevice>,
+        default_sink: Option<&crate::pipewire::registry::DefaultDevice>,
+    ) -> Option<(Vec<(PortId, PortId)>, String, String, String)> {
+        if !self.enabled {
+            return None;
+        }
+        match self.mode? {
+            RelayMode::Emitter => {
+                let source = match &self.send_source {
+                    RelaySendSource::DefaultInput => {
+                        Self::find_default_node(graph, registry, default_source, true)?
+                    }
+                    RelaySendSource::InputDevice(selector)
+                    | RelaySendSource::OutputMonitor(selector) => {
+                        let monitor =
+                            matches!(&self.send_source, RelaySendSource::OutputMonitor(_));
+                        let node = Self::find_node(graph, registry, selector, true)?;
+                        if monitor {
+                            // Re-resolve the same node with monitor filtering
+                            // in the port lookup below.
+                            node
+                        } else {
+                            node
+                        }
+                    }
+                    RelaySendSource::DefaultOutputMonitor => {
+                        // The default sink metadata names the playback node;
+                        // the route consumes that node's source monitor
+                        // ports.
+                        Self::find_default_node(graph, registry, default_sink, true)?
+                    }
+                    RelaySendSource::ManualGraph => return None,
+                };
+                let monitor = matches!(
+                    &self.send_source,
+                    RelaySendSource::DefaultOutputMonitor | RelaySendSource::OutputMonitor(_)
+                );
+                let (source_fl, source_fr) =
+                    Self::find_audio_ports(graph, source.0, true, monitor)?;
+                let (sink_fl, sink_fr) = Self::relay_sink_ports(graph)?;
+                Some((
+                    vec![(source_fl, sink_fl), (source_fr, sink_fr)],
+                    source.1.clone(),
+                    RELAY_SINK_NAME.to_owned(),
+                    format!("{} -> Relay Speaker", source.1),
+                ))
+            }
+            RelayMode::Receiver => {
+                let sink = match &self.receive_sink {
+                    RelayReceiveSink::DefaultOutput => {
+                        Self::find_default_node(graph, registry, default_sink, false)?
+                    }
+                    RelayReceiveSink::OutputDevice(selector) => {
+                        Self::find_node(graph, registry, selector, false)?
+                    }
+                    RelayReceiveSink::ManualGraph => return None,
+                };
+                let (source_fl, source_fr) = Self::relay_source_ports(graph)?;
+                let (sink_fl, sink_fr) = Self::find_audio_ports(graph, sink.0, false, false)?;
+                Some((
+                    vec![(source_fl, sink_fl), (source_fr, sink_fr)],
+                    RELAY_SOURCE_NAME.to_owned(),
+                    sink.1.clone(),
+                    format!("Relay Microphone -> {}", sink.1),
+                ))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Callback state
 // ---------------------------------------------------------------------------
 
@@ -777,6 +1045,7 @@ pub(super) struct RelayRuntimeSet {
     _sink: RelayNodeRuntime,
     pub playback_shared: Arc<RelayPlaybackShared>,
     pub router: RelayPlaybackRouter,
+    pub local_router: RelayLocalRouter,
 }
 
 impl RelayRuntimeSet {
@@ -820,6 +1089,7 @@ impl RelayRuntimeSet {
             _sink: sink,
             playback_shared,
             router: RelayPlaybackRouter::new(),
+            local_router: RelayLocalRouter::default(),
         })
     }
 

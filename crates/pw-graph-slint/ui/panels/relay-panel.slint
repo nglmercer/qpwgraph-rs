@@ -32,10 +32,10 @@ export component RelayPanel inherits Rectangle {
     in property <[string]> relay-codec-options: [];
     in property <[string]> relay-frame-options: [];
     in property <[string]> relay-transport-options: [];
-    in property <[string]> relay-endpoint-options: [];
-    in property <bool> relay-windows-endpoints: false;
-    in-out property <int> relay-capture-endpoint-index: 0;
-    in-out property <int> relay-playback-endpoint-index: 0;
+    in property <[string]> relay-send-source-options: [];
+    in property <[string]> relay-receive-sink-options: [];
+    in-out property <int> relay-send-source-index: 0;
+    in-out property <int> relay-receive-sink-index: 0;
     in property <bool> relay-available: false;
     in property <bool> relay-host-active: false;
     in property <string> relay-host-endpoint: "";
@@ -71,8 +71,8 @@ export component RelayPanel inherits Rectangle {
     Rectangle { x: 16px; y: 49px; width: parent.width - 32px; height: 1px; background: #3d4a56; }
     TabStrip {
         x: 16px; y: 62px; width: parent.width - 32px;
-        first: UiI18n.localized("relay.direction_mobile_to_desktop");
-        second: UiI18n.localized("relay.direction_desktop_to_mobile");
+        first: UiI18n.localized("relay.mode_emitter");
+        second: UiI18n.localized("relay.mode_receiver");
         third: UiI18n.localized("relay.tab_advanced");
         current-index <=> root.relay-tab;
     }
@@ -92,20 +92,28 @@ export component RelayPanel inherits Rectangle {
 
             if root.relay-direction-switching: Text {
                 min-height: 24px;
-                text: UiI18n.localized("relay.direction_switching");
+                text: UiI18n.localized("relay.mode_switching");
                 color: #e0b062;
                 font-size: 10px * UiTheme.panel-scale;
                 wrap: word-wrap;
             }
 
-            if root.relay-tab == 1: FormSection {
+            if root.relay-tab == 0: FormSection {
                 VerticalLayout {
                     spacing: 8px;
                     Text {
-                        text: UiI18n.localized("relay.effective_role_emitter");
+                        text: UiI18n.localized("relay.mode_emitter");
                         color: #aebdca;
                         font-size: 10px * UiTheme.panel-scale;
                         wrap: word-wrap;
+                    }
+                    FormRow {
+                        label: UiI18n.localized("relay.send_source");
+                        RelayComboBox {
+                            height: 31px;
+                            model: root.relay-send-source-options;
+                            current-index <=> root.relay-send-source-index;
+                        }
                     }
                     RelayLineEdit { height: 31px; placeholder-text: UiI18n.localized("relay.target"); text <=> root.relay-client-target; }
                     HorizontalLayout {
@@ -116,7 +124,7 @@ export component RelayPanel inherits Rectangle {
                 }
             }
 
-            if root.relay-tab == 1: Text {
+            if root.relay-tab == 0: Text {
                 height: 22px;
                 text: UiI18n.localized("relay.group_available");
                 color: #aebdca;
@@ -127,7 +135,7 @@ export component RelayPanel inherits Rectangle {
             // This list is the desktop's discovery: without a word here an
             // empty section reads as a broken panel rather than as a search
             // still running.
-            if root.relay-tab == 1 && root.relay-rows.length == 0: Text {
+            if root.relay-tab == 0 && root.relay-rows.length == 0: Text {
                 min-height: 40px;
                 text: UiI18n.localized("relay.no_peers");
                 color: #8393a0;
@@ -135,7 +143,7 @@ export component RelayPanel inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            if root.relay-tab == 1: VerticalLayout {
+            if root.relay-tab == 0: VerticalLayout {
                 spacing: 7px;
                 for row in root.relay-rows: Rectangle {
                     // Two text lines plus a meter lane, with the actions in a
@@ -231,29 +239,29 @@ export component RelayPanel inherits Rectangle {
                 }
             }
 
-            if root.relay-tab == 0: FormSection {
+            if root.relay-tab == 1: FormSection {
                 title: UiI18n.localized("relay.title");
-                summary: UiI18n.localized("relay.mobile_to_desktop_hint");
+                summary: UiI18n.localized("relay.receiver_mode_hint");
 
                 Text {
                     min-height: 22px;
-                    text: UiI18n.localized("relay.effective_role_host");
+                        text: UiI18n.localized("relay.mode_receiver");
                     color: #aebdca;
                     font-size: 10px * UiTheme.panel-scale;
                     wrap: word-wrap;
                 }
 
-                if root.relay-windows-endpoints: FormRow {
-                    label: UiI18n.localized("relay.capture_endpoint");
-                    RelayComboBox { height: 31px; model: root.relay-endpoint-options; current-index <=> root.relay-capture-endpoint-index; }
+                FormRow {
+                    label: UiI18n.localized("relay.receive_sink");
+                    RelayComboBox {
+                        height: 31px;
+                        model: root.relay-receive-sink-options;
+                        current-index <=> root.relay-receive-sink-index;
+                    }
                 }
-                if root.relay-windows-endpoints: FormRow {
-                    label: UiI18n.localized("relay.playback_endpoint");
-                    RelayComboBox { height: 31px; model: root.relay-endpoint-options; current-index <=> root.relay-playback-endpoint-index; }
-                }
-                if root.relay-windows-endpoints: Text {
+                if root.relay-receive-sink-options.length == 0: Text {
                     min-height: 28px;
-                    text: UiI18n.localized("relay.windows_endpoint_help");
+                    text: UiI18n.localized("relay.local_route_unavailable");
                     color: #8393a0;
                     font-size: 8px * UiTheme.panel-scale;
                     wrap: word-wrap;

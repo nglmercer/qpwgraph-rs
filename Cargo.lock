@@ -4112,6 +4112,7 @@ dependencies = [
  "pw-graph-effects",
  "pw-graph-relay",
  "pw-graph-utils",
+ "serde_json",
  "thiserror 1.0.69",
  "windows",
  "windows-core",

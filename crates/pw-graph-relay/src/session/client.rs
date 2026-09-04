@@ -484,15 +484,16 @@ pub(super) fn client_thread(
         }
     }
     let tcp_audio = audio_over_tcp.then(TcpAudioSlot::new);
+    let peer_id = if host_id.trim().is_empty() {
+        host_name.clone()
+    } else {
+        host_id.clone()
+    };
     let record = Arc::new(SessionRecord {
         id,
         wire_id,
         peer: PeerInfo {
-            id: if host_id.trim().is_empty() {
-                host_name.clone()
-            } else {
-                host_id
-            },
+            id: peer_id.clone(),
             name: host_name,
             kind: DeviceKind::Other,
             addr: target,
@@ -503,6 +504,10 @@ pub(super) fn client_thread(
         // Client perspective: it sends when emitting, receives when playing.
         sending: roles.emit,
         receiving: roles.receive,
+        active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
+            emit: roles.emit,
+            receive: roles.receive,
+        })),
         stop: Arc::new(AtomicBool::new(false)),
         bye_requested: AtomicBool::new(false),
         control_generation: AtomicU64::new(1),
@@ -518,11 +523,17 @@ pub(super) fn client_thread(
         capture_convert: Mutex::new(prepared_capture_converter(local, format)),
         audio_sealer: Mutex::new(audio_sealer),
         audio_opener: Mutex::new(audio_opener),
-        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
-            generation: config.direction_generation,
-            direction: roles.direction().unwrap_or(config.direction),
-            device_id: config.device_id.clone(),
-        })),
+        direction: Mutex::new(DirectionNegotiation::with_initial_flow(
+            DirectionOffer {
+                generation: config.direction_generation,
+                direction: roles.direction().unwrap_or(config.direction),
+                device_id: config.device_id.clone(),
+            },
+            &config.device_id,
+            &peer_id,
+            roles.emit,
+            config.direction_generation,
+        )),
     });
     if !inner.insert_session(Arc::clone(&record)) {
         let reason = "the local session limit was reached".to_string();
@@ -749,15 +760,16 @@ pub(super) fn client_session_after_auth(
         }
     }
     let tcp_audio = audio_over_tcp.then(TcpAudioSlot::new);
+    let peer_id = if host_id.trim().is_empty() {
+        host_name.clone()
+    } else {
+        host_id.clone()
+    };
     let record = Arc::new(SessionRecord {
         id,
         wire_id,
         peer: PeerInfo {
-            id: if host_id.trim().is_empty() {
-                host_name.clone()
-            } else {
-                host_id
-            },
+            id: peer_id.clone(),
             name: host_name,
             kind: DeviceKind::Other,
             addr: target,
@@ -767,6 +779,10 @@ pub(super) fn client_session_after_auth(
         format,
         sending: roles.emit,
         receiving: roles.receive,
+        active_roles: AtomicU8::new(SessionRecord::role_bits(Roles {
+            emit: roles.emit,
+            receive: roles.receive,
+        })),
         stop: Arc::new(AtomicBool::new(false)),
         bye_requested: AtomicBool::new(false),
         control_generation: AtomicU64::new(1),
@@ -782,11 +798,17 @@ pub(super) fn client_session_after_auth(
         capture_convert: Mutex::new(prepared_capture_converter(local, format)),
         audio_sealer: Mutex::new(audio_sealer),
         audio_opener: Mutex::new(audio_opener),
-        direction: Mutex::new(DirectionNegotiation::new(DirectionOffer {
-            generation: config.direction_generation,
-            direction: roles.direction().unwrap_or(config.direction),
-            device_id: config.device_id.clone(),
-        })),
+        direction: Mutex::new(DirectionNegotiation::with_initial_flow(
+            DirectionOffer {
+                generation: config.direction_generation,
+                direction: roles.direction().unwrap_or(config.direction),
+                device_id: config.device_id.clone(),
+            },
+            &config.device_id,
+            &peer_id,
+            roles.emit,
+            config.direction_generation,
+        )),
     });
     if !inner.insert_session(Arc::clone(&record)) {
         let reason = "the local session limit was reached".to_string();

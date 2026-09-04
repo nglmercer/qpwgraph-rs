@@ -17,6 +17,7 @@ relay = ["dep:pw-graph-relay"]
 pw-graph-core = { path = "../pw-graph-core" }
 pw-graph-effects = { path = "../pw-graph-effects" }
 thiserror.workspace = true
+serde_json.workspace = true
 pw-graph-utils = { path = "../pw-graph-utils" }
 # The relay engine (pairing, transport, codec, discovery) is portable; only
 # the audio endpoints that feed it are platform specific.

@@ -1,6 +1,6 @@
 <resources>
     <string name="relay_app_title">qpwgraph Relay</string>
-    <string name="relay_app_subtitle">Choisissez une direction audio entre votre téléphone et votre PC.</string>
+    <string name="relay_app_subtitle">Choisissez si cet appareil émet ou reçoit l’audio.</string>
     <string name="nav_receiver">Récepteur</string>
     <string name="nav_emitter">Émetteur</string>
     <string name="nav_discover">Découvrir</string>
@@ -10,7 +10,7 @@
     <string name="action_forget">Oublier</string>
     <string name="label_status">Statut</string>
     <string name="label_level">Niveau : %1$d%%</string>
-    <string name="receiver_host_address_label">Adresse de l’hôte</string>
+    <string name="receiver_host_address_label">Adresse du pair</string>
     <string name="receiver_host_address_hint">192.168.1.20:48123</string>
     <string name="receiver_pin_label">Code PIN</string>
     <string name="receiver_codec_label">Codec</string>
@@ -29,8 +29,8 @@
     <string name="emitter_capture_source_label">Source de capture</string>
     <string name="emitter_capture_microphone">Microphone</string>
     <string name="emitter_capture_playback">Lecture de l’appareil</string>
-    <string name="emitter_start_host">Démarrer l’hôte</string>
-    <string name="emitter_stop_host">Arrêter l’hôte</string>
+    <string name="emitter_start_host">Démarrer le récepteur</string>
+    <string name="emitter_stop_host">Arrêter le récepteur</string>
     <string name="emitter_reachable_title">Accessible à</string>
     <string name="emitter_active_sessions">Sessions actives</string>
     <string name="discover_start">Lancer la découverte</string>

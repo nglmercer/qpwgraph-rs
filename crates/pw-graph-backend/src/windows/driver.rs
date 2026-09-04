@@ -54,6 +54,8 @@ struct RelayConfigOptions {
     transport: api::RelayTransportPreference,
     direction: api::RelayDirection,
     direction_generation: u64,
+    mode: api::RelayMode,
+    mode_generation: u64,
     device_id: String,
     trusted_peers: Vec<api::RelayTrustedPeer>,
     trust_new_peers: bool,
@@ -95,6 +97,25 @@ pub struct WindowsAudioDriver {
     /// Playback endpoints the relay can be pointed at, refreshed with the graph.
     #[cfg(feature = "relay")]
     pub(super) relay_endpoint_choices: Vec<(String, String)>,
+    /// Physical eCapture devices offered to an Emitter.
+    #[cfg(feature = "relay")]
+    pub(super) relay_input_choices: Vec<(String, String)>,
+    /// Current local mode and source/sink selection. These are independent of
+    /// the legacy `RelayEndpoints` pair retained for old callers.
+    #[cfg(feature = "relay")]
+    pub(super) relay_mode: api::RelayMode,
+    #[cfg(feature = "relay")]
+    pub(super) relay_mode_generation: u64,
+    #[cfg(feature = "relay")]
+    pub(super) relay_send_source: api::RelaySendSource,
+    #[cfg(feature = "relay")]
+    pub(super) relay_receive_sink: api::RelayReceiveSink,
+    #[cfg(feature = "relay")]
+    pub(super) relay_default_generation: u64,
+    #[cfg(feature = "relay")]
+    pub(super) relay_default_input: Option<String>,
+    #[cfg(feature = "relay")]
+    pub(super) relay_default_output: Option<String>,
 }
 
 impl WindowsAudioDriver {
@@ -157,6 +178,22 @@ impl WindowsAudioDriver {
             relay_endpoints: Default::default(),
             #[cfg(feature = "relay")]
             relay_endpoint_choices: snapshot.playback_endpoints,
+            #[cfg(feature = "relay")]
+            relay_input_choices: snapshot.capture_endpoints,
+            #[cfg(feature = "relay")]
+            relay_mode: api::RelayMode::Receiver,
+            #[cfg(feature = "relay")]
+            relay_mode_generation: 0,
+            #[cfg(feature = "relay")]
+            relay_send_source: api::RelaySendSource::DefaultInput,
+            #[cfg(feature = "relay")]
+            relay_receive_sink: api::RelayReceiveSink::DefaultOutput,
+            #[cfg(feature = "relay")]
+            relay_default_generation: snapshot.default_generation,
+            #[cfg(feature = "relay")]
+            relay_default_input: snapshot.default_input,
+            #[cfg(feature = "relay")]
+            relay_default_output: snapshot.default_output,
         })
     }
 
@@ -170,24 +207,46 @@ impl WindowsAudioDriver {
         config: pw_graph_relay::EngineConfig,
     ) -> BackendResult<&crate::windows_relay::WindowsRelayDevices> {
         let wanted = self.relay_endpoints.clone();
-        let restart = self
-            .relay
-            .as_ref()
-            .is_some_and(|devices| devices.endpoints() != &wanted);
-        if restart {
-            self.relay = None;
-        }
-        match self.relay.as_ref() {
-            Some(devices) => {
-                devices.handle().update_config(config);
+        let mode = self.relay_mode;
+        let send_source = self.relay_send_source.clone();
+        let receive_sink = self.relay_receive_sink.clone();
+        let default_generation = self.relay_default_generation;
+        let restart = self.relay.as_ref().is_some_and(|devices| {
+            devices.endpoints() != &wanted
+                || devices.needs_restart(mode, &send_source, &receive_sink, default_generation)
+        });
+        if self.relay.is_some() {
+            if restart {
+                // Keep the authenticated engine/session table alive while
+                // replacing only the WASAPI worker.
+                let devices = self.relay.as_mut().expect("relay exists");
+                devices.restart_endpoint(mode, send_source, receive_sink, default_generation)?;
             }
-            None => {
-                self.relay = Some(crate::windows_relay::WindowsRelayDevices::start(
-                    config, wanted,
-                )?);
-            }
+            self.relay
+                .as_ref()
+                .expect("relay exists")
+                .handle()
+                .update_config(config);
+        } else {
+            self.relay = Some(crate::windows_relay::WindowsRelayDevices::start_mode(
+                config,
+                wanted,
+                mode,
+                send_source,
+                receive_sink,
+                default_generation,
+            )?);
         }
         Ok(self.relay.as_ref().expect("relay was just created"))
+    }
+
+    #[cfg(feature = "relay")]
+    fn reconcile_relay_worker(&mut self) -> BackendResult<()> {
+        let Some(config) = self.relay.as_ref().map(|devices| devices.handle().config()) else {
+            return Ok(());
+        };
+        let _ = self.ensure_relay(config)?;
+        Ok(())
     }
 
     /// Choose which endpoints the relay taps and plays on.
@@ -205,37 +264,22 @@ impl WindowsAudioDriver {
             return Ok(());
         }
         self.relay_endpoints = endpoints;
-        // Only restart something that is already running; otherwise the choice
-        // simply applies when the relay is next started.
-        let Some(devices) = self.relay.as_ref() else {
-            return Ok(());
-        };
-        let mut config = devices.handle().config();
-        let status = devices.handle().status();
-        // A WASAPI client cannot be moved between devices, so the endpoints are
-        // torn down and rebuilt. Keep hosting across that: switching which
-        // speakers are relayed must not silently drop the peers' connection
-        // point, and reusing the port keeps an already-shared address valid.
-        if let Some(port) = status.host_port {
-            config.port = port;
-        }
-        // Stop the listener before dropping, so the control port is released
-        // rather than lingering while the new engine tries to bind it.
-        if status.host_active {
-            let _ = devices.handle().host_stop();
-        }
-        self.relay = None;
-
-        let devices = self.ensure_relay(config.clone())?;
-        if !status.host_active {
-            return Ok(());
-        }
-        match devices.handle().host_start() {
-            Ok(_) => Ok(()),
-            Err(error) => Err(BackendError::native(format!(
-                "relay host restart failed: {error}"
-            ))),
-        }
+        // Preserve the old pair API while translating it into the canonical
+        // Emitter/Receiver selectors. The running engine stays alive; only the
+        // one affected WASAPI worker is replaced by `ensure_relay`.
+        self.relay_send_source = self
+            .relay_endpoints
+            .capture
+            .clone()
+            .map(api::RelaySendSource::OutputMonitor)
+            .unwrap_or(api::RelaySendSource::DefaultOutputMonitor);
+        self.relay_receive_sink = self
+            .relay_endpoints
+            .playback
+            .clone()
+            .map(api::RelayReceiveSink::OutputDevice)
+            .unwrap_or(api::RelayReceiveSink::DefaultOutput);
+        self.reconcile_relay_worker()
     }
 
     /// Endpoints the relay is configured to use.
@@ -263,9 +307,11 @@ impl WindowsAudioDriver {
             frame_ms: options.frame_ms,
             sample_rate: crate::windows_relay::RELAY_SAMPLE_RATE,
             channels: crate::windows_relay::RELAY_CHANNELS,
-            client_roles: api::desktop_relay_client_roles(options.direction),
+            client_roles: options.mode.roles(),
             direction: options.direction,
             direction_generation: options.direction_generation,
+            mode: options.mode,
+            mode_generation: options.mode_generation,
             transport: options.transport,
             trusted_peers: options.trusted_peers,
             trust_new_peers: options.trust_new_peers,
@@ -435,6 +481,14 @@ impl WindowsAudioDriver {
         #[cfg(feature = "relay")]
         {
             self.relay_endpoint_choices = snapshot.playback_endpoints;
+            self.relay_input_choices = snapshot.capture_endpoints;
+            self.relay_default_input = snapshot.default_input;
+            self.relay_default_output = snapshot.default_output;
+            let default_generation = snapshot.default_generation;
+            if self.relay_default_generation != default_generation {
+                self.relay_default_generation = default_generation;
+                self.reconcile_relay_worker()?;
+            }
         }
         Ok(())
     }
@@ -774,7 +828,9 @@ impl crate::api::EffectDriver for WindowsAudioDriver {
 /// Relay support on Windows.
 ///
 /// The engine is the same one PipeWire uses; only the audio endpoints differ.
-/// See `windows_relay` for why the microphone role cannot be offered here.
+/// Direct mode supports physical input capture, playback-monitor loopback, and
+/// render output. A separate optional driver is needed only for a system-wide
+/// virtual capture endpoint.
 #[cfg(feature = "relay")]
 impl api::RelayDriver for WindowsAudioDriver {
     fn relay_available(&self) -> bool {
@@ -793,6 +849,13 @@ impl api::RelayDriver for WindowsAudioDriver {
     }
 
     fn relay_start_host(&mut self, request: api::RelayHostRequest) -> BackendResult<u16> {
+        if request.mode != api::RelayMode::Receiver {
+            return Err(BackendError::unsupported(
+                "a local relay host must run in Receiver mode",
+            ));
+        }
+        self.relay_mode = request.mode;
+        self.relay_mode_generation = request.mode_generation;
         let config = Self::relay_config(RelayConfigOptions {
             device_name: request.device_name,
             pin: request.pin,
@@ -802,6 +865,8 @@ impl api::RelayDriver for WindowsAudioDriver {
             transport: request.transport,
             direction: request.direction,
             direction_generation: request.direction_generation,
+            mode: request.mode,
+            mode_generation: request.mode_generation,
             device_id: request.device_id,
             trusted_peers: request.trusted_peers,
             trust_new_peers: request.trust_new_peers,
@@ -829,6 +894,11 @@ impl api::RelayDriver for WindowsAudioDriver {
         direction: api::RelayDirection,
         direction_generation: u64,
     ) -> BackendResult<api::RelaySessionId> {
+        self.relay_mode = match direction {
+            api::RelayDirection::MobileToDesktop => api::RelayMode::Receiver,
+            api::RelayDirection::DesktopToMobile => api::RelayMode::Emitter,
+        };
+        self.relay_mode_generation = direction_generation;
         if self.relay.is_none() {
             let config = Self::relay_config(RelayConfigOptions {
                 device_name: "qpwgraph-rs".into(),
@@ -839,20 +909,80 @@ impl api::RelayDriver for WindowsAudioDriver {
                 transport: api::RelayTransportPreference::Auto,
                 direction,
                 direction_generation,
+                mode: match direction {
+                    api::RelayDirection::MobileToDesktop => api::RelayMode::Receiver,
+                    api::RelayDirection::DesktopToMobile => api::RelayMode::Emitter,
+                },
+                mode_generation: direction_generation,
                 device_id: pw_graph_relay::generate_device_id(),
                 trusted_peers: Vec::new(),
                 trust_new_peers: true,
             });
             self.ensure_relay(config)?;
         }
-        let devices = self.relay.as_ref().expect("relay was just created");
-        let mut config = devices.handle().config();
+        let mut config = self
+            .relay
+            .as_ref()
+            .expect("relay was just created")
+            .handle()
+            .config();
         config.direction = direction;
         config.direction_generation = direction_generation;
+        config.mode = self.relay_mode;
+        config.mode_generation = self.relay_mode_generation;
         let roles = api::desktop_relay_client_roles(direction);
         config.client_roles = roles;
-        devices.handle().update_config(config);
+        let _ = self.ensure_relay(config.clone())?;
+        let devices = self.relay.as_ref().expect("relay was just created");
         Ok(devices.handle().connect(target, pin, roles))
+    }
+
+    fn relay_connect_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        pin: &str,
+        mode: api::RelayMode,
+        generation: u64,
+    ) -> BackendResult<api::RelaySessionId> {
+        let direction = match mode {
+            api::RelayMode::Emitter => api::RelayDirection::DesktopToMobile,
+            api::RelayMode::Receiver => api::RelayDirection::MobileToDesktop,
+        };
+        self.relay_mode = mode;
+        self.relay_mode_generation = generation;
+        if self.relay.is_none() {
+            let config = Self::relay_config(RelayConfigOptions {
+                device_name: "qpwgraph-rs".into(),
+                pin: pin.to_owned(),
+                port: 0,
+                codec: api::RelayCodecKind::Opus,
+                frame_ms: 10,
+                transport: api::RelayTransportPreference::Auto,
+                direction,
+                direction_generation: generation,
+                mode,
+                mode_generation: generation,
+                device_id: pw_graph_relay::generate_device_id(),
+                trusted_peers: Vec::new(),
+                trust_new_peers: true,
+            });
+            self.ensure_relay(config)?;
+        }
+        let mut config = self
+            .relay
+            .as_ref()
+            .expect("relay was just created")
+            .handle()
+            .config();
+        config.pin = pin.to_owned();
+        config.direction = direction;
+        config.direction_generation = generation;
+        config.mode = mode;
+        config.mode_generation = generation;
+        config.client_roles = mode.roles();
+        let _ = self.ensure_relay(config)?;
+        let devices = self.relay.as_ref().expect("relay was just created");
+        Ok(devices.handle().connect_mode(target, pin, mode))
     }
 
     fn relay_connect_trusted(
@@ -863,6 +993,11 @@ impl api::RelayDriver for WindowsAudioDriver {
         direction: api::RelayDirection,
         direction_generation: u64,
     ) -> BackendResult<api::RelaySessionId> {
+        self.relay_mode = match direction {
+            api::RelayDirection::MobileToDesktop => api::RelayMode::Receiver,
+            api::RelayDirection::DesktopToMobile => api::RelayMode::Emitter,
+        };
+        self.relay_mode_generation = direction_generation;
         if self.relay.is_none() {
             let config = Self::relay_config(RelayConfigOptions {
                 device_name: "qpwgraph-rs".into(),
@@ -873,22 +1008,84 @@ impl api::RelayDriver for WindowsAudioDriver {
                 transport: api::RelayTransportPreference::Auto,
                 direction,
                 direction_generation,
+                mode: match direction {
+                    api::RelayDirection::MobileToDesktop => api::RelayMode::Receiver,
+                    api::RelayDirection::DesktopToMobile => api::RelayMode::Emitter,
+                },
+                mode_generation: direction_generation,
                 device_id: pw_graph_relay::generate_device_id(),
                 trusted_peers: Vec::new(),
                 trust_new_peers: false,
             });
             self.ensure_relay(config)?;
         }
-        let devices = self.relay.as_ref().expect("relay was just created");
-        let mut config = devices.handle().config();
+        let mut config = self
+            .relay
+            .as_ref()
+            .expect("relay was just created")
+            .handle()
+            .config();
         config.direction = direction;
         config.direction_generation = direction_generation;
+        config.mode = self.relay_mode;
+        config.mode_generation = self.relay_mode_generation;
         let roles = api::desktop_relay_client_roles(direction);
         config.client_roles = roles;
-        devices.handle().update_config(config);
+        let _ = self.ensure_relay(config.clone())?;
+        let devices = self.relay.as_ref().expect("relay was just created");
         Ok(devices
             .handle()
             .connect_trusted(target, peer_id, secret, roles))
+    }
+
+    fn relay_connect_trusted_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        peer_id: &str,
+        secret: [u8; 32],
+        mode: api::RelayMode,
+        generation: u64,
+    ) -> BackendResult<api::RelaySessionId> {
+        let direction = match mode {
+            api::RelayMode::Emitter => api::RelayDirection::DesktopToMobile,
+            api::RelayMode::Receiver => api::RelayDirection::MobileToDesktop,
+        };
+        self.relay_mode = mode;
+        self.relay_mode_generation = generation;
+        if self.relay.is_none() {
+            let config = Self::relay_config(RelayConfigOptions {
+                device_name: "qpwgraph-rs".into(),
+                pin: String::new(),
+                port: 0,
+                codec: api::RelayCodecKind::Opus,
+                frame_ms: 10,
+                transport: api::RelayTransportPreference::Auto,
+                direction,
+                direction_generation: generation,
+                mode,
+                mode_generation: generation,
+                device_id: pw_graph_relay::generate_device_id(),
+                trusted_peers: Vec::new(),
+                trust_new_peers: false,
+            });
+            self.ensure_relay(config)?;
+        }
+        let mut config = self
+            .relay
+            .as_ref()
+            .expect("relay was just created")
+            .handle()
+            .config();
+        config.direction = direction;
+        config.direction_generation = generation;
+        config.mode = mode;
+        config.mode_generation = generation;
+        config.client_roles = mode.roles();
+        let _ = self.ensure_relay(config)?;
+        let devices = self.relay.as_ref().expect("relay was just created");
+        Ok(devices
+            .handle()
+            .connect_trusted_mode(target, peer_id, secret, mode))
     }
 
     fn relay_configure_identity(
@@ -913,6 +1110,8 @@ impl api::RelayDriver for WindowsAudioDriver {
                 transport,
                 direction: api::RelayDirection::MobileToDesktop,
                 direction_generation: 0,
+                mode: self.relay_mode,
+                mode_generation: self.relay_mode_generation,
                 device_id,
                 trusted_peers,
                 trust_new_peers: true,
@@ -947,6 +1146,36 @@ impl api::RelayDriver for WindowsAudioDriver {
             .handle()
             .offer_direction(session, direction, generation)
             .map_err(|error| BackendError::native(format!("relay direction offer failed: {error}")))
+    }
+
+    fn relay_offer_flow(
+        &mut self,
+        session: api::RelaySessionId,
+        flow: api::RelayFlow,
+        generation: u64,
+    ) -> BackendResult<()> {
+        let Some(devices) = self.relay.as_ref() else {
+            return Err(BackendError::native("no relay session exists"));
+        };
+        devices
+            .handle()
+            .offer_flow(session, flow, generation)
+            .map_err(|error| BackendError::native(format!("relay flow offer failed: {error}")))
+    }
+
+    fn relay_offer_mode(
+        &mut self,
+        session: api::RelaySessionId,
+        mode: api::RelayMode,
+        generation: u64,
+    ) -> BackendResult<()> {
+        let Some(devices) = self.relay.as_ref() else {
+            return Err(BackendError::native("no relay session exists"));
+        };
+        devices
+            .handle()
+            .offer_mode(session, mode, generation)
+            .map_err(|error| BackendError::native(format!("relay mode offer failed: {error}")))
     }
 
     fn relay_trusted_enrollment_secret(
@@ -998,10 +1227,37 @@ impl api::RelayDriver for WindowsAudioDriver {
     }
 
     fn relay_events(&mut self) -> Vec<api::RelayEvent> {
-        self.relay
+        let mut events = self
+            .relay
             .as_mut()
             .map(|devices| devices.handle().events())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let resolved_modes: Vec<(api::RelayMode, u64)> = events
+            .iter()
+            .filter_map(|event| match event {
+                api::RelayEvent::FlowResolved {
+                    generation, mode, ..
+                } => Some((*mode, *generation)),
+                _ => None,
+            })
+            .collect();
+        for (mode, generation) in resolved_modes {
+            self.relay_mode = mode;
+            self.relay_mode_generation = generation;
+            let Some(config) = self.relay.as_ref().map(|devices| devices.handle().config()) else {
+                continue;
+            };
+            let mut config = config;
+            config.mode = mode;
+            config.mode_generation = generation;
+            config.client_roles = mode.roles();
+            if let Err(error) = self.ensure_relay(config) {
+                events.push(api::RelayEvent::Error {
+                    message: format!("could not switch Windows relay endpoint: {error}"),
+                });
+            }
+        }
+        events
     }
 
     fn relay_discovery_start(&mut self) -> BackendResult<()> {
@@ -1015,6 +1271,8 @@ impl api::RelayDriver for WindowsAudioDriver {
                 transport: api::RelayTransportPreference::Auto,
                 direction: api::RelayDirection::MobileToDesktop,
                 direction_generation: 0,
+                mode: self.relay_mode,
+                mode_generation: self.relay_mode_generation,
                 device_id: pw_graph_relay::generate_device_id(),
                 trusted_peers: Vec::new(),
                 trust_new_peers: true,
@@ -1055,5 +1313,120 @@ impl api::RelayDriver for WindowsAudioDriver {
 
     fn relay_local_links(&self) -> Vec<api::RelayLocalLink> {
         pw_graph_relay::netlink::display_links()
+    }
+
+    fn relay_send_sources(&self) -> Vec<api::RelayEndpointInfo> {
+        let mut sources = vec![api::RelayEndpointInfo {
+            id: "default-input".into(),
+            name: "Default input".into(),
+            description: "Current Windows eCapture default device".into(),
+        }];
+        sources.extend(
+            self.relay_input_choices
+                .iter()
+                .map(|(id, name)| api::RelayEndpointInfo {
+                    id: format!("input:{id}"),
+                    name: name.clone(),
+                    description: "WASAPI eCapture input device".into(),
+                }),
+        );
+        sources.push(api::RelayEndpointInfo {
+            id: "default-output-monitor".into(),
+            name: "Default output monitor".into(),
+            description: "Current Windows eRender loopback monitor".into(),
+        });
+        sources.extend(self.relay_endpoint_choices.iter().map(|(id, name)| {
+            api::RelayEndpointInfo {
+                id: format!("monitor:{id}"),
+                name: format!("{name} monitor"),
+                description: "WASAPI eRender loopback monitor".into(),
+            }
+        }));
+        sources
+    }
+
+    fn relay_receive_sinks(&self) -> Vec<api::RelayEndpointInfo> {
+        let mut sinks = vec![api::RelayEndpointInfo {
+            id: "default-output".into(),
+            name: "Default output".into(),
+            description: "Current Windows eRender default device".into(),
+        }];
+        sinks.extend(
+            self.relay_endpoint_choices
+                .iter()
+                .map(|(id, name)| api::RelayEndpointInfo {
+                    id: format!("output:{id}"),
+                    name: name.clone(),
+                    description: "WASAPI eRender output device".into(),
+                }),
+        );
+        sinks
+    }
+
+    fn relay_set_send_source(&mut self, source: api::RelaySendSource) -> BackendResult<()> {
+        self.relay_send_source = normalize_windows_send_source(source)?;
+        self.reconcile_relay_worker()
+    }
+
+    fn relay_set_receive_sink(&mut self, sink: api::RelayReceiveSink) -> BackendResult<()> {
+        self.relay_receive_sink = normalize_windows_receive_sink(sink)?;
+        self.reconcile_relay_worker()
+    }
+
+    fn relay_ensure_local_route(
+        &mut self,
+        mode: api::RelayMode,
+    ) -> BackendResult<api::RelayLocalRouteState> {
+        self.relay_mode = mode;
+        self.reconcile_relay_worker()?;
+        let resolved = self
+            .relay
+            .as_ref()
+            .and_then(|devices| devices.resolved_endpoint().map(str::to_owned));
+        Ok(api::RelayLocalRouteState {
+            mode: Some(mode),
+            active: self.relay.is_some(),
+            source_id: (mode == api::RelayMode::Emitter)
+                .then(|| resolved.clone().unwrap_or_else(|| "default-input".into())),
+            sink_id: (mode == api::RelayMode::Receiver)
+                .then(|| resolved.unwrap_or_else(|| "default-output".into())),
+            description: match mode {
+                api::RelayMode::Emitter => "Windows direct emitter route".into(),
+                api::RelayMode::Receiver => "Windows direct receiver route".into(),
+            },
+        })
+    }
+}
+
+#[cfg(feature = "relay")]
+fn normalize_windows_send_source(
+    source: api::RelaySendSource,
+) -> BackendResult<api::RelaySendSource> {
+    match source {
+        api::RelaySendSource::InputDevice(id) => Ok(api::RelaySendSource::InputDevice(
+            id.strip_prefix("input:").unwrap_or(&id).to_owned(),
+        )),
+        api::RelaySendSource::OutputMonitor(id) => Ok(api::RelaySendSource::OutputMonitor(
+            id.strip_prefix("monitor:").unwrap_or(&id).to_owned(),
+        )),
+        api::RelaySendSource::ManualGraph => Err(BackendError::unsupported(
+            "Windows direct relay cannot use a manual graph source",
+        )),
+        other => Ok(other),
+    }
+}
+
+#[cfg(feature = "relay")]
+fn normalize_windows_receive_sink(
+    sink: api::RelayReceiveSink,
+) -> BackendResult<api::RelayReceiveSink> {
+    match sink {
+        api::RelayReceiveSink::OutputDevice(id) => Ok(api::RelayReceiveSink::OutputDevice(
+            id.strip_prefix("output:").unwrap_or(&id).to_owned(),
+        )),
+        api::RelayReceiveSink::ManualGraph => Err(BackendError::unsupported(
+            "Windows direct relay cannot use a manual graph sink",
+        )),
+        other => Ok(other),
     }
 }

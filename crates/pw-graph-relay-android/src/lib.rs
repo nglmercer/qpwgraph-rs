@@ -3,9 +3,9 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
 use pw_graph_relay_sdk::{
     CodecKind, DeviceKind, EngineStatus, LinkKind, PeerInfo, RelayBrowser, RelayClient,
-    RelayClientBuilder, RelayEvent, RelayHandle, RelayHost, RelayHostBuilder, RelayHostPrepared,
-    RelayDirection, SessionId, TransportPreference, TrustedPeer, MAX_DISCOVERED_PEER_ADDRESSES,
-    MAX_REALTIME_QUANTUM_SAMPLES, MAX_TRUSTED_PEERS,
+    RelayClientBuilder, RelayDirection, RelayEvent, RelayHandle, RelayHost, RelayHostBuilder,
+    RelayHostPrepared, RelayMode, SessionId, TransportPreference, TrustedPeer,
+    MAX_DISCOVERED_PEER_ADDRESSES, MAX_REALTIME_QUANTUM_SAMPLES, MAX_TRUSTED_PEERS,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -79,9 +79,19 @@ fn parse_direction(value: &str) -> Result<RelayDirection, String> {
         "emit" => Ok(RelayDirection::MobileToDesktop),
         "receive" => Ok(RelayDirection::DesktopToMobile),
         "both" => Err("the Android relay accepts one-way audio only; both is disabled".into()),
-        other => RelayDirection::parse(other)
-            .ok_or_else(|| format!("unknown audio direction '{other}'")),
+        other => {
+            RelayDirection::parse(other).ok_or_else(|| format!("unknown audio direction '{other}'"))
+        }
     }
+}
+
+fn parse_mode(value: &str) -> Result<RelayMode, String> {
+    RelayMode::parse(value).ok_or_else(|| {
+        format!(
+            "unknown relay mode '{}'; expected emitter or receiver",
+            value.trim()
+        )
+    })
 }
 
 fn direction_generation(value: jlong) -> Result<u64, String> {
@@ -338,6 +348,18 @@ fn event_json(event: RelayEvent) -> serde_json::Value {
             "direction": direction.as_str(),
             "winner_device_id": winner_device_id,
         }),
+        RelayEvent::FlowResolved {
+            id,
+            generation,
+            flow,
+            mode,
+        } => json!({
+            "type": "mode_resolved",
+            "session": id.0,
+            "generation": generation,
+            "mode": mode.as_str(),
+            "emitter_id": flow.emitter_id,
+        }),
         RelayEvent::AudioLevel { id, rms } => json!({
             "type":"level", "session":id.0, "rms":rms
         }),
@@ -387,6 +409,8 @@ fn session_status_json(session: &pw_graph_relay_sdk::SessionStatus) -> serde_jso
         "control_state": session.control_state,
         "audio_channel_state": session.audio_channel_state,
         "trusted": session.trusted,
+        "mode": session.mode.map(|mode| mode.as_str()),
+        "emitter_id": session.flow.as_ref().map(|flow| flow.emitter_id.clone()),
     })
 }
 
@@ -430,6 +454,61 @@ pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_create(
             .device_name(device_name)
             .device_kind(DeviceKind::Android)
             .direction(direction)
+            .direction_generation(generation)
+            .codec(codec)
+            .transport(transport)
+            .audio(sample_rate, channels, frame_ms)
+            .trusted_peers(trusted_peers);
+        if !device_id.trim().is_empty() {
+            builder = builder.device_id(device_id);
+        }
+        let client = builder
+            .trust_new_peers(true)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        let mut guard = clients()
+            .lock()
+            .map_err(|_| "client store poisoned".to_string())?;
+        guard.insert(handle, ClientSlot::Prepared(client));
+        Ok(json!({"type":"created", "handle":handle}))
+    })();
+    match result {
+        Ok(value) => json_string(&mut env, value).unwrap_or(std::ptr::null_mut()),
+        Err(error) => error_json(&mut env, error).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_createMode(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    device_name: JString<'_>,
+    device_id: JString<'_>,
+    trusted_peers: JString<'_>,
+    mode: JString<'_>,
+    generation: jlong,
+    codec: JString<'_>,
+    transport: JString<'_>,
+    sample_rate: jint,
+    channels: jint,
+    frame_ms: jint,
+) -> jni::sys::jstring {
+    let result = (|| -> Result<serde_json::Value, String> {
+        let device_name = string(&mut env, device_name)?;
+        let device_id = string(&mut env, device_id)?;
+        let trusted_peers = parse_trusted_peers(&string(&mut env, trusted_peers)?)?;
+        let mode = parse_mode(&string(&mut env, mode)?)?;
+        let generation = direction_generation(generation)?;
+        let codec = parse_codec(&string(&mut env, codec)?)?;
+        let transport = parse_transport(&string(&mut env, transport)?)?;
+        let sample_rate = positive_u32("sample rate", sample_rate)?;
+        let channels = android_channels(channels)?;
+        let frame_ms = positive_u16("frame duration", frame_ms)?;
+        let mut builder = RelayClientBuilder::new()
+            .device_name(device_name)
+            .device_kind(DeviceKind::Android)
+            .mode(mode)
             .direction_generation(generation)
             .codec(codec)
             .transport(transport)
@@ -694,8 +773,8 @@ pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_offerDirection(
     generation: jlong,
 ) -> jni::sys::jstring {
     let result = (|| -> Result<serde_json::Value, String> {
-        let engine = client_engine_handle(handle)?
-            .ok_or_else(|| "client is not connected".to_string())?;
+        let engine =
+            client_engine_handle(handle)?.ok_or_else(|| "client is not connected".to_string())?;
         let session = u64::try_from(session).map_err(|_| "session id is invalid".to_string())?;
         let direction = parse_direction(&string(&mut env, direction)?)?;
         let generation = direction_generation(generation)?;
@@ -706,6 +785,39 @@ pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_offerDirection(
                     "type": "direction_offered",
                     "session": session,
                     "direction": direction.as_str(),
+                    "generation": generation,
+                })
+            })
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(value) => json_string(&mut env, value).unwrap_or(std::ptr::null_mut()),
+        Err(error) => error_json(&mut env, error).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_offerMode(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    session: jlong,
+    mode: JString<'_>,
+    generation: jlong,
+) -> jni::sys::jstring {
+    let result = (|| -> Result<serde_json::Value, String> {
+        let engine =
+            client_engine_handle(handle)?.ok_or_else(|| "client is not connected".to_string())?;
+        let session = u64::try_from(session).map_err(|_| "session id is invalid".to_string())?;
+        let mode = parse_mode(&string(&mut env, mode)?)?;
+        let generation = direction_generation(generation)?;
+        engine
+            .offer_mode(SessionId(session), mode, generation)
+            .map(|()| {
+                json!({
+                    "type": "mode_offered",
+                    "session": session,
+                    "mode": mode.as_str(),
                     "generation": generation,
                 })
             })
@@ -889,8 +1001,8 @@ pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_release(
 }
 
 // ---------------------------------------------------------------------------
-// Host (emitter broadcast) support: an Android device can also be the host
-// that other relay peers connect to.
+// Receiver-host support: an Android device can host a Receiver endpoint that
+// Emitter peers connect to.
 // ---------------------------------------------------------------------------
 
 static HOSTS: OnceLock<Mutex<HashMap<i64, HostSlot>>> = OnceLock::new();
@@ -951,6 +1063,70 @@ pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_hostCreate(
             .codec(codec)
             .transport(transport)
             .direction(direction)
+            .direction_generation(generation)
+            .audio(sample_rate, channels, frame_ms)
+            .trusted_peers(trusted_peers);
+        if !device_id.trim().is_empty() {
+            builder = builder.device_id(device_id);
+        }
+        let host = builder
+            .trust_new_peers(true)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        let mut guard = hosts()
+            .lock()
+            .map_err(|_| "host store poisoned".to_string())?;
+        guard.insert(handle, HostSlot::Prepared(host));
+        Ok(json!({"type":"created", "handle":handle}))
+    })();
+    match result {
+        Ok(value) => json_string(&mut env, value).unwrap_or(std::ptr::null_mut()),
+        Err(error) => error_json(&mut env, error).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_hostCreateMode(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    device_name: JString<'_>,
+    device_id: JString<'_>,
+    trusted_peers: JString<'_>,
+    pin: JString<'_>,
+    port: jint,
+    codec: JString<'_>,
+    transport: JString<'_>,
+    mode: JString<'_>,
+    generation: jlong,
+    sample_rate: jint,
+    channels: jint,
+    frame_ms: jint,
+) -> jni::sys::jstring {
+    let result = (|| -> Result<serde_json::Value, String> {
+        let device_name = string(&mut env, device_name)?;
+        let device_id = string(&mut env, device_id)?;
+        let trusted_peers = parse_trusted_peers(&string(&mut env, trusted_peers)?)?;
+        let pin = string(&mut env, pin)?;
+        let port = port_u16(port)?;
+        let codec = parse_codec(&string(&mut env, codec)?)?;
+        let transport = parse_transport(&string(&mut env, transport)?)?;
+        let mode = parse_mode(&string(&mut env, mode)?)?;
+        if mode != RelayMode::Receiver {
+            return Err("Android hosts are Receiver endpoints; use a client for Emitter".into());
+        }
+        let generation = direction_generation(generation)?;
+        let sample_rate = positive_u32("sample rate", sample_rate)?;
+        let channels = android_channels(channels)?;
+        let frame_ms = positive_u16("frame duration", frame_ms)?;
+        let mut builder = RelayHostBuilder::new()
+            .device_name(device_name)
+            .device_kind(DeviceKind::Android)
+            .pin(pin)
+            .port(port)
+            .codec(codec)
+            .transport(transport)
+            .mode(mode)
             .direction_generation(generation)
             .audio(sample_rate, channels, frame_ms)
             .trusted_peers(trusted_peers);
@@ -1268,8 +1444,8 @@ pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_hostOfferDirection(
     generation: jlong,
 ) -> jni::sys::jstring {
     let result = (|| -> Result<serde_json::Value, String> {
-        let engine = host_engine_handle(handle)?
-            .ok_or_else(|| "host is not running".to_string())?;
+        let engine =
+            host_engine_handle(handle)?.ok_or_else(|| "host is not running".to_string())?;
         let session = u64::try_from(session).map_err(|_| "session id is invalid".to_string())?;
         let direction = parse_direction(&string(&mut env, direction)?)?;
         let generation = direction_generation(generation)?;
@@ -1280,6 +1456,39 @@ pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_hostOfferDirection(
                     "type": "direction_offered",
                     "session": session,
                     "direction": direction.as_str(),
+                    "generation": generation,
+                })
+            })
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(value) => json_string(&mut env, value).unwrap_or(std::ptr::null_mut()),
+        Err(error) => error_json(&mut env, error).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_qpwgraph_relay_NativeBridge_hostOfferMode(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    session: jlong,
+    mode: JString<'_>,
+    generation: jlong,
+) -> jni::sys::jstring {
+    let result = (|| -> Result<serde_json::Value, String> {
+        let engine =
+            host_engine_handle(handle)?.ok_or_else(|| "host is not running".to_string())?;
+        let session = u64::try_from(session).map_err(|_| "session id is invalid".to_string())?;
+        let mode = parse_mode(&string(&mut env, mode)?)?;
+        let generation = direction_generation(generation)?;
+        engine
+            .offer_mode(SessionId(session), mode, generation)
+            .map(|()| {
+                json!({
+                    "type": "mode_offered",
+                    "session": session,
+                    "mode": mode.as_str(),
                     "generation": generation,
                 })
             })
@@ -1618,8 +1827,14 @@ mod tests {
 
     #[test]
     fn parses_android_client_options() {
-        assert_eq!(parse_direction("emit").unwrap(), RelayDirection::MobileToDesktop);
-        assert_eq!(parse_direction("receive").unwrap(), RelayDirection::DesktopToMobile);
+        assert_eq!(
+            parse_direction("emit").unwrap(),
+            RelayDirection::MobileToDesktop
+        );
+        assert_eq!(
+            parse_direction("receive").unwrap(),
+            RelayDirection::DesktopToMobile
+        );
         assert!(parse_direction("both").is_err());
         assert_eq!(parse_codec("pcm").unwrap(), CodecKind::Pcm);
         assert_eq!(parse_codec("opus").unwrap(), CodecKind::Opus);

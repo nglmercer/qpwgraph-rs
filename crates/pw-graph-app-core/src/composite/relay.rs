@@ -102,6 +102,21 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         Ok(session)
     }
 
+    fn relay_connect_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        pin: &str,
+        mode: pw_graph_backend::RelayMode,
+        generation: u64,
+    ) -> BackendResult<pw_graph_backend::RelaySessionId> {
+        let session = self
+            .relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_connect_mode(target, pin, mode, generation)?;
+        self.rebuild_after_native_mutation();
+        Ok(session)
+    }
+
     fn relay_connect_trusted(
         &mut self,
         target: std::net::SocketAddr,
@@ -113,13 +128,23 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         let session = self
             .relay_backend_mut()
             .ok_or_else(Self::relay_unavailable)?
-            .relay_connect_trusted(
-                target,
-                peer_id,
-                secret,
-                direction,
-                direction_generation,
-            )?;
+            .relay_connect_trusted(target, peer_id, secret, direction, direction_generation)?;
+        self.rebuild_after_native_mutation();
+        Ok(session)
+    }
+
+    fn relay_connect_trusted_mode(
+        &mut self,
+        target: std::net::SocketAddr,
+        peer_id: &str,
+        secret: [u8; 32],
+        mode: pw_graph_backend::RelayMode,
+        generation: u64,
+    ) -> BackendResult<pw_graph_backend::RelaySessionId> {
+        let session = self
+            .relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_connect_trusted_mode(target, peer_id, secret, mode, generation)?;
         self.rebuild_after_native_mutation();
         Ok(session)
     }
@@ -139,6 +164,28 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         self.relay_backend_mut()
             .ok_or_else(Self::relay_unavailable)?
             .relay_offer_direction(session, direction, generation)
+    }
+
+    fn relay_offer_flow(
+        &mut self,
+        session: pw_graph_backend::RelaySessionId,
+        flow: pw_graph_backend::RelayFlow,
+        generation: u64,
+    ) -> BackendResult<()> {
+        self.relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_offer_flow(session, flow, generation)
+    }
+
+    fn relay_offer_mode(
+        &mut self,
+        session: pw_graph_backend::RelaySessionId,
+        mode: pw_graph_backend::RelayMode,
+        generation: u64,
+    ) -> BackendResult<()> {
+        self.relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_offer_mode(session, mode, generation)
     }
 
     fn relay_configure_identity(
@@ -191,18 +238,33 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         // When a session becomes ready the native graph (relay nodes/links)
         // has changed. Merge it into the composite view so the first connect
         // exposes a verified route without requiring a manual disconnect/reconnect.
-        if events
-            .iter()
-            .any(|e| matches!(
-                e,
+        let resolved_mode = events.iter().find_map(|event| match event {
+            pw_graph_backend::RelayEvent::FlowResolved { mode, .. } => Some(*mode),
+            _ => None,
+        });
+        if events.iter().any(|event| {
+            matches!(
+                event,
                 pw_graph_backend::RelayEvent::SessionEstablished { .. }
                     | pw_graph_backend::RelayEvent::DirectionResolved { .. }
-            ))
-        {
+                    | pw_graph_backend::RelayEvent::FlowResolved { .. }
+            )
+        }) {
             self.rebuild_after_native_mutation();
-            // Ensure the backend route was verified after the merged refresh.
+            // Ensure the backend's mode-specific route was verified after the
+            // merged refresh. FlowResolved is authoritative for a live session;
+            // the status fallback also covers an ordinary SessionEstablished.
             if let Some(driver) = self.relay_backend_mut() {
-                let _ = driver.relay_ensure_playback_route();
+                let mode = resolved_mode
+                    .or_else(|| {
+                        driver
+                            .relay_status()
+                            .sessions
+                            .first()
+                            .and_then(|session| session.mode)
+                    })
+                    .unwrap_or(pw_graph_backend::RelayMode::Receiver);
+                let _ = driver.relay_ensure_local_route(mode);
             }
         }
         events
@@ -285,5 +347,44 @@ impl pw_graph_backend::RelayDriver for CompositeDriver {
         self.relay_backend_mut()
             .ok_or_else(Self::relay_unavailable)?
             .relay_ensure_playback_route()
+    }
+
+    fn relay_send_sources(&self) -> Vec<pw_graph_backend::RelayEndpointInfo> {
+        self.relay_backend()
+            .map(|driver| driver.relay_send_sources())
+            .unwrap_or_default()
+    }
+
+    fn relay_receive_sinks(&self) -> Vec<pw_graph_backend::RelayEndpointInfo> {
+        self.relay_backend()
+            .map(|driver| driver.relay_receive_sinks())
+            .unwrap_or_default()
+    }
+
+    fn relay_set_send_source(
+        &mut self,
+        source: pw_graph_backend::RelaySendSource,
+    ) -> BackendResult<()> {
+        self.relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_set_send_source(source)
+    }
+
+    fn relay_set_receive_sink(
+        &mut self,
+        sink: pw_graph_backend::RelayReceiveSink,
+    ) -> BackendResult<()> {
+        self.relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_set_receive_sink(sink)
+    }
+
+    fn relay_ensure_local_route(
+        &mut self,
+        mode: pw_graph_backend::RelayMode,
+    ) -> BackendResult<pw_graph_backend::RelayLocalRouteState> {
+        self.relay_backend_mut()
+            .ok_or_else(Self::relay_unavailable)?
+            .relay_ensure_local_route(mode)
     }
 }

@@ -15,14 +15,15 @@
 // items are `pub(crate)`: the session threads in `crate::session` are siblings
 // and reach them by path.
 use crate::{
-    discovery, pairing, resolve_direction_offers, session, usb_probe, AudioFormat, CodecKind,
-    Converter, DeviceKind, DirectionAck, DirectionOffer,
-    LinkKind, Opener, PcmQueue, RelayDirection, Roles, Sealer, TransportPreference,
+    discovery, pairing, resolve_direction_offers, resolve_flow_offers, session, usb_probe,
+    AudioFormat, CodecKind, Converter, DeviceKind, DirectionAck, DirectionOffer, FlowAck,
+    FlowOffer, LinkKind, Opener, PcmQueue, RelayDirection, RelayFlow, RelayMode, Roles, Sealer,
+    TransportPreference,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;

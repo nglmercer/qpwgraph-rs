@@ -14,7 +14,7 @@ backends do.
 | Volume, mute, and metering | Yes | Yes, peak metering where available |
 | Effects | Yes | Yes, hosted in the router on carried routes |
 | MIDI routing | ALSA Sequencer | WinMM, with fan-out and fan-in |
-| Relay | Yes, virtual nodes | Yes, endpoint loopback/render; no microphone emulation |
+| Relay | Yes, virtual nodes | Yes, direct eCapture/eRender-loopback emitters and eRender receivers |
 
 The rest of this document breaks each of those rows down and says which of the
 differences are backlog items and which are facts about the operating system.
@@ -227,9 +227,9 @@ are flagged passive, monitor-only, and non-reconnecting.
 | --- | --- | --- | --- |
 | Effect nodes | Yes | Yes, hosted in the router | Equivalent |
 | Effect insertion into a link | Yes | Yes, on routes qpwgraph carries | Equivalent |
-| Relay: send this machine's audio | Yes | Yes, selected render endpoint loopback | Partial |
-| Relay: play a peer's audio here | Yes | Yes, selected render endpoint | Partial |
-| Relay: peer audio as a microphone | Yes | No | Platform limitation |
+| Relay: emit local audio | Yes, selected source to Relay Speaker | Yes, physical input or selected render monitor | Partial |
+| Relay: receive peer audio | Yes, Relay Microphone to selected sink | Yes, selected render endpoint | Partial |
+| Relay: peer audio as a system capture endpoint | Yes, virtual Relay Microphone | No, without an optional driver | Platform limitation |
 | Relay: send one application only | Yes | No | Missing (build 20348+) |
 | Relay: choose which endpoint | n/a | Yes, by stable endpoint ID | Partial |
 | MIDI | ALSA | WinMM, with routing, fan-out, and fan-in | Equivalent for MIDI 1.0 |
@@ -278,25 +278,24 @@ neutral and builds on both targets. Only the audio endpoints that drive
 `RelayHandle::push_capture` and `RelayHandle::pull_playback` differ.
 
 On Linux those endpoints are two virtual PipeWire nodes, so *any* application
-can be routed into or out of the relay through the patchbay, in either
-direction.
+can be routed into or out of the relay through the patchbay. Emitter mode links
+the selected local source to Relay Speaker; Receiver mode links Relay
+Microphone to the selected real sink. Default selectors follow WirePlumber's
+actual default source or sink, and only qpwgraph-owned automatic links move
+when that default changes.
 
-On Windows they are WASAPI streams on the selected render endpoint: a loopback
-capture supplies what that endpoint is playing, and a render stream plays what
-peers send. The relay panel exposes the available endpoint names and persists
-their stable Core Audio IDs independently for capture and playback. `None`
-means the system default; a removed saved endpoint falls back to the default.
-Changing a selection restarts only the relay WASAPI streams when they are
-already active.
+On Windows, Emitter mode opens either a physical input with WASAPI `eCapture`
+or a playback monitor with `eRender` loopback. Receiver mode opens an `eRender`
+stream for peer audio. The relay panel exposes independent source and sink
+lists and persists stable Core Audio IDs; default selectors follow the current
+endpoint and a removed explicit device falls back safely. Changing a selection
+restarts the one active WASAPI worker, and never leaves a second worker behind.
 
-What Windows cannot do is present received audio as a **microphone** to other
-applications. That needs a capture endpoint, and Windows has no user-mode API
-for creating one — a selectable device requires a kernel-mode driver, which is
-what tools like VB-Cable install. On Windows, the relay `emit` role means
-sending the selected render endpoint's loopback, while `receive` means playing
-peer audio on the selected render endpoint; neither role creates a microphone
-device. Individual applications cannot be routed into the relay on Windows;
-the loopback tap is whole-endpoint.
+Windows cannot present received audio as a **microphone** to other applications
+without an optional kernel-mode virtual-audio driver. Direct Receiver mode is
+still fully usable because it plays peer audio on the selected render endpoint.
+Individual applications cannot be selected as Windows relay sources; the
+loopback tap is whole-endpoint.
 
 ### Refresh and notification behavior
 
