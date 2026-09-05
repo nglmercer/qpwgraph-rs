@@ -9,6 +9,28 @@ use super::*;
 
 const MAX_PROCESS_METER_CAPTURES: usize = 32;
 
+fn bound_process_meter_targets(
+    targets: impl IntoIterator<Item = ProcessMeterTarget>,
+) -> Vec<ProcessMeterTarget> {
+    targets
+        .into_iter()
+        .take(MAX_PROCESS_METER_CAPTURES)
+        .collect()
+}
+
+fn process_meter_levels(
+    process_meter: Option<&ProcessMeterReading>,
+    native_peak: Option<f32>,
+) -> Option<(f32, f32, u32)> {
+    let process_meter = process_meter.filter(|meter| meter.available);
+    let peak = process_meter.map(|meter| meter.peak).or(native_peak)?;
+    Some((
+        process_meter.map_or(0.0, |meter| meter.rms),
+        peak,
+        process_meter.map_or(0, |meter| meter.age_ms),
+    ))
+}
+
 /// One refresh answer. Audio state is not carried here -- it lives in the
 /// shared map, which the refresh fills and the callbacks keep current.
 pub(super) struct WorkerSnapshot {
@@ -1193,25 +1215,24 @@ impl CoreAudioWorker {
         }
         let mut result = Vec::new();
         let format = crate::router::AudioFormat::new(48_000, 2);
-        let targets = self
-            .sessions
-            .iter()
-            .filter(|session| {
-                session.flow == Audio::eRender
-                    && session.process_id != 0
-                    && session.process_identity.is_some()
-                    && self.meter_wanted(session.node_id)
-            })
-            .filter_map(|session| {
-                Some(ProcessMeterTarget {
-                    node_id: session.node_id,
-                    selector: session.process_identity.as_ref()?.selector_key()?,
-                    pid: session.process_id,
-                    mode: ProcessLoopbackMode::IncludeProcessTree,
+        let targets = bound_process_meter_targets(
+            self.sessions
+                .iter()
+                .filter(|session| {
+                    session.flow == Audio::eRender
+                        && session.process_id != 0
+                        && session.process_identity.is_some()
+                        && self.meter_wanted(session.node_id)
                 })
-            })
-            .take(MAX_PROCESS_METER_CAPTURES)
-            .collect::<Vec<_>>();
+                .filter_map(|session| {
+                    Some(ProcessMeterTarget {
+                        node_id: session.node_id,
+                        selector: session.process_identity.as_ref()?.selector_key()?,
+                        pid: session.process_id,
+                        mode: ProcessLoopbackMode::IncludeProcessTree,
+                    })
+                }),
+        );
         self.process_captures.reconcile_meters(targets, format);
         // Per-application levels, straight off each session's own meter.
         for session in &self.sessions {
@@ -1224,11 +1245,8 @@ impl CoreAudioWorker {
                 .as_ref()
                 .and_then(|meter| unsafe { meter.GetPeakValue() }.ok())
                 .map(|peak| peak.clamp(0.0, 1.0));
-            let Some(peak) = process_meter
-                .as_ref()
-                .filter(|meter| meter.available)
-                .map(|meter| meter.peak)
-                .or(native_peak)
+            let Some((rms, peak, age_ms)) =
+                process_meter_levels(process_meter.as_ref(), native_peak)
             else {
                 continue;
             };
@@ -1238,15 +1256,9 @@ impl CoreAudioWorker {
                 // The process-loopback path reports true RMS. If it is
                 // unavailable, keep the native peak fallback honest and do
                 // not present that peak as an RMS value.
-                rms: process_meter
-                    .as_ref()
-                    .filter(|meter| meter.available)
-                    .map_or(0.0, |meter| meter.rms),
+                rms,
                 peak,
-                age_ms: process_meter
-                    .as_ref()
-                    .filter(|meter| meter.available)
-                    .map_or(0, |meter| meter.age_ms),
+                age_ms,
                 available: true,
             });
         }
@@ -1286,5 +1298,66 @@ impl Drop for CoreAudioWorker {
             self.enumerator
                 .UnregisterEndpointNotificationCallback(&self.endpoint_notification)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(node: usize) -> ProcessMeterTarget {
+        ProcessMeterTarget {
+            node_id: NodeId(node as u64),
+            selector: format!("sha256:{node:064x}"),
+            pid: node as u32 + 1,
+            mode: ProcessLoopbackMode::IncludeProcessTree,
+        }
+    }
+
+    #[test]
+    fn always_policy_process_targets_are_bounded() {
+        let targets = bound_process_meter_targets((0..MAX_PROCESS_METER_CAPTURES + 8).map(target));
+        assert_eq!(targets.len(), MAX_PROCESS_METER_CAPTURES);
+        assert_eq!(
+            targets.first().map(|target| target.node_id),
+            Some(NodeId(0))
+        );
+        assert_eq!(
+            targets.last().map(|target| target.node_id),
+            Some(NodeId((MAX_PROCESS_METER_CAPTURES - 1) as u64))
+        );
+    }
+
+    #[test]
+    fn native_peak_survives_unavailable_process_loopback() {
+        let process_meter = ProcessMeterReading {
+            rms: 0.0,
+            peak: 0.0,
+            age_ms: u32::MAX,
+            available: false,
+            state: ProcessCaptureState::Unavailable {
+                reason: "activation failed".into(),
+            },
+        };
+        assert_eq!(
+            process_meter_levels(Some(&process_meter), Some(0.42)),
+            Some((0.0, 0.42, 0))
+        );
+        assert_eq!(process_meter_levels(Some(&process_meter), None), None);
+    }
+
+    #[test]
+    fn process_rms_and_peak_replace_native_peak_when_available() {
+        let process_meter = ProcessMeterReading {
+            rms: 0.25,
+            peak: 0.5,
+            age_ms: 17,
+            available: true,
+            state: ProcessCaptureState::Active,
+        };
+        assert_eq!(
+            process_meter_levels(Some(&process_meter), Some(0.9)),
+            Some((0.25, 0.5, 17))
+        );
     }
 }

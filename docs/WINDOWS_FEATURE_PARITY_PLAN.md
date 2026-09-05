@@ -1424,7 +1424,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 [x] process RMS available (opt-in helper smoke test passed locally)
 [ ] process loopback unavailable -> peak fallback
 [x] on-demand worker closes (opt-in helper smoke test passed locally)
-[ ] always policy bounded
+[x] always policy bounded (32-target cap and fallback policy unit-tested locally)
 ```
 
 ## Virtual driver

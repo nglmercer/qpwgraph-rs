@@ -76,6 +76,11 @@ $env:PW_GRAPH_TEST_PROCESS_POLICY = '1'
 cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture
 ```
 
+The `always` policy is bounded to 32 process-loopback workers. If an
+activation is unavailable, the worker keeps the native Core Audio peak meter
+when one exists and reports RMS as unavailable instead of presenting peak as
+fabricated RMS; both policies are covered by backend unit tests.
+
 The worker also watches the target process lifetime and reports a lost stream
 when the target exits instead of leaving a silent capture alive:
 

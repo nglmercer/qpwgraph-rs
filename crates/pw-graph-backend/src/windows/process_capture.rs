@@ -192,6 +192,12 @@ impl ProcessCaptureManager {
 
     fn reconcile(&mut self, format: AudioFormat) {
         let wanted = self.wanted_identities();
+        // A failed activation is useful only while its selector/PID is still
+        // requested. Once a session disappears, discard the diagnostic entry
+        // as well; otherwise a long-running worker would accumulate one
+        // stale status for every short-lived process (and falsely report
+        // those old captures forever).
+        self.failed.retain(|identity, _| wanted.contains(identity));
         let consumers: BTreeMap<_, _> = wanted
             .iter()
             .map(|identity| (identity.clone(), self.consumers_for(identity)))
@@ -574,6 +580,30 @@ mod tests {
         assert_eq!(manager.active_count(), 0);
 
         manager.set_external_relay(None);
+        assert!(manager.statuses().is_empty());
+    }
+
+    #[test]
+    fn stale_failed_capture_statuses_are_released_with_their_target() {
+        let identity = CaptureIdentity::Selector {
+            selector: "sha256:gone".into(),
+            pid: 42,
+            mode: ProcessLoopbackMode::IncludeProcessTree,
+        };
+        let mut manager = ProcessCaptureManager::new();
+        manager.failed.insert(
+            identity,
+            FailedCapture {
+                error: "target exited".into(),
+                attempted_at: Instant::now(),
+                state: ProcessCaptureState::Lost {
+                    reason: "target exited".into(),
+                },
+            },
+        );
+
+        manager.reconcile_meters(std::iter::empty(), AudioFormat::new(48_000, 2));
+
         assert!(manager.statuses().is_empty());
     }
 }
