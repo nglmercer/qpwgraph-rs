@@ -30,6 +30,9 @@ const GUID KSNODETYPE_SPEAKER = {
 #define QPWGRAPH_DRIVER_TAG ((ULONG)'aPWQ')
 #define QPWGRAPH_MAX_PACKET_COUNT 8
 #define QPWGRAPH_HNS_PER_SEC 10000000ULL
+#ifndef KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM
+#define KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM 0x00000200UL
+#endif
 
 static const GUID QpwgraphRenderComponentGuid = {
     0x9f1d8d45,
@@ -118,6 +121,7 @@ typedef struct _QPWGRAPH_STREAM_CONTEXT {
   volatile LONG64 LastPacketStart;
   LARGE_INTEGER PerformanceCounterFrequency;
   PVOID PacketBuffers[QPWGRAPH_MAX_PACKET_COUNT];
+  BOOLEAN RenderEndOfStream;
 } QPWGRAPH_STREAM_CONTEXT, *PQPWGRAPH_STREAM_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QPWGRAPH_STREAM_CONTEXT,
@@ -642,10 +646,13 @@ static NTSTATUS QpwgraphEvtStreamPrepareHardware(ACXSTREAM Stream) {
 
   Context->State = AcxStreamStatePause;
   Context->CountedRunning = FALSE;
+  Context->RenderEndOfStream = FALSE;
   InterlockedExchange(&Context->CurrentPacket, 0);
   InterlockedExchange64(&Context->Position, 0);
   InterlockedExchange64(&Context->StartPosition, 0);
   InterlockedExchange64(&Context->GlitchAdjust, 0);
+  InterlockedExchange64(&Context->CurrentPacketStart, 0);
+  InterlockedExchange64(&Context->LastPacketStart, 0);
   return STATUS_SUCCESS;
 }
 
@@ -671,6 +678,9 @@ static NTSTATUS QpwgraphEvtStreamReleaseHardware(ACXSTREAM Stream) {
   InterlockedExchange64(&Context->Position, 0);
   InterlockedExchange64(&Context->StartPosition, 0);
   InterlockedExchange64(&Context->GlitchAdjust, 0);
+  InterlockedExchange64(&Context->CurrentPacketStart, 0);
+  InterlockedExchange64(&Context->LastPacketStart, 0);
+  Context->RenderEndOfStream = FALSE;
   return STATUS_SUCCESS;
 }
 
@@ -697,6 +707,7 @@ static NTSTATUS QpwgraphEvtStreamRun(ACXSTREAM Stream) {
   }
 
   counter = KeQueryPerformanceCounter(NULL);
+  InterlockedExchange64(&Context->CurrentPacketStart, counter.QuadPart);
   InterlockedExchange64(
       &Context->StartTime,
       (LONG64)KSCONVERT_PERFORMANCE_TIME(
@@ -757,12 +768,20 @@ static NTSTATUS QpwgraphEvtStreamSetRenderPacket(ACXSTREAM Stream, ULONG Packet,
   PQPWGRAPH_STREAM_CONTEXT Context;
   ULONG currentPacket;
 
-  UNREFERENCED_PARAMETER(Flags);
-  UNREFERENCED_PARAMETER(EosPacketLength);
   PAGED_CODE();
   Context = QpwgraphGetStreamContext(Stream);
   if (Context == NULL) {
     return STATUS_INVALID_PARAMETER;
+  }
+  if ((Flags & ~KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) != 0 ||
+      (!(Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) &&
+       EosPacketLength != 0) ||
+      ((Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) &&
+       EosPacketLength > Context->PacketSize)) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (Context->RenderEndOfStream) {
+    return STATUS_INVALID_DEVICE_STATE;
   }
 
   currentPacket =
@@ -772,6 +791,9 @@ static NTSTATUS QpwgraphEvtStreamSetRenderPacket(ACXSTREAM Stream, ULONG Packet,
   }
   if (Packet > currentPacket + 1) {
     return STATUS_DATA_OVERRUN;
+  }
+  if (Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) {
+    Context->RenderEndOfStream = TRUE;
   }
   return STATUS_SUCCESS;
 }
@@ -929,6 +951,7 @@ static NTSTATUS QpwgraphCreateStream(WDFDEVICE Device, ACXCIRCUIT Circuit,
   Context->Cable = Cable;
   Context->IsCapture = IsCapture;
   Context->CountedRunning = FALSE;
+  Context->RenderEndOfStream = FALSE;
   Context->State = AcxStreamStateStop;
   KeQueryPerformanceCounter(&Context->PerformanceCounterFrequency);
   return STATUS_SUCCESS;
