@@ -42,6 +42,25 @@ on the test machine from an elevated PowerShell prompt. An existing code
 signing certificate can be selected with
 `-CertificateThumbprint <thumbprint>` instead.
 
+For a guided elevated flow, use the staged `test-validation.ps1` runner. Each
+phase is explicit; only phases passed `-Reboot` restart the machine:
+
+```powershell
+Set-Location drivers/windows-audio/target/qpwgraph-audio-package
+.\test-validation.ps1 -Phase Prepare
+.\test-validation.ps1 -Phase EnableTestMode -Reboot
+# After Windows restarts in Test Mode:
+.\test-validation.ps1 -Phase Install
+.\test-validation.ps1 -Phase Smoke
+# Replace oem42.inf with the exact name printed by Install:
+.\test-validation.ps1 -Phase Uninstall -PublishedInf oem42.inf
+.\test-validation.ps1 -Phase DisableTestMode -Reboot
+```
+
+The runner requires Administrator elevation, builds the smoke probe during
+`Prepare`, imports only the public test certificate, performs role and
+round-trip verification, and never enables `-SkipEndpointVerification`.
+
 Build the smoke probe before installation:
 
 ```powershell

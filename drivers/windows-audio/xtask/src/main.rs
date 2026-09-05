@@ -125,6 +125,7 @@ fn stage_package(
         "install.ps1",
         "uninstall.ps1",
         "sign-test.ps1",
+        "test-validation.ps1",
         "README.md",
     ] {
         let path = output.join(filename);
@@ -194,7 +195,13 @@ fn stage_package(
     fs::write(output.join("manifest.json"), ready_manifest)
         .map_err(|error| format!("write staged manifest: {error}"))?;
 
-    for filename in ["install.ps1", "uninstall.ps1", "sign-test.ps1", "README.md"] {
+    for filename in [
+        "install.ps1",
+        "uninstall.ps1",
+        "sign-test.ps1",
+        "test-validation.ps1",
+        "README.md",
+    ] {
         let source = package_source.join(filename);
         fs::copy(&source, output.join(filename))
             .map_err(|error| format!("copy {}: {error}", source.display()))?;
@@ -682,6 +689,28 @@ fn validate_package_metadata() {
             signing_script.contains(required),
             "{} is missing test-signing marker {required}",
             package.join("sign-test.ps1").display()
+        );
+    }
+    let validation_script =
+        fs::read_to_string(package.join("test-validation.ps1")).unwrap_or_else(|error| {
+            panic!(
+                "could not read {}: {error}",
+                package.join("test-validation.ps1").display()
+            );
+        });
+    for required in [
+        "#requires -RunAsAdministrator",
+        "EnableTestMode",
+        "-AllowTestSigned",
+        "--verify-roles",
+        "--round-trip",
+        "PublishedInf",
+        "DisableTestMode",
+    ] {
+        assert!(
+            validation_script.contains(required),
+            "{} is missing guided-validation marker {required}",
+            package.join("test-validation.ps1").display()
         );
     }
     println!("driver package metadata validated");
