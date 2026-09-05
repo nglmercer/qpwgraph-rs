@@ -253,6 +253,21 @@ impl ProcessCaptureManager {
             }
 
             let (selector, pid, mode) = identity_parts(&identity);
+            if process_loopback_failure_injected() {
+                let message =
+                    "process-loopback activation was disabled by the integration-test fault";
+                self.failed.insert(
+                    identity,
+                    FailedCapture {
+                        error: message.into(),
+                        attempted_at: Instant::now(),
+                        state: ProcessCaptureState::Unavailable {
+                            reason: message.into(),
+                        },
+                    },
+                );
+                continue;
+            }
             if let Err(error) = verify_live_process_identity(&selector, pid) {
                 let message = error.to_string();
                 self.failed.insert(
@@ -465,6 +480,17 @@ impl ProcessCaptureManager {
     pub fn clear_failures(&mut self) {
         self.failed.clear();
     }
+}
+
+/// A deterministic fault switch for the Windows integration suite. It is
+/// deliberately opt-in and only skips process-loopback activation; the live
+/// session's native `IAudioMeterInformation` path remains untouched so the
+/// peak-fallback contract can be exercised on a real audio session.
+fn process_loopback_failure_injected() -> bool {
+    std::env::var("PW_GRAPH_TEST_PROCESS_LOOPBACK_FAILURE")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 fn capture_identity(key: &ProcessCaptureKey) -> CaptureIdentity {

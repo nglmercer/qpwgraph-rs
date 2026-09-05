@@ -528,6 +528,72 @@ fn meter_policy_controls_process_worker_lifetime() {
 }
 
 #[test]
+fn process_loopback_failure_preserves_native_peak() {
+    if std::env::var("PW_GRAPH_TEST_PROCESS_LOOPBACK_FAILURE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let Some(helper) = helper_path() else {
+        panic!("Cargo did not provide CARGO_BIN_EXE_windows-audio-test-tone");
+    };
+    let mut child = spawn_tone(&helper, 30_000, 1_000, 0.25, 1);
+    let result = (|| -> Result<(), String> {
+        let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
+        driver
+            .set_meter_policy(MeterPolicy::Always)
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            driver.refresh().map_err(|error| error.to_string())?;
+            let helper_node = driver
+                .graph()
+                .nodes
+                .values()
+                .find(|node| {
+                    node.name
+                        .to_ascii_lowercase()
+                        .contains("windows-audio-test-tone")
+                        && driver.node_capabilities(node.id).meter_peak
+                })
+                .map(|node| node.id);
+            let Some(helper_node) = helper_node else {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            if let Some(meter) = driver
+                .audio_meters()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|meter| meter.node_id == helper_node)
+            {
+                if meter.available && meter.peak > 0.05 {
+                    if meter.rms != 0.0 {
+                        return Err(format!(
+                            "fault-injected process capture fabricated RMS {:.3}",
+                            meter.rms
+                        ));
+                    }
+                    if !driver.windows_audio_report().contains("state=Unavailable") {
+                        return Err(
+                            "Windows audio report did not retain the process-loopback failure"
+                                .into(),
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err("native peak fallback was not observed for the live helper session".into())
+    })();
+    stop_child(&mut child);
+    result.expect("process-loopback failure fallback smoke test failed");
+}
+
+#[test]
 fn process_loopback_reports_loss_when_target_exits() {
     if std::env::var("PW_GRAPH_TEST_PROCESS_EXIT").ok().as_deref() != Some("1") {
         return;

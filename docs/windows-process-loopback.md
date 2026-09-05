@@ -81,6 +81,16 @@ activation is unavailable, the worker keeps the native Core Audio peak meter
 when one exists and reports RMS as unavailable instead of presenting peak as
 fabricated RMS; both policies are covered by backend unit tests.
 
+To exercise that fallback on a live session, inject only the
+process-loopback activation failure. The helper still renders normally, so
+the native session peak must remain available and the report must retain the
+failure reason:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_LOOPBACK_FAILURE = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture --test-threads=1 process_loopback_failure_preserves_native_peak
+```
+
 The helper also covers a silent process and a process that starts after the
 backend has already been created. Run both opt-in checks together when
 validating session discovery and zero-level metering:

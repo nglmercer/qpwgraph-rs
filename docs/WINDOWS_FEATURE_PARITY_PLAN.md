@@ -351,7 +351,7 @@ Keep process-loopback RMS for eligible active sessions, subject to a sane worker
 ```text
 [x] ordinary app session can report true RMS without virtual driver (opt-in helper smoke test passed locally)
 [ ] audible output is unchanged
-[ ] peak fallback survives process-loopback failure
+[x] peak fallback survives process-loopback failure (opt-in live native-peak fallback smoke test passed locally with fault-injected process-loopback activation)
 [x] meter policy controls worker lifetime (opt-in helper smoke test passed locally)
 [x] process exit closes capture (opt-in live smoke test passed locally)
 ```
@@ -1422,7 +1422,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 ```text
 [x] native peak only (opt-in live session-meter smoke test passed locally)
 [x] process RMS available (opt-in helper smoke test passed locally)
-[ ] process loopback unavailable -> peak fallback
+[x] process loopback unavailable -> peak fallback (opt-in live fault-injected fallback smoke test passed locally)
 [x] on-demand worker closes (opt-in helper smoke test passed locally)
 [x] always policy bounded (32-target cap and fallback policy unit-tested locally)
 ```

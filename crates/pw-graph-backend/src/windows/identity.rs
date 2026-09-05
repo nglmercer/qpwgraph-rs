@@ -38,6 +38,74 @@ pub struct WindowsEndpointSelector {
     pub data_flow: AudioFlow,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EndpointCandidateIdentity {
+    stable_id: Option<String>,
+    current_mmdevice_id: String,
+    friendly_name: Option<String>,
+}
+
+/// Select an active endpoint using the same durability order as the native
+/// resolver. Keeping this decision independent from COM objects makes the
+/// churn and ambiguity rules deterministic and prevents a future caller from
+/// accidentally making a friendly-name match authoritative.
+fn resolve_endpoint_candidate_index(
+    selector: &WindowsEndpointSelector,
+    candidates: &[EndpointCandidateIdentity],
+) -> BackendResult<Option<usize>> {
+    if let Some(stable_id) = selector.stable_id.as_deref() {
+        let matches: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.stable_id.as_deref() == Some(stable_id))
+            .map(|(index, _)| index)
+            .collect();
+        match matches.as_slice() {
+            [] => {}
+            [index] => return Ok(Some(*index)),
+            _ => {
+                return Err(BackendError::unsupported(
+                    "stable endpoint selector matched multiple active endpoints",
+                ));
+            }
+        }
+    }
+
+    if let Some(mmdevice_id) = selector.current_mmdevice_id.as_deref() {
+        let matches: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.current_mmdevice_id == mmdevice_id)
+            .map(|(index, _)| index)
+            .collect();
+        match matches.as_slice() {
+            [] => {}
+            [index] => return Ok(Some(*index)),
+            _ => {
+                return Err(BackendError::unsupported(
+                    "current MMDevice selector matched multiple active endpoints",
+                ));
+            }
+        }
+    }
+
+    let Some(name) = selector.friendly_name.as_deref() else {
+        return Ok(None);
+    };
+    let matches: Vec<_> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate
+                .friendly_name
+                .as_deref()
+                .is_some_and(|candidate_name| candidate_name.eq_ignore_ascii_case(name))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    Ok((matches.len() == 1).then(|| matches[0]))
+}
+
 impl WindowsEndpointSelector {
     pub fn from_device(device: &Audio::IMMDevice, data_flow: AudioFlow) -> Option<Self> {
         let current_mmdevice_id = unsafe { device.GetId() }.ok().map(take_pwstr);
@@ -59,87 +127,34 @@ impl WindowsEndpointSelector {
             AudioFlow::Render => Audio::eRender,
             AudioFlow::Capture => Audio::eCapture,
         };
-        // Windows documents this value as opaque and case-sensitive. Do not
-        // normalize it before falling back to the less durable selectors.
-        if let Some(stable_id) = self.stable_id.as_deref() {
-            let collection =
-                unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
-                    .map_err(|error| native_error("enumerate stable endpoint selector", error))?;
-            let count = unsafe { collection.GetCount() }
-                .map_err(|error| native_error("read stable endpoint selector count", error))?;
-            let mut matched = None;
-            for index in 0..count {
-                let Ok(device) = (unsafe { collection.Item(index) }) else {
-                    continue;
-                };
-                if endpoint_stable_id(&device)
-                    .as_deref()
-                    .is_some_and(|candidate| candidate == stable_id)
-                {
-                    if matched.is_some() {
-                        return Err(BackendError::unsupported(
-                            "stable endpoint selector matched multiple active endpoints",
-                        ));
-                    }
-                    matched = Some(device);
-                }
-            }
-            if matched.is_some() {
-                return Ok(matched);
-            }
-        }
-        if let Some(mmdevice_id) = self.current_mmdevice_id.as_deref() {
-            // `IMMDeviceEnumerator::GetDevice` does not carry the selector's
-            // data-flow contract. Resolve through the active collection so a
-            // stale/corrupt capture ID can never be returned for a render
-            // selector (or vice versa).
-            if let Some(device) = active_device_by_id(enumerator, flow, mmdevice_id)? {
-                return Ok(Some(device));
-            }
-        }
-        let Some(name) = self.friendly_name.as_deref() else {
-            return Ok(None);
-        };
         let collection = unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
-            .map_err(|error| native_error("enumerate endpoint selector fallback", error))?;
+            .map_err(|error| native_error("enumerate endpoint selector", error))?;
         let count = unsafe { collection.GetCount() }
-            .map_err(|error| native_error("read endpoint selector fallback count", error))?;
-        let mut matches = Vec::new();
+            .map_err(|error| native_error("read endpoint selector count", error))?;
+        let mut candidates = Vec::with_capacity(count as usize);
         for index in 0..count {
             let Ok(device) = (unsafe { collection.Item(index) }) else {
                 continue;
             };
-            if endpoint_name(&device)
-                .as_deref()
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
-            {
-                matches.push(device);
-            }
+            let current_mmdevice_id = unsafe { device.GetId() }
+                .map(take_pwstr)
+                .map_err(|error| native_error("read endpoint selector ID", error))?;
+            candidates.push((
+                device.clone(),
+                EndpointCandidateIdentity {
+                    stable_id: endpoint_stable_id(&device),
+                    current_mmdevice_id,
+                    friendly_name: endpoint_name(&device),
+                },
+            ));
         }
-        Ok((matches.len() == 1).then(|| matches.remove(0)))
+        let identities: Vec<_> = candidates
+            .iter()
+            .map(|(_, identity)| identity.clone())
+            .collect();
+        Ok(resolve_endpoint_candidate_index(self, &identities)?
+            .map(|index| candidates[index].0.clone()))
     }
-}
-
-fn active_device_by_id(
-    enumerator: &Audio::IMMDeviceEnumerator,
-    flow: Audio::EDataFlow,
-    wanted_id: &str,
-) -> BackendResult<Option<Audio::IMMDevice>> {
-    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
-        .map_err(|error| native_error("enumerate current endpoint selector", error))?;
-    let count = unsafe { collection.GetCount() }
-        .map_err(|error| native_error("read current endpoint selector count", error))?;
-    for index in 0..count {
-        let device = unsafe { collection.Item(index) }
-            .map_err(|error| native_error("read current endpoint selector", error))?;
-        let id = unsafe { device.GetId() }
-            .map(take_pwstr)
-            .map_err(|error| native_error("read current endpoint selector ID", error))?;
-        if id == wanted_id {
-            return Ok(Some(device));
-        }
-    }
-    Ok(None)
 }
 
 pub(super) fn endpoint_stable_id(device: &Audio::IMMDevice) -> Option<String> {
@@ -420,4 +435,104 @@ pub(super) fn effect_input_port_local_id(instance_id: &str) -> u64 {
 
 pub(super) fn effect_output_port_local_id(instance_id: &str) -> u64 {
     stable_local_id(&format!("effect-out:{instance_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selector(
+        stable_id: Option<&str>,
+        current_id: Option<&str>,
+        name: Option<&str>,
+    ) -> WindowsEndpointSelector {
+        WindowsEndpointSelector {
+            stable_id: stable_id.map(str::to_owned),
+            current_mmdevice_id: current_id.map(str::to_owned),
+            friendly_name: name.map(str::to_owned),
+            data_flow: AudioFlow::Render,
+        }
+    }
+
+    fn candidate(
+        stable_id: Option<&str>,
+        current_id: &str,
+        name: Option<&str>,
+    ) -> EndpointCandidateIdentity {
+        EndpointCandidateIdentity {
+            stable_id: stable_id.map(str::to_owned),
+            current_mmdevice_id: current_id.to_owned(),
+            friendly_name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn stable_endpoint_id_survives_current_mmdevice_id_churn() {
+        let selector = selector(
+            Some("stable-speakers"),
+            Some("old-mmdevice"),
+            Some("Speakers"),
+        );
+        let candidates = vec![
+            candidate(Some("stable-speakers"), "new-mmdevice", Some("Speakers")),
+            candidate(Some("other-stable"), "old-mmdevice", Some("Speakers")),
+        ];
+
+        assert_eq!(
+            resolve_endpoint_candidate_index(&selector, &candidates).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn current_mmdevice_id_is_the_second_choice() {
+        let selector = selector(
+            Some("stale-stable"),
+            Some("current-mmdevice"),
+            Some("Speakers"),
+        );
+        let candidates = vec![
+            candidate(
+                Some("new-stable"),
+                "current-mmdevice",
+                Some("Renamed speakers"),
+            ),
+            candidate(Some("other-stable"), "other-mmdevice", Some("Speakers")),
+        ];
+
+        assert_eq!(
+            resolve_endpoint_candidate_index(&selector, &candidates).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn friendly_name_fallback_requires_one_active_match() {
+        let selector = selector(None, None, Some("Speakers"));
+        let unique = vec![candidate(None, "mmdevice-a", Some("speakers"))];
+        assert_eq!(
+            resolve_endpoint_candidate_index(&selector, &unique).unwrap(),
+            Some(0)
+        );
+
+        let ambiguous = vec![
+            candidate(None, "mmdevice-a", Some("Speakers")),
+            candidate(None, "mmdevice-b", Some("Speakers")),
+        ];
+        assert_eq!(
+            resolve_endpoint_candidate_index(&selector, &ambiguous).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_durable_selectors_fail_closed() {
+        let selector = selector(Some("same-stable"), Some("mmdevice"), Some("Speakers"));
+        let candidates = vec![
+            candidate(Some("same-stable"), "mmdevice-a", Some("A")),
+            candidate(Some("same-stable"), "mmdevice-b", Some("B")),
+        ];
+
+        assert!(resolve_endpoint_candidate_index(&selector, &candidates).is_err());
+    }
 }
