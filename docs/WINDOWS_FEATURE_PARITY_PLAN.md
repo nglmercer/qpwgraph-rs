@@ -302,8 +302,8 @@ crates/pw-graph-slint/src/source.rs
 [ ] only target-process audio reaches the relay
 [ ] another application on the same endpoint is excluded
 [ ] child-process mode behaves as documented
-[ ] target exit does not kill the relay control session
-[ ] target restart safely resolves a new PID
+[x] target exit does not kill the relay control session (opt-in local host/client smoke test passed locally)
+[x] target restart safely resolves a new PID (opt-in helper smoke test passed locally)
 ```
 
 ---
@@ -352,7 +352,7 @@ Keep process-loopback RMS for eligible active sessions, subject to a sane worker
 [x] ordinary app session can report true RMS without virtual driver (opt-in helper smoke test passed locally)
 [ ] audible output is unchanged
 [ ] peak fallback survives process-loopback failure
-[ ] meter policy controls worker lifetime
+[x] meter policy controls worker lifetime (opt-in helper smoke test passed locally)
 [x] process exit closes capture (opt-in live smoke test passed locally)
 ```
 
@@ -1403,7 +1403,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 [ ] silent process
 [ ] process starts after qpwgraph
 [x] process exits during capture (opt-in live smoke test passed locally)
-[ ] process restarts with new PID
+[x] process restarts with new PID (opt-in helper relay smoke test passed locally)
 [ ] PID reused by unrelated executable
 [ ] 1000 activation/start/stop cycles
 ```
@@ -1411,9 +1411,9 @@ That is why private AudioPolicyConfig work belongs near the end.
 ## Relay
 
 ```text
-[ ] normal app -> single-app relay without driver
-[ ] app exits -> control session remains
-[ ] app returns -> source can recover
+[x] normal app -> single-app relay without driver (opt-in helper smoke test passed locally)
+[x] app exits -> control session remains (opt-in local host/client smoke test passed locally)
+[x] app returns -> source can recover (opt-in helper smoke test passed locally)
 [ ] output endpoint changes while app relay active
 ```
 
@@ -1423,7 +1423,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 [ ] native peak only
 [x] process RMS available (opt-in helper smoke test passed locally)
 [ ] process loopback unavailable -> peak fallback
-[ ] on-demand worker closes
+[x] on-demand worker closes (opt-in helper smoke test passed locally)
 [ ] always policy bounded
 ```
 
@@ -1600,9 +1600,9 @@ Do not call the next milestone complete merely because a driver `.sys` builds.
 Call **Windows parity milestone 2** complete when all of these work:
 
 ```text
-[ ] single-app relay from a normal application without driver
-[ ] true RMS for a normal application without driver
-[ ] stable app selectors survive restart
+[x] single-app relay from a normal application without driver (opt-in helper smoke test passed locally)
+[x] true RMS for a normal application without driver (opt-in helper smoke test passed locally)
+[x] stable app selectors survive restart (opt-in helper smoke test passed locally)
 [ ] stable endpoint selectors survive normal endpoint churn
 [ ] saved application route has an explicit reconciler state
 [ ] one real Rust ACX render endpoint enumerates and streams

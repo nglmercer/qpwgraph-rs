@@ -31,15 +31,17 @@ observed, immutable session links. A session becomes routable only after it is
 already attached to `QPWGraph Virtual Output`, which is the proof that the
 original dry path has been isolated.
 
-The Windows relay reuses that same gate. Its Emitter source list includes
-`application:<selector>` entries for active render sessions on QPWGraph Virtual
-Output. The selector is a hash of the executable path; the current PID is
-resolved from the live worker snapshot and is never persisted. Process-loopback
-capture then feeds the relay's bounded PCM hand-off with the same negotiated
-format as physical sources. If the session disappears or activation is
-unsupported, the relay reports an error and does not substitute another
-process. When used as a graph route instead, the same source feeds the router's
-conversion, effects, meters, and route diagnostics.
+The Windows relay reuses the same process-loopback implementation, but its
+Emitter source list is intentionally independent of virtual-output isolation:
+it includes `application:<selector>` entries for active render sessions on
+ordinary endpoints as well as isolated sessions. The selector is a hash of the
+executable path; the current PID is resolved from the live worker snapshot and
+is never persisted. Process-loopback capture then feeds the relay's bounded
+PCM hand-off with the same negotiated format as physical sources. If the
+session disappears or activation is unsupported, the relay reports an error
+and does not substitute another process. When used as a graph route instead,
+the same source feeds the router's conversion, effects, meters, and route
+diagnostics.
 
 The persisted Windows policy reserves an explicit opt-in switch for frontends
 that want to expose process capture:
@@ -67,6 +69,13 @@ $env:PW_GRAPH_TEST_PROCESS_RMS = '1'
 cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture
 ```
 
+The policy/lifetime smoke test exercises `always`, `on-demand`, and `off`:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_POLICY = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture
+```
+
 The worker also watches the target process lifetime and reports a lost stream
 when the target exits instead of leaving a silent capture alive:
 
@@ -74,6 +83,20 @@ when the target exits instead of leaving a silent capture alive:
 $env:PW_GRAPH_TEST_PROCESS_EXIT = '1'
 cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture
 ```
+
+The opt-in relay smoke test selects the helper as an ordinary application
+source, starts the direct Emitter worker without the virtual driver, observes
+the worker stop after the target exits, and verifies that the same stable
+selector binds after a new PID appears:
+
+```powershell
+$env:PW_GRAPH_TEST_RELAY_APPLICATION = '1'
+cargo test -p windows-audio-test-tone --features relay-tests --test process_loopback --locked -- --nocapture
+```
+
+Set `PW_GRAPH_TEST_RELAY_APPLICATION_SESSION=1` as well to run the local
+authenticated host/client variant; it verifies that target exit stops only the
+capture worker while the relay control session remains active.
 
 The repository includes a deterministic target-process helper. Build and run
 it for a manual smoke test (the first line prints the PID to capture):

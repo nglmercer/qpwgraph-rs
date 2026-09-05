@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+relay-tests = ["pw-graph-backend/relay"]
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
