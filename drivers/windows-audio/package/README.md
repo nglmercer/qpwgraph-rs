@@ -23,6 +23,74 @@ generates `qpwgraph-audio.cat`, and stages the installable file set under
 this directory remains `bootstrap-fail-closed`; the generated manifest is
 marked `ready` only after the real `.sys` and catalog have been produced.
 
+## Development test signing
+
+The staged package is unsigned. On a disposable test VM, run the bundled
+helper from the staged package in a WDK/eWDK developer prompt:
+
+```powershell
+Push-Location drivers/windows-audio/target/qpwgraph-audio-package
+.\sign-test.ps1 -CreateCertificate
+Pop-Location
+```
+
+The helper signs `qpwgraph_audio.sys`, regenerates the catalog so its hashes
+match the signed driver, and signs `qpwgraph-audio.cat`. It does not change
+boot settings, install the package, or import the certificate. Import the
+printed `.cer` into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`
+on the test machine from an elevated PowerShell prompt. An existing code
+signing certificate can be selected with
+`-CertificateThumbprint <thumbprint>` instead.
+
+Build the smoke probe before installation:
+
+```powershell
+cargo build --manifest-path drivers/windows-audio/tests/smoke/Cargo.toml --locked
+$smoke = (Resolve-Path drivers/windows-audio/target/debug/qpwgraph-audio-smoke.exe).Path
+```
+
+In an elevated Command Prompt, enable test signing and reboot the disposable
+test machine:
+
+```text
+bcdedit /set testsigning on
+shutdown /r /t 0
+```
+
+After reboot, verify the Test Mode watermark and install with endpoint
+verification enabled:
+
+```powershell
+Push-Location drivers/windows-audio/target/qpwgraph-audio-package
+.\install.ps1 -AllowTestSigned -SmokeProbe $smoke -Verbose
+Pop-Location
+```
+
+Record the exact `oemNN.inf` printed by the installer. The smoke probe then
+provides the live gates:
+
+```powershell
+& $smoke --verify-roles
+& $smoke --list
+& $smoke --render-name 'QPWGraph Virtual Output' --capture-name 'QPWGraph Virtual Monitor'
+& $smoke --round-trip --duration-ms 5000
+```
+
+Do not use `-SkipEndpointVerification` for the acceptance pass. If the
+package or endpoint verification fails, the installer rolls back the exact
+published package. For a successful run, uninstall with the recorded package
+name and verify disappearance:
+
+```powershell
+Push-Location drivers/windows-audio/target/qpwgraph-audio-package
+.\uninstall.ps1 -PublishedInf oemNN.inf -SmokeProbe $smoke -Verbose
+Pop-Location
+```
+
+Only after uninstalling should test signing be disabled and the machine
+rebooted with `bcdedit /set testsigning off`. Driver Verifier, HLK, Secure
+Boot, upgrade, and client-application tests remain separate release gates.
+
 The default driver build intentionally returns `STATUS_NOT_SUPPORTED` from
 device-add. The opt-in `acx` build now contains the ACX app and relay endpoint
 transactions (device, circuits, pins, format, RT packet timing, and two

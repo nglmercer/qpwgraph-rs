@@ -124,6 +124,7 @@ fn stage_package(
         "manifest.json",
         "install.ps1",
         "uninstall.ps1",
+        "sign-test.ps1",
         "README.md",
     ] {
         let path = output.join(filename);
@@ -193,7 +194,7 @@ fn stage_package(
     fs::write(output.join("manifest.json"), ready_manifest)
         .map_err(|error| format!("write staged manifest: {error}"))?;
 
-    for filename in ["install.ps1", "uninstall.ps1", "README.md"] {
+    for filename in ["install.ps1", "uninstall.ps1", "sign-test.ps1", "README.md"] {
         let source = package_source.join(filename);
         fs::copy(&source, output.join(filename))
             .map_err(|error| format!("copy {}: {error}", source.display()))?;
@@ -662,6 +663,25 @@ fn validate_package_metadata() {
             uninstall_script.contains(required),
             "{} is missing lifecycle-safety marker {required}",
             package.join("uninstall.ps1").display()
+        );
+    }
+    let signing_script = fs::read_to_string(package.join("sign-test.ps1")).unwrap_or_else(|error| {
+        panic!(
+            "could not read {}: {error}",
+            package.join("sign-test.ps1").display()
+        );
+    });
+    for required in [
+        "New-SelfSignedCertificate",
+        "signtool.exe",
+        "Inf2Cat.exe",
+        "CertificateThumbprint",
+        "LocalMachine\\TrustedPublisher",
+    ] {
+        assert!(
+            signing_script.contains(required),
+            "{} is missing test-signing marker {required}",
+            package.join("sign-test.ps1").display()
         );
     }
     println!("driver package metadata validated");
