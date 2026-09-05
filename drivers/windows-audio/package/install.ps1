@@ -23,7 +23,8 @@ if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
     $PackageRoot = $PSScriptRoot
 }
 
-$rootDeviceInstanceId = 'ROOT\QPWGRAPH_AUDIO'
+# DevGen puts root devices under ROOT\DEVGEN; the hardware ID is separate.
+$rootDeviceInstanceId = 'ROOT\DEVGEN\QPWGRAPH_AUDIO'
 $rootDeviceHardwareId = 'Root\QPWGRAPH_AUDIO'
 $script:rootDeviceNeedsCleanup = $false
 

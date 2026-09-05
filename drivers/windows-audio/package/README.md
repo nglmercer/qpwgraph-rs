@@ -152,7 +152,7 @@ device/circuit/stream bridge can be compiled. It does not prove that the
 driver loads, enumerates an endpoint, or passes shared-mode, verifier, HLK, or
 signing validation; the package remains fail-closed until those gates pass.
 
-`install.ps1` creates the development-only `ROOT\QPWGRAPH_AUDIO` devnode with
+`install.ps1` creates the development-only `ROOT\DEVGEN\QPWGRAPH_AUDIO` devnode with
 WDK `devgen.exe`, then uses PnPUtil for package installation and removal while
 keeping the lifecycle fail-closed. A release install requires the built
 `qpwgraph-audio.inf`, `.cat`, `.sys`, a `ready` manifest with a driver version, and the

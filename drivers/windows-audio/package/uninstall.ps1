@@ -13,7 +13,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$rootDeviceInstanceId = 'ROOT\QPWGRAPH_AUDIO'
+$rootDeviceInstanceId = 'ROOT\DEVGEN\QPWGRAPH_AUDIO'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
