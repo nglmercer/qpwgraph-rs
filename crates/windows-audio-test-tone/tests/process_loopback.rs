@@ -109,6 +109,113 @@ fn helper_audio_is_visible_to_process_loopback_when_opted_in() {
 }
 
 #[test]
+fn process_loopback_includes_audio_from_child_processes() {
+    if std::env::var("PW_GRAPH_TEST_PROCESS_CHILD_TREE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let Some(helper) = helper_path() else {
+        panic!("Cargo did not provide CARGO_BIN_EXE_windows-audio-test-tone");
+    };
+    let mut parent = Command::new(helper)
+        .args([
+            "--duration-ms",
+            "30000",
+            "--frequency",
+            "1000",
+            "--amplitude",
+            "0.25",
+            "--spawn-child-only",
+        ])
+        .spawn()
+        .expect("start deterministic child-tree tone helper");
+    let result = (|| -> Result<(), String> {
+        let (mut source, mut worker) = ProcessLoopbackSource::open(
+            parent.id(),
+            ProcessLoopbackMode::IncludeProcessTree,
+            AudioFormat::new(48_000, 2),
+            4_096,
+        )
+        .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut block = vec![0.0f32; 480 * 2];
+        while Instant::now() < deadline {
+            let read = source.read(&mut block);
+            if read.health == StreamHealth::Lost {
+                break;
+            }
+            if read.frames > 0
+                && block[..read.frames * 2]
+                    .iter()
+                    .any(|sample| sample.abs() > 0.01)
+            {
+                worker.stop();
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        worker.stop();
+        Err("include-process-tree loopback did not expose child audio".into())
+    })();
+    stop_child(&mut parent);
+    result.expect("child-process loopback smoke test failed");
+}
+
+#[test]
+fn process_loopback_excludes_another_application_on_the_same_endpoint() {
+    if std::env::var("PW_GRAPH_TEST_PROCESS_ISOLATION")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let Some(helper) = helper_path() else {
+        panic!("Cargo did not provide CARGO_BIN_EXE_windows-audio-test-tone");
+    };
+    let mut target = spawn_tone(&helper, 30_000, 1_000, 0.25, 1);
+    let mut other = spawn_tone(&helper, 30_000, 3_000, 0.8, 1);
+    let result = (|| -> Result<(), String> {
+        let (mut source, mut worker) = ProcessLoopbackSource::open(
+            target.id(),
+            ProcessLoopbackMode::IncludeProcessTree,
+            AudioFormat::new(48_000, 2),
+            4_096,
+        )
+        .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut block = vec![0.0f32; 480 * 2];
+        while Instant::now() < deadline {
+            let read = source.read(&mut block);
+            if read.health == StreamHealth::Lost {
+                break;
+            }
+            if read.frames > 0 {
+                let samples = &block[..read.frames * 2];
+                let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+                    / samples.len() as f32)
+                    .sqrt();
+                // The target's 0.25 sine is about 0.177 RMS. Including the
+                // other process' 0.8 sine would raise this well above 0.3.
+                if (0.05..0.3).contains(&rms) {
+                    worker.stop();
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        worker.stop();
+        Err("process-loopback capture included the wrong endpoint session".into())
+    })();
+    stop_child(&mut target);
+    stop_child(&mut other);
+    result.expect("process isolation smoke test failed");
+}
+
+#[test]
 fn helper_audio_provides_true_process_rms_without_virtual_driver() {
     if std::env::var("PW_GRAPH_TEST_PROCESS_RMS").ok().as_deref() != Some("1") {
         return;
@@ -218,6 +325,57 @@ fn silent_process_remains_meterable_without_fabricating_audio() {
     })();
     stop_child(&mut child);
     result.expect("silent process smoke test failed");
+}
+
+#[test]
+fn multiple_audio_sessions_in_one_process_remain_meterable() {
+    if std::env::var("PW_GRAPH_TEST_PROCESS_MULTI_SESSION")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let Some(helper) = helper_path() else {
+        panic!("Cargo did not provide CARGO_BIN_EXE_windows-audio-test-tone");
+    };
+    let mut child = spawn_tone(&helper, 30_000, 1_000, 0.25, 2);
+    let result = (|| -> Result<(), String> {
+        let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
+        driver
+            .set_meter_policy(MeterPolicy::Always)
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            driver.refresh().map_err(|error| error.to_string())?;
+            let helper_nodes: Vec<_> = driver
+                .graph()
+                .nodes
+                .values()
+                .filter(|node| {
+                    node.name
+                        .to_ascii_lowercase()
+                        .contains("windows-audio-test-tone")
+                        && driver.node_capabilities(node.id).meter_rms
+                })
+                .map(|node| node.id)
+                .collect();
+            if helper_nodes.len() >= 2 {
+                let meters = driver.audio_meters().map_err(|error| error.to_string())?;
+                if helper_nodes.iter().all(|node_id| {
+                    meters.iter().any(|meter| {
+                        meter.node_id == *node_id && meter.available && meter.rms > 0.05
+                    })
+                }) {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err("the helper did not expose two independent active audio sessions".into())
+    })();
+    stop_child(&mut child);
+    result.expect("multiple-session process smoke test failed");
 }
 
 #[test]
@@ -436,6 +594,36 @@ fn process_loopback_reports_loss_when_target_exits() {
     })();
     stop_child(&mut child);
     result.expect("process exit smoke test failed");
+}
+
+#[test]
+fn process_loopback_survives_one_thousand_start_stop_cycles() {
+    if std::env::var("PW_GRAPH_TEST_PROCESS_CYCLES")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let Some(helper) = helper_path() else {
+        panic!("Cargo did not provide CARGO_BIN_EXE_windows-audio-test-tone");
+    };
+    let mut child = spawn_tone(&helper, 120_000, 1_000, 0.25, 1);
+    let result = (|| -> Result<(), String> {
+        for cycle in 0..1_000 {
+            let (_, mut worker) = ProcessLoopbackSource::open(
+                child.id(),
+                ProcessLoopbackMode::IncludeProcessTree,
+                AudioFormat::new(48_000, 2),
+                1_024,
+            )
+            .map_err(|error| format!("activation cycle {cycle} failed: {error}"))?;
+            worker.stop();
+        }
+        Ok(())
+    })();
+    stop_child(&mut child);
+    result.expect("process-loopback cycle smoke test failed");
 }
 
 #[cfg(feature = "relay-tests")]

@@ -1182,6 +1182,8 @@ enabled = true
                     executable_name: Some("tone.exe".into()),
                     ..WindowsApplicationSelector::default()
                 },
+                destination_stable_id: Some("stable-speakers".into()),
+                destination_mmdevice_id: Some("{current-speakers}".into()),
                 destination_endpoint_id: Some("endpoint-instance-id".into()),
                 destination_name: Some("Speakers".into()),
                 effect_chain: vec!["builtin.noise-gate".into()],
@@ -1208,6 +1210,19 @@ enabled = true
         assert_eq!(restored_effect.instance_id, "route-gate");
         assert_eq!(restored_effect.parameters["threshold-db"], -42.0);
         assert!(!restored_effect.enabled);
+
+        let directory = std::env::temp_dir().join(format!(
+            "pw-graph-config-windows-routes-{}",
+            std::process::id()
+        ));
+        let path = directory.join("config.toml");
+        config.save_to(&path).unwrap();
+        let file_restored = AppConfig::load_from(&path).unwrap();
+        assert_eq!(
+            file_restored.windows_application_routes,
+            config.windows_application_routes
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1268,6 +1283,23 @@ enabled = true
             ..WindowsApplicationSelector::default()
         }
         .is_stable());
+    }
+
+    #[test]
+    fn display_name_only_selector_never_matches_a_live_candidate() {
+        let selector = WindowsApplicationSelector {
+            display_name: Some("Player".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        let candidate = WindowsApplicationSelector {
+            executable_path_hash: Some("sha256:unrelated".into()),
+            executable_name: Some("other.exe".into()),
+            display_name: Some("Player".into()),
+            ..WindowsApplicationSelector::default()
+        };
+
+        assert!(!selector.is_stable());
+        assert!(!selector.matches(&candidate));
     }
 
     #[test]

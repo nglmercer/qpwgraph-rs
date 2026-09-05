@@ -130,7 +130,7 @@ pub extern "C" fn qpwgraph_audio_transport_clear_relay() {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex, vec::Vec};
+    use std::{sync::Mutex, vec, vec::Vec};
 
     use super::*;
 

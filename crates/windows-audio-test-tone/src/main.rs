@@ -8,6 +8,8 @@
 
 #[cfg(any(target_os = "windows", test))]
 use std::f32::consts::TAU;
+#[cfg(target_os = "windows")]
+use std::process::{Child, Command};
 #[cfg(any(target_os = "windows", test))]
 use std::time::Duration;
 #[cfg(target_os = "windows")]
@@ -25,6 +27,8 @@ struct Options {
     frequency: f32,
     amplitude: f32,
     sessions: usize,
+    spawn_child_only: bool,
+    child_leaf: bool,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -35,6 +39,8 @@ impl Default for Options {
             frequency: 440.0,
             amplitude: 0.25,
             sessions: 1,
+            spawn_child_only: false,
+            child_leaf: false,
         }
     }
 }
@@ -82,6 +88,14 @@ where
     let mut options = Options::default();
     let mut args = arguments.into_iter().map(Into::into);
     while let Some(argument) = args.next() {
+        if argument == "--spawn-child-only" {
+            options.spawn_child_only = true;
+            continue;
+        }
+        if argument == "--child-leaf" {
+            options.child_leaf = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| format!("missing value for {argument}"))?;
@@ -127,7 +141,7 @@ fn main() {
     let options = match parse_options() {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("{error}\nusage: windows-audio-test-tone [--duration-ms N] [--frequency HZ] [--amplitude 0..1] [--sessions N]");
+            eprintln!("{error}\nusage: windows-audio-test-tone [--duration-ms N] [--frequency HZ] [--amplitude 0..1] [--sessions N] [--spawn-child-only]");
             std::process::exit(2);
         }
     };
@@ -141,24 +155,59 @@ fn main() {
         options.sessions
     );
 
-    let mut workers = Vec::with_capacity(options.sessions);
-    for index in 0..options.sessions {
-        let worker_options = options;
-        workers.push(
-            std::thread::Builder::new()
-                .name(format!("qpwgraph-test-tone-{index}"))
-                .spawn(move || play(worker_options))
-                .unwrap_or_else(|error| {
-                    eprintln!("could not start tone session {index}: {error}");
-                    std::process::exit(1);
-                }),
+    let mut child: Option<Child> = None;
+    if options.spawn_child_only && !options.child_leaf {
+        let child_frequency = (options.frequency * 3.0).min(20_000.0);
+        let duration_ms = options.duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        child = Some(
+            Command::new(std::env::current_exe().unwrap_or_else(|error| {
+                eprintln!("could not locate the helper executable: {error}");
+                std::process::exit(1);
+            }))
+            .args([
+                "--duration-ms".to_owned(),
+                duration_ms.to_string(),
+                "--frequency".to_owned(),
+                child_frequency.to_string(),
+                "--amplitude".to_owned(),
+                options.amplitude.to_string(),
+                "--child-leaf".to_owned(),
+            ])
+            .spawn()
+            .unwrap_or_else(|error| {
+                eprintln!("could not start child tone process: {error}");
+                std::process::exit(1);
+            }),
         );
+    }
+
+    let mut workers = Vec::with_capacity(if options.spawn_child_only {
+        0
+    } else {
+        options.sessions
+    });
+    if !options.spawn_child_only {
+        for index in 0..options.sessions {
+            let worker_options = options;
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("qpwgraph-test-tone-{index}"))
+                    .spawn(move || play(worker_options, index))
+                    .unwrap_or_else(|error| {
+                        eprintln!("could not start tone session {index}: {error}");
+                        std::process::exit(1);
+                    }),
+            );
+        }
     }
     for worker in workers {
         if let Err(error) = worker.join() {
             eprintln!("tone session panicked: {error:?}");
             std::process::exit(1);
         }
+    }
+    if let Some(mut child) = child {
+        let _ = child.wait();
     }
 }
 
@@ -169,7 +218,7 @@ fn main() {
 }
 
 #[cfg(target_os = "windows")]
-fn play(options: Options) {
+fn play(options: Options, session_index: usize) {
     use windows::Win32::System::Com::{self, COINIT_MULTITHREADED};
 
     let initialized = unsafe { Com::CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -177,7 +226,7 @@ fn play(options: Options) {
         eprintln!("could not initialize COM: {initialized:?}");
         return;
     }
-    let result = play_wasapi(options);
+    let result = play_wasapi(options, session_index);
     unsafe { Com::CoUninitialize() };
     if let Err(error) = result {
         eprintln!("tone session failed: {error}");
@@ -185,7 +234,7 @@ fn play(options: Options) {
 }
 
 #[cfg(target_os = "windows")]
-fn play_wasapi(options: Options) -> windows::core::Result<()> {
+fn play_wasapi(options: Options, session_index: usize) -> windows::core::Result<()> {
     use windows::Win32::Media::Audio;
     use windows::Win32::System::Com::CLSCTX_ALL;
 
@@ -195,6 +244,12 @@ fn play_wasapi(options: Options) -> windows::core::Result<()> {
     };
     let device = unsafe { enumerator.GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole)? };
     let client: Audio::IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+    // Give each helper worker its own Core Audio session. This keeps
+    // `--sessions N` useful for validating applications with multiple active
+    // sessions instead of relying on Windows' process-default grouping.
+    let session_guid = windows::core::GUID::from_u128(
+        0x6f6f_7077_6772_6170_685f_746f_6e65_0000_u128 | session_index as u128,
+    );
     let bits = 32u16;
     let block_align = CHANNELS * bits / 8;
     let format = Audio::WAVEFORMATEX {
@@ -215,7 +270,7 @@ fn play_wasapi(options: Options) -> windows::core::Result<()> {
             400_000,
             0,
             &format,
-            None,
+            Some(&session_guid as *const _),
         )?
     };
     let buffer_frames = unsafe { client.GetBufferSize()? } as usize;

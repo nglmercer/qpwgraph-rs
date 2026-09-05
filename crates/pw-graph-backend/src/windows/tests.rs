@@ -154,6 +154,29 @@ fn live_backend_startup_is_optional_for_headless_windows_ci() {
 }
 
 #[test]
+fn portable_backend_starts_without_the_optional_virtual_driver() {
+    if std::env::var_os("PW_GRAPH_TEST_PORTABLE_NO_DRIVER").is_none() {
+        return;
+    }
+    let Ok(mut driver) = WindowsAudioDriver::new() else {
+        // A headless machine cannot prove the portable path, so keep this
+        // opt-in smoke test harmless on CI without Core Audio.
+        return;
+    };
+    assert!(matches!(
+        driver.virtual_audio_driver_health(),
+        VirtualAudioDriverHealth::NotInstalled | VirtualAudioDriverHealth::Incomplete { .. }
+    ));
+    let nodes = driver
+        .refresh()
+        .expect("physical Core Audio should remain available without the optional driver");
+    assert!(nodes.iter().any(|node| {
+        node.node_type == NodeType::WindowsAudioEndpoint
+            && !node.name.to_ascii_lowercase().contains("qpwgraph")
+    }));
+}
+
+#[test]
 fn every_playback_endpoint_offers_a_monitor_alongside_its_input() {
     let Ok(driver) = WindowsAudioDriver::new() else {
         return;

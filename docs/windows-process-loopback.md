@@ -91,6 +91,29 @@ $env:PW_GRAPH_TEST_PROCESS_START_AFTER_DRIVER = '1'
 cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture --test-threads=1
 ```
 
+To validate multiple Core Audio sessions owned by one process, add:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_MULTI_SESSION = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture --test-threads=1
+```
+
+The same test target can validate process-tree inclusion and target isolation
+with two independent helpers:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_CHILD_TREE = '1'
+$env:PW_GRAPH_TEST_PROCESS_ISOLATION = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture --test-threads=1
+```
+
+For activation lifetime stress coverage, run the bounded 1000-cycle check:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_CYCLES = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture --test-threads=1
+```
+
 The worker also watches the target process lifetime and reports a lost stream
 when the target exits instead of leaving a silent capture alive:
 

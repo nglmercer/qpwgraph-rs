@@ -597,6 +597,180 @@ mod tests {
     }
 
     #[test]
+    fn missing_application_waits_without_requesting_capture() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_endpoint_id: Some("speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        reconciler.reconcile(&ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            endpoints: vec![endpoint("speaker", "Speakers")],
+            ..ApplicationRouteEnvironment::default()
+        });
+
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::WaitingForApplication);
+        assert!(reconciler.capture_requests().is_empty());
+    }
+
+    #[test]
+    fn missing_destination_degrades_and_returning_endpoint_restores() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_stable_id: Some("stable-speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        let mut environment = ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            applications: vec![app("sha256:player", 42, true)],
+            captures: BTreeMap::from([(
+                ("sha256:player".into(), 42),
+                ProcessCaptureReadiness::Ready,
+            )]),
+            ..ApplicationRouteEnvironment::default()
+        };
+
+        reconciler.reconcile(&environment);
+        assert_eq!(
+            reconciler.plan(0).map(|plan| plan.state),
+            Some(ApplicationRouteState::DestinationMissing)
+        );
+
+        environment.endpoints = vec![endpoint("speaker", "Speakers")];
+        reconciler.reconcile(&environment);
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::Active);
+        assert_eq!(
+            plan.activation.as_ref().map(|activation| activation.pid),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn legacy_destination_selector_migrates_to_stable_identity() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_endpoint_id: Some("speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        reconciler.migrate_destination_selectors(&[endpoint("speaker", "Speakers")]);
+
+        let route = &reconciler.rules()[0];
+        assert_eq!(
+            route.destination_stable_id.as_deref(),
+            Some("stable-speaker")
+        );
+        assert_eq!(route.destination_mmdevice_id.as_deref(), Some("speaker"));
+        assert_eq!(route.destination_name.as_deref(), Some("Speakers"));
+    }
+
+    #[test]
+    fn stable_destination_survives_current_mmdevice_id_churn() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_stable_id: Some("stable-speaker".into()),
+            destination_mmdevice_id: Some("old-mmdevice-id".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut current_endpoint = endpoint("new-mmdevice-id", "Speakers");
+        current_endpoint.stable_id = Some("stable-speaker".into());
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        reconciler.reconcile(&ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            applications: vec![app("sha256:player", 42, true)],
+            endpoints: vec![current_endpoint],
+            captures: BTreeMap::from([(
+                ("sha256:player".into(), 42),
+                ProcessCaptureReadiness::Ready,
+            )]),
+            ..ApplicationRouteEnvironment::default()
+        });
+
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::Active);
+        assert_eq!(
+            plan.activation
+                .as_ref()
+                .and_then(|activation| activation.destination.current_mmdevice_id.as_deref()),
+            Some("new-mmdevice-id")
+        );
+    }
+
+    #[test]
+    fn a_restarted_application_reuses_the_rule_with_its_new_pid() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_endpoint_id: Some("speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        let mut environment = ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            applications: vec![app("sha256:player", 41, true)],
+            endpoints: vec![endpoint("speaker", "Speakers")],
+            captures: BTreeMap::from([(
+                ("sha256:player".into(), 41),
+                ProcessCaptureReadiness::Ready,
+            )]),
+            ..ApplicationRouteEnvironment::default()
+        };
+
+        reconciler.reconcile(&environment);
+        assert_eq!(
+            reconciler
+                .plan(0)
+                .and_then(|plan| plan.activation.as_ref())
+                .map(|activation| activation.pid),
+            Some(41)
+        );
+
+        environment.applications = vec![app("sha256:player", 42, true)];
+        environment.captures =
+            BTreeMap::from([(("sha256:player".into(), 42), ProcessCaptureReadiness::Ready)]);
+        reconciler.reconcile(&environment);
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::Active);
+        assert_eq!(
+            plan.activation.as_ref().map(|activation| activation.pid),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn a_reused_pid_with_a_different_selector_is_not_activated() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_endpoint_id: Some("speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        reconciler.reconcile(&ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            applications: vec![app("sha256:unrelated", 41, true)],
+            endpoints: vec![endpoint("speaker", "Speakers")],
+            captures: BTreeMap::from([(
+                ("sha256:unrelated".into(), 41),
+                ProcessCaptureReadiness::Ready,
+            )]),
+            ..ApplicationRouteEnvironment::default()
+        });
+
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::WaitingForApplication);
+        assert!(plan.activation.is_none());
+        assert!(reconciler.capture_requests().is_empty());
+    }
+
+    #[test]
     fn capture_readiness_for_an_old_pid_cannot_activate_a_restarted_app() {
         let route = WindowsApplicationRoute {
             application: app("sha256:player", 1, true).selector,

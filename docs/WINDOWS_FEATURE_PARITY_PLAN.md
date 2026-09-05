@@ -299,9 +299,9 @@ crates/pw-graph-slint/src/source.rs
 ```text
 [ ] Chrome/Firefox/VLC on normal speakers appears as an application relay source
 [ ] starting app relay does not change the application's local output
-[ ] only target-process audio reaches the relay
-[ ] another application on the same endpoint is excluded
-[ ] child-process mode behaves as documented
+[x] only target-process audio reaches the relay (opt-in two-helper process-loopback isolation smoke test passed locally)
+[x] another application on the same endpoint is excluded (opt-in two-helper process-loopback isolation smoke test passed locally)
+[x] child-process mode behaves as documented (opt-in child-tree process-loopback smoke test passed locally)
 [x] target exit does not kill the relay control session (opt-in local host/client smoke test passed locally)
 [x] target restart safely resolves a new PID (opt-in helper smoke test passed locally)
 ```
@@ -475,10 +475,10 @@ This matters for:
 ### Acceptance
 
 ```text
-[ ] unpackaged Win32 app survives restart
+[x] unpackaged Win32 app survives restart (reconciler + opt-in helper restart coverage passed locally)
 [ ] packaged app survives restart/update when its stable app identity remains
-[ ] PID reuse never activates an unrelated app
-[ ] display-name-only selector never activates automatically
+[x] PID reuse never activates an unrelated app (identity/reconciler tests passed locally)
+[x] display-name-only selector never activates automatically (selector test passed locally)
 ```
 
 ---
@@ -617,12 +617,12 @@ Do not poll aggressively.
 ### Acceptance
 
 ```text
-[ ] saved route survives app restart
-[ ] saved route survives qpwgraph restart
-[ ] missing app shows WaitingForApplication
-[ ] missing endpoint shows degraded state
-[ ] returning endpoint restores safely
-[ ] reused PID never matches by number
+[x] saved route survives app restart (reconciler restart transition test passed locally)
+[x] saved route survives qpwgraph restart (configuration file round-trip test passed locally)
+[x] missing app shows WaitingForApplication (reconciler test passed locally)
+[x] missing endpoint shows degraded state (reconciler test passed locally)
+[x] returning endpoint restores safely (reconciler test passed locally)
+[x] reused PID never matches by number (reconciler identity test passed locally)
 [x] complete effect instances restore transactionally or fail closed
 ```
 
@@ -1300,7 +1300,7 @@ Release-driver gate:
 ```text
 [ ] Driver Verifier clean
 [ ] relevant HLK audio tests complete
-[ ] INF/package validation clean
+[x] INF/package validation clean (WDK stampinf/Inf2Cat completed with no errors or warnings locally)
 [ ] Microsoft signing pipeline established
 [ ] Secure Boot installation verified
 [ ] upgrade and uninstall verified
@@ -1399,13 +1399,13 @@ That is why private AudioPolicyConfig work belongs near the end.
 [x] ordinary Win32 app (deterministic helper; opt-in live smoke test passed locally)
 [ ] packaged/MSIX app
 [ ] browser with child processes
-[ ] multiple audio sessions in same process
+[x] multiple audio sessions in same process (opt-in helper live smoke test passed locally)
 [x] silent process (opt-in helper live smoke test passed locally)
 [x] process starts after qpwgraph (opt-in helper live smoke test passed locally)
 [x] process exits during capture (opt-in live smoke test passed locally)
 [x] process restarts with new PID (opt-in helper relay smoke test passed locally)
 [ ] PID reused by unrelated executable
-[ ] 1000 activation/start/stop cycles
+[x] 1000 activation/start/stop cycles (opt-in live process-loopback cycle test passed locally)
 ```
 
 ## Relay
@@ -1420,7 +1420,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 ## Metering
 
 ```text
-[ ] native peak only
+[x] native peak only (opt-in live session-meter smoke test passed locally)
 [x] process RMS available (opt-in helper smoke test passed locally)
 [ ] process loopback unavailable -> peak fallback
 [x] on-demand worker closes (opt-in helper smoke test passed locally)
@@ -1610,7 +1610,7 @@ Call **Windows parity milestone 2** complete when all of these work:
 [ ] Relay Microphone works in an ordinary Windows capture client
 [ ] per-app effects work after manual isolation (repository restore path is in place;
     live processor validation remains)
-[ ] portable app still works with no driver installed
+[x] portable app still works with no driver installed (opt-in backend startup smoke test passed locally)
 ```
 
 Automatic private-ABI app routing is not required for this milestone.
