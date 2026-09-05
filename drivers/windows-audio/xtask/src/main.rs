@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const TARGET_KMDF_VERSION: &str = "1.31";
+
 fn main() {
     let arguments: Vec<String> = std::env::args().collect();
     if arguments
@@ -160,11 +162,21 @@ fn stage_package(
             "-v".to_owned(),
             "*".to_owned(),
             "-k".to_owned(),
-            "1.33".to_owned(),
+            TARGET_KMDF_VERSION.to_owned(),
         ],
         output,
         "stampinf",
     )?;
+
+    let stamped_inf = fs::read_to_string(&output_inf)
+        .map_err(|error| format!("read stamped {}: {error}", output_inf.display()))?;
+    if !stamped_inf.contains("KmdfLibraryVersion=1.31") {
+        return Err(format!(
+            "{} does not target KMDF {}",
+            output_inf.display(),
+            TARGET_KMDF_VERSION
+        ));
+    }
 
     let inf2cat = find_wdk_tool("Inf2Cat.exe").ok_or(
         "Inf2Cat.exe was not found below WDKContentRoot\\bin; install the WDK packaging tools",

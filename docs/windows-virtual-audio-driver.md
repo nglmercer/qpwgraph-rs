@@ -36,8 +36,8 @@ signing validation prove those endpoints on Windows. Installing the default
 binary is therefore intentionally impossible rather than silently creating no
 endpoint.
 
-Build/package commands require a real eWDK/WDK developer prompt, KMDF 1.33,
-a released LLVM 17--21 toolchain, and the WDK tools. LLVM 22 currently breaks
+Build/package commands require a real eWDK/WDK developer prompt, KMDF 1.31 or
+newer, a released LLVM 17--21 toolchain, and the WDK tools. LLVM 22 currently breaks
 bindgen's WDK layout generation. Run them from the nested workspace:
 
 ```powershell

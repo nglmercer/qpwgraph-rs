@@ -1,7 +1,7 @@
 # QPWGraph Windows virtual-audio package
 
 This is a nested Rust workspace so normal application builds never acquire a
-WDK dependency. Use an eWDK/WDK developer prompt with KMDF 1.33 and a
+WDK dependency. Use an eWDK/WDK developer prompt with KMDF 1.31 or newer and a
 released LLVM 17--21 toolchain available; LLVM 22 currently breaks bindgen's
 WDK layout generation:
 

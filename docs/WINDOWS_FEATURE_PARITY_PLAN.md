@@ -24,12 +24,16 @@ The repository-side evidence for this snapshot is complete:
 - the user-mode smoke probe passed `--verify-absent`, confirming that no
   provider-owned QPWGraph endpoint is currently installed on this machine.
 
-The current machine has no installed QPWGraph endpoint, is not running an
-elevated PowerShell session, and cannot read the boot configuration store.
-Therefore the privileged test-signing/install/reboot step has not been
-attempted; the live endpoint, client, Verifier, HLK, signing, Secure Boot, and
-package lifecycle checks below remain unchecked until that external gate is
-authorized and performed on a disposable Windows test image.
+The first authorized live pass on the Windows 10 version 2004 test image then
+created `ROOT\DEVGEN\QPWGRAPH_AUDIO` and installed `oem18.inf`, but the ACX
+endpoint smoke gate failed because the driver did not load. System events
+reported `Driver Version: 1.33` against a loaded KMDF library version `1.31`.
+The driver metadata is now retargeted to KMDF 1.31; the staged package must be
+rebuilt, test-signed again, and reinstalled before endpoint evidence can be
+recorded. The current `oem18.inf` test install was explicitly made with
+endpoint verification skipped and is not acceptance evidence. Live endpoint,
+client, Verifier, HLK, signing, Secure Boot, and package lifecycle checks below
+remain unchecked until that rebuild and external validation pass completes.
 
 The main architectural rule stays unchanged:
 
