@@ -24,7 +24,7 @@ pub unsafe extern "system" fn driver_entry(
         EvtDriverDeviceAdd: Some(evt_device_add),
         ..WDF_DRIVER_CONFIG::default()
     };
-    let mut handle = core::ptr::null_mut::<WDFDRIVER>();
+    let mut handle: WDFDRIVER = core::ptr::null_mut();
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverCreate,

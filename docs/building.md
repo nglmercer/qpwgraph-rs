@@ -60,11 +60,20 @@ cargo build --release --locked -p pw-graph-app
 ```
 
 The optional virtual-audio driver is not part of those portable commands. It
-has its own workspace and requires an eWDK prompt with KMDF/ACX headers:
+has its own workspace and requires an eWDK/WDK developer prompt with KMDF/ACX
+headers plus a released LLVM 17--21 toolchain for bindgen. LLVM 22 currently
+produces invalid WDK layout bindings. Run driver commands from the nested
+workspace so its static-CRT configuration is loaded:
 
 ```powershell
-cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
-cargo make --cwd drivers/windows-audio
+Push-Location drivers/windows-audio
+$env:LIBCLANG_PATH = 'C:\LLVM21\bin' # adjust to your LLVM 17--21 installation
+$env:Path = "$env:LIBCLANG_PATH;$env:Path"
+cargo test -p qpwgraph-audio-core --locked
+cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
+cargo check -p qpwgraph-audio --features acx --locked
+cargo make
+Pop-Location
 ```
 
 The deterministic process-loopback target is a normal user-mode build and

@@ -10,7 +10,9 @@
 use crate::ffi;
 #[cfg(feature = "acx")]
 use core::ffi::c_void;
-use wdk_sys::{NTSTATUS, PWDFDEVICE_INIT, STATUS_NOT_SUPPORTED, WDFDEVICE, WDFDRIVER};
+#[cfg(not(feature = "acx"))]
+use wdk_sys::STATUS_NOT_SUPPORTED;
+use wdk_sys::{NTSTATUS, PWDFDEVICE_INIT, WDFDEVICE, WDFDRIVER};
 
 /// The four binding milestones that must be proven before a virtual endpoint
 /// is allowed to advertise itself to Windows.

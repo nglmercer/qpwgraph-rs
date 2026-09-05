@@ -1,8 +1,11 @@
-#include "acx_wrapper.h"
-
+#include <wdm.h>
+#include <windef.h>
 #include <ks.h>
-#include <ksmedia.h>
+#define NOBITMAP
 #include <mmreg.h>
+#include <ksmedia.h>
+
+#include "acx_wrapper.h"
 
 #define QPWGRAPH_DRIVER_TAG ((ULONG)'aPWQ')
 #define QPWGRAPH_MAX_PACKET_COUNT 8

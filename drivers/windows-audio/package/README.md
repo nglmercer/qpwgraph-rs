@@ -1,15 +1,21 @@
 # QPWGraph Windows virtual-audio package
 
 This is a nested Rust workspace so normal application builds never acquire a
-WDK dependency. Use an eWDK prompt with KMDF 1.33 and LLVM available:
+WDK dependency. Use an eWDK/WDK developer prompt with KMDF 1.33 and a
+released LLVM 17--21 toolchain available; LLVM 22 currently breaks bindgen's
+WDK layout generation:
 
 ```powershell
+Push-Location drivers/windows-audio
+$env:LIBCLANG_PATH = 'C:\LLVM21\bin' # adjust to your LLVM 17--21 installation
+$env:Path = "$env:LIBCLANG_PATH;$env:Path"
 cargo test -p qpwgraph-audio-core
 cargo run -p qpwgraph-audio-xtask -- --validate-package
 cargo run -p qpwgraph-audio-xtask -- --audit-toolchain
 cargo run -p qpwgraph-audio-xtask
-cargo make --cwd drivers/windows-audio
+cargo make
 cargo run -p qpwgraph-audio-smoke -- --list
+Pop-Location
 ```
 
 The default driver build intentionally returns `STATUS_NOT_SUPPORTED` from
@@ -44,7 +50,9 @@ it is not evidence that an endpoint build succeeded.
 
 After a passing audit, the opt-in binding compilation is:
 
-    cargo check -p qpwgraph-audio --features acx
+    Push-Location drivers/windows-audio
+    cargo check -p qpwgraph-audio --features acx --locked
+    Pop-Location
 
 That command proves that the selected eWDK ACX headers and the feature-gated
 device/circuit/stream bridge can be compiled. It does not prove that the

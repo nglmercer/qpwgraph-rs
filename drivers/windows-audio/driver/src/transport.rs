@@ -18,19 +18,18 @@ fn pcm16_to_f32(low: u8, high: u8) -> f32 {
 }
 
 fn f32_to_pcm16(sample: f32) -> i16 {
-    let bounded = if sample.is_nan() {
-        0.0
-    } else {
-        sample
-    };
+    let bounded = if sample.is_nan() { 0.0 } else { sample };
     if bounded <= -1.0 {
         i16::MIN
     } else if bounded >= 1.0 {
         i16::MAX
     } else {
-        (bounded * 32_768.0)
-            .round()
-            .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+        let scaled = bounded * 32_768.0;
+        if scaled.is_sign_negative() {
+            (scaled - 0.5) as i16
+        } else {
+            (scaled + 0.5) as i16
+        }
     }
 }
 
@@ -93,11 +92,7 @@ pub unsafe extern "C" fn qpwgraph_audio_transport_pop_relay_pcm16(
     unsafe { pop_pcm16_from(&RELAY_CABLE, data, bytes) }
 }
 
-unsafe fn pop_pcm16_from(
-    cable: &SpscSampleRing<CABLE_SAMPLES>,
-    data: *mut u8,
-    bytes: u32,
-) -> u32 {
+unsafe fn pop_pcm16_from(cable: &SpscSampleRing<CABLE_SAMPLES>, data: *mut u8, bytes: u32) -> u32 {
     if data.is_null() || bytes < 2 {
         return 0;
     }
@@ -163,12 +158,7 @@ mod tests {
 
         let mut output = vec![0_u8; input_bytes.len()];
         assert_eq!(
-            unsafe {
-                qpwgraph_audio_transport_pop_pcm16(
-                    output.as_mut_ptr(),
-                    output.len() as u32,
-                )
-            },
+            unsafe { qpwgraph_audio_transport_pop_pcm16(output.as_mut_ptr(), output.len() as u32) },
             input_bytes.len() as u32
         );
         assert_eq!(output, input_bytes);
@@ -181,9 +171,7 @@ mod tests {
         qpwgraph_audio_transport_clear_relay();
         let input = pcm16_bytes(&[1_024, -2_048]);
         assert_eq!(
-            unsafe {
-                qpwgraph_audio_transport_push_pcm16(input.as_ptr(), input.len() as u32)
-            },
+            unsafe { qpwgraph_audio_transport_push_pcm16(input.as_ptr(), input.len() as u32) },
             0
         );
 
@@ -201,10 +189,7 @@ mod tests {
 
         let mut app_output = vec![0_u8; input.len()];
         unsafe {
-            qpwgraph_audio_transport_pop_pcm16(
-                app_output.as_mut_ptr(),
-                app_output.len() as u32,
-            );
+            qpwgraph_audio_transport_pop_pcm16(app_output.as_mut_ptr(), app_output.len() as u32);
         }
         assert_eq!(app_output, input);
     }

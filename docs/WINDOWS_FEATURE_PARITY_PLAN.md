@@ -1,6 +1,9 @@
 # Windows next-feature plan
 
-Status snapshot: 2026-09-05. The repository now contains the P0 user-mode implementation slices below; live ACX, endpoint, HLK, and signing gates remain explicitly open.
+Status snapshot: 2026-09-05. The repository now contains the P0 user-mode
+implementation slices below. The WDK/ACX header-and-link compile gate has
+also passed locally with WDK 10.0.26100 and released LLVM 21.1.2; live
+endpoint, HLK, and signing gates remain explicitly open.
 
 This document replaces the old “build everything from zero” roadmap with the next implementation steps after the Windows parity foundations landed.
 
@@ -693,9 +696,11 @@ streaming validation pass.
 
 Before implementing circuits, prove that the eWDK environment can generate/link the ACX APIs required by the selected sample architecture.
 
-The repository preflight for this gate is:
+Run the repository preflight from the nested workspace:
 
-    cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask -- --audit-toolchain
+    Push-Location drivers/windows-audio
+    cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
+    Pop-Location
 
 It reports WDKContentRoot, versioned KM CRT headers, acx.h, the target
 architecture's `acxstub.lib`, cl.exe, msbuild.exe, and clang.exe separately.
@@ -705,7 +710,9 @@ successful ACX build.
 
 Once that preflight passes, the opt-in binding compilation is:
 
-    cargo check -p qpwgraph-audio --features acx
+    Push-Location drivers/windows-audio
+    cargo check -p qpwgraph-audio --features acx --locked
+    Pop-Location
 
 This is a header/ABI and feature-bridge compilation gate. It does not close
 the endpoint milestone or authorize installing the package.
@@ -732,8 +739,9 @@ probes; the production bridge is still gated on the eWDK and Windows tests.
 
 The opt-in eWDK CI job runs both `--audit-toolchain` and
 `cargo check -p qpwgraph-audio --features acx` before attempting the package
-build. The local machine currently lacks the WDK/eWDK headers, so the gate
-remains unchecked here.
+build. On 2026-09-05 both commands passed locally with WDK 10.0.26100 and
+LLVM 21.1.2. LLVM 22 currently produces invalid WDK layout bindings, so the
+audit accepts released LLVM 17--21 and reports newer versions as unsupported.
 
 ### Preferred approach
 
@@ -749,10 +757,10 @@ Do not add a C++ production driver merely because ACX headers require custom bin
 Do not claim four-endpoint readiness until this succeeds:
 
 ```text
-[ ] ACX device initialization compiles
-[ ] ACX circuit creation compiles
-[ ] ACX pin/format config compiles
-[ ] ACX stream callback config compiles
+[x] ACX device initialization compiles
+[x] ACX circuit creation compiles
+[x] ACX pin/format config compiles
+[x] ACX stream callback config compiles
 [ ] test-signed package loads
 ```
 

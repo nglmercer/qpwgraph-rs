@@ -3,9 +3,11 @@
 // This header is intentionally tiny. The build script supplies the versioned
 // WDK include roots; ACX's public umbrella header supplies the exact
 // configuration layouts, callback typedefs, and DDI declarations.
-#include <acx.h>
+#include <ntddk.h>
+#include <ntstrsafe.h>
+#include <ntintsafe.h>
 #include <wdf.h>
-#include <wdm.h>
+#include <acx.h>
 
 // Bindgen sees these as ordinary NTSTATUS-returning functions while the WDK
 // compiler expands the version-correct ACX *_INIT macros inside the eWDK.

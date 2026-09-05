@@ -36,12 +36,19 @@ signing validation prove those endpoints on Windows. Installing the default
 binary is therefore intentionally impossible rather than silently creating no
 endpoint.
 
-Build/package commands require a real eWDK prompt, KMDF 1.33, LLVM, and the
-WDK tools:
+Build/package commands require a real eWDK/WDK developer prompt, KMDF 1.33,
+a released LLVM 17--21 toolchain, and the WDK tools. LLVM 22 currently breaks
+bindgen's WDK layout generation. Run them from the nested workspace:
 
 ```powershell
-cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
-cargo make --cwd drivers/windows-audio
+Push-Location drivers/windows-audio
+$env:LIBCLANG_PATH = 'C:\LLVM21\bin' # adjust to your LLVM 17--21 installation
+$env:Path = "$env:LIBCLANG_PATH;$env:Path"
+cargo test -p qpwgraph-audio-core --locked
+cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
+cargo check -p qpwgraph-audio --features acx --locked
+cargo make
+Pop-Location
 ```
 
 The installer must never take over Windows defaults. Development packages may

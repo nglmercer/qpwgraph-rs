@@ -18,7 +18,7 @@ mod windows_smoke {
     use std::ffi::c_void;
     use std::time::{Duration, Instant};
 
-    use windows::core::{GUID, Result as WindowsResult};
+    use windows::core::{Result as WindowsResult, GUID};
     use windows::Win32::Devices::Properties;
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
@@ -301,8 +301,7 @@ mod windows_smoke {
             for endpoint in endpoints {
                 let Some(service) = property_string(
                     &endpoint.device,
-                    &Properties::DEVPKEY_Device_Service
-                        as *const _ as *const PROPERTYKEY,
+                    &Properties::DEVPKEY_Device_Service as *const _ as *const PROPERTYKEY,
                 ) else {
                     continue;
                 };
@@ -318,9 +317,10 @@ mod windows_smoke {
                         endpoint.id
                     )));
                 };
-                let Some((expected_flow, _)) = expected.iter().find(
-                    |(_, expected_role)| role.eq_ignore_ascii_case(expected_role),
-                ) else {
+                let Some((expected_flow, _)) = expected
+                    .iter()
+                    .find(|(_, expected_role)| role.eq_ignore_ascii_case(expected_role))
+                else {
                     return Err(SmokeError::Failure(format!(
                         "provider-owned endpoint {} advertises unknown role {role:?}",
                         endpoint.id

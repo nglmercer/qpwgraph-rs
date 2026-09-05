@@ -112,7 +112,7 @@ fn audit_toolchain() {
         ));
     }
 
-    for tool in ["cl.exe", "msbuild.exe", "clang.exe"] {
+    for tool in ["cl.exe", "msbuild.exe"] {
         match executable_on_path(tool) {
             Some(path) => checks.push(Check::ok(tool, path)),
             None => checks.push(Check::missing(
@@ -120,6 +120,26 @@ fn audit_toolchain() {
                 "not found on PATH; use the matching VS/eWDK developer prompt",
             )),
         }
+    }
+
+    match executable_on_path("clang.exe") {
+        Some(path) => match clang_version(&path) {
+            Some((major, version)) if (17..=21).contains(&major) => {
+                checks.push(Check::ok("clang.exe", format!("{path} (LLVM {version})")))
+            }
+            Some((_, version)) => checks.push(Check::missing(
+                "clang.exe",
+                format!("{path} reports LLVM {version}; use a released LLVM 17-21 toolchain"),
+            )),
+            None => checks.push(Check::missing(
+                "clang.exe",
+                format!("{path} did not report a parseable LLVM version"),
+            )),
+        },
+        None => checks.push(Check::missing(
+            "clang.exe",
+            "not found on PATH; use the matching VS/eWDK developer prompt",
+        )),
     }
 
     let mut missing = 0;
@@ -177,6 +197,23 @@ fn executable_on_path(name: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn clang_version(path: &str) -> Option<(u32, String)> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut tokens = stdout.split_whitespace();
+    tokens.find(|token| *token == "version")?;
+    let version = tokens.next()?.to_string();
+    let major = version
+        .split('.')
+        .next()
+        .filter(|component| !component.is_empty())
+        .and_then(|component| component.parse().ok())?;
+    Some((major, version))
 }
 
 fn find_directory_with_suffix(root: &Path, suffix: &[&str]) -> Option<PathBuf> {
