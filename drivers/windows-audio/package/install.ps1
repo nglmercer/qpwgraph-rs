@@ -58,6 +58,23 @@ if (@(Compare-Object -ReferenceObject $expectedRoles -DifferenceObject $actualRo
     throw 'The package manifest does not contain exactly the four expected endpoint roles.'
 }
 
+function Get-QpwgraphDeviceDiagnosis {
+    try {
+        $device = Get-PnpDevice -InstanceId $rootDeviceInstanceId -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $device) {
+            return 'root devnode ROOT\DEVGEN\QPWGRAPH_AUDIO is absent'
+        }
+        $problem = ''
+        try {
+            $problemValue = $device | Select-Object -ExpandProperty Problem -ErrorAction SilentlyContinue
+            if ($null -ne $problemValue) { $problem = ", Problem=$problemValue" }
+        } catch { }
+        return "Status=$($device.Status), Class=$($device.Class)$problem"
+    } catch {
+        return "could not query root devnode: $($_.Exception.Message)"
+    }
+}
+
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -72,6 +89,61 @@ function Assert-TestSigningEnabled {
         throw '-AllowTestSigned requires Windows test-signing mode to be enabled for the current boot entry.'
     }
     Write-Warning 'Installing a test-signed development package; this is not a release-signing proof.'
+}
+
+function Find-SignTool {
+    $onPath = Get-Command 'signtool.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $onPath) {
+        return $onPath.Source
+    }
+
+    $roots = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:WDKContentRoot)) {
+        $roots += Join-Path $env:WDKContentRoot 'bin'
+    }
+    $roots += 'C:\Program Files (x86)\Windows Kits\10\bin'
+    $roots += 'C:\Program Files\Windows Kits\10\bin'
+    foreach ($root in ($roots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            continue
+        }
+        foreach ($architecture in @('x64', 'x86', 'arm64')) {
+            $candidate = Get-ChildItem -LiteralPath $root -Filter 'signtool.exe' -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Directory.Name -ieq $architecture } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+            if ($null -ne $candidate) {
+                return $candidate.FullName
+            }
+        }
+    }
+    throw 'signtool.exe was not found on PATH or below the WDK bin directory. Run from a WDK/eWDK developer prompt or install the WDK signing tools.'
+}
+
+function Assert-PackageSignatures {
+    $signTool = Find-SignTool
+    $catalog = Join-Path $packageRootPath 'qpwgraph-audio.cat'
+    $targets = @(
+        @{ Catalog = ''; File = $catalog; Description = 'Catalog signature verification' },
+        @{ Catalog = $catalog; File = $inf; Description = 'INF catalog verification' },
+        @{ Catalog = $catalog; File = (Join-Path $packageRootPath 'qpwgraph_audio.sys'); Description = 'Driver catalog verification' }
+    )
+    foreach ($target in $targets) {
+        $arguments = @('verify', '/v', '/pa')
+        if (-not [string]::IsNullOrWhiteSpace($target.Catalog)) {
+            $arguments += @('/c', $target.Catalog)
+        }
+        $arguments += $target.File
+        $output = (& $signTool @arguments 2>&1 | Out-String)
+        $exitCode = $LASTEXITCODE
+        if (-not [string]::IsNullOrWhiteSpace($output)) {
+            Write-Verbose ($output.TrimEnd())
+        }
+        if ($exitCode -ne 0) {
+            throw "$($target.Description) failed for $($target.File) with exit code ${exitCode}: $($output.Trim())"
+        }
+    }
+    Write-Verbose "Verified the staged package signatures with $signTool"
 }
 
 function Find-DevGen {
@@ -177,7 +249,8 @@ function Wait-ForEndpointRoles {
         } catch {
             $lastError = $_.Exception.Message
             if ((Get-Date) -ge $deadline) {
-                throw "QPWGraph endpoints did not pass provider-role verification before the timeout: $lastError"
+                $diagnosis = Get-QpwgraphDeviceDiagnosis
+                throw "QPWGraph endpoints did not pass provider-role verification before the timeout: $lastError [$diagnosis]"
             }
             Start-Sleep -Seconds 1
         }
@@ -199,6 +272,7 @@ if (-not $SkipEndpointVerification) {
 Assert-Administrator
 if ($AllowTestSigned) {
     Assert-TestSigningEnabled
+    Assert-PackageSignatures
 } else {
     Write-Verbose 'Installing through PnPUtil with normal Windows signature policy.'
 }

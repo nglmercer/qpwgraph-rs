@@ -53,11 +53,16 @@ fn generate_acx_bindings() -> Result<(), Box<dyn std::error::Error>> {
     let wrapper_source = out_file.with_file_name("acx_static_wrappers");
     let wdk_config = wdk_build::Config::from_env_auto()?;
 
+    // Compile against the ACX 1.1 surface supported by Windows 10 version
+    // 2004. Keep the minimum framework version separate: the bridge only
+    // uses DDIs common to the older ACX surface, and ACX can probe the
+    // framework's available function/structure tables at runtime.
     let builder = bindgen::Builder::wdk_default(&wdk_config)?
         .header(wrapper.to_string_lossy())
         .clang_arg(format!("--include-directory={}", acx_include.display()))
         .clang_arg("--define-macro=ACX_VERSION_MAJOR=1")
         .clang_arg("--define-macro=ACX_VERSION_MINOR=1")
+        .clang_arg("--define-macro=ACX_MINIMUM_VERSION_REQUIRED=0")
         .allowlist_function("^qpwgraph_acx_.*")
         .wrap_static_fns(true)
         .wrap_static_fns_path(&wrapper_source)
@@ -96,6 +101,7 @@ fn generate_acx_bindings() -> Result<(), Box<dyn std::error::Error>> {
     }
     compiler.define("ACX_VERSION_MAJOR", "1");
     compiler.define("ACX_VERSION_MINOR", "1");
+    compiler.define("ACX_MINIMUM_VERSION_REQUIRED", "0");
     compiler.flag_if_supported("/kernel");
     compiler.compile("qpwgraph_acx_bindings");
     println!(

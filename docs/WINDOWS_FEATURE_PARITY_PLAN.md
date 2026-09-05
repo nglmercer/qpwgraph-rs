@@ -21,6 +21,10 @@ The repository-side evidence for this snapshot is complete:
   Visual Studio 2022, and LLVM 21.1.2; INF stamping and Inf2Cat reported no
   errors or warnings, and the unsigned ACX package is staged under
   `drivers/windows-audio/target/qpwgraph-audio-package`.
+- `--validate-package` passed after the installer gained a pre-PnPUtil
+  `signtool verify /pa` check for the catalog itself and the catalog's INF/SYS
+  membership; the signing helper performs the same verification immediately
+  after test-signing.
 - the user-mode smoke probe passed `--verify-absent`, confirming that no
   provider-owned QPWGraph endpoint is currently installed on this machine.
 
@@ -28,12 +32,16 @@ The first authorized live pass on the Windows 10 version 2004 test image then
 created `ROOT\DEVGEN\QPWGRAPH_AUDIO` and installed `oem18.inf`, but the ACX
 endpoint smoke gate failed because the driver did not load. System events
 reported `Driver Version: 1.33` against a loaded KMDF library version `1.31`.
-The driver metadata is now retargeted to KMDF 1.31; the staged package must be
-rebuilt, test-signed again, and reinstalled before endpoint evidence can be
-recorded. The current `oem18.inf` test install was explicitly made with
-endpoint verification skipped and is not acceptance evidence. Live endpoint,
-client, Verifier, HLK, signing, Secure Boot, and package lifecycle checks below
-remain unchecked until that rebuild and external validation pass completes.
+The package was retargeted to KMDF 1.31 and the explicitly skipped `oem18.inf`
+install was removed. A fresh `oem19.inf` attempt then reached PnPUtil but Code
+Integrity reported the driver-store catalog as unsigned; that attempt was also
+not acceptance evidence. The rebuilt package now targets the ACX 1.1 surface
+supported by Windows 10 version 2004 while keeping the minimum ACX framework
+version separate, and both signing/install helpers verify the exact staged
+artifacts before PnPUtil is called. Re-run `Prepare` and the normal `Install`
+phase to obtain a fresh live result. Live endpoint, client, Verifier, HLK,
+Microsoft signing, Secure Boot, and package lifecycle checks below remain
+unchecked until the external validation passes.
 
 The main architectural rule stays unchanged:
 

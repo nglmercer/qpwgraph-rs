@@ -35,8 +35,9 @@ Pop-Location
 ```
 
 The helper signs `qpwgraph_audio.sys`, regenerates the catalog so its hashes
-match the signed driver, and signs `qpwgraph-audio.cat`. It does not change
-boot settings, install the package, or import the certificate. Import the
+match the signed driver, signs `qpwgraph-audio.cat`, and verifies the exact
+catalog/INF/SYS set that will be installed. It does not change boot settings,
+install the package, or import the certificate. Import the
 printed `.cer` into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`
 on the test machine from an elevated PowerShell prompt. An existing code
 signing certificate can be selected with
@@ -160,7 +161,8 @@ keeping the lifecycle fail-closed. A release install requires the built
 endpoint roles, and removes the exact published `oemNN.inf` automatically if
 that verification fails. `-SkipEndpointVerification` is available only for an
 explicitly managed test operation. `-AllowTestSigned` additionally requires
-Windows test-signing mode. The uninstaller requires the exact published
+Windows test-signing mode and verifies the staged catalog signature plus its
+INF/SYS membership before invoking PnPUtil. The uninstaller requires the exact published
 `oemNN.inf`, verifies that the roles disappear, and supports `-WhatIf`; it
 never searches for or removes an unrelated driver package.
 

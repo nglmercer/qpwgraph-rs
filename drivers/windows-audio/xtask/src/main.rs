@@ -652,6 +652,10 @@ fn validate_package_metadata() {
         "implementation_status",
         "qpwgraph-audio.cat",
         "qpwgraph_audio.sys",
+        "signtool.exe",
+        "Assert-PackageSignatures",
+        "Catalog signature verification",
+        "Driver catalog verification",
         "qpwgraph-audio-smoke",
         "--verify-roles",
         "/delete-driver",
@@ -661,6 +665,7 @@ fn validate_package_metadata() {
         "devgen.exe",
         "Root\\QPWGRAPH_AUDIO",
         "/remove-device",
+        "Get-QpwgraphDeviceDiagnosis",
     ] {
         assert!(
             install_script.contains(required),
@@ -700,6 +705,9 @@ fn validate_package_metadata() {
         "Inf2Cat.exe",
         "CertificateThumbprint",
         "LocalMachine\\TrustedPublisher",
+        "Invoke-SignatureVerification",
+        "Catalog signature verification",
+        "Driver catalog verification",
     ] {
         assert!(
             signing_script.contains(required),

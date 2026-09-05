@@ -121,6 +121,27 @@ function Invoke-Tool([string] $Tool, [string[]] $Arguments, [string] $Name) {
     }
 }
 
+function Invoke-SignatureVerification(
+    [string] $Tool,
+    [string] $Catalog,
+    [string] $File,
+    [string] $Description
+) {
+    $arguments = @('verify', '/v', '/pa')
+    if (-not [string]::IsNullOrWhiteSpace($Catalog)) {
+        $arguments += @('/c', $Catalog)
+    }
+    $arguments += $File
+    $output = (& $Tool @arguments 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+    if (-not [string]::IsNullOrWhiteSpace($output)) {
+        Write-Verbose ($output.TrimEnd())
+    }
+    if ($exitCode -ne 0) {
+        throw "$Description failed with exit code ${exitCode}: $($output.Trim())"
+    }
+}
+
 $signTool = Find-WdkTool 'signtool.exe'
 $inf2Cat = Find-WdkTool 'Inf2Cat.exe'
 $storeArguments = @()
@@ -136,6 +157,12 @@ Invoke-Tool $signTool (@('sign', '/fd', 'SHA256', '/sha1', $CertificateThumbprin
 Write-Output 'Regenerating the package catalog after driver signing'
 Invoke-Tool $inf2Cat @("/driver:$packageRootPath", '/os:10_X64') 'Inf2Cat'
 Invoke-Tool $signTool (@('sign', '/fd', 'SHA256', '/sha1', $CertificateThumbprint) + $storeArguments + @($cat)) 'SignTool catalog signing'
+
+# Verify the exact files that the installer will hand to PnPUtil. This catches
+# an unsigned or stale catalog before it is copied into the driver store.
+Invoke-SignatureVerification $signTool '' $cat 'Catalog signature verification'
+Invoke-SignatureVerification $signTool $cat $sys 'Driver catalog verification'
+Invoke-SignatureVerification $signTool $cat $inf 'INF catalog verification'
 
 Write-Output "Test-signed package ready at $packageRootPath"
 Write-Output "Certificate thumbprint: $CertificateThumbprint"
