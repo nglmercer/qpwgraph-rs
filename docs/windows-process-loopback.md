@@ -59,6 +59,22 @@ activation is an opt-in test on a Windows 10 build 20348+ host with
 active audio session, so it is not run on headless CI. The deterministic helper
 path passed on the local Windows 10 host on 2026-09-05.
 
+The same helper can exercise the complete backend meter path, including a
+true per-process RMS reading without a virtual driver:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_RMS = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture
+```
+
+The worker also watches the target process lifetime and reports a lost stream
+when the target exits instead of leaving a silent capture alive:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_EXIT = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture
+```
+
 The repository includes a deterministic target-process helper. Build and run
 it for a manual smoke test (the first line prints the PID to capture):
 

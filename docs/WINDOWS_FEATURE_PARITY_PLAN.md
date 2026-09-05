@@ -349,11 +349,11 @@ Keep process-loopback RMS for eligible active sessions, subject to a sane worker
 ### Acceptance
 
 ```text
-[ ] ordinary app session can report true RMS without virtual driver
+[x] ordinary app session can report true RMS without virtual driver (opt-in helper smoke test passed locally)
 [ ] audible output is unchanged
 [ ] peak fallback survives process-loopback failure
 [ ] meter policy controls worker lifetime
-[ ] process exit closes capture
+[x] process exit closes capture (opt-in live smoke test passed locally)
 ```
 
 ---
@@ -1402,7 +1402,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 [ ] multiple audio sessions in same process
 [ ] silent process
 [ ] process starts after qpwgraph
-[ ] process exits during capture
+[x] process exits during capture (opt-in live smoke test passed locally)
 [ ] process restarts with new PID
 [ ] PID reused by unrelated executable
 [ ] 1000 activation/start/stop cycles
@@ -1421,7 +1421,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 
 ```text
 [ ] native peak only
-[ ] process RMS available
+[x] process RMS available (opt-in helper smoke test passed locally)
 [ ] process loopback unavailable -> peak fallback
 [ ] on-demand worker closes
 [ ] always policy bounded

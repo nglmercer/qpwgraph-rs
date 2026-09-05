@@ -16,11 +16,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use windows::core::{IUnknown, Interface};
+use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio;
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
 };
 use windows::Win32::System::Com::{self, BLOB, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{
+    OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+};
 use windows::Win32::System::Variant::VT_BLOB;
 
 use crate::api::{BackendError, BackendResult};
@@ -293,6 +297,7 @@ fn run(
         return;
     }
 
+    let process_liveness = ProcessLiveness::open(pid);
     let result = activate_process_audio_client(pid, mode)
         .map_err(|error| native("activate process-loopback audio client", error))
         .and_then(|client| {
@@ -305,7 +310,7 @@ fn run(
             unsafe { client.Start() }
                 .map_err(|error| native("start process-loopback capture", error))?;
             let _ = started.send(Ok(()));
-            capture_loop(&capture, feed, format, stop);
+            capture_loop(&capture, feed, format, stop, &process_liveness);
             let _ = unsafe { client.Stop() };
             Ok(())
         });
@@ -492,15 +497,46 @@ fn initialize_client(client: &Audio::IAudioClient, format: AudioFormat) -> Backe
     .map_err(|error| native("initialize process-loopback audio client", error))
 }
 
+/// A process-loopback stream can remain open and deliver silence after its
+/// target exits. Keep a wait handle beside the WASAPI client so the worker can
+/// report that state transition instead of leaving a silent route alive.
+struct ProcessLiveness(Option<windows::Win32::Foundation::HANDLE>);
+
+impl ProcessLiveness {
+    fn open(pid: u32) -> Self {
+        let access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+        let handle = unsafe { OpenProcess(access, false, pid) }.ok();
+        Self(handle)
+    }
+
+    fn has_exited(&self) -> bool {
+        self.0
+            .is_some_and(|handle| unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 })
+    }
+}
+
+impl Drop for ProcessLiveness {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = unsafe { CloseHandle(handle) };
+        }
+    }
+}
+
 fn capture_loop(
     capture: &Audio::IAudioCaptureClient,
     mut feed: RingSourceFeed,
     format: AudioFormat,
     stop: &AtomicBool,
+    process_liveness: &ProcessLiveness,
 ) {
     let channels = usize::from(format.channels);
     let silence = vec![0.0f32; format.samples(4096)];
     while !stop.load(Ordering::Acquire) {
+        if process_liveness.has_exited() {
+            feed.mark_lost();
+            return;
+        }
         let mut pending = match unsafe { capture.GetNextPacketSize() } {
             Ok(value) => value,
             Err(_) => {
@@ -577,7 +613,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activation_blob_points_at_owned_box() {
+    fn activation_blob_uses_the_expected_parameter_layout() {
         // This compile-time/layout assertion protects the most dangerous part
         // of process activation: the blob must contain exactly the params.
         assert_eq!(size_of::<Audio::AUDIOCLIENT_ACTIVATION_PARAMS>() as u32, 12);
