@@ -81,6 +81,16 @@ activation is unavailable, the worker keeps the native Core Audio peak meter
 when one exists and reports RMS as unavailable instead of presenting peak as
 fabricated RMS; both policies are covered by backend unit tests.
 
+The helper also covers a silent process and a process that starts after the
+backend has already been created. Run both opt-in checks together when
+validating session discovery and zero-level metering:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_SILENT = '1'
+$env:PW_GRAPH_TEST_PROCESS_START_AFTER_DRIVER = '1'
+cargo test -p windows-audio-test-tone --test process_loopback --locked -- --nocapture --test-threads=1
+```
+
 The worker also watches the target process lifetime and reports a lost stream
 when the target exits instead of leaving a silent capture alive:
 

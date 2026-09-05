@@ -1400,8 +1400,8 @@ That is why private AudioPolicyConfig work belongs near the end.
 [ ] packaged/MSIX app
 [ ] browser with child processes
 [ ] multiple audio sessions in same process
-[ ] silent process
-[ ] process starts after qpwgraph
+[x] silent process (opt-in helper live smoke test passed locally)
+[x] process starts after qpwgraph (opt-in helper live smoke test passed locally)
 [x] process exits during capture (opt-in live smoke test passed locally)
 [x] process restarts with new PID (opt-in helper relay smoke test passed locally)
 [ ] PID reused by unrelated executable

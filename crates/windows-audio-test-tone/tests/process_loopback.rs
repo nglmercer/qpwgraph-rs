@@ -17,6 +17,7 @@ use pw_graph_backend::{
     RelayTransportPreference,
 };
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,28 @@ fn helper_path() -> Option<std::path::PathBuf> {
 fn stop_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn spawn_tone(
+    helper: &Path,
+    duration_ms: u64,
+    frequency: u32,
+    amplitude: f32,
+    sessions: usize,
+) -> Child {
+    Command::new(helper)
+        .args([
+            "--duration-ms".into(),
+            duration_ms.to_string(),
+            "--frequency".into(),
+            frequency.to_string(),
+            "--amplitude".into(),
+            amplitude.to_string(),
+            "--sessions".into(),
+            sessions.to_string(),
+        ])
+        .spawn()
+        .expect("start deterministic WASAPI test tone")
 }
 
 #[test]
@@ -143,6 +166,102 @@ fn helper_audio_provides_true_process_rms_without_virtual_driver() {
     })();
     stop_child(&mut child);
     result.expect("process RMS smoke test failed");
+}
+
+#[test]
+fn silent_process_remains_meterable_without_fabricating_audio() {
+    if std::env::var("PW_GRAPH_TEST_PROCESS_SILENT")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let Some(helper) = helper_path() else {
+        panic!("Cargo did not provide CARGO_BIN_EXE_windows-audio-test-tone");
+    };
+    let mut child = spawn_tone(&helper, 30_000, 1_000, 0.0, 1);
+    let result = (|| -> Result<(), String> {
+        let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
+        driver
+            .set_meter_policy(MeterPolicy::Always)
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            driver.refresh().map_err(|error| error.to_string())?;
+            let rms_nodes: Vec<_> = driver
+                .graph()
+                .nodes
+                .values()
+                .filter(|node| {
+                    node.name
+                        .to_ascii_lowercase()
+                        .contains("windows-audio-test-tone")
+                })
+                .filter(|node| driver.node_capabilities(node.id).meter_rms)
+                .map(|node| node.id)
+                .collect();
+            if !rms_nodes.is_empty() {
+                let meters = driver.audio_meters().map_err(|error| error.to_string())?;
+                if meters.iter().any(|meter| {
+                    rms_nodes.contains(&meter.node_id)
+                        && meter.available
+                        && meter.rms <= 0.001
+                        && meter.peak <= 0.001
+                }) {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err("silent helper did not produce an available zero-level process meter".into())
+    })();
+    stop_child(&mut child);
+    result.expect("silent process smoke test failed");
+}
+
+#[test]
+fn process_started_after_driver_is_discovered_and_metered() {
+    if std::env::var("PW_GRAPH_TEST_PROCESS_START_AFTER_DRIVER")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let Some(helper) = helper_path() else {
+        panic!("Cargo did not provide CARGO_BIN_EXE_windows-audio-test-tone");
+    };
+    let result = (|| -> Result<(), String> {
+        let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
+        driver
+            .set_meter_policy(MeterPolicy::Always)
+            .map_err(|error| error.to_string())?;
+        driver.refresh().map_err(|error| error.to_string())?;
+        let baseline_nodes: BTreeSet<_> = driver.graph().nodes.keys().copied().collect();
+        let mut child = spawn_tone(&helper, 30_000, 1_000, 0.25, 1);
+        let result = (|| -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < deadline {
+                driver.refresh().map_err(|error| error.to_string())?;
+                if driver.graph().nodes.values().any(|node| {
+                    !baseline_nodes.contains(&node.id)
+                        && node
+                            .name
+                            .to_ascii_lowercase()
+                            .contains("windows-audio-test-tone")
+                        && driver.node_capabilities(node.id).meter_rms
+                }) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err("process started after qpwgraph but never became an RMS-capable session".into())
+        })();
+        stop_child(&mut child);
+        result
+    })();
+    result.expect("process-start-after-driver smoke test failed");
 }
 
 #[test]
