@@ -234,6 +234,9 @@ jobs:
       - name: Test allocation-free driver core
         working-directory: drivers/windows-audio
         run: cargo test -p qpwgraph-audio-core --locked
+      - name: Test the nested driver workspace
+        working-directory: drivers/windows-audio
+        run: cargo test --workspace --locked
       - name: Build and package the KMDF driver
         shell: pwsh
         working-directory: drivers/windows-audio
