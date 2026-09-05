@@ -48,6 +48,14 @@ fn build_opus(is_static: bool) {
 
     println!("cargo:info=Building Opus via CMake.");
     let mut config = cmake::Config::new(opus_path);
+    // Rust's MSVC targets use the DLL CRT in both debug and release builds.
+    // CMake otherwise selects /MDd for its Debug configuration, which leaves
+    // the static Opus library referring to MSVCRTD and makes Rust test
+    // binaries fail to link with __imp__CrtDbgReportW.
+    if cfg!(all(windows, target_env = "msvc")) {
+        config.define("CMAKE_POLICY_DEFAULT_CMP0091", "NEW");
+        config.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL");
+    }
     if let Ok(target) = env::var("TARGET") {
         let abi = match target.as_str() {
             "aarch64-linux-android" => Some("arm64-v8a"),
