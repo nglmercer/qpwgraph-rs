@@ -195,7 +195,9 @@ function Test-QpwgraphRootDevice {
 function Ensure-QpwgraphRootDevice {
     if (Test-QpwgraphRootDevice) {
         Write-Verbose "Using existing root device $rootDeviceInstanceId"
-        $script:rootDeviceNeedsCleanup = $true
+        # The device may belong to an already-installed copy of this package.
+        # Never remove a devnode that this invocation did not create.
+        $script:rootDeviceNeedsCleanup = $false
         return
     }
 
@@ -290,9 +292,12 @@ $pnputilExitCode = $LASTEXITCODE
 if (-not [string]::IsNullOrWhiteSpace($pnputilOutput)) {
     Write-Verbose ($pnputilOutput.TrimEnd())
 }
-if ($pnputilExitCode -ne 0) {
+if ($pnputilExitCode -ne 0 -and $pnputilOutput -notmatch '(?im)Driver package is up-to-date on device') {
     Remove-QpwgraphRootDevice
     throw "PnPUtil failed with exit code $pnputilExitCode. No Windows default device was changed."
+}
+if ($pnputilExitCode -ne 0) {
+    Write-Verbose "PnPUtil reported an already-current package with exit code $pnputilExitCode; continuing with endpoint verification."
 }
 
 $publishedMatch = [regex]::Match($pnputilOutput, '(?im)Published\s+Name\s*:\s*(oem\d+\.inf)')

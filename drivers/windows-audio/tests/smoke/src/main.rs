@@ -1,11 +1,12 @@
 //! Windows endpoint smoke probe for the optional driver package.
 //!
 //! The probe is deliberately user-mode and does not install, remove, or
-//! select a Windows default device.  It enumerates active endpoints by their
-//! display name, opens a shared-mode WASAPI client, starts it briefly, then
-//! stops and resets it.  The optional round-trip mode also writes a tone and
-//! requires non-silent capture.  A missing endpoint is an expected fail-closed
-//! result until the ACX package has been installed on the test machine.
+//! select a Windows default device. It enumerates active endpoints by display
+//! name, MMDevice id, or provider-owned semantic role, opens a shared-mode
+//! WASAPI client, starts it briefly, then stops and resets it. The optional
+//! round-trip mode also writes a tone and requires non-silent capture. A
+//! missing endpoint is an expected fail-closed result until the ACX package
+//! has been installed on the test machine.
 
 #[cfg(not(windows))]
 fn main() {
@@ -18,9 +19,13 @@ mod windows_smoke {
     use std::ffi::c_void;
     use std::time::{Duration, Instant};
 
-    use windows::core::{Result as WindowsResult, GUID};
+    use windows::core::{Result as WindowsResult, GUID, PCWSTR};
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_PropertyW, CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
+    };
     use windows::Win32::Devices::Properties;
-    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::Devices::Properties::{DEVPROPTYPE, DEVPROP_TYPE_STRING};
+    use windows::Win32::Foundation::{DEVPROPKEY, PROPERTYKEY};
     use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
     use windows::Win32::System::Com::{
         self, CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
@@ -29,8 +34,8 @@ mod windows_smoke {
     use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
     const DEFAULT_RENDER_NAME: &str = "QPWGraph Virtual Output";
-    const DEFAULT_CAPTURE_NAME: &str = "QPWGraph Virtual Monitor";
     const QPWGRAPH_DRIVER_SERVICE: &str = "qpwgraph_audio";
+    const QPWGRAPH_ROOT_DEVICE_INSTANCE_ID: &str = "ROOT\\DEVGEN\\QPWGRAPH_AUDIO";
     const PKEY_QPWGRAPH_ENDPOINT_ROLE: PROPERTYKEY = PROPERTYKEY {
         fmtid: GUID::from_u128(0x3c8e_8ef9_1f7f_4fcb_9c36_4a7e_19f3_6d12),
         pid: 2,
@@ -73,6 +78,7 @@ mod windows_smoke {
     enum Selector {
         Name(String),
         Id(String),
+        Role(String),
     }
 
     #[derive(Clone, Debug)]
@@ -177,7 +183,8 @@ mod windows_smoke {
                 }
                 "--list" => list = true,
                 "--round-trip" => {
-                    capture = Some(Selector::Name(DEFAULT_CAPTURE_NAME.into()));
+                    render = Selector::Role("app-render".into());
+                    capture = Some(Selector::Role("app-monitor".into()));
                     round_trip = true;
                 }
                 "--verify-roles" => verify_roles = true,
@@ -238,7 +245,7 @@ mod windows_smoke {
              --render-id ID               select render endpoint by MMDevice id\n\
              --capture-name NAME         also open a capture endpoint by name\n\
              --capture-id ID             also open a capture endpoint by MMDevice id\n\
-             --round-trip                write a tone and verify captured PCM\n\
+             --round-trip                use app roles, write a tone, verify captured PCM\n\
              --verify-roles              require all four provider-owned QPWGraph endpoints\n\
              --verify-absent             require no provider-owned QPWGraph endpoints\n\
              --duration-ms N             start each client for N milliseconds (max 60000)"
@@ -299,22 +306,46 @@ mod windows_smoke {
         let mut provider_endpoints = Vec::new();
         for (flow, endpoints) in [(Flow::Render, renders), (Flow::Capture, captures)] {
             for endpoint in endpoints {
-                let Some(service) = property_string(
-                    &endpoint.device,
-                    &Properties::DEVPKEY_Device_Service as *const _ as *const PROPERTYKEY,
-                ) else {
-                    continue;
-                };
-                if !service.eq_ignore_ascii_case(QPWGRAPH_DRIVER_SERVICE) {
-                    continue;
-                }
-                let Some(role) = property_string(
+                let role = property_string(
                     &endpoint.device,
                     &PKEY_QPWGRAPH_ENDPOINT_ROLE as *const PROPERTYKEY,
-                ) else {
+                );
+                let parent =
+                    devnode_property_string(&endpoint.id, &Properties::DEVPKEY_Device_Parent);
+                let service = parent
+                    .as_deref()
+                    .and_then(|parent_id| {
+                        devnode_property_string_for_instance(
+                            parent_id,
+                            &Properties::DEVPKEY_Device_Service,
+                        )
+                    })
+                    .or_else(|| {
+                        devnode_property_string(&endpoint.id, &Properties::DEVPKEY_Device_Service)
+                    });
+                let provider_identity = service
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(QPWGRAPH_DRIVER_SERVICE))
+                    && parent.as_deref().is_some_and(|value| {
+                        value.eq_ignore_ascii_case(QPWGRAPH_ROOT_DEVICE_INSTANCE_ID)
+                    });
+                if !provider_identity {
+                    if role.is_some() {
+                        return Err(SmokeError::Failure(format!(
+                            "provider-owned endpoint {} has a role but no matching service or parent identity (service={service:?}, parent={parent:?})",
+                            endpoint.id
+                        )));
+                    }
+                    continue;
+                }
+                let Some(role) = role else {
                     return Err(SmokeError::Failure(format!(
-                        "provider-owned endpoint {} has no readable QPWGraph endpoint role",
-                        endpoint.id
+                        "provider-owned endpoint {} has no readable QPWGraph endpoint role ({})",
+                        endpoint.id,
+                        property_diagnostic(
+                            &endpoint.device,
+                            &PKEY_QPWGRAPH_ENDPOINT_ROLE as *const PROPERTYKEY,
+                        )
                     )));
                 };
                 let Some((expected_flow, _)) = expected
@@ -394,6 +425,38 @@ mod windows_smoke {
             .filter(|endpoint| match selector {
                 Selector::Name(name) => endpoint.name.eq_ignore_ascii_case(name),
                 Selector::Id(id) => endpoint.id == *id,
+                Selector::Role(role) => {
+                    let parent =
+                        devnode_property_string(&endpoint.id, &Properties::DEVPKEY_Device_Parent);
+                    let service = parent
+                        .as_deref()
+                        .and_then(|parent_id| {
+                            devnode_property_string_for_instance(
+                                parent_id,
+                                &Properties::DEVPKEY_Device_Service,
+                            )
+                        })
+                        .or_else(|| {
+                            devnode_property_string(
+                                &endpoint.id,
+                                &Properties::DEVPKEY_Device_Service,
+                            )
+                        });
+                    let provider_identity = service
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(QPWGRAPH_DRIVER_SERVICE))
+                        && parent.as_deref().is_some_and(|value| {
+                            value.eq_ignore_ascii_case(QPWGRAPH_ROOT_DEVICE_INSTANCE_ID)
+                        });
+                    if !provider_identity {
+                        return false;
+                    }
+                    property_string(
+                        &endpoint.device,
+                        &PKEY_QPWGRAPH_ENDPOINT_ROLE as *const PROPERTYKEY,
+                    )
+                    .is_some_and(|value| value.eq_ignore_ascii_case(role))
+                }
             })
             .collect();
         match matches.as_slice() {
@@ -402,6 +465,7 @@ mod windows_smoke {
                 let wanted = match selector {
                     Selector::Name(name) => format!("friendly name {name:?}"),
                     Selector::Id(id) => format!("MMDevice id {id:?}"),
+                    Selector::Role(role) => format!("provider role {role:?}"),
                 };
                 Err(SmokeError::MissingEndpoint(format!(
                     "no active {} endpoint matched {wanted}; run --list",
@@ -462,6 +526,94 @@ mod windows_smoke {
         });
         let _ = unsafe { Com::StructuredStorage::PropVariantClear(&mut value) };
         text.filter(|value| !value.is_empty())
+    }
+
+    fn property_diagnostic(device: &Audio::IMMDevice, key: *const PROPERTYKEY) -> String {
+        let Ok(store) = (unsafe { device.OpenPropertyStore(STGM_READ) }) else {
+            return "OpenPropertyStore failed".into();
+        };
+        let count = unsafe { store.GetCount() }.unwrap_or(0);
+        let mut listed = false;
+        for index in 0..count {
+            let mut candidate: PROPERTYKEY = unsafe { std::mem::zeroed() };
+            if unsafe { store.GetAt(index, &mut candidate) }.is_ok()
+                && candidate.fmtid == unsafe { (*key).fmtid }
+                && candidate.pid == unsafe { (*key).pid }
+            {
+                listed = true;
+                break;
+            }
+        }
+        match unsafe { store.GetValue(key) } {
+            Ok(mut value) => {
+                let variant_type = unsafe { value.Anonymous.Anonymous.vt };
+                let _ = unsafe { Com::StructuredStorage::PropVariantClear(&mut value) };
+                format!(
+                    "property store entries={count}, key-listed={listed}, value-vt={variant_type:?}"
+                )
+            }
+            Err(error) => format!(
+                "property store entries={count}, key-listed={listed}, GetValue failed: {error}"
+            ),
+        }
+    }
+
+    fn devnode_property_string(endpoint_id: &str, key: &DEVPROPKEY) -> Option<String> {
+        devnode_property_string_for_instance(&format!("SWD\\MMDEVAPI\\{endpoint_id}"), key)
+    }
+
+    fn devnode_property_string_for_instance(instance_id: &str, key: &DEVPROPKEY) -> Option<String> {
+        let instance_id_wide: Vec<u16> = instance_id
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut devinst = 0u32;
+        let locate_result = unsafe {
+            CM_Locate_DevNodeW(
+                &mut devinst,
+                PCWSTR(instance_id_wide.as_ptr()),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        };
+        if locate_result != CR_SUCCESS {
+            return None;
+        }
+
+        let mut property_type = DEVPROPTYPE(0);
+        let mut property_size = 0u32;
+        unsafe {
+            CM_Get_DevNode_PropertyW(
+                devinst,
+                key,
+                &mut property_type,
+                None,
+                &mut property_size,
+                0,
+            );
+        }
+        if property_size == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; property_size as usize];
+        let result = unsafe {
+            CM_Get_DevNode_PropertyW(
+                devinst,
+                key,
+                &mut property_type,
+                Some(buffer.as_mut_ptr()),
+                &mut property_size,
+                0,
+            )
+        };
+        if result != CR_SUCCESS || property_type != DEVPROP_TYPE_STRING {
+            return None;
+        }
+        let utf16 = buffer
+            .chunks_exact(2)
+            .map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]]))
+            .take_while(|character| *character != 0)
+            .collect::<Vec<_>>();
+        (!utf16.is_empty()).then(|| String::from_utf16_lossy(&utf16))
     }
 
     fn open_start_stop(

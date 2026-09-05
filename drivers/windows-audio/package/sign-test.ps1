@@ -9,7 +9,9 @@ param(
     [Parameter(Mandatory = $false)]
     [string] $CertificateSubject = 'CN=QPWGraph Audio Test',
     [Parameter(Mandatory = $false)]
-    [string] $CertificateOutputPath
+    [string] $CertificateOutputPath,
+    [Parameter(Mandatory = $false)]
+    [switch] $ImportCertificate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +28,9 @@ if (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint) -and $CreateCertif
 }
 if (-not [string]::IsNullOrWhiteSpace($CertificateOutputPath) -and -not $CreateCertificate) {
     throw '-CertificateOutputPath is only valid with -CreateCertificate.'
+}
+if ($ImportCertificate -and -not $CreateCertificate) {
+    throw '-ImportCertificate is only valid with -CreateCertificate.'
 }
 
 $packageRootPath = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path
@@ -64,7 +69,13 @@ if ($CreateCertificate) {
         $CertificateOutputPath = Join-Path ([IO.Path]::GetTempPath()) 'qpwgraph-audio-test.cer'
     }
     Export-Certificate -Cert $certificate -FilePath $CertificateOutputPath -Type CERT | Out-Null
-    Write-Warning "Copy $CertificateOutputPath to the test machine and import it into LocalMachine\Root and LocalMachine\TrustedPublisher before installation."
+    if ($ImportCertificate) {
+        Import-Certificate -FilePath $CertificateOutputPath -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+        Import-Certificate -FilePath $CertificateOutputPath -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+        Write-Output 'Imported the disposable test certificate into LocalMachine\Root and LocalMachine\TrustedPublisher.'
+    } else {
+        Write-Warning "Copy $CertificateOutputPath to the test machine and import it into LocalMachine\Root and LocalMachine\TrustedPublisher before installation."
+    }
 } else {
     $normalizedThumbprint = $CertificateThumbprint -replace '\s', ''
     $certificate = Get-ChildItem -Path 'Cert:\CurrentUser\My' |

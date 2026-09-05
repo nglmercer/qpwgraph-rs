@@ -128,6 +128,8 @@ fn stage_package(
         "uninstall.ps1",
         "sign-test.ps1",
         "test-validation.ps1",
+        "run-validation-elevated.ps1",
+        "run-validation.cmd",
         "README.md",
     ] {
         let path = output.join(filename);
@@ -212,6 +214,8 @@ fn stage_package(
         "uninstall.ps1",
         "sign-test.ps1",
         "test-validation.ps1",
+        "run-validation-elevated.ps1",
+        "run-validation.cmd",
         "README.md",
     ] {
         let source = package_source.join(filename);
@@ -533,18 +537,22 @@ fn validate_package_metadata() {
         "AddInterface=%KSCATEGORY_RENDER%,%KSNAME_RelaySink%,QPWGraph_RelaySink_Interface",
         "AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_RelayMicrophone%,QPWGraph_RelayMicrophone_Interface",
         "[QPWGraph_Output_Interface.AddReg]",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"app-render\"",
         "AddProperty=QPWGraph_Output_Interface.AddProperty",
         "[QPWGraph_Output_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"app-render\"",
         "[QPWGraph_Monitor_Interface.AddReg]",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"app-monitor\"",
         "AddProperty=QPWGraph_Monitor_Interface.AddProperty",
         "[QPWGraph_Monitor_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"app-monitor\"",
         "[QPWGraph_RelaySink_Interface.AddReg]",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"relay-render\"",
         "AddProperty=QPWGraph_RelaySink_Interface.AddProperty",
         "[QPWGraph_RelaySink_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"relay-render\"",
         "[QPWGraph_RelayMicrophone_Interface.AddReg]",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"relay-capture\"",
         "AddProperty=QPWGraph_RelayMicrophone_Interface.AddProperty",
         "[QPWGraph_RelayMicrophone_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"relay-capture\"",
@@ -567,16 +575,20 @@ fn validate_package_metadata() {
         "AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_VirtualMonitor%,QPWGraph_Monitor_Interface",
         "AddInterface=%KSCATEGORY_RENDER%,%KSNAME_RelaySink%,QPWGraph_RelaySink_Interface",
         "AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_RelayMicrophone%,QPWGraph_RelayMicrophone_Interface",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"app-render\"",
         "AddProperty=QPWGraph_Output_Interface.AddProperty",
         "[QPWGraph_Output_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"app-render\"",
         "AddProperty=QPWGraph_Monitor_Interface.AddProperty",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"app-monitor\"",
         "[QPWGraph_Monitor_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"app-monitor\"",
         "AddProperty=QPWGraph_RelaySink_Interface.AddProperty",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"relay-render\"",
         "[QPWGraph_RelaySink_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"relay-render\"",
         "AddProperty=QPWGraph_RelayMicrophone_Interface.AddProperty",
+        "HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%,,\"relay-capture\"",
         "[QPWGraph_RelayMicrophone_Interface.AddProperty]",
         "%QPWGraph_EndpointRoleGuid%,2,18,,\"relay-capture\"",
         "PKEY_QPWGraph_EndpointRole=\"{3c8e8ef9-1f7f-4fcb-9c36-4a7e19f36d12},2\"",
@@ -586,13 +598,6 @@ fn validate_package_metadata() {
             driver_inf_text.contains(required),
             "{} is missing required INF marker {required}",
             driver_inf.display()
-        );
-    }
-    for (path, text) in [(&inf, &inf_text), (&driver_inf, &driver_inf_text)] {
-        assert!(
-            !text.contains("HKR,EP\\0,%PKEY_QPWGraph_EndpointRole%"),
-            "{} still publishes the semantic role through the legacy registry-only form",
-            path.display()
         );
     }
     let manifest_text = fs::read_to_string(&manifest).unwrap_or_else(|error| {
@@ -666,6 +671,8 @@ fn validate_package_metadata() {
         "Root\\QPWGRAPH_AUDIO",
         "/remove-device",
         "Get-QpwgraphDeviceDiagnosis",
+        "Driver package is up-to-date on device",
+        "Never remove a devnode that this invocation did not create",
     ] {
         assert!(
             install_script.contains(required),
@@ -693,14 +700,16 @@ fn validate_package_metadata() {
             package.join("uninstall.ps1").display()
         );
     }
-    let signing_script = fs::read_to_string(package.join("sign-test.ps1")).unwrap_or_else(|error| {
-        panic!(
-            "could not read {}: {error}",
-            package.join("sign-test.ps1").display()
-        );
-    });
+    let signing_script =
+        fs::read_to_string(package.join("sign-test.ps1")).unwrap_or_else(|error| {
+            panic!(
+                "could not read {}: {error}",
+                package.join("sign-test.ps1").display()
+            );
+        });
     for required in [
         "New-SelfSignedCertificate",
+        "ImportCertificate",
         "signtool.exe",
         "Inf2Cat.exe",
         "CertificateThumbprint",
@@ -735,6 +744,23 @@ fn validate_package_metadata() {
             validation_script.contains(required),
             "{} is missing guided-validation marker {required}",
             package.join("test-validation.ps1").display()
+        );
+    }
+    let elevated_validation_script =
+        fs::read_to_string(package.join("run-validation-elevated.ps1")).unwrap_or_else(|error| {
+            panic!(
+                "could not read {}: {error}",
+                package.join("run-validation-elevated.ps1").display()
+            );
+        });
+    for required in [
+        "Start-Process -FilePath 'powershell.exe' -Verb RunAs",
+        "validation-last.log",
+    ] {
+        assert!(
+            elevated_validation_script.contains(required),
+            "{} is missing elevated-launch marker {required}",
+            package.join("run-validation-elevated.ps1").display()
         );
     }
     println!("driver package metadata validated");

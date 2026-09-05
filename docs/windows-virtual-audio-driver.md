@@ -16,9 +16,10 @@ Endpoint ownership is not inferred from these display names. The provider must
 publish the `qpwgraph_audio` service identity and the project-owned endpoint
 role property (`app-render`, `app-monitor`, `relay-render`, or
 `relay-capture`) on each endpoint interface; the user-mode worker records the
-opaque stable endpoint id and driver version when available. The INF uses the
-INF `AddProperty` sections on each audio interface for all four semantic
-roles.
+opaque stable endpoint id and driver version when available. The INF writes
+the role into each endpoint's `HKR,EP\0` property store for
+`IMMDevice::OpenPropertyStore` and retains typed `AddProperty` metadata for
+device-property consumers.
 
 Mixing, effects, resampling, gain, meters, relay policy, persistence, and UI
 remain in the Rust user-mode router. The stream transport is bounded and
@@ -31,10 +32,11 @@ overflow, and discontinuity tests. The default driver package remains a
 fail-closed Stage-0 bootstrap: device-add returns `STATUS_NOT_SUPPORTED`.
 An opt-in eWDK build now contains the ACX app and relay endpoint pairs,
 circuit/stream callbacks, and two independent Rust-owned bounded PCM-cable
-paths, but it is not installable until shared-mode, verifier, package, and
-signing validation prove those endpoints on Windows. Installing the default
-binary is therefore intentionally impossible rather than silently creating no
-endpoint.
+paths. A Windows 10 test-signed validation pass now proves endpoint
+enumeration, role ownership, shared-mode streaming, and the app cable's
+non-silent round trip. The source/default package remains fail-closed, and a
+public release still requires Verifier, HLK, Microsoft signing, Secure Boot,
+and ordinary-client validation.
 
 Build/package commands require a real eWDK/WDK developer prompt, KMDF 1.31 or
 newer, a released LLVM 17--21 toolchain, and the WDK tools. LLVM 22 currently breaks

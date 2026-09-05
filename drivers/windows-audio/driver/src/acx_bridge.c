@@ -144,6 +144,20 @@ static NTSTATUS
 QpwgraphEvtDeviceReleaseHardware(WDFDEVICE Device,
                                  WDFCMRESLIST ResourcesTranslated);
 
+static NTSTATUS QpwgraphEvtDeviceD0Entry(WDFDEVICE Device,
+                                         WDF_POWER_DEVICE_STATE PreviousState);
+
+static NTSTATUS QpwgraphEvtDeviceD0Exit(WDFDEVICE Device,
+                                        WDF_POWER_DEVICE_STATE TargetState);
+
+static NTSTATUS QpwgraphEvtCircuitPowerUp(WDFDEVICE Device,
+                                          ACXCIRCUIT Circuit,
+                                          WDF_POWER_DEVICE_STATE PreviousState);
+
+static NTSTATUS QpwgraphEvtCircuitPowerDown(WDFDEVICE Device,
+                                            ACXCIRCUIT Circuit,
+                                            WDF_POWER_DEVICE_STATE TargetState);
+
 static NTSTATUS QpwgraphEvtRenderCircuitCreateStream(
     WDFDEVICE Device, ACXCIRCUIT Circuit, ACXPIN Pin,
     PACXSTREAM_INIT StreamInit, ACXDATAFORMAT StreamFormat,
@@ -1046,7 +1060,15 @@ static NTSTATUS QpwgraphCreateCircuit(WDFDEVICE Device, BOOLEAN IsCapture,
   }
   (VOID) AcxCircuitInitAssignName(circuitInit, &circuitName);
   AcxCircuitInitSetCircuitType(circuitInit, IsCapture ? AcxCircuitTypeCapture
-                                                      : AcxCircuitTypeRender);
+                                                       : AcxCircuitTypeRender);
+  {
+    ACX_CIRCUIT_PNPPOWER_CALLBACKS powerCallbacks;
+    ACX_CIRCUIT_PNPPOWER_CALLBACKS_INIT(&powerCallbacks);
+    powerCallbacks.EvtAcxCircuitPowerUp = QpwgraphEvtCircuitPowerUp;
+    powerCallbacks.EvtAcxCircuitPowerDown = QpwgraphEvtCircuitPowerDown;
+    AcxCircuitInitSetAcxCircuitPnpPowerCallbacks(circuitInit,
+                                                 &powerCallbacks);
+  }
   status = AcxCircuitInitAssignAcxCreateStreamCallback(
       circuitInit, IsCapture ? (Cable == QpwgraphRelayCable
                                     ? QpwgraphEvtRelayCaptureCircuitCreateStream
@@ -1106,10 +1128,11 @@ static NTSTATUS QpwgraphCreateCircuit(WDFDEVICE Device, BOOLEAN IsCapture,
     return status;
   }
 
-  // The endpoint-facing pin owns the device format list: Source for render
-  // circuits and Sink for capture circuits.  The circuit-side pin is the
-  // stream connection and is not the endpoint format authority.
-  formatList = AcxPinGetRawDataFormatList(pins[1]);
+  // ACX associates the raw processing-mode format list with the host/stream
+  // pin. This is the pin used by the Microsoft ACX render and capture
+  // samples; the bridge pin describes the physical endpoint side of the
+  // circuit and does not own the stream format list.
+  formatList = AcxPinGetRawDataFormatList(pins[0]);
   if (formatList == NULL) {
     return STATUS_INSUFFICIENT_RESOURCES;
   }
@@ -1279,6 +1302,42 @@ QpwgraphEvtDeviceReleaseHardware(WDFDEVICE Device,
   return status;
 }
 
+static NTSTATUS QpwgraphEvtDeviceD0Entry(WDFDEVICE Device,
+                                         WDF_POWER_DEVICE_STATE PreviousState) {
+  UNREFERENCED_PARAMETER(Device);
+  UNREFERENCED_PARAMETER(PreviousState);
+  PAGED_CODE();
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS QpwgraphEvtDeviceD0Exit(WDFDEVICE Device,
+                                        WDF_POWER_DEVICE_STATE TargetState) {
+  UNREFERENCED_PARAMETER(Device);
+  UNREFERENCED_PARAMETER(TargetState);
+  PAGED_CODE();
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS QpwgraphEvtCircuitPowerUp(WDFDEVICE Device,
+                                          ACXCIRCUIT Circuit,
+                                          WDF_POWER_DEVICE_STATE PreviousState) {
+  UNREFERENCED_PARAMETER(Device);
+  UNREFERENCED_PARAMETER(Circuit);
+  UNREFERENCED_PARAMETER(PreviousState);
+  PAGED_CODE();
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS QpwgraphEvtCircuitPowerDown(WDFDEVICE Device,
+                                            ACXCIRCUIT Circuit,
+                                            WDF_POWER_DEVICE_STATE TargetState) {
+  UNREFERENCED_PARAMETER(Device);
+  UNREFERENCED_PARAMETER(Circuit);
+  UNREFERENCED_PARAMETER(TargetState);
+  PAGED_CODE();
+  return STATUS_SUCCESS;
+}
+
 NTSTATUS qpwgraph_acx_device_add(void *driver, void *device_init) {
   ACX_DEVICEINIT_CONFIG deviceInitConfig;
   ACX_DEVICE_CONFIG deviceConfig;
@@ -1306,6 +1365,8 @@ NTSTATUS qpwgraph_acx_device_add(void *driver, void *device_init) {
   WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
   pnpCallbacks.EvtDevicePrepareHardware = QpwgraphEvtDevicePrepareHardware;
   pnpCallbacks.EvtDeviceReleaseHardware = QpwgraphEvtDeviceReleaseHardware;
+  pnpCallbacks.EvtDeviceD0Entry = QpwgraphEvtDeviceD0Entry;
+  pnpCallbacks.EvtDeviceD0Exit = QpwgraphEvtDeviceD0Exit;
   WdfDeviceInitSetPnpPowerEventCallbacks(deviceInit, &pnpCallbacks);
 
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, QPWGRAPH_DEVICE_CONTEXT);

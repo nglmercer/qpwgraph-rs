@@ -75,16 +75,28 @@ function Assert-ReadyPackage {
 }
 
 function Invoke-Native([string] $FilePath, [string[]] $Arguments, [string] $Description) {
+    # PowerShell 5.1 promotes native stderr to an error record when the caller
+    # uses $ErrorActionPreference = 'Stop'. Cargo and several WDK tools write
+    # normal progress/status text to stderr, so success must be determined by
+    # the native exit code instead of the stream destination.
+    $ErrorActionPreference = 'Continue'
     & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Description failed with exit code $LASTEXITCODE."
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Description failed with exit code $exitCode."
     }
 }
 
 function Invoke-PowerShellScript([string] $ScriptPath, [string[]] $Arguments, [string] $Description) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Description failed with exit code $LASTEXITCODE."
+    $ErrorActionPreference = 'Continue'
+    $output = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @Arguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    foreach ($item in $output) {
+        Write-Output $item
+    }
+    if ($exitCode -ne 0) {
+        $details = ($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+        throw "$Description failed with exit code $exitCode. $details"
     }
 }
 
@@ -106,7 +118,7 @@ function Invoke-Prepare {
     }
 
     $certificatePath = Join-Path ([IO.Path]::GetTempPath()) ("qpwgraph-audio-test-{0}.cer" -f [Guid]::NewGuid())
-    $signOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $signScript -CreateCertificate -CertificateOutputPath $certificatePath 2>&1)
+    $signOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $signScript -CreateCertificate -ImportCertificate -CertificateOutputPath $certificatePath 2>&1)
     if ($LASTEXITCODE -ne 0) {
         $details = ($signOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
         throw "The package signing helper failed: $details"
@@ -128,6 +140,7 @@ function Invoke-Prepare {
 
     $smokeManifest = Join-Path $repositoryRoot 'drivers\windows-audio\tests\smoke\Cargo.toml'
     Invoke-Native 'cargo.exe' @('build', '--manifest-path', $smokeManifest, '--locked') 'The smoke-probe build'
+    Write-Output 'Smoke probe build completed successfully.'
     $script:smokePath = Join-Path $repositoryRoot 'drivers\windows-audio\target\debug\qpwgraph-audio-smoke.exe'
 
     Write-Output "Package signed with test certificate $thumbprint"
@@ -174,8 +187,6 @@ function Invoke-Smoke {
     Invoke-Native $smokePath @('--verify-roles') 'Provider-role verification'
     Invoke-Native $smokePath @('--list') 'Endpoint listing'
     Invoke-Native $smokePath @(
-        '--render-name', 'QPWGraph Virtual Output',
-        '--capture-name', 'QPWGraph Virtual Monitor',
         '--round-trip',
         '--duration-ms', $RoundTripDurationMs.ToString()
     ) 'Render/capture round-trip'

@@ -37,28 +37,33 @@ Pop-Location
 The helper signs `qpwgraph_audio.sys`, regenerates the catalog so its hashes
 match the signed driver, signs `qpwgraph-audio.cat`, and verifies the exact
 catalog/INF/SYS set that will be installed. It does not change boot settings,
-install the package, or import the certificate. Import the
+install the package, or import the certificate unless `-ImportCertificate` is
+passed. Import the
 printed `.cer` into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`
 on the test machine from an elevated PowerShell prompt. An existing code
 signing certificate can be selected with
 `-CertificateThumbprint <thumbprint>` instead.
 
-For a guided elevated flow, use the staged `test-validation.ps1` runner. Each
-phase is explicit; only phases passed `-Reboot` restart the machine:
+For a guided elevated flow, use the staged `run-validation.cmd` launcher. It
+uses `ExecutionPolicy Bypass`, requests a Windows UAC elevation when needed,
+and writes the complete result to `validation-last.log`, so the validation
+output can be inspected without copying it from a separate administrator
+console. Each phase is explicit; only phases passed `-Reboot` restart the
+machine:
 
-```powershell
+```text
 Set-Location drivers/windows-audio/target/qpwgraph-audio-package
-.\test-validation.ps1 -Phase Prepare
-.\test-validation.ps1 -Phase EnableTestMode -Reboot
+.\run-validation.cmd -Phase Prepare
+.\run-validation.cmd -Phase EnableTestMode -Reboot
 # After Windows restarts in Test Mode:
-.\test-validation.ps1 -Phase Install
-.\test-validation.ps1 -Phase Smoke
+.\run-validation.cmd -Phase Install
+.\run-validation.cmd -Phase Smoke
 # Replace oem42.inf with the exact name printed by Install:
-.\test-validation.ps1 -Phase Uninstall -PublishedInf oem42.inf
-.\test-validation.ps1 -Phase DisableTestMode -Reboot
+.\run-validation.cmd -Phase Uninstall -PublishedInf oem42.inf
+.\run-validation.cmd -Phase DisableTestMode -Reboot
 ```
 
-The runner requires Administrator elevation, builds the smoke probe during
+The launcher requires Administrator elevation, builds the smoke probe during
 `Prepare`, imports only the public test certificate, creates the development
 root devnode through the WDK `devgen.exe` tool, performs role and round-trip
 verification, and never enables `-SkipEndpointVerification`.
@@ -93,7 +98,6 @@ provides the live gates:
 ```powershell
 & $smoke --verify-roles
 & $smoke --list
-& $smoke --render-name 'QPWGraph Virtual Output' --capture-name 'QPWGraph Virtual Monitor'
 & $smoke --round-trip --duration-ms 5000
 ```
 
@@ -129,12 +133,16 @@ The package must never set a Windows default audio device. Test signing is for
 development machines only; public packages require Microsoft signing and
 Secure Boot validation.
 
-The four endpoint roles are published as provider-owned custom interface
-properties with INF `AddProperty` sections: `app-render` for Virtual Output,
-`app-monitor` for Virtual Monitor, `relay-render` for Relay Sink, and
-`relay-capture` for Relay Microphone. The ACX bridge gives the app pair and
-relay pair independent bounded PCM cables; live endpoint enumeration and
-verifier gates are still required before the package can become installable.
+The four endpoint roles are published as provider-owned custom endpoint
+properties in the INF `HKR,EP\0` sections, so
+`IMMDevice::OpenPropertyStore` can read them: `app-render` for Virtual
+Output, `app-monitor` for Virtual Monitor, `relay-render` for Relay Sink, and
+`relay-capture` for Relay Microphone. The matching typed `AddProperty`
+sections remain on each interface for device-property consumers. The ACX
+bridge gives the app pair and relay pair independent bounded PCM cables. The
+Windows 10 test-signed pass verified all four roles and the app cable's
+non-silent round trip; Driver Verifier, HLK, release-signing, Secure Boot, and
+ordinary-client relay tests remain separate release gates.
 
 The `--audit-toolchain` command is the explicit ACX gate. It checks
 WDKContentRoot, the versioned KM CRT headers, acx.h, the target-architecture
@@ -149,9 +157,11 @@ After a passing audit, the opt-in binding compilation is:
     Pop-Location
 
 That command proves that the selected eWDK ACX headers and the feature-gated
-device/circuit/stream bridge can be compiled. It does not prove that the
-driver loads, enumerates an endpoint, or passes shared-mode, verifier, HLK, or
-signing validation; the package remains fail-closed until those gates pass.
+device/circuit/stream bridge can be compiled. The test-signed Windows pass
+also proves that the generated driver loads, enumerates all four roles, and
+passes the basic shared-mode round trip. The package remains development-only
+until Verifier, HLK, release-signing, Secure Boot, and ordinary-client gates
+pass.
 
 `install.ps1` creates the development-only `ROOT\DEVGEN\QPWGRAPH_AUDIO` devnode with
 WDK `devgen.exe`, then uses PnPUtil for package installation and removal while
@@ -175,8 +185,8 @@ Example release lifecycle commands:
 
 After a signed package is installed on a Windows test machine, run the smoke
 probe with `--render-name "QPWGraph Virtual Output"` or the exact
-`--render-id` printed by `--list`. `--round-trip` additionally opens
-`QPWGraph Virtual Monitor`, writes a deterministic tone to the render stream,
-and requires non-silent captured PCM. Without `--round-trip`, the probe only
-exercises shared-mode open/start/stop/reset. It exits with code 2 when the
-requested endpoint is absent.
+`--render-id` printed by `--list`. `--round-trip` selects the provider-owned
+`app-render` and `app-monitor` roles, writes a deterministic tone to the render
+stream, and requires non-silent captured PCM. Without `--round-trip`, the
+probe only exercises shared-mode open/start/stop/reset. It exits with code 2
+when the requested endpoint is absent.

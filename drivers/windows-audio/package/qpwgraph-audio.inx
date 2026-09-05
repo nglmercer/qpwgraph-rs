@@ -49,6 +49,7 @@ AddProperty=QPWGraph_Output_Interface.AddProperty
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%QPWGraph.VirtualOutputName%
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_QPWGraph_EndpointRole%,,"app-render"
 HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
 
 [QPWGraph_Output_Interface.AddProperty]
@@ -62,6 +63,7 @@ AddProperty=QPWGraph_Monitor_Interface.AddProperty
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%QPWGraph.VirtualMonitorName%
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_QPWGraph_EndpointRole%,,"app-monitor"
 HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
 
 [QPWGraph_Monitor_Interface.AddProperty]
@@ -75,6 +77,7 @@ AddProperty=QPWGraph_RelaySink_Interface.AddProperty
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%QPWGraph.RelaySinkName%
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_QPWGraph_EndpointRole%,,"relay-render"
 HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
 
 [QPWGraph_RelaySink_Interface.AddProperty]
@@ -88,6 +91,7 @@ AddProperty=QPWGraph_RelayMicrophone_Interface.AddProperty
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%QPWGraph.RelayMicrophoneName%
 HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_QPWGraph_EndpointRole%,,"relay-capture"
 HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
 
 [QPWGraph_RelayMicrophone_Interface.AddProperty]

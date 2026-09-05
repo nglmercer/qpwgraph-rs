@@ -3,8 +3,11 @@
 Status snapshot: 2026-09-05. The repository now contains the P0 user-mode
 implementation slices below. The ACX-enabled release driver links locally and
 the WDK `stampinf`/`Inf2Cat` package stage passes with WDK 10.0.26100 and
-released LLVM 21.1.2; live endpoint, HLK, and signing gates remain explicitly
-open.
+released LLVM 21.1.2. A live Windows 10 version 2004 test-signed pass now
+verifies all four ACX endpoints, role ownership, shared-mode streaming, a
+non-silent app render/monitor round trip, install, and uninstall. Driver
+Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client gates remain
+explicitly open.
 
 This document replaces the old “build everything from zero” roadmap with the next implementation steps after the Windows parity foundations landed.
 
@@ -27,21 +30,21 @@ The repository-side evidence for this snapshot is complete:
   after test-signing.
 - the user-mode smoke probe passed `--verify-absent`, confirming that no
   provider-owned QPWGraph endpoint is currently installed on this machine.
+- the live Windows 10 version 2004 validation pass installed `oem19.inf`,
+  verified `app-render`, `app-monitor`, `relay-render`, and `relay-capture`,
+  passed the 48 kHz stereo shared-mode round trip with non-silent PCM, and
+  removed the exact package again without changing Windows defaults; the
+  machine is clean after that pass.
 
-The first authorized live pass on the Windows 10 version 2004 test image then
-created `ROOT\DEVGEN\QPWGRAPH_AUDIO` and installed `oem18.inf`, but the ACX
-endpoint smoke gate failed because the driver did not load. System events
-reported `Driver Version: 1.33` against a loaded KMDF library version `1.31`.
-The package was retargeted to KMDF 1.31 and the explicitly skipped `oem18.inf`
-install was removed. A fresh `oem19.inf` attempt then reached PnPUtil but Code
-Integrity reported the driver-store catalog as unsigned; that attempt was also
-not acceptance evidence. The rebuilt package now targets the ACX 1.1 surface
-supported by Windows 10 version 2004 while keeping the minimum ACX framework
-version separate, and both signing/install helpers verify the exact staged
-artifacts before PnPUtil is called. Re-run `Prepare` and the normal `Install`
-phase to obtain a fresh live result. Live endpoint, client, Verifier, HLK,
-Microsoft signing, Secure Boot, and package lifecycle checks below remain
-unchecked until the external validation passes.
+The first authorized live attempts on the Windows 10 version 2004 test image
+exposed two packaging defects: the driver was initially built for KMDF 1.33
+while the image loaded KMDF 1.31, and a later catalog was not trusted by Code
+Integrity. The package is now retargeted to KMDF 1.31, targets the ACX 1.1
+surface supported by Windows 10 version 2004, and both signing/install helpers
+verify the exact staged artifacts before PnPUtil is called. The successful
+`oem19.inf` pass then proved the endpoint and stream gates locally. Release
+Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client evidence
+remain external gates.
 
 The main architectural rule stays unchanged:
 
@@ -59,7 +62,7 @@ The main architectural rule stays unchanged:
 - [x] persisted application routes reconcile on startup/refresh and migrate legacy destination selectors;
 - [x] Windows audio report can be copied from the UI without exposing PCM, paths, or relay secrets;
 - [x] virtual endpoint ownership now requires the qpwgraph service plus a provider-published semantic role property;
-- [x] endpoint roles use typed INF `AddProperty` declarations, duplicate roles fail closed, and stable endpoint IDs remain case-sensitive;
+- [x] endpoint roles use typed INF `AddProperty` declarations plus endpoint-store `HKR,EP\0` values, duplicate roles fail closed, and stable endpoint IDs remain case-sensitive;
 - [x] provider-role smoke validation rejects missing, unknown, wrong-flow, and duplicate roles, while opt-in eWDK CI is required when enabled;
 - [x] the driver smoke binary enumerates active endpoints, exercises shared-mode open/start/stop/reset, and can verify a non-silent round trip without changing defaults;
 - [x] driver timing/discontinuity primitives, bounded `VirtualCable` transport, and fail-closed ACX binding gates are present;
@@ -68,7 +71,8 @@ The main architectural rule stays unchanged:
 - [x] complete persisted application-route effect instances restore transactionally with parameters and bypass/enabled state, while legacy ID-only chains fail closed;
 - [x] rejected Windows route/effect/gain replacements restore the prior router tables and control-plane ownership instead of leaving half-applied state;
 - [x] Windows rejects module-backed effects until a matching realtime host exists, and the ACX bridge enforces one render producer and one capture consumer per bounded cable;
-- [ ] a real enumerated/streaming endpoint, relay microphone, installer-ready package, and HLK/signing evidence still require an eWDK/Windows validation pass.
+- [x] a test-signed Windows 10 pass enumerates and streams the four ACX endpoints, verifies the relay-microphone role, and proves the install-ready development package lifecycle without changing defaults;
+- [ ] Driver Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client relay/effects evidence remain release gates.
 
 ---
 
@@ -780,8 +784,10 @@ timer-driven packet completion, and monotonic presentation position. Each
 pair crosses the narrow C ABI into its own Rust `SpscSampleRing`, and capture
 underflow is filled with silence. The small bindgen wrappers remain narrow ABI
 boundaries; the production bridge now also links as a release kernel driver.
-Test-signed Windows endpoint and stream tests are still required before the
-package is considered ready.
+The test-signed Windows endpoint and stream pass now covers endpoint
+enumeration, role ownership, shared-mode start/stop, and the app cable's
+non-silent round trip. Verifier, HLK, release-signing, Secure Boot, and
+ordinary-client tests remain separate gates.
 
 The opt-in eWDK CI job runs both `--audit-toolchain` and
 `cargo check -p qpwgraph-audio --features acx` before attempting the package
@@ -809,7 +815,7 @@ Do not claim four-endpoint readiness until this succeeds:
 [x] ACX stream callback config compiles
 [x] ACX-enabled release driver links
 [x] unsigned INF/CAT package stages
-[ ] test-signed package loads
+[x] test-signed package loads and passes endpoint-role/shared-mode smoke
 ```
 
 ---
@@ -818,8 +824,9 @@ Do not claim four-endpoint readiness until this succeeds:
 
 The feature-gated implementation creates the app render/monitor pair and the
 independent relay sink/microphone pair, and connects each pair to its own
-bounded Rust cable. The acceptance conditions below remain unchecked until a
-real eWDK/test-signed Windows pass.
+bounded Rust cable. The test-signed Windows pass verified all four endpoint
+roles and the app render/monitor stream; relay ordinary-client acceptance and
+release stability gates remain open.
 
 The first live validation target is the app render/monitor pair; relay
 endpoint acceptance depends on the same stream, verifier, and package gates.
@@ -1019,7 +1026,8 @@ pub struct QpwVirtualEndpointIdentity {
 The provider contract used by the worker is:
 
 ```text
-DEVPKEY_Device_Service == qpwgraph_audio
+endpoint parent == ROOT\\DEVGEN\\QPWGRAPH_AUDIO
+parent DEVPKEY_Device_Service == qpwgraph_audio
 PKEY_QPWGraph_EndpointRole == app-render | app-monitor | relay-render | relay-capture
 ```
 
@@ -1028,10 +1036,13 @@ The current key declaration is `{3c8e8ef9-1f7f-4fcb-9c36-4a7e19f36d12},2`.
 The role key is project-owned and is intentionally separate from the display
 name. The worker also records `PKEY_AudioEndpoint_StableId` and the driver
 version when Windows exposes them. The ACX endpoint still has to publish this
-contract on each endpoint interface. The current INF template uses `AddProperty`
-sections for all four role values; until a live ACX install exposes and verifies
-both properties on all four endpoints, the health state stays
-`NotInstalled`/`Incomplete` and application isolation remains fail-closed.
+contract on each endpoint interface. The current INF template uses endpoint
+store `HKR,EP\0` values for the four role values and retains typed
+`AddProperty` sections for device-property consumers. The live test-signed
+install exposed and verified both forms on all four endpoints. The Windows 10
+image does not expose `PKEY_AudioEndpoint_StableId`, so the selector continues
+to fall back to the opaque MMDevice ID and then a unique friendly name on that
+OS.
 
 ### Required behavior
 
@@ -1046,7 +1057,8 @@ driver update -> retain semantic identity if possible
 # 11. Priority P1 — Relay virtual microphone pair
 
 The feature-gated bridge now includes the second independent cable; live
-endpoint enumeration and ordinary-client acceptance remain open:
+endpoint enumeration and role ownership are verified, while ordinary-client
+acceptance remains open:
 
 ```text
 QPWGraph Relay Sink
