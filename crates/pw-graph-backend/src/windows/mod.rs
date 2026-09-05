@@ -33,7 +33,9 @@ use pw_graph_core::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "relay")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -54,10 +56,12 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows_core::BOOL;
 
 pub mod app_route_policy;
+mod app_route_reconciler;
 mod callbacks;
 mod driver;
 mod effects;
 mod identity;
+mod process_capture;
 pub mod process_loopback;
 mod routing;
 pub mod virtual_device;
@@ -68,20 +72,73 @@ mod tests;
 
 // One 2,100-line file before; `pub(super)` keeps the reach a bare item had
 // there, which is private to `windows`.
+#[cfg(feature = "relay")]
+pub(crate) use self::app_route_policy::verify_live_process_identity;
 pub use self::app_route_policy::{
     AppRoutePolicy, AppRoutePolicySupport, AudioFlow, AudioRole, ProcessIdentity,
     UnsupportedAppRoutePolicy,
+};
+pub use self::app_route_reconciler::{
+    ApplicationRouteActivation, ApplicationRouteCandidate, ApplicationRouteEnvironment,
+    ApplicationRoutePlan, ApplicationRouteReconciler, ApplicationRouteState,
+    ProcessCaptureReadiness,
 };
 use self::callbacks::*;
 pub use self::driver::WindowsAudioDriver;
 use self::driver::*;
 use self::effects::*;
+#[cfg(feature = "relay")]
+pub(crate) use self::identity::find_qpwgraph_endpoint;
+pub use self::identity::WindowsEndpointSelector;
 use self::identity::*;
+pub use self::process_capture::{
+    ProcessCaptureConsumer, ProcessCaptureKey, ProcessCaptureManager, ProcessCaptureRequest,
+    ProcessCaptureState, ProcessCaptureStatus, ProcessMeterReading, ProcessMeterTarget,
+};
 pub use self::process_loopback::{
     ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
 };
 use self::routing::*;
 pub use self::virtual_device::{
-    classify_virtual_endpoint, QpwVirtualEndpointRole, VirtualAudioDriverHealth,
+    classify_driver_owned_endpoint, classify_virtual_endpoint, QpwVirtualEndpointIdentity,
+    QpwVirtualEndpointRole, VirtualAudioDriverHealth,
 };
 use self::worker::*;
+
+/// Capabilities of a Windows application session are intentionally split by
+/// operation. Process-loopback capture is read-only and does not prove that
+/// qpwgraph may rerender the application locally; only an application already
+/// isolated on QPWGraph Virtual Output gets the latter capabilities.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessAudioCapabilities {
+    pub capture_readonly: bool,
+    pub relay_source: bool,
+    pub meter_peak: bool,
+    pub meter_rms: bool,
+    pub mutable_route: bool,
+    pub effects: bool,
+}
+
+impl ProcessAudioCapabilities {
+    pub const fn capture_only() -> Self {
+        Self {
+            capture_readonly: true,
+            relay_source: true,
+            meter_peak: true,
+            meter_rms: true,
+            mutable_route: false,
+            effects: false,
+        }
+    }
+
+    pub const fn isolated() -> Self {
+        Self {
+            capture_readonly: true,
+            relay_source: true,
+            meter_peak: true,
+            meter_rms: true,
+            mutable_route: true,
+            effects: true,
+        }
+    }
+}

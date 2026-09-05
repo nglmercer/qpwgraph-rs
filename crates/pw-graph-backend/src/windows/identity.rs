@@ -7,6 +7,244 @@
 
 use super::*;
 
+/// `PKEY_AudioEndpoint_StableId` was added to the Windows 11 24H2 SDK after
+/// the `windows` crate version currently used by this project. The property is
+/// the next value in the documented `PKEY_AudioEndpoint_*` key family; keep
+/// the raw key isolated here until generated bindings expose it.
+const PKEY_AUDIO_ENDPOINT_STABLE_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x1da5_d803_d492_4edd_8c23_e0c0_ffee_7f0e),
+    pid: 12,
+};
+
+/// Project-owned endpoint role property.  The ACX endpoint provider must
+/// publish this value; it is the semantic part of the ownership proof and is
+/// deliberately not inferred from a user-editable friendly name.  Custom
+/// device-property identifiers start at 2; PID 1 is reserved by the platform.
+const PKEY_QPWGRAPH_ENDPOINT_ROLE: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x3c8e_8ef9_1f7f_4fcb_9c36_4a7e_19f3_6d12),
+    pid: 2,
+};
+
+const QPWGRAPH_DRIVER_SERVICE: &str = "qpwgraph_audio";
+
+/// The durable selector used when Windows exposes a stable endpoint id.
+/// `current_mmdevice_id` and `friendly_name` are fallbacks and diagnostics,
+/// never a replacement for a matching stable id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsEndpointSelector {
+    pub stable_id: Option<String>,
+    pub current_mmdevice_id: Option<String>,
+    pub friendly_name: Option<String>,
+    pub data_flow: AudioFlow,
+}
+
+impl WindowsEndpointSelector {
+    pub fn from_device(device: &Audio::IMMDevice, data_flow: AudioFlow) -> Option<Self> {
+        let current_mmdevice_id = unsafe { device.GetId() }.ok().map(take_pwstr);
+        Some(Self {
+            stable_id: endpoint_stable_id(device),
+            current_mmdevice_id,
+            friendly_name: endpoint_name(device),
+            data_flow,
+        })
+    }
+
+    /// Resolve in durability order. Friendly-name fallback is accepted only
+    /// when exactly one active endpoint has the requested name and flow.
+    pub fn resolve(
+        &self,
+        enumerator: &Audio::IMMDeviceEnumerator,
+    ) -> BackendResult<Option<Audio::IMMDevice>> {
+        let flow = match self.data_flow {
+            AudioFlow::Render => Audio::eRender,
+            AudioFlow::Capture => Audio::eCapture,
+        };
+        // Windows documents this value as opaque and case-sensitive. Do not
+        // normalize it before falling back to the less durable selectors.
+        if let Some(stable_id) = self.stable_id.as_deref() {
+            let collection =
+                unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
+                    .map_err(|error| native_error("enumerate stable endpoint selector", error))?;
+            let count = unsafe { collection.GetCount() }
+                .map_err(|error| native_error("read stable endpoint selector count", error))?;
+            let mut matched = None;
+            for index in 0..count {
+                let Ok(device) = (unsafe { collection.Item(index) }) else {
+                    continue;
+                };
+                if endpoint_stable_id(&device)
+                    .as_deref()
+                    .is_some_and(|candidate| candidate == stable_id)
+                {
+                    if matched.is_some() {
+                        return Err(BackendError::unsupported(
+                            "stable endpoint selector matched multiple active endpoints",
+                        ));
+                    }
+                    matched = Some(device);
+                }
+            }
+            if matched.is_some() {
+                return Ok(matched);
+            }
+        }
+        if let Some(mmdevice_id) = self.current_mmdevice_id.as_deref() {
+            // `IMMDeviceEnumerator::GetDevice` does not carry the selector's
+            // data-flow contract. Resolve through the active collection so a
+            // stale/corrupt capture ID can never be returned for a render
+            // selector (or vice versa).
+            if let Some(device) = active_device_by_id(enumerator, flow, mmdevice_id)? {
+                return Ok(Some(device));
+            }
+        }
+        let Some(name) = self.friendly_name.as_deref() else {
+            return Ok(None);
+        };
+        let collection = unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
+            .map_err(|error| native_error("enumerate endpoint selector fallback", error))?;
+        let count = unsafe { collection.GetCount() }
+            .map_err(|error| native_error("read endpoint selector fallback count", error))?;
+        let mut matches = Vec::new();
+        for index in 0..count {
+            let Ok(device) = (unsafe { collection.Item(index) }) else {
+                continue;
+            };
+            if endpoint_name(&device)
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+            {
+                matches.push(device);
+            }
+        }
+        Ok((matches.len() == 1).then(|| matches.remove(0)))
+    }
+}
+
+fn active_device_by_id(
+    enumerator: &Audio::IMMDeviceEnumerator,
+    flow: Audio::EDataFlow,
+    wanted_id: &str,
+) -> BackendResult<Option<Audio::IMMDevice>> {
+    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
+        .map_err(|error| native_error("enumerate current endpoint selector", error))?;
+    let count = unsafe { collection.GetCount() }
+        .map_err(|error| native_error("read current endpoint selector count", error))?;
+    for index in 0..count {
+        let device = unsafe { collection.Item(index) }
+            .map_err(|error| native_error("read current endpoint selector", error))?;
+        let id = unsafe { device.GetId() }
+            .map(take_pwstr)
+            .map_err(|error| native_error("read current endpoint selector ID", error))?;
+        if id == wanted_id {
+            return Ok(Some(device));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn endpoint_stable_id(device: &Audio::IMMDevice) -> Option<String> {
+    unsafe { property_string(device, &PKEY_AUDIO_ENDPOINT_STABLE_ID) }
+}
+
+/// Resolve an endpoint identity only from provider-owned properties.  The
+/// service name proves which package owns the endpoint; the project role
+/// property survives a friendly-name rename and avoids conflating the four
+/// semantic endpoints.  Until the ACX provider publishes both properties,
+/// this returns `None` and the worker keeps the virtual-driver state degraded.
+pub(super) fn qpwgraph_virtual_endpoint_identity(
+    device: &Audio::IMMDevice,
+    mmdevice_id: &str,
+) -> Option<QpwVirtualEndpointIdentity> {
+    let service = unsafe {
+        property_string(
+            device,
+            &Properties::DEVPKEY_Device_Service as *const _ as *const _,
+        )
+    }?;
+    if !service.eq_ignore_ascii_case(QPWGRAPH_DRIVER_SERVICE) {
+        return None;
+    }
+    let role = unsafe { property_string(device, &PKEY_QPWGRAPH_ENDPOINT_ROLE) }
+        .and_then(|value| qpwgraph_endpoint_role(&value))?;
+    classify_driver_owned_endpoint(
+        role,
+        endpoint_stable_id(device),
+        mmdevice_id.to_owned(),
+        unsafe {
+            property_string(
+                device,
+                &Properties::DEVPKEY_Device_DriverVersion as *const _ as *const _,
+            )
+        },
+        true,
+    )
+}
+
+pub(super) fn qpwgraph_endpoint_role_matches_flow(
+    flow: Audio::EDataFlow,
+    role: QpwVirtualEndpointRole,
+) -> bool {
+    matches!(
+        (flow, role),
+        (Audio::eRender, QpwVirtualEndpointRole::AppRender)
+            | (Audio::eRender, QpwVirtualEndpointRole::RelayRender)
+            | (Audio::eCapture, QpwVirtualEndpointRole::AppMonitor)
+            | (Audio::eCapture, QpwVirtualEndpointRole::RelayCapture)
+    )
+}
+
+/// Find one active endpoint by the provider-owned service and semantic role.
+/// Friendly names are intentionally not consulted: relay output must never be
+/// redirected to an unrelated endpoint that happens to use the same label.
+#[cfg(feature = "relay")]
+pub(crate) fn find_qpwgraph_endpoint(
+    enumerator: &Audio::IMMDeviceEnumerator,
+    flow: Audio::EDataFlow,
+    role: QpwVirtualEndpointRole,
+) -> BackendResult<Option<Audio::IMMDevice>> {
+    if !qpwgraph_endpoint_role_matches_flow(flow, role) {
+        return Ok(None);
+    }
+    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
+        .map_err(|error| native_error("enumerate qpwgraph virtual endpoints", error))?;
+    let count = unsafe { collection.GetCount() }
+        .map_err(|error| native_error("read qpwgraph virtual endpoint count", error))?;
+    let mut matched = None;
+    for index in 0..count {
+        let device = unsafe { collection.Item(index) }
+            .map_err(|error| native_error("read qpwgraph virtual endpoint", error))?;
+        let mmdevice_id = unsafe { device.GetId() }
+            .map(take_pwstr)
+            .map_err(|error| native_error("read qpwgraph virtual endpoint ID", error))?;
+        if qpwgraph_virtual_endpoint_identity(&device, &mmdevice_id)
+            .is_some_and(|identity| identity.role == role)
+        {
+            if matched.is_some() {
+                return Err(BackendError::unsupported(format!(
+                    "multiple provider-owned endpoints advertise the {:?} role",
+                    role
+                )));
+            }
+            matched = Some(device);
+        }
+    }
+    Ok(matched)
+}
+
+fn qpwgraph_endpoint_role(value: &str) -> Option<QpwVirtualEndpointRole> {
+    [
+        QpwVirtualEndpointRole::AppRender,
+        QpwVirtualEndpointRole::AppMonitor,
+        QpwVirtualEndpointRole::RelayRender,
+        QpwVirtualEndpointRole::RelayCapture,
+    ]
+    .into_iter()
+    .find(|role| {
+        value.eq_ignore_ascii_case(role.config_key())
+            || value.eq_ignore_ascii_case(role.stable_name())
+    })
+}
+
 pub(super) fn native_error(operation: &str, error: impl std::fmt::Display) -> BackendError {
     BackendError::Native(format!("{operation} failed: {error}"))
 }

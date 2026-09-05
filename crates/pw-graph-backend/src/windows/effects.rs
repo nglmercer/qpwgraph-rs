@@ -33,6 +33,11 @@ use pw_graph_effects::{EffectDescriptor, EffectHost, EffectInstanceConfig};
 pub(super) struct WindowsEffects {
     host: EffectHost,
     instances: BTreeMap<String, EffectInstance>,
+    /// Effects owned by a persisted Windows application route are kept out
+    /// of the public standalone-effect list. Their complete configuration
+    /// lives on the route itself, and exposing them as independent UI effects
+    /// would cause them to be persisted twice.
+    route_instances: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for WindowsEffects {
@@ -48,6 +53,7 @@ impl WindowsEffects {
         Self {
             host: EffectHost::new(),
             instances: BTreeMap::new(),
+            route_instances: BTreeSet::new(),
         }
     }
 
@@ -56,7 +62,7 @@ impl WindowsEffects {
     }
 
     pub(super) fn instances(&self) -> Vec<EffectInstance> {
-        self.instances.values().cloned().collect()
+        self.iter().cloned().collect()
     }
 
     pub(super) fn get(&self, instance_id: &str) -> Option<&EffectInstance> {
@@ -64,7 +70,20 @@ impl WindowsEffects {
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &EffectInstance> {
+        self.instances
+            .values()
+            .filter(|instance| !self.route_instances.contains(&instance.config.instance_id))
+    }
+
+    /// Iterate over both standalone and application-route effects when the
+    /// graph is rebuilt. Route effects are intentionally not returned by the
+    /// public `instances`/`iter` views above.
+    pub(super) fn all_instances(&self) -> impl Iterator<Item = &EffectInstance> {
         self.instances.values()
+    }
+
+    pub(super) fn mark_route_instance(&mut self, instance_id: impl Into<String>) {
+        self.route_instances.insert(instance_id.into());
     }
 
     fn remember(&mut self, instance: EffectInstance) {
@@ -73,6 +92,7 @@ impl WindowsEffects {
     }
 
     fn forget(&mut self, instance_id: &str) -> Option<EffectInstance> {
+        self.route_instances.remove(instance_id);
         self.instances.remove(instance_id)
     }
 }
@@ -141,6 +161,11 @@ impl WindowsAudioDriver {
                 "an effect instance already exists as {}",
                 request.instance_id
             )));
+        }
+        if request.module_path.is_some() {
+            return Err(BackendError::unsupported(
+                "Windows effect modules are not yet hosted by the realtime effect runtime",
+            ));
         }
         let descriptor = self
             .effects
@@ -212,6 +237,92 @@ impl WindowsAudioDriver {
         self.effect_positions
             .insert(request.instance_id.clone(), request.position);
         self.effects.remember(instance.clone());
+        Ok(instance)
+    }
+
+    /// Create an effect owned by one persisted application route.
+    ///
+    /// Route effects use the same realtime host and processor registry as
+    /// ordinary effect nodes, but remain private to the route owner so they
+    /// cannot be serialized as a second, free-standing effect by the UI.
+    pub(super) fn create_application_effect(
+        &mut self,
+        config: EffectInstanceConfig,
+        position: [f32; 2],
+    ) -> BackendResult<EffectInstance> {
+        if config.instance_id.trim().is_empty() {
+            return Err(BackendError::native(
+                "a persisted application effect needs a non-empty instance ID",
+            ));
+        }
+        if config.module_path.is_some() {
+            return Err(BackendError::unsupported(
+                "Windows effect modules are not yet hosted by the realtime effect runtime",
+            ));
+        }
+        if self.effects.instances.contains_key(&config.instance_id) {
+            return Err(BackendError::native(format!(
+                "an effect instance already exists as {}",
+                config.instance_id
+            )));
+        }
+        let descriptor = self
+            .effects
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == config.effect_id)
+            .ok_or_else(|| {
+                BackendError::unsupported(format!("unknown effect: {}", config.effect_id))
+            })?;
+        let mut processor = self
+            .effects
+            .host
+            .create(&config.effect_id)
+            .map_err(|error| BackendError::native(format!("effect creation failed: {error}")))?;
+        for (parameter, value) in &config.parameters {
+            processor
+                .set_parameter(parameter, *value)
+                .map_err(|error| BackendError::native(format!("effect parameter: {error}")))?;
+        }
+
+        let ids = effect_ids(&config.instance_id);
+        let instance = EffectInstance {
+            config: config.clone(),
+            node_id: ids.node,
+            input_port: ids.input,
+            output_port: ids.output,
+            source: None,
+            destination: None,
+            error: None,
+        };
+        if self.routing.is_none() {
+            self.routing = Some(WindowsRouting::start()?);
+        }
+        let routing = self.routing.as_mut().expect("routing was just started");
+        routing.add_effect(
+            ids.input,
+            ids.output,
+            processor,
+            WindowsRouting::effect_spec(WindowsRouting::block_frames()),
+        )?;
+        if !config.enabled {
+            if let Err(error) = routing.set_effect_bypassed(ids.input, true) {
+                let _ = routing.remove_effect(ids.input);
+                return Err(error);
+            }
+        }
+
+        if let Err(error) =
+            Self::draw_effect(&mut self.graph, &instance, &descriptor.name, position)
+        {
+            let _ = routing.remove_effect(ids.input);
+            return Err(error);
+        }
+        self.positions.insert(ids.node, position);
+        self.effect_positions
+            .insert(config.instance_id.clone(), position);
+        self.effects.remember(instance.clone());
+        self.effects.mark_route_instance(config.instance_id);
         Ok(instance)
     }
 

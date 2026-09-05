@@ -4,6 +4,9 @@
   "driver": "qpwgraph-audio",
   "driver_version": "0.1.0",
   "implementation_status": "bootstrap-fail-closed",
+  "endpoint_role_property": "PKEY_QPWGraph_EndpointRole",
+  "endpoint_role_property_key": "{3c8e8ef9-1f7f-4fcb-9c36-4a7e19f36d12},2",
+  "driver_service": "qpwgraph_audio",
   "endpoint_roles": [
     "app-render",
     "app-monitor",

@@ -15,6 +15,28 @@ use crate::api;
 /// still reports unity, because that is all its own control can do.
 pub(super) const ROUTED_VOLUME_MAX: f32 = 1.5;
 
+/// Read the kernel-reported Windows version for diagnostics.  `GetVersionExW`
+/// is compatibility-shimmed for some application manifests; `RtlGetVersion`
+/// reports the host build that matters when reproducing Core Audio behavior.
+fn windows_os_build() -> String {
+    use windows::Wdk::System::SystemServices::RtlGetVersion;
+    use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..OSVERSIONINFOW::default()
+    };
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status.0 >= 0 {
+        format!(
+            "{}.{}.{}",
+            version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber
+        )
+    } else {
+        format!("unavailable (NTSTATUS 0x{:08x})", status.0 as u32)
+    }
+}
+
 pub(super) const WINDOWS_AUDIO_CAPABILITIES: BackendCapabilities = BackendCapabilities {
     topology: true,
     // True because qpwgraph carries these routes itself: a link between two
@@ -80,6 +102,31 @@ pub struct WindowsAudioDriver {
     /// Which ports name a device the router can open a stream for. Rebuilt
     /// with the graph, because an unplugged endpoint takes its ports with it.
     pub(super) endpoint_ports: BTreeMap<PortId, EndpointPort>,
+    pub(super) endpoint_selectors: BTreeMap<String, WindowsEndpointSelector>,
+    /// Per-session process capabilities. Read-only capture and relay are
+    /// available for ordinary render sessions; mutable routing/effects stay
+    /// limited to sessions proven isolated on the qpwgraph virtual output.
+    pub(super) process_audio_capabilities: BTreeMap<NodeId, ProcessAudioCapabilities>,
+    /// Live candidates and persisted-rule decisions are kept separate from
+    /// the graph so a process restart can be reconciled without inventing a
+    /// graph edge or persisting a PID.
+    pub(super) application_route_candidates: Vec<ApplicationRouteCandidate>,
+    pub(super) application_route_ports: BTreeMap<(String, u32), PortId>,
+    pub(super) application_routes: ApplicationRouteReconciler,
+    /// Links restored from persisted application rules, keyed by rule index.
+    /// A route with effects owns a short chain of links rather than one direct
+    /// edge; all of them are removed/rebuilt as the live selector changes.
+    pub(super) application_route_links: BTreeMap<usize, Vec<LinkId>>,
+    /// Private effect instances created for persisted application routes.
+    pub(super) application_route_effects: BTreeMap<usize, Vec<String>>,
+    /// Last successfully installed activation. Keeping the accepted plan
+    /// lets refreshes preserve realtime processors instead of tearing them
+    /// down and recreating them when nothing actually changed.
+    pub(super) application_route_activations: BTreeMap<usize, ApplicationRouteActivation>,
+    pub(super) process_captures: Vec<ProcessCaptureStatus>,
+    /// Provider-verified virtual endpoint roles for diagnostics and future
+    /// endpoint-specific worker restart decisions.
+    pub(super) virtual_endpoint_identities: Vec<QpwVirtualEndpointIdentity>,
     /// Health of the optional four-endpoint qpwgraph driver package.
     pub(super) virtual_driver_health: VirtualAudioDriverHealth,
     /// The routes qpwgraph owns, and the audio behind them.
@@ -104,8 +151,10 @@ pub struct WindowsAudioDriver {
     /// Physical eCapture devices offered to an Emitter.
     #[cfg(feature = "relay")]
     pub(super) relay_input_choices: Vec<(String, String)>,
-    /// Live applications already isolated on QPWGraph Virtual Output, as
-    /// `(stable selector, display name, current PID)`.
+    /// Live render applications available as read-only process-loopback relay
+    /// sources, as `(stable selector, display name, current PID)`. This list
+    /// is intentionally independent of virtual-output isolation; isolation is
+    /// checked only when a mutable local route is requested.
     #[cfg(feature = "relay")]
     pub(super) relay_application_sources: Vec<(String, String, u32)>,
     /// Current local mode and source/sink selection. These are independent of
@@ -177,6 +226,16 @@ impl WindowsAudioDriver {
             dirty,
             worker: Some(worker),
             endpoint_ports: snapshot.endpoint_ports,
+            endpoint_selectors: snapshot.endpoint_selectors,
+            process_audio_capabilities: snapshot.process_audio_capabilities,
+            application_route_candidates: snapshot.application_route_candidates,
+            application_route_ports: snapshot.application_route_ports,
+            application_routes: ApplicationRouteReconciler::default(),
+            application_route_links: BTreeMap::new(),
+            application_route_effects: BTreeMap::new(),
+            application_route_activations: BTreeMap::new(),
+            process_captures: snapshot.process_captures,
+            virtual_endpoint_identities: snapshot.virtual_endpoint_identities,
             virtual_driver_health: snapshot.virtual_driver_health,
             routing: None,
             effects: WindowsEffects::new(),
@@ -221,13 +280,18 @@ impl WindowsAudioDriver {
         let mode = self.relay_mode;
         let send_source = self.relay_send_source.clone();
         let receive_sink = self.relay_receive_sink.clone();
+        // The persisted/UI selector may be a PKEY stable id. Resolve it to
+        // the current MMDevice id only at the WASAPI boundary; the relay
+        // object keeps the durable selector for restart comparisons.
+        let resolved_send_source = self.resolve_relay_send_source(&send_source);
+        let resolved_receive_sink = self.resolve_relay_receive_sink(&receive_sink);
         let application = if mode == api::RelayMode::Emitter {
             match &send_source {
                 api::RelaySendSource::Application(selector) => Some(
                     self.relay_application_source(selector)
                         .ok_or_else(|| {
                             BackendError::unsupported(
-                                "selected application is not currently isolated on QPWGraph Virtual Output",
+                                "selected application is not currently available for process-loopback capture",
                             )
                         })
                         .and_then(|application| {
@@ -239,7 +303,9 @@ impl WindowsAudioDriver {
                             let matches = ProcessIdentity::from_pid(application.pid)
                                 .ok()
                                 .and_then(|identity| identity.selector_key())
-                                .is_some_and(|key| key == application.selector_key);
+                                .is_some_and(|key| {
+                                    key.eq_ignore_ascii_case(&application.selector_key)
+                                });
                             matches.then_some(application).ok_or_else(|| {
                                 BackendError::unsupported(
                                     "selected application changed before process-loopback activation; refresh the Windows audio graph",
@@ -253,41 +319,109 @@ impl WindowsAudioDriver {
             None
         };
         let default_generation = self.relay_default_generation;
+        let selection = crate::windows_relay::RelayWorkerSelection {
+            mode,
+            send_source,
+            receive_sink,
+            application,
+            default_generation,
+            resolved_send_source,
+            resolved_receive_sink,
+        };
         let restart = self.relay.as_ref().is_some_and(|devices| {
             devices.endpoints() != &wanted
                 || devices.needs_restart(
-                    mode,
-                    &send_source,
-                    &receive_sink,
-                    application.as_ref(),
-                    default_generation,
+                    selection.mode,
+                    &selection.send_source,
+                    &selection.receive_sink,
+                    selection.application.as_ref(),
+                    selection.default_generation,
                 )
         });
         if let Some(devices) = self.relay.as_mut() {
             if restart {
                 // Keep the authenticated engine/session table alive while
                 // replacing only the WASAPI worker.
-                devices.restart_endpoint(
-                    mode,
-                    send_source,
-                    receive_sink,
-                    application,
-                    default_generation,
-                )?;
+                devices.restart_endpoint(selection)?;
             }
             devices.handle().update_config(config);
         } else {
             self.relay = Some(crate::windows_relay::WindowsRelayDevices::start_mode(
-                config,
-                wanted,
-                mode,
-                send_source,
-                receive_sink,
-                application,
-                default_generation,
+                config, wanted, selection,
             )?);
         }
+        self.sync_relay_capture_manager()?;
         Ok(self.relay.as_ref().expect("relay was just created"))
+    }
+
+    #[cfg(feature = "relay")]
+    fn sync_relay_capture_manager(&mut self) -> BackendResult<()> {
+        let key = self
+            .relay
+            .as_ref()
+            .and_then(|devices| devices.process_capture_key().cloned());
+        let (sender, receiver) = mpsc::channel();
+        self.command_tx
+            .send(WorkerCommand::SetExternalRelayCapture(key, sender))
+            .map_err(|_| BackendError::Native("Windows audio worker is unavailable".into()))?;
+        self.process_captures = Self::response(receiver)?;
+        if !self.application_routes.rules().is_empty() {
+            self.reconcile_application_route_snapshot();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "relay")]
+    fn resolve_relay_send_source(&self, source: &api::RelaySendSource) -> api::RelaySendSource {
+        match source {
+            api::RelaySendSource::InputDevice(id) => api::RelaySendSource::InputDevice(
+                self.resolve_relay_endpoint_id(id, AudioFlow::Capture),
+            ),
+            api::RelaySendSource::OutputMonitor(id) => api::RelaySendSource::OutputMonitor(
+                self.resolve_relay_endpoint_id(id, AudioFlow::Render),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    #[cfg(feature = "relay")]
+    fn resolve_relay_receive_sink(&self, sink: &api::RelayReceiveSink) -> api::RelayReceiveSink {
+        match sink {
+            api::RelayReceiveSink::OutputDevice(id) => api::RelayReceiveSink::OutputDevice(
+                self.resolve_relay_endpoint_id(id, AudioFlow::Render),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    #[cfg(feature = "relay")]
+    fn resolve_relay_endpoint_id(&self, selector: &str, flow: AudioFlow) -> String {
+        self.endpoint_selectors
+            .iter()
+            .find(|(_, endpoint)| {
+                endpoint.data_flow == flow
+                    && (endpoint
+                        .stable_id
+                        .as_deref()
+                        .is_some_and(|stable_id| stable_id == selector)
+                        || endpoint.current_mmdevice_id.as_deref() == Some(selector))
+            })
+            .map(|(current_id, _)| current_id.clone())
+            .unwrap_or_else(|| selector.to_owned())
+    }
+
+    #[cfg(feature = "relay")]
+    fn relay_endpoint_selector_token(&self, current_id: &str, flow: AudioFlow) -> String {
+        self.endpoint_selectors
+            .get(current_id)
+            .filter(|endpoint| endpoint.data_flow == flow)
+            .and_then(|endpoint| {
+                endpoint
+                    .stable_id
+                    .clone()
+                    .or_else(|| endpoint.current_mmdevice_id.clone())
+            })
+            .unwrap_or_else(|| current_id.to_owned())
     }
 
     #[cfg(feature = "relay")]
@@ -297,7 +431,7 @@ impl WindowsAudioDriver {
     ) -> Option<crate::windows_relay::RelayApplicationSource> {
         self.relay_application_sources
             .iter()
-            .find(|(key, _, _)| key == selector)
+            .find(|(key, _, _)| key.eq_ignore_ascii_case(selector))
             .map(
                 |(selector_key, _, pid)| crate::windows_relay::RelayApplicationSource {
                     selector_key: selector_key.clone(),
@@ -498,6 +632,457 @@ impl WindowsAudioDriver {
         UnsupportedAppRoutePolicy.support()
     }
 
+    /// Return the capability split for a live Windows application session.
+    /// `None` means that the node is not an application session or has no
+    /// stable live process identity to which capture could be attached.
+    pub fn process_audio_capabilities(&self, node: NodeId) -> Option<ProcessAudioCapabilities> {
+        self.process_audio_capabilities.get(&node).copied()
+    }
+
+    /// Reconcile persisted application routes against the latest live Windows
+    /// snapshot. This method only emits transactional plans; the caller must
+    /// apply an `Active` plan through the graph/router and report any apply
+    /// failure as a degraded route. A PID is accepted only as part of the
+    /// current candidate snapshot and is never written to configuration.
+    pub fn reconcile_application_routes(
+        &mut self,
+        routes: Vec<pw_graph_config::WindowsApplicationRoute>,
+    ) -> BackendResult<Vec<ApplicationRoutePlan>> {
+        self.application_routes.set_rules(routes);
+        // Refreshing after installing the rules lets the same refresh pass
+        // resolve the current PID, request its capture lease, and publish the
+        // final state instead of returning an artificial intermediate plan.
+        self.refresh_snapshot(true)?;
+        Ok(self.application_routes.plans().cloned().collect())
+    }
+
+    fn clear_application_route_links(&mut self) -> BackendResult<()> {
+        let mut rules = BTreeSet::new();
+        rules.extend(self.application_route_links.keys().copied());
+        rules.extend(self.application_route_effects.keys().copied());
+        rules.extend(self.application_route_activations.keys().copied());
+        for rule in rules {
+            self.remove_application_route(rule)?;
+        }
+        Ok(())
+    }
+
+    fn remove_application_route(&mut self, rule_index: usize) -> BackendResult<()> {
+        let links = self
+            .application_route_links
+            .remove(&rule_index)
+            .unwrap_or_default();
+        let mut first_error = None;
+        for link_id in links {
+            if let Some(routing) = self.routing.as_mut() {
+                if routing.owns(link_id) {
+                    match routing.disconnect(link_id) {
+                        Ok(removed) => {
+                            let _ = self.graph.remove_link(removed.id);
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                } else {
+                    let _ = self.graph.remove_link(link_id);
+                }
+            } else {
+                let _ = self.graph.remove_link(link_id);
+            }
+        }
+
+        let effect_ids = self
+            .application_route_effects
+            .remove(&rule_index)
+            .unwrap_or_default();
+        for effect_id in effect_ids.into_iter().rev() {
+            if let Err(error) = self.destroy_effect(&effect_id) {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.application_route_activations.remove(&rule_index);
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Apply the safe, direct portion of an active persisted route. The
+    /// reconciler performs identity/isolation/capture checks; this is the
+    /// transactional graph/router boundary that turns an accepted plan into
+    /// an actual process-loopback -> endpoint route.
+    ///
+    /// Effect instances and their links are created as one route transaction.
+    /// A route must never be reported active while silently bypassing a saved
+    /// processor or while leaving only half of its graph chain installed.
+    fn apply_application_route_plans(&mut self) -> BackendResult<()> {
+        let mut desired: BTreeMap<usize, (ApplicationRouteActivation, PortId, PortId)> =
+            BTreeMap::new();
+        let mut unapplied = Vec::new();
+        for plan in self.application_routes.plans() {
+            let Some(activation) = plan.activation.as_ref() else {
+                continue;
+            };
+            let Some(selector) = activation.selector.runtime_key() else {
+                unapplied.push((
+                    plan.rule_index,
+                    "active route has no runtime application identity".into(),
+                ));
+                continue;
+            };
+            let Some(source) = self
+                .application_route_ports
+                .get(&(selector, activation.pid))
+                .copied()
+            else {
+                unapplied.push((
+                    plan.rule_index,
+                    "isolated application source port is no longer present".into(),
+                ));
+                continue;
+            };
+            let Some(destination_id) = activation.destination.current_mmdevice_id.as_deref() else {
+                unapplied.push((
+                    plan.rule_index,
+                    "resolved destination has no current MMDevice id".into(),
+                ));
+                continue;
+            };
+            let Some(destination) = self
+                .endpoint_ports
+                .iter()
+                .find(|(_, endpoint)| {
+                    endpoint.role == EndpointPortRole::Render
+                        && endpoint.device_id == destination_id
+                })
+                .map(|(port, _)| *port)
+            else {
+                unapplied.push((
+                    plan.rule_index,
+                    "resolved destination render port is no longer present".into(),
+                ));
+                continue;
+            };
+            desired.insert(plan.rule_index, (activation.clone(), source, destination));
+        }
+        for (rule, reason) in unapplied {
+            self.application_routes.mark_degraded(rule, reason);
+        }
+
+        let existing: BTreeSet<_> = self
+            .application_route_activations
+            .keys()
+            .chain(self.application_route_links.keys())
+            .chain(self.application_route_effects.keys())
+            .copied()
+            .collect();
+        for rule in existing {
+            let keep = desired
+                .get(&rule)
+                .is_some_and(|(activation, source, destination)| {
+                    self.application_route_activations.get(&rule) == Some(activation)
+                        && self
+                            .application_route_effects
+                            .get(&rule)
+                            .and_then(|effect_ids| {
+                                self.route_link_ids(*source, *destination, effect_ids)
+                            })
+                            .is_some_and(|link_ids| {
+                                self.application_route_links.get(&rule) == Some(&link_ids)
+                                    && link_ids.iter().all(|link| {
+                                        self.routing
+                                            .as_ref()
+                                            .is_some_and(|routing| routing.owns(*link))
+                                    })
+                            })
+                });
+            if !keep {
+                self.remove_application_route(rule)?;
+            }
+        }
+
+        for plan in self.application_routes.plans().cloned().collect::<Vec<_>>() {
+            let Some((activation, source, destination)) = desired.get(&plan.rule_index).cloned()
+            else {
+                continue;
+            };
+            if self.application_route_activations.get(&plan.rule_index) == Some(&activation) {
+                continue;
+            }
+            if self.routing.is_none() {
+                self.routing = Some(WindowsRouting::start()?);
+            }
+            match self.install_application_route(
+                plan.rule_index,
+                activation.clone(),
+                source,
+                destination,
+            ) {
+                Ok((links, effects)) => {
+                    self.application_route_links.insert(plan.rule_index, links);
+                    self.application_route_effects
+                        .insert(plan.rule_index, effects);
+                    self.application_route_activations
+                        .insert(plan.rule_index, activation);
+                }
+                Err(error) => {
+                    let reason = format!("could not activate restored route: {error}");
+                    if activation.effect_instances.is_empty() {
+                        self.application_routes
+                            .mark_degraded(plan.rule_index, reason);
+                    } else {
+                        self.application_routes
+                            .mark_effect_restore_failed(plan.rule_index, reason);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn route_effect_id(rule_index: usize, position: usize, instance_id: &str) -> String {
+        format!("windows-application-route:{rule_index}:{position}:{instance_id}")
+    }
+
+    fn route_link_ids(
+        &self,
+        source: PortId,
+        destination: PortId,
+        effect_ids: &[String],
+    ) -> Option<Vec<LinkId>> {
+        let mut output = source;
+        let mut links = Vec::with_capacity(effect_ids.len() + 1);
+        for effect_id in effect_ids {
+            let effect = self.effects.get(effect_id)?;
+            links.push(managed_link(output, effect.input_port).id);
+            output = effect.output_port;
+        }
+        links.push(managed_link(output, destination).id);
+        Some(links)
+    }
+
+    fn route_effect_position(
+        &self,
+        source: PortId,
+        destination: PortId,
+        index: usize,
+        count: usize,
+    ) -> [f32; 2] {
+        let source_position = self
+            .graph
+            .port(source)
+            .and_then(|port| self.graph.node(port.node_id))
+            .map(|node| node.position)
+            .unwrap_or([0.0, 0.0]);
+        let destination_position = self
+            .graph
+            .port(destination)
+            .and_then(|port| self.graph.node(port.node_id))
+            .map(|node| node.position)
+            .unwrap_or([320.0, 0.0]);
+        let fraction = (index + 1) as f32 / (count + 1) as f32;
+        [
+            source_position[0] + (destination_position[0] - source_position[0]) * fraction,
+            source_position[1] + (destination_position[1] - source_position[1]) * fraction,
+        ]
+    }
+
+    fn install_application_route(
+        &mut self,
+        rule_index: usize,
+        activation: ApplicationRouteActivation,
+        source: PortId,
+        destination: PortId,
+    ) -> BackendResult<(Vec<LinkId>, Vec<String>)> {
+        if activation.effect_instances.len() > 16 {
+            return Err(BackendError::unsupported(
+                "application effect chain exceeds the Windows route limit of 16 processors",
+            ));
+        }
+        let mut effect_ids = Vec::with_capacity(activation.effect_instances.len());
+        for (index, config) in activation.effect_instances.iter().enumerate() {
+            let mut route_config = config.clone();
+            route_config.instance_id =
+                Self::route_effect_id(rule_index, index, &config.instance_id);
+            let position = self.route_effect_position(
+                source,
+                destination,
+                index,
+                activation.effect_instances.len(),
+            );
+            match self.create_application_effect(route_config, position) {
+                Ok(_) => effect_ids.push(Self::route_effect_id(
+                    rule_index,
+                    index,
+                    &config.instance_id,
+                )),
+                Err(error) => {
+                    for effect_id in effect_ids.into_iter().rev() {
+                        let _ = self.destroy_effect(&effect_id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let Some(link_ids) = self.route_link_ids(source, destination, &effect_ids) else {
+            for effect_id in effect_ids.into_iter().rev() {
+                let _ = self.destroy_effect(&effect_id);
+            }
+            return Err(BackendError::native(
+                "restored application effect disappeared",
+            ));
+        };
+        let links: Vec<_> = {
+            let mut output = source;
+            let mut links = Vec::with_capacity(effect_ids.len() + 1);
+            for effect_id in &effect_ids {
+                let effect = self
+                    .effects
+                    .get(effect_id)
+                    .expect("effect was just created");
+                links.push(managed_link(output, effect.input_port));
+                output = effect.output_port;
+            }
+            links.push(managed_link(output, destination));
+            links
+        };
+        let mut connected = Vec::new();
+        for link in &links {
+            let result = self
+                .routing
+                .as_mut()
+                .expect("routing was started before installing a route")
+                .connect(link.clone(), &self.endpoint_ports);
+            if let Err(error) = result {
+                for link_id in connected.into_iter().rev() {
+                    if let Some(routing) = self.routing.as_mut() {
+                        let _ = routing.disconnect(link_id);
+                    }
+                    let _ = self.graph.remove_link(link_id);
+                }
+                for effect_id in effect_ids.into_iter().rev() {
+                    let _ = self.destroy_effect(&effect_id);
+                }
+                return Err(error);
+            }
+            connected.push(link.id);
+        }
+
+        let gain_result = self
+            .routing
+            .as_mut()
+            .expect("routing is still present")
+            .set_source_gain(source, activation.gain.clamp(0.0, 1.5));
+        if let Err(error) = gain_result {
+            for link_id in connected.iter().rev().copied() {
+                if let Some(routing) = self.routing.as_mut() {
+                    let _ = routing.disconnect(link_id);
+                }
+                let _ = self.graph.remove_link(link_id);
+            }
+            for effect_id in effect_ids.into_iter().rev() {
+                let _ = self.destroy_effect(&effect_id);
+            }
+            return Err(error);
+        }
+
+        let mut graph_links = Vec::new();
+        for link in &links {
+            if let Err(error) = self
+                .graph
+                .add_link(link.id, link.output_port, link.input_port)
+            {
+                for link_id in graph_links.into_iter().rev() {
+                    let _ = self.graph.remove_link(link_id);
+                }
+                for link_id in connected.into_iter().rev() {
+                    if let Some(routing) = self.routing.as_mut() {
+                        let _ = routing.disconnect(link_id);
+                    }
+                }
+                for effect_id in effect_ids.into_iter().rev() {
+                    let _ = self.destroy_effect(&effect_id);
+                }
+                return Err(error.into());
+            }
+            graph_links.push(link.id);
+        }
+        Ok((link_ids, effect_ids))
+    }
+
+    fn reconcile_application_route_snapshot(&mut self) {
+        let mut captures = BTreeMap::new();
+        for capture in &self.process_captures {
+            let readiness = match &capture.state {
+                ProcessCaptureState::Active => ProcessCaptureReadiness::Ready,
+                ProcessCaptureState::Unavailable { reason }
+                | ProcessCaptureState::Lost { reason } => {
+                    ProcessCaptureReadiness::Failed(reason.clone())
+                }
+            };
+            captures.insert((capture.key.selector.clone(), capture.key.pid), readiness);
+        }
+        let environment = ApplicationRouteEnvironment {
+            // This is deliberately a capability boundary, not a version
+            // guess. Unsupported activation is reported by the capture
+            // readiness state and never becomes an active route.
+            os_supported: true,
+            virtual_driver_ready: matches!(
+                self.virtual_driver_health,
+                VirtualAudioDriverHealth::Ready { .. }
+            ),
+            effects_available: true,
+            applications: self.application_route_candidates.clone(),
+            endpoints: self.endpoint_selectors.values().cloned().collect(),
+            captures,
+        };
+        self.application_routes
+            .migrate_destination_selectors(&environment.endpoints);
+        self.application_routes.reconcile(&environment);
+    }
+
+    fn sync_application_route_captures(&mut self) -> BackendResult<()> {
+        let requests = self
+            .application_routes
+            .capture_requests()
+            .into_iter()
+            .filter_map(|(_, selector, pid)| {
+                Some(ProcessCaptureRequest {
+                    selector: selector.runtime_key()?,
+                    pid,
+                    mode: ProcessLoopbackMode::IncludeProcessTree,
+                })
+            })
+            .collect();
+        let (sender, receiver) = mpsc::channel();
+        self.command_tx
+            .send(WorkerCommand::ReconcileProcessCaptures(requests, sender))
+            .map_err(|_| BackendError::Native("Windows audio worker is unavailable".into()))?;
+        self.process_captures = Self::response(receiver)?;
+        self.reconcile_application_route_snapshot();
+        Ok(())
+    }
+
+    /// Route candidates that still need a process-loopback activation before
+    /// their saved local route can be considered. The caller can feed these
+    /// requests to the worker-owned capture manager and invoke reconciliation
+    /// again after the manager reports `Active`.
+    pub fn application_route_capture_requests(
+        &self,
+    ) -> Vec<(usize, pw_graph_config::WindowsApplicationSelector, u32)> {
+        self.application_routes.capture_requests()
+    }
+
+    /// Return the reconciler's current rules after any legacy endpoint
+    /// selector migration. The caller may persist this copy; live PIDs and
+    /// native endpoint objects are never part of it.
+    pub fn application_route_rules(&self) -> Vec<pw_graph_config::WindowsApplicationRoute> {
+        self.application_routes.rules().to_vec()
+    }
+
     /// Export a bounded, text-only Windows audio report for diagnostics.
     ///
     /// The report deliberately contains graph identities, capabilities, and
@@ -508,6 +1093,7 @@ impl WindowsAudioDriver {
         use std::fmt::Write as _;
 
         let mut report = String::from("qpwgraph Windows audio report\n");
+        let _ = writeln!(report, "os=Windows build={}", windows_os_build());
         let _ = writeln!(
             report,
             "virtual_driver={:?}\nnodes={} ports={} observed_links={} managed_links={}",
@@ -523,6 +1109,28 @@ impl WindowsAudioDriver {
                 .as_ref()
                 .map_or(0, |routing| routing.links().count()),
         );
+        let _ = writeln!(
+            report,
+            "process_loopback_captures={}",
+            self.process_captures.len()
+        );
+        let _ = writeln!(
+            report,
+            "process_loopback_support=operational_activation_probe_per_session"
+        );
+        for capture in &self.process_captures {
+            let _ = writeln!(
+                report,
+                "process_capture selector={:?} pid={} generation={} mode={:?} consumers={} state={:?} error={:?}",
+                capture.key.selector,
+                capture.key.pid,
+                capture.key.generation,
+                capture.key.mode,
+                capture.consumers.len(),
+                capture.state,
+                capture.last_error,
+            );
+        }
         for node in self.graph.nodes.values() {
             let capabilities = self.node_capabilities(node.id);
             let _ = writeln!(
@@ -536,11 +1144,66 @@ impl WindowsAudioDriver {
                 self.node_supports_routing(node.id),
             );
         }
+        for (mmdevice_id, selector) in &self.endpoint_selectors {
+            let _ = writeln!(
+                report,
+                "endpoint mmdevice_id_hash={:016x} stable_id={:?} friendly_name={:?} flow={:?}",
+                stable_local_id(mmdevice_id),
+                selector.stable_id,
+                selector.friendly_name,
+                selector.data_flow,
+            );
+        }
+        for identity in &self.virtual_endpoint_identities {
+            let _ = writeln!(
+                report,
+                "virtual_endpoint role={:?} mmdevice_id_hash={:016x} stable_id={:?} driver_version={:?}",
+                identity.role,
+                stable_local_id(&identity.mmdevice_id),
+                identity.stable_endpoint_id,
+                identity.driver_version,
+            );
+        }
+        for plan in self.application_routes.plans() {
+            let app_key = plan
+                .application
+                .as_ref()
+                .and_then(|application| application.selector.runtime_key())
+                .unwrap_or_else(|| "<none>".into());
+            let pid = plan
+                .application
+                .as_ref()
+                .map_or(0, |application| application.pid);
+            let destination = plan
+                .destination
+                .as_ref()
+                .map(|endpoint| endpoint.stable_id.as_deref().unwrap_or("<no-stable-id>"))
+                .unwrap_or("<none>");
+            let _ = writeln!(
+                report,
+                "application_route rule={} state={:?} selector={:?} pid={} destination_stable_id={:?} reason={:?}",
+                plan.rule_index, plan.state, app_key, pid, destination, plan.reason,
+            );
+        }
+        #[cfg(feature = "relay")]
+        if let Some(relay) = &self.relay {
+            let config = relay.handle().config();
+            let resolved_hash = relay.resolved_endpoint().map(stable_local_id);
+            let _ = writeln!(
+                report,
+                "relay mode={:?} endpoint_active={} source={:?} sink={:?} resolved_id_hash={:?}",
+                config.mode,
+                relay.endpoint_active(),
+                self.relay_send_source,
+                self.relay_receive_sink,
+                resolved_hash,
+            );
+        }
         #[cfg(feature = "relay")]
         for (selector, name, pid) in &self.relay_application_sources {
             let _ = writeln!(
                 report,
-                "relay_application selector={selector:?} name={name:?} pid={pid} active=virtualized",
+                "relay_application selector={selector:?} name={name:?} pid={pid} active=capture-only",
             );
         }
         for (link, metrics) in self.route_metrics() {
@@ -601,11 +1264,32 @@ impl WindowsAudioDriver {
             }
         }
         self.endpoint_ports = snapshot.endpoint_ports;
+        self.endpoint_selectors = snapshot.endpoint_selectors;
+        self.process_audio_capabilities = snapshot.process_audio_capabilities;
+        self.application_route_candidates = snapshot.application_route_candidates;
+        self.application_route_ports = snapshot.application_route_ports;
+        self.process_captures = snapshot.process_captures;
+        self.virtual_endpoint_identities = snapshot.virtual_endpoint_identities;
         self.virtual_driver_health = snapshot.virtual_driver_health;
+        if !self.application_routes.rules().is_empty() {
+            self.reconcile_application_route_snapshot();
+            self.sync_application_route_captures()?;
+        } else {
+            // Rules may have been removed after a previous refresh. Release
+            // route-owned process captures as well as the graph links.
+            if self.process_captures.iter().any(|capture| {
+                capture
+                    .consumers
+                    .contains(&ProcessCaptureConsumer::OwnedRoute)
+            }) {
+                self.sync_application_route_captures()?;
+            }
+            self.clear_application_route_links()?;
+        }
         // Core Audio has never heard of an effect, so the rebuilt graph has
         // no effect nodes in it. Draw them again before the links, or the
         // links that pass through them would have nowhere to land.
-        for instance in self.effects.iter() {
+        for instance in self.effects.all_instances() {
             let name = self
                 .effects
                 .descriptors()
@@ -633,6 +1317,7 @@ impl WindowsAudioDriver {
             }
         }
         self.graph = graph;
+        self.apply_application_route_plans()?;
         self.meterable = snapshot.meterable;
         // A refresh re-reads volumes from Core Audio, which knows only about
         // the part of the level it is holding. Multiply the route's software
@@ -670,18 +1355,19 @@ impl WindowsAudioDriver {
                     ) if !self
                         .relay_application_sources
                         .iter()
-                        .any(|(key, _, _)| key == selector)
+                        .any(|(key, _, _)| key.eq_ignore_ascii_case(selector))
                 );
                 if selected_missing {
                     if let Some(devices) = self.relay.as_mut() {
                         devices.deactivate_application(
-                            "Windows relay application source disappeared or left QPWGraph Virtual Output",
+                            "Windows relay application source disappeared; process-loopback worker stopped",
                         );
                     }
                 } else {
                     self.reconcile_relay_worker()?;
                 }
             }
+            self.sync_relay_capture_manager()?;
         }
         Ok(())
     }
@@ -765,13 +1451,10 @@ impl GraphDriver for WindowsAudioDriver {
         self.graph.nodes.get(&node).is_some_and(|node_record| {
             node_record.node_type == NodeType::WindowsAudioEndpoint
                 || (node_record.node_type == NodeType::WindowsAudioSession
-                    && self.graph.ports.values().any(|port| {
-                        port.node_id == node
-                            && matches!(
-                                self.endpoint_ports.get(&port.id).map(|port| port.role),
-                                Some(EndpointPortRole::Process { .. })
-                            )
-                    }))
+                    && self
+                        .process_audio_capabilities
+                        .get(&node)
+                        .is_some_and(|capabilities| capabilities.mutable_route))
         })
     }
 
@@ -814,6 +1497,10 @@ impl GraphDriver for WindowsAudioDriver {
             // a permanently silent RMS bar next to a working peak one.
             capabilities.meter_peak = true;
             capabilities.meter_rms = false;
+        }
+        if let Some(process) = self.process_audio_capabilities.get(&node) {
+            capabilities.meter_peak |= process.meter_peak;
+            capabilities.meter_rms = process.meter_rms;
         }
         if self.carries_node(node) {
             // Once the router owns the PCM there is a real RMS to show, and
@@ -922,7 +1609,8 @@ impl GraphDriver for WindowsAudioDriver {
         self.command_tx
             .send(WorkerCommand::AudioMeters(sender))
             .map_err(|_| BackendError::Native("Windows audio worker is unavailable".into()))?;
-        let mut meters = Self::response(receiver)?;
+        let (mut meters, process_captures) = Self::response(receiver)?;
+        self.process_captures = process_captures;
         let Some(routing) = self.routing.as_ref() else {
             return Ok(meters);
         };
@@ -1531,9 +2219,12 @@ impl api::RelayDriver for WindowsAudioDriver {
             self.relay_input_choices
                 .iter()
                 .map(|(id, name)| api::RelayEndpointInfo {
-                    id: format!("input:{id}"),
+                    id: format!(
+                        "input:{}",
+                        self.relay_endpoint_selector_token(id, AudioFlow::Capture)
+                    ),
                     name: name.clone(),
-                    description: "WASAPI eCapture input device".into(),
+                    description: "WASAPI eCapture input device; selection uses the stable endpoint identity when available".into(),
                 }),
         );
         sources.extend(
@@ -1542,8 +2233,7 @@ impl api::RelayDriver for WindowsAudioDriver {
                 .map(|(selector, name, _pid)| api::RelayEndpointInfo {
                     id: format!("application:{selector}"),
                     name: name.clone(),
-                    description: "Process-loopback source for an app on QPWGraph Virtual Output"
-                        .into(),
+                    description: "Capture-only process-loopback source; the app keeps its normal local output".into(),
                 }),
         );
         sources.push(api::RelayEndpointInfo {
@@ -1553,9 +2243,12 @@ impl api::RelayDriver for WindowsAudioDriver {
         });
         sources.extend(self.relay_endpoint_choices.iter().map(|(id, name)| {
             api::RelayEndpointInfo {
-                id: format!("monitor:{id}"),
+                id: format!(
+                    "monitor:{}",
+                    self.relay_endpoint_selector_token(id, AudioFlow::Render)
+                ),
                 name: format!("{name} monitor"),
-                description: "WASAPI eRender loopback monitor".into(),
+                description: "WASAPI eRender loopback monitor; selection uses the stable endpoint identity when available".into(),
             }
         }));
         sources
@@ -1571,17 +2264,26 @@ impl api::RelayDriver for WindowsAudioDriver {
             self.relay_endpoint_choices
                 .iter()
                 .map(|(id, name)| api::RelayEndpointInfo {
-                    id: format!("output:{id}"),
+                    id: format!(
+                        "output:{}",
+                        self.relay_endpoint_selector_token(id, AudioFlow::Render)
+                    ),
                     name: name.clone(),
-                    description: "WASAPI eRender output device".into(),
+                    description: "WASAPI eRender output device; selection uses the stable endpoint identity when available".into(),
                 }),
         );
-        let relay_render_present = self.relay_endpoint_choices.iter().any(|(_, name)| {
-            classify_virtual_endpoint(name) == Some(QpwVirtualEndpointRole::RelayRender)
-        });
-        let relay_capture_present = self.relay_input_choices.iter().any(|(_, name)| {
-            classify_virtual_endpoint(name) == Some(QpwVirtualEndpointRole::RelayCapture)
-        });
+        // The receive choice is a provider-owned endpoint, not a friendly
+        // name. A third-party device may use the same label, and advertising
+        // it here would create a UI option that can only fail later at the
+        // WASAPI open boundary.
+        let relay_render_present = self
+            .virtual_endpoint_identities
+            .iter()
+            .any(|identity| identity.role == QpwVirtualEndpointRole::RelayRender);
+        let relay_capture_present = self
+            .virtual_endpoint_identities
+            .iter()
+            .any(|identity| identity.role == QpwVirtualEndpointRole::RelayCapture);
         if relay_render_present && relay_capture_present {
             sinks.push(api::RelayEndpointInfo {
                 id: "virtual-microphone".into(),

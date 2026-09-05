@@ -35,6 +35,7 @@
 //! stops, and the closing happens on the caller's thread rather than between
 //! two blocks of audio.
 
+use super::app_route_policy::verify_live_process_identity;
 use super::*;
 
 use crate::router::engine::{
@@ -229,8 +230,21 @@ impl WindowsRouting {
         if self.source_gain(port) == gain {
             return Ok(());
         }
-        self.source_gains.insert(port, gain);
-        self.install()
+        let previous = self.source_gains.insert(port, gain);
+        match self.install() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                match previous {
+                    Some(previous) => {
+                        self.source_gains.insert(port, previous);
+                    }
+                    None => {
+                        self.source_gains.remove(&port);
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     /// The geometry every effect on a Windows route is prepared for.
@@ -291,17 +305,29 @@ impl WindowsRouting {
         let Some(effect) = self.effects.remove(&input_port) else {
             return Err(BackendError::native("no such effect is registered"));
         };
-        self.effect_outputs.remove(&effect.output_port);
+        let output_port = effect.output_port;
+        self.effect_outputs.remove(&output_port);
         let dropped: Vec<Link> = self
             .links
             .values()
-            .filter(|link| link.output_port == effect.output_port || link.input_port == input_port)
+            .filter(|link| link.output_port == output_port || link.input_port == input_port)
             .cloned()
             .collect();
         for link in &dropped {
             self.links.remove(&link.id);
         }
-        let result = self.install();
+        if let Err(error) = self.install() {
+            // `install` is all-or-nothing in the router core. Restore the
+            // control-plane tables as well, so a rejected removal does not
+            // leave the effect apparently gone while the old route remains
+            // live.
+            self.effects.insert(input_port, effect);
+            self.effect_outputs.insert(output_port, input_port);
+            for link in &dropped {
+                self.links.insert(link.id, link.clone());
+            }
+            return Err(error);
+        }
         for link in &dropped {
             self.release_source(link.output_port);
             self.release_sink(link.input_port);
@@ -313,7 +339,6 @@ impl WindowsRouting {
             .router
             .with(move |core| core.remove_processor(processor));
         drop(released);
-        result?;
         Ok(dropped)
     }
 
@@ -415,10 +440,15 @@ impl WindowsRouting {
             .ok_or_else(|| BackendError::native("that route is not one this backend created"))?;
         // Reinstalling first means the router has already let go of the
         // devices by the time they are closed.
-        let result = self.install();
+        if let Err(error) = self.install() {
+            // The router kept the old table after rejecting the replacement;
+            // put the link back before returning so device ownership and the
+            // control-plane graph still describe that live table.
+            self.links.insert(link.id, link.clone());
+            return Err(error);
+        }
         self.release_source(link.output_port);
         self.release_sink(link.input_port);
-        result?;
         Ok(link)
     }
 
@@ -442,12 +472,17 @@ impl WindowsRouting {
         for link in &stale {
             self.links.remove(&link.id);
         }
-        let result = self.install();
+        if let Err(error) = self.install() {
+            for link in &stale {
+                self.links.insert(link.id, link.clone());
+            }
+            return Err(error);
+        }
         for link in &stale {
             self.release_source(link.output_port);
             self.release_sink(link.input_port);
         }
-        result
+        Ok(())
     }
 
     /// Reopen every WASAPI worker used by a route that reported a lost
@@ -716,7 +751,7 @@ impl WindowsRouting {
             return Ok(());
         }
         let device_id = Some(endpoint.device_id.as_str());
-        let (source, endpoint_worker) = match endpoint.role {
+        let (source, endpoint_worker) = match &endpoint.role {
             EndpointPortRole::Capture => {
                 let (source, worker) =
                     wasapi::open_capture_source(device_id, ROUTE_FORMAT, RING_FRAMES)?;
@@ -727,9 +762,10 @@ impl WindowsRouting {
                     wasapi::open_loopback_source(device_id, ROUTE_FORMAT, RING_FRAMES)?;
                 (source, DeviceEndpoint::Wasapi(worker))
             }
-            EndpointPortRole::Process { pid } => {
+            EndpointPortRole::Process { pid, selector } => {
+                verify_live_process_identity(selector, *pid)?;
                 let (source, worker) = ProcessLoopbackSource::open(
-                    pid,
+                    *pid,
                     ProcessLoopbackMode::IncludeProcessTree,
                     ROUTE_FORMAT,
                     RING_FRAMES,

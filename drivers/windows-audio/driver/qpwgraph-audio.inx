@@ -27,6 +27,72 @@ DefaultDestDir=12
 [QPWGraph_Install.NT]
 CopyFiles=DriverCopyFiles
 
+[QPWGraph_Install.NT.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_VirtualOutput%,QPWGraph_Output_Interface
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_VirtualOutput%,QPWGraph_Output_Interface
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_VirtualOutput%,QPWGraph_Output_Interface
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_VirtualMonitor%,QPWGraph_Monitor_Interface
+AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_VirtualMonitor%,QPWGraph_Monitor_Interface
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_VirtualMonitor%,QPWGraph_Monitor_Interface
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_RelaySink%,QPWGraph_RelaySink_Interface
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_RelaySink%,QPWGraph_RelaySink_Interface
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_RelaySink%,QPWGraph_RelaySink_Interface
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_RelayMicrophone%,QPWGraph_RelayMicrophone_Interface
+AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_RelayMicrophone%,QPWGraph_RelayMicrophone_Interface
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_RelayMicrophone%,QPWGraph_RelayMicrophone_Interface
+
+[QPWGraph_Output_Interface]
+AddReg=QPWGraph_Output_Interface.AddReg
+AddProperty=QPWGraph_Output_Interface.AddProperty
+
+[QPWGraph_Output_Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%QPWGraph.VirtualOutputName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[QPWGraph_Output_Interface.AddProperty]
+%QPWGraph_EndpointRoleGuid%,2,18,,"app-render"
+
+[QPWGraph_Monitor_Interface]
+AddReg=QPWGraph_Monitor_Interface.AddReg
+AddProperty=QPWGraph_Monitor_Interface.AddProperty
+
+[QPWGraph_Monitor_Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%QPWGraph.VirtualMonitorName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[QPWGraph_Monitor_Interface.AddProperty]
+%QPWGraph_EndpointRoleGuid%,2,18,,"app-monitor"
+
+[QPWGraph_RelaySink_Interface]
+AddReg=QPWGraph_RelaySink_Interface.AddReg
+AddProperty=QPWGraph_RelaySink_Interface.AddProperty
+
+[QPWGraph_RelaySink_Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%QPWGraph.RelaySinkName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[QPWGraph_RelaySink_Interface.AddProperty]
+%QPWGraph_EndpointRoleGuid%,2,18,,"relay-render"
+
+[QPWGraph_RelayMicrophone_Interface]
+AddReg=QPWGraph_RelayMicrophone_Interface.AddReg
+AddProperty=QPWGraph_RelayMicrophone_Interface.AddProperty
+
+[QPWGraph_RelayMicrophone_Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%QPWGraph.RelayMicrophoneName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[QPWGraph_RelayMicrophone_Interface.AddProperty]
+%QPWGraph_EndpointRoleGuid%,2,18,,"relay-capture"
+
 [DriverCopyFiles]
 qpwgraph_audio.sys
 
@@ -50,3 +116,21 @@ KmdfLibraryVersion=$KMDFVERSION$
 ProviderName="qpwgraph-rs contributors"
 DeviceName="QPWGraph Virtual Audio (development)"
 DiskName="QPWGraph Virtual Audio installation media"
+Proxy.CLSID="{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE="{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME="{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSNAME_VirtualOutput="QPWGraphVirtualOutput"
+KSNAME_VirtualMonitor="QPWGraphVirtualMonitor"
+KSNAME_RelaySink="QPWGraphRelaySink"
+KSNAME_RelayMicrophone="QPWGraphRelayMicrophone"
+KSNODETYPE_ANY="{00000000-0000-0000-0000-000000000000}"
+PKEY_AudioEndpoint_Association="{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode="{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+QPWGraph_EndpointRoleGuid="{3c8e8ef9-1f7f-4fcb-9c36-4a7e19f36d12}"
+PKEY_QPWGraph_EndpointRole="{3c8e8ef9-1f7f-4fcb-9c36-4a7e19f36d12},2"
+QPWGraph.VirtualOutputName="QPWGraph Virtual Output"
+QPWGraph.VirtualMonitorName="QPWGraph Virtual Monitor"
+QPWGraph.RelaySinkName="QPWGraph Relay Sink"
+QPWGraph.RelayMicrophoneName="QPWGraph Relay Microphone"

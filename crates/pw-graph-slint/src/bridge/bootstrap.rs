@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 /// The opened application state, plus the meter policy the window shows.
 pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, MeterPolicy) {
     let config_file = config_path("qpwgraph-rs");
-    let config = AppConfig::load_from(&config_file).unwrap_or_default();
+    let mut config = AppConfig::load_from(&config_file).unwrap_or_default();
     let language = args
         .language
         .clone()
@@ -53,6 +53,19 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
             "{status} · {}",
             i18n.format("status.refresh_failed", &[("error", error)])
         );
+    }
+    #[cfg(target_os = "windows")]
+    if !config.windows_application_routes.is_empty() {
+        if let Err(error) =
+            source.reconcile_windows_application_routes(config.windows_application_routes.clone())
+        {
+            status = format!(
+                "{status} · {}",
+                i18n.format("status.refresh_failed", &[("error", error)])
+            );
+        } else if let Some(routes) = source.windows_application_route_rules() {
+            config.windows_application_routes = routes;
+        }
     }
     let view = UiGraphState::from_config(&config);
     let app = Rc::new(RefCell::new(Application {

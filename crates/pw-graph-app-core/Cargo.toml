@@ -16,6 +16,7 @@ relay = ["pw-graph-backend/relay"]
 
 [dependencies]
 pw-graph-backend = { path = "../pw-graph-backend", default-features = false }
+pw-graph-config = { path = "../pw-graph-config" }
 pw-graph-core = { path = "../pw-graph-core" }
 pw-graph-effects = { path = "../pw-graph-effects" }
 

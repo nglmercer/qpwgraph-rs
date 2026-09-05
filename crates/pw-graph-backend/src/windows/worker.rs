@@ -7,6 +7,8 @@
 
 use super::*;
 
+const MAX_PROCESS_METER_CAPTURES: usize = 32;
+
 /// One refresh answer. Audio state is not carried here -- it lives in the
 /// shared map, which the refresh fills and the callbacks keep current.
 pub(super) struct WorkerSnapshot {
@@ -20,6 +22,23 @@ pub(super) struct WorkerSnapshot {
     /// QPWGraph Virtual Output. That documented user action proves the dry
     /// path is isolated; ordinary sessions remain observed-only.
     pub(super) endpoint_ports: BTreeMap<PortId, EndpointPort>,
+    pub(super) endpoint_selectors: BTreeMap<String, WindowsEndpointSelector>,
+    /// Per-application capabilities. Capture-only capabilities are separate
+    /// from the mutable route proof in `endpoint_ports`.
+    pub(super) process_audio_capabilities: BTreeMap<NodeId, ProcessAudioCapabilities>,
+    /// Stable render-session candidates used by the persisted application
+    /// route reconciler. The live PID is runtime-only and never persisted.
+    pub(super) application_route_candidates: Vec<ApplicationRouteCandidate>,
+    /// Runtime source ports for isolated application sessions. These are
+    /// looked up by selector/PID during route restoration and never stored in
+    /// configuration.
+    pub(super) application_route_ports: BTreeMap<(String, u32), PortId>,
+    /// Safe, bounded diagnostics for process-loopback workers owned by this
+    /// COM worker. The actual PCM never leaves the worker through a snapshot.
+    pub(super) process_captures: Vec<ProcessCaptureStatus>,
+    /// Endpoint roles that were proved by the driver service/property
+    /// contract. Friendly names are intentionally absent from this proof.
+    pub(super) virtual_endpoint_identities: Vec<QpwVirtualEndpointIdentity>,
     pub(super) virtual_driver_health: VirtualAudioDriverHealth,
     /// Render endpoints as `(device id, display name)`, for relay selection.
     #[cfg(feature = "relay")]
@@ -27,8 +46,8 @@ pub(super) struct WorkerSnapshot {
     /// Capture endpoints as `(device id, display name)`, for relay selection.
     #[cfg(feature = "relay")]
     pub(super) capture_endpoints: Vec<(String, String)>,
-    /// Live render sessions already attached to QPWGraph Virtual Output as
-    /// `(stable process selector, display name, current PID)`.
+    /// Live render sessions that can be captured read-only by process
+    /// loopback as `(stable process selector, display name, current PID)`.
     #[cfg(feature = "relay")]
     pub(super) application_sources: Vec<(String, String, u32)>,
     /// Current defaults and a monotonically changing notification generation.
@@ -50,7 +69,7 @@ pub(super) struct EndpointPort {
     pub(super) role: EndpointPortRole,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum EndpointPortRole {
     /// A recording device. Opens as a capture source.
     Capture,
@@ -60,7 +79,9 @@ pub(super) enum EndpointPortRole {
     /// A playback device. Opens as a render sink.
     Render,
     /// An application already isolated on QPWGraph Virtual Output.
-    Process { pid: u32 },
+    /// The selector is carried alongside the PID so route activation can
+    /// re-check identity immediately before opening process loopback.
+    Process { pid: u32, selector: String },
 }
 
 #[derive(Debug)]
@@ -71,7 +92,16 @@ pub(super) enum WorkerCommand {
     SetMute(NodeId, bool, Sender<BackendResult<()>>),
     SetMeterPolicy(MeterPolicy, Sender<BackendResult<()>>),
     RequestMeters(BTreeSet<NodeId>, Sender<BackendResult<()>>),
-    AudioMeters(Sender<BackendResult<Vec<AudioMeter>>>),
+    ReconcileProcessCaptures(
+        Vec<ProcessCaptureRequest>,
+        Sender<BackendResult<Vec<ProcessCaptureStatus>>>,
+    ),
+    #[cfg(feature = "relay")]
+    SetExternalRelayCapture(
+        Option<ProcessCaptureKey>,
+        Sender<BackendResult<Vec<ProcessCaptureStatus>>>,
+    ),
+    AudioMeters(Sender<BackendResult<(Vec<AudioMeter>, Vec<ProcessCaptureStatus>)>>),
     ResetAudio(Sender<BackendResult<()>>),
     Shutdown,
 }
@@ -140,8 +170,22 @@ pub(super) fn worker_thread(
                 worker.requested_meters = nodes;
                 let _ = sender.send(Ok(()));
             }
+            WorkerCommand::ReconcileProcessCaptures(requests, sender) => {
+                worker
+                    .process_captures
+                    .reconcile_routes(requests, crate::router::AudioFormat::new(48_000, 2));
+                let _ = sender.send(Ok(worker.process_captures.statuses()));
+            }
+            #[cfg(feature = "relay")]
+            WorkerCommand::SetExternalRelayCapture(key, sender) => {
+                worker.process_captures.set_external_relay(key);
+                let _ = sender.send(Ok(worker.process_captures.statuses()));
+            }
             WorkerCommand::AudioMeters(sender) => {
-                let _ = sender.send(worker.audio_meters());
+                let result = worker
+                    .audio_meters()
+                    .map(|meters| (meters, worker.process_captures.statuses()));
+                let _ = sender.send(result);
             }
             WorkerCommand::ResetAudio(sender) => {
                 worker.requested_meters.clear();
@@ -166,6 +210,10 @@ pub(super) struct EndpointRecord {
     /// there is nothing to read back from a microphone that its own port does
     /// not already carry.
     pub(super) monitor_port_id: Option<PortId>,
+    pub(super) selector: WindowsEndpointSelector,
+    /// Present only after the endpoint provider has proved both qpwgraph
+    /// service ownership and the semantic role property.
+    pub(super) virtual_identity: Option<QpwVirtualEndpointIdentity>,
 }
 
 pub(super) struct SessionRecord {
@@ -175,6 +223,10 @@ pub(super) struct SessionRecord {
     pub(super) node_id: NodeId,
     pub(super) port_id: PortId,
     pub(super) process_id: u32,
+    /// Stable identity resolved while this live session was enumerated. The
+    /// PID is still useful for the immediate activation, but never stands in
+    /// for this selector when a process restarts.
+    pub(super) process_identity: Option<ProcessIdentity>,
     /// The session's own peak meter, kept so a level can be read without
     /// re-enumerating the endpoint every frame.
     ///
@@ -205,6 +257,7 @@ pub(super) struct CoreAudioWorker {
     )>,
     pub(super) endpoints: Vec<EndpointRecord>,
     pub(super) sessions: Vec<SessionRecord>,
+    pub(super) process_captures: ProcessCaptureManager,
     pub(super) meter_policy: MeterPolicy,
     pub(super) requested_meters: BTreeSet<NodeId>,
     /// Shared with the public driver and every change callback.
@@ -230,10 +283,12 @@ impl CoreAudioWorker {
         let enumerator: Audio::IMMDeviceEnumerator =
             unsafe { Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .map_err(|error| native_error("create MMDeviceEnumerator", error))?;
+        #[cfg(feature = "relay")]
         let default_generation = Arc::new(AtomicU64::new(0));
         let endpoint_notification: Audio::IMMNotificationClient = EndpointNotificationClient {
             dirty: Arc::clone(&dirty),
             topology_dirty: Arc::clone(&topology_dirty),
+            #[cfg(feature = "relay")]
             default_generation: Arc::clone(&default_generation),
         }
         .into();
@@ -257,6 +312,7 @@ impl CoreAudioWorker {
             default_generation,
             endpoints: Vec::new(),
             sessions: Vec::new(),
+            process_captures: ProcessCaptureManager::new(),
             meter_policy: MeterPolicy::OnDemand,
             requested_meters: BTreeSet::new(),
         })
@@ -321,6 +377,21 @@ impl CoreAudioWorker {
                 ))?;
             }
 
+            let data_flow = if flow == Audio::eRender {
+                AudioFlow::Render
+            } else {
+                AudioFlow::Capture
+            };
+            let selector = WindowsEndpointSelector::from_device(&device, data_flow).unwrap_or(
+                WindowsEndpointSelector {
+                    stable_id: None,
+                    current_mmdevice_id: None,
+                    friendly_name: None,
+                    data_flow,
+                },
+            );
+            let virtual_identity = qpwgraph_virtual_endpoint_identity(&device, &endpoint_id)
+                .filter(|identity| qpwgraph_endpoint_role_matches_flow(flow, identity.role));
             let endpoint = EndpointRecord {
                 id: endpoint_id,
                 flow,
@@ -328,6 +399,8 @@ impl CoreAudioWorker {
                 node_id,
                 port_id,
                 monitor_port_id,
+                selector,
+                virtual_identity,
             };
             sessions.extend(self.add_sessions(&endpoint, &mut graph)?);
             endpoints.push(endpoint);
@@ -471,7 +544,8 @@ impl CoreAudioWorker {
     /// Windows reports that the application is already attached to
     /// QPWGraph Virtual Output. That proves its dry path is isolated, so a
     /// process-loopback source cannot accidentally create dry + processed
-    /// duplicate audio.
+    /// duplicate audio. Capture-only consumers use `process_audio_capabilities`
+    /// and never become graph edges.
     pub(super) fn endpoint_ports(&self) -> BTreeMap<PortId, EndpointPort> {
         let mut ports = BTreeMap::new();
         for endpoint in &self.endpoints {
@@ -503,12 +577,22 @@ impl CoreAudioWorker {
             }
             let virtualized = self.session_is_virtualized(session);
             if virtualized {
+                let Some(selector) = session
+                    .process_identity
+                    .as_ref()
+                    .and_then(ProcessIdentity::selector_key)
+                else {
+                    // A mutable process route is not safe without a stable
+                    // identity to compare at activation time.
+                    continue;
+                };
                 ports.insert(
                     session.port_id,
                     EndpointPort {
                         device_id: session.endpoint_id.clone(),
                         role: EndpointPortRole::Process {
                             pid: session.process_id,
+                            selector,
                         },
                     },
                 );
@@ -517,26 +601,42 @@ impl CoreAudioWorker {
         ports
     }
 
+    /// Process-loopback capture is valid for any live render session. Only
+    /// the mutable route/effects bits depend on the session already being on
+    /// QPWGraph Virtual Output.
+    pub(super) fn process_audio_capabilities(&self) -> BTreeMap<NodeId, ProcessAudioCapabilities> {
+        self.sessions
+            .iter()
+            .filter(|session| session.flow == Audio::eRender && session.process_id != 0)
+            .map(|session| {
+                let mut capabilities = if self.session_is_virtualized(session) {
+                    ProcessAudioCapabilities::isolated()
+                } else {
+                    ProcessAudioCapabilities::capture_only()
+                };
+                capabilities.meter_peak = session.meter.is_some() || capabilities.capture_readonly;
+                (session.node_id, capabilities)
+            })
+            .collect()
+    }
+
     fn session_is_virtualized(&self, session: &SessionRecord) -> bool {
         self.endpoints
             .iter()
             .find(|endpoint| endpoint.id == session.endpoint_id)
-            .and_then(|endpoint| self.graph.nodes.get(&endpoint.node_id))
-            .and_then(|node| classify_virtual_endpoint(&node.name))
-            == Some(QpwVirtualEndpointRole::AppRender)
+            .and_then(|endpoint| endpoint.virtual_identity.as_ref())
+            .is_some_and(|identity| identity.role == QpwVirtualEndpointRole::AppRender)
     }
 
     #[cfg(feature = "relay")]
     fn application_sources(&self) -> Vec<(String, String, u32)> {
         let mut sources = BTreeMap::new();
+        let mut ambiguous = BTreeSet::new();
         for session in &self.sessions {
-            if session.flow != Audio::eRender
-                || session.process_id == 0
-                || !self.session_is_virtualized(session)
-            {
+            if session.flow != Audio::eRender || session.process_id == 0 {
                 continue;
             }
-            let Ok(identity) = ProcessIdentity::from_pid(session.process_id) else {
+            let Some(identity) = session.process_identity.as_ref() else {
                 continue;
             };
             let Some(selector) = identity.selector_key() else {
@@ -548,13 +648,22 @@ impl CoreAudioWorker {
                 .get(&session.node_id)
                 .map(|node| node.name.trim().to_owned())
                 .filter(|name| !name.is_empty())
-                .or(identity.display_name)
-                .or(identity.executable_name)
+                .or(identity.display_name.clone())
+                .or(identity.executable_name.clone())
                 .unwrap_or_else(|| format!("Application ({})", session.process_id));
-            sources
-                .entry(selector)
-                .or_insert((name, session.process_id));
+            match sources.entry(selector.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((name, session.process_id));
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().1 != session.process_id =>
+                {
+                    ambiguous.insert(selector);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
         }
+        sources.retain(|selector, _| !ambiguous.contains(selector));
         sources
             .into_iter()
             .map(|(selector, (name, pid))| (selector, name, pid))
@@ -566,14 +675,20 @@ impl CoreAudioWorker {
             graph: self.graph.clone(),
             meterable: self.meterable_nodes(),
             endpoint_ports: self.endpoint_ports(),
-            virtual_driver_health: VirtualAudioDriverHealth::from_endpoint_names(
-                self.endpoints.iter().filter_map(|endpoint| {
-                    self.graph
-                        .nodes
-                        .get(&endpoint.node_id)
-                        .map(|node| node.name.as_str())
-                }),
-                None,
+            endpoint_selectors: self
+                .endpoints
+                .iter()
+                .map(|endpoint| (endpoint.id.clone(), endpoint.selector.clone()))
+                .collect(),
+            virtual_endpoint_identities: self
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint.virtual_identity.clone())
+                .collect(),
+            virtual_driver_health: VirtualAudioDriverHealth::from_verified_identities(
+                self.endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint.virtual_identity.clone()),
             ),
             #[cfg(feature = "relay")]
             playback_endpoints: self
@@ -607,6 +722,10 @@ impl CoreAudioWorker {
                 .collect(),
             #[cfg(feature = "relay")]
             application_sources: self.application_sources(),
+            process_audio_capabilities: self.process_audio_capabilities(),
+            application_route_candidates: self.application_route_candidates(),
+            application_route_ports: self.application_route_ports(),
+            process_captures: self.process_captures.statuses(),
             #[cfg(feature = "relay")]
             default_input: self.default_endpoint_id(Audio::eCapture),
             #[cfg(feature = "relay")]
@@ -614,6 +733,59 @@ impl CoreAudioWorker {
             #[cfg(feature = "relay")]
             default_generation: self.default_generation.load(Ordering::Acquire),
         }
+    }
+
+    pub(super) fn application_route_candidates(&self) -> Vec<ApplicationRouteCandidate> {
+        let mut candidates = BTreeMap::new();
+        for session in &self.sessions {
+            if session.flow != Audio::eRender || session.process_id == 0 {
+                continue;
+            }
+            let Some(identity) = session.process_identity.as_ref() else {
+                continue;
+            };
+            let selector = identity.application_selector();
+            let Some(key) = selector.runtime_key() else {
+                continue;
+            };
+            let isolated = self.session_is_virtualized(session);
+            match candidates.entry((key.to_owned(), session.process_id)) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(ApplicationRouteCandidate {
+                        selector,
+                        pid: session.process_id,
+                        isolated,
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // Process loopback captures the process, not one Core
+                    // Audio session. If any session for this PID still
+                    // reaches a physical endpoint, local rerendering would
+                    // create a dry + processed duplicate.
+                    entry.get_mut().isolated &= isolated;
+                }
+            }
+        }
+        candidates.into_values().collect()
+    }
+
+    pub(super) fn application_route_ports(&self) -> BTreeMap<(String, u32), PortId> {
+        self.sessions
+            .iter()
+            .filter(|session| {
+                session.flow == Audio::eRender
+                    && session.process_id != 0
+                    && self.session_is_virtualized(session)
+            })
+            .filter_map(|session| {
+                Some((
+                    session.process_identity.as_ref()?.selector_key()?,
+                    session.process_id,
+                    session.port_id,
+                ))
+            })
+            .map(|(selector, pid, port)| ((selector, pid), port))
+            .collect()
     }
 
     #[cfg(feature = "relay")]
@@ -794,6 +966,9 @@ impl CoreAudioWorker {
                 Err(_) => continue,
             };
             let process_id = unsafe { control2.GetProcessId() }.unwrap_or(0);
+            let process_identity = (process_id != 0)
+                .then(|| ProcessIdentity::from_pid(process_id).ok())
+                .flatten();
             let display_name = unsafe { control2.GetDisplayName() }
                 .map(take_pwstr)
                 .unwrap_or_default();
@@ -847,6 +1022,7 @@ impl CoreAudioWorker {
                 node_id,
                 port_id,
                 process_id,
+                process_identity,
                 meter,
             });
         }
@@ -996,35 +1172,81 @@ impl CoreAudioWorker {
             .chain(
                 self.sessions
                     .iter()
-                    .filter(|session| session.meter.is_some())
+                    .filter(|session| {
+                        session.meter.is_some()
+                            || (session.flow == Audio::eRender
+                                && session.process_id != 0
+                                && session.process_identity.is_some())
+                    })
                     .map(|session| session.node_id),
             )
             .collect()
     }
 
-    pub(super) fn audio_meters(&self) -> BackendResult<Vec<AudioMeter>> {
+    pub(super) fn audio_meters(&mut self) -> BackendResult<Vec<AudioMeter>> {
         if self.meter_policy == MeterPolicy::Disabled {
+            self.process_captures.reconcile_meters(
+                std::iter::empty(),
+                crate::router::AudioFormat::new(48_000, 2),
+            );
             return Ok(Vec::new());
         }
         let mut result = Vec::new();
+        let format = crate::router::AudioFormat::new(48_000, 2);
+        let targets = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.flow == Audio::eRender
+                    && session.process_id != 0
+                    && session.process_identity.is_some()
+                    && self.meter_wanted(session.node_id)
+            })
+            .filter_map(|session| {
+                Some(ProcessMeterTarget {
+                    node_id: session.node_id,
+                    selector: session.process_identity.as_ref()?.selector_key()?,
+                    pid: session.process_id,
+                    mode: ProcessLoopbackMode::IncludeProcessTree,
+                })
+            })
+            .take(MAX_PROCESS_METER_CAPTURES)
+            .collect::<Vec<_>>();
+        self.process_captures.reconcile_meters(targets, format);
         // Per-application levels, straight off each session's own meter.
         for session in &self.sessions {
-            let Some(meter) = session.meter.as_ref() else {
-                continue;
-            };
             if !self.meter_wanted(session.node_id) {
                 continue;
             }
-            let Ok(peak) = (unsafe { meter.GetPeakValue() }) else {
+            let process_meter = self.process_captures.meter(session.node_id);
+            let native_peak = session
+                .meter
+                .as_ref()
+                .and_then(|meter| unsafe { meter.GetPeakValue() }.ok())
+                .map(|peak| peak.clamp(0.0, 1.0));
+            let Some(peak) = process_meter
+                .as_ref()
+                .filter(|meter| meter.available)
+                .map(|meter| meter.peak)
+                .or(native_peak)
+            else {
                 continue;
             };
             result.push(AudioMeter {
                 node_id: session.node_id,
                 port_id: None,
-                // Like the endpoint meter, this is peak only.
-                rms: 0.0,
-                peak: peak.clamp(0.0, 1.0),
-                age_ms: 0,
+                // The process-loopback path reports true RMS. If it is
+                // unavailable, keep the native peak fallback honest and do
+                // not present that peak as an RMS value.
+                rms: process_meter
+                    .as_ref()
+                    .filter(|meter| meter.available)
+                    .map_or(0.0, |meter| meter.rms),
+                peak,
+                age_ms: process_meter
+                    .as_ref()
+                    .filter(|meter| meter.available)
+                    .map_or(0, |meter| meter.age_ms),
                 available: true,
             });
         }

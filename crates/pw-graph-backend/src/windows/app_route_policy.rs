@@ -12,7 +12,8 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use windows::core::PWSTR;
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+use windows::Win32::Storage::Packaging::Appx::{GetApplicationUserModelId, GetPackageFamilyName};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -29,8 +30,8 @@ pub struct ProcessIdentity {
 impl ProcessIdentity {
     pub fn is_stable(&self) -> bool {
         self.executable_path_hash.is_some()
-            || self.package_family_name.is_some()
             || self.app_user_model_id.is_some()
+            || (self.package_family_name.is_some() && self.executable_name.is_some())
     }
 
     /// Resolve the stable identity that is available for a live process.
@@ -60,10 +61,12 @@ impl ProcessIdentity {
                 &mut length,
             )
         };
-        let _ = unsafe { CloseHandle(process) };
-        result.map_err(|error| {
-            BackendError::native(format!("could not read process {pid} identity: {error}"))
-        })?;
+        if let Err(error) = result {
+            let _ = unsafe { CloseHandle(process) };
+            return Err(BackendError::native(format!(
+                "could not read process {pid} identity: {error}"
+            )));
+        }
         let path = OsString::from_wide(&buffer[..length as usize]);
         let path = path.to_string_lossy().into_owned();
         let executable_name = Path::new(&path)
@@ -71,11 +74,14 @@ impl ProcessIdentity {
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty());
         let executable_path_hash = Some(hash_executable_path(&path));
+        let package_family_name = package_family_name(process);
+        let app_user_model_id = app_user_model_id(process);
+        let _ = unsafe { CloseHandle(process) };
         Ok(Self {
             executable_path_hash,
             executable_name: executable_name.clone(),
-            package_family_name: None,
-            app_user_model_id: None,
+            package_family_name,
+            app_user_model_id,
             display_name: executable_name,
         })
     }
@@ -83,30 +89,83 @@ impl ProcessIdentity {
     /// A compact selector suitable for endpoint-choice IDs and diagnostics.
     /// It contains no path or PID and is stable across process restarts.
     pub fn selector_key(&self) -> Option<String> {
-        self.executable_path_hash
-            .clone()
-            .or_else(|| self.package_family_name.clone())
-            .or_else(|| self.app_user_model_id.clone())
+        // Packaged identities survive executable-path changes across MSIX
+        // updates. A package family can contain multiple executables, so the
+        // fallback includes executable identity when AUMID is unavailable.
+        self.application_selector().runtime_key()
     }
 
-    /// Match only fields present in the persisted selector. Stable fields are
+    /// Convert the live identity to the persisted selector shape without
+    /// carrying the PID or the executable path itself across the boundary.
+    pub fn application_selector(&self) -> pw_graph_config::WindowsApplicationSelector {
+        pw_graph_config::WindowsApplicationSelector {
+            executable_path_hash: self.executable_path_hash.clone(),
+            executable_name: self.executable_name.clone(),
+            package_family_name: self.package_family_name.clone(),
+            app_user_model_id: self.app_user_model_id.clone(),
+            display_name: self.display_name.clone(),
+        }
+    }
+
+    /// Match using the strongest stable identity available. Stable fields are
     /// compared case-insensitively because Windows paths and package names are
     /// case-insensitive even when their spelling changes between launches.
     pub fn matches(&self, candidate: &Self) -> bool {
-        fn field_matches(expected: &Option<String>, actual: &Option<String>) -> bool {
-            expected.as_ref().is_none_or(|expected| {
-                actual
-                    .as_deref()
-                    .is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
-            })
-        }
-        self.is_stable()
-            && field_matches(&self.executable_path_hash, &candidate.executable_path_hash)
-            && field_matches(&self.executable_name, &candidate.executable_name)
-            && field_matches(&self.package_family_name, &candidate.package_family_name)
-            && field_matches(&self.app_user_model_id, &candidate.app_user_model_id)
-            && field_matches(&self.display_name, &candidate.display_name)
+        self.application_selector()
+            .matches(&candidate.application_selector())
     }
+}
+
+/// Verify the identity immediately before a PID-backed Core Audio activation.
+///
+/// A worker snapshot is allowed to become stale between enumeration and the
+/// call that opens process loopback.  Re-reading the process here closes the
+/// PID-reuse window for every caller that activates a process source, rather
+/// than leaving each capture path to invent its own check.
+pub(crate) fn verify_live_process_identity(selector: &str, pid: u32) -> BackendResult<()> {
+    let identity = ProcessIdentity::from_pid(pid)?;
+    let actual = identity
+        .selector_key()
+        .ok_or_else(|| BackendError::unsupported("live process has no stable capture identity"))?;
+    if !actual.eq_ignore_ascii_case(selector) {
+        return Err(BackendError::unsupported(format!(
+            "process identity changed before process-loopback activation for PID {pid}"
+        )));
+    }
+    Ok(())
+}
+
+fn package_family_name(process: windows::Win32::Foundation::HANDLE) -> Option<String> {
+    let mut length = 0u32;
+    let result = unsafe { GetPackageFamilyName(process, &mut length, None) };
+    if result != ERROR_INSUFFICIENT_BUFFER || length == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; length as usize];
+    let result =
+        unsafe { GetPackageFamilyName(process, &mut length, Some(PWSTR(buffer.as_mut_ptr()))) };
+    (result == ERROR_SUCCESS).then(|| wide_result(&buffer, length))
+}
+
+fn app_user_model_id(process: windows::Win32::Foundation::HANDLE) -> Option<String> {
+    let mut length = 0u32;
+    let result = unsafe { GetApplicationUserModelId(process, &mut length, None) };
+    if result != ERROR_INSUFFICIENT_BUFFER || length == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; length as usize];
+    let result = unsafe {
+        GetApplicationUserModelId(process, &mut length, Some(PWSTR(buffer.as_mut_ptr())))
+    };
+    (result == ERROR_SUCCESS).then(|| wide_result(&buffer, length))
+}
+
+fn wide_result(buffer: &[u16], length: u32) -> String {
+    let length = usize::try_from(length)
+        .unwrap_or(buffer.len())
+        .min(buffer.len())
+        .saturating_sub(1);
+    String::from_utf16_lossy(&buffer[..length])
 }
 
 fn hash_executable_path(path: &str) -> String {

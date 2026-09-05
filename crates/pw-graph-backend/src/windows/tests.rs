@@ -199,11 +199,11 @@ fn only_endpoints_offer_a_connect_gesture() {
             NodeType::WindowsAudioSession => {
                 let has_process_port = node.ports.iter().any(|port| {
                     matches!(
-                        driver
-                            .endpoint_ports
-                            .get(port)
-                            .map(|endpoint| endpoint.role),
-                        Some(EndpointPortRole::Process { .. })
+                        driver.endpoint_ports.get(port),
+                        Some(endpoint) if matches!(
+                            &endpoint.role,
+                            EndpointPortRole::Process { .. }
+                        )
                     )
                 });
                 assert_eq!(routable, has_process_port, "{} routing mismatch", node.name);

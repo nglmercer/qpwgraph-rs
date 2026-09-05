@@ -1,6 +1,7 @@
 mod args;
 mod bridge;
 mod canvas;
+mod diagnostics;
 mod model;
 mod names;
 mod shortcuts;

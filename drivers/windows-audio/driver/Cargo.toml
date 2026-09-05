@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# The ACX ABI is supplied by the eWDK rather than by `wdk-sys`. Keep the
+# binding experiment opt-in until an eWDK build proves the exact header and
+# import-library contract on the target image.
+acx = []
+
 [lib]
 crate-type = ["cdylib"]
 path = "src/lib.rs"
@@ -17,6 +23,8 @@ wdk-panic.workspace = true
 wdk-sys.workspace = true
 
 [build-dependencies]
+bindgen = "0.71.1"
+cc = "1.4.5"
 wdk-build.workspace = true
 
 [package.metadata.wdk.driver-model]

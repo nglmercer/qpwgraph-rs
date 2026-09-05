@@ -223,6 +223,10 @@ fn relay_receive_sink(selector: &str) -> RelayReceiveSink {
 }
 
 fn sync_config(application: &mut Application) {
+    #[cfg(target_os = "windows")]
+    if let Some(routes) = application.source.windows_application_route_rules() {
+        application.config.windows_application_routes = routes;
+    }
     application.config.zoom = application.view.zoom;
     application.config.thumbnail_view = application.view.thumbnail_mode;
     application.config.minimap_visible = application.view.minimap_visible;

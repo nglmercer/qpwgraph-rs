@@ -1,15 +1,13 @@
 //! KMDF bootstrap for the ACX virtual audio adapter.
 //!
-//! Device/circuit creation is intentionally a separate milestone. Until the
-//! ACX circuit is implemented, `EvtDeviceAdd` rejects the device so the
-//! development package cannot claim to expose an audio endpoint it does not
-//! yet own.
+//! The default build is fail-closed. The opt-in `acx` build owns the first
+//! app/relay endpoint transaction in the ACX bridge and remains an eWDK-only
+//! validation target until it passes the Windows smoke and verifier gates.
 
 use wdk::{nt_success, paged_code};
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING,
-    PDRIVER_OBJECT, PWDFDEVICE_INIT, STATUS_NOT_SUPPORTED, STATUS_SUCCESS, WDFDRIVER,
-    WDF_DRIVER_CONFIG,
+    call_unsafe_wdf_function_binding, DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT,
+    PWDFDEVICE_INIT, STATUS_SUCCESS, WDFDRIVER, WDF_DRIVER_CONFIG,
 };
 
 const WDF_DRIVER_CONFIG_SIZE: u32 = core::mem::size_of::<WDF_DRIVER_CONFIG>() as u32;
@@ -40,15 +38,21 @@ pub unsafe extern "system" fn driver_entry(
     if !nt_success(status) {
         return status;
     }
+    #[cfg(feature = "acx")]
+    {
+        let status = unsafe { crate::acx::initialize_driver(handle) };
+        if !nt_success(status) {
+            return status;
+        }
+    }
     STATUS_SUCCESS
 }
 
-/// ACX adapter creation will replace this callback in the next driver stage.
+/// ACX adapter creation is isolated behind the binding gate. The normal
+/// package still rejects device-add; the eWDK-only feature path creates the
+/// app and relay endpoint pairs through the documented ACX bridge.
 #[link_section = "PAGE"]
-extern "C" fn evt_device_add(
-    _driver: WDFDRIVER,
-    _device_init: PWDFDEVICE_INIT,
-) -> NTSTATUS {
+extern "C" fn evt_device_add(driver: WDFDRIVER, device_init: PWDFDEVICE_INIT) -> NTSTATUS {
     paged_code!();
-    STATUS_NOT_SUPPORTED
+    unsafe { crate::acx::add_device(driver, device_init) }
 }

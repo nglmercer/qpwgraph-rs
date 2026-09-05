@@ -145,6 +145,23 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
         "preferences" => toggle_overlay(window, Overlay::Preferences),
         "history" => toggle_overlay(window, Overlay::History),
         "shortcuts" => toggle_overlay(window, Overlay::Shortcuts),
+        "copy-windows-audio-report" => {
+            #[cfg(target_os = "windows")]
+            {
+                let report = application.source.windows_audio_report();
+                match crate::diagnostics::copy_text(&report) {
+                    Ok(()) => application.status = application.t("status.windows_report_copied"),
+                    Err(error) => {
+                        application.status = application
+                            .tf("status.windows_report_copy_failed", &[("error", error)]);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                application.status = application.t("status.windows_report_unavailable");
+            }
+        }
         "effects" => {
             if window.get_show_effects() {
                 cancel_effect_setup(window, application);

@@ -111,35 +111,67 @@ impl WindowsApplicationSelector {
     /// intentionally not enough because unrelated applications may reuse it.
     pub fn is_stable(&self) -> bool {
         self.executable_path_hash.is_some()
-            || self.package_family_name.is_some()
             || self.app_user_model_id.is_some()
+            || (self.package_family_name.is_some() && self.executable_name.is_some())
     }
 
     pub fn stable_key(&self) -> Option<&str> {
-        self.executable_path_hash
+        self.app_user_model_id
             .as_deref()
             .or(self.package_family_name.as_deref())
-            .or(self.app_user_model_id.as_deref())
+            .or(self.executable_path_hash.as_deref())
     }
 
-    /// Match fields supplied by this selector against a live candidate. Empty
-    /// optional fields are wildcards; every supplied field must agree. This
-    /// keeps a name-only hint useful for display while requiring a stable
-    /// identity before a route is activated.
-    pub fn matches(&self, candidate: &Self) -> bool {
-        fn field_matches(expected: &Option<String>, actual: &Option<String>) -> bool {
-            expected.as_ref().is_none_or(|expected| {
-                actual
-                    .as_deref()
-                    .is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
-            })
+    /// Runtime key used to share process-loopback leases. A package family
+    /// can contain more than one executable, so package-family-only identity
+    /// is not sufficient for an in-process capture registry. Persisted route
+    /// matching still uses the complete selector fields above.
+    pub fn runtime_key(&self) -> Option<String> {
+        if let Some(aumid) = self.app_user_model_id.as_deref() {
+            return Some(aumid.to_owned());
         }
-        self.is_stable()
-            && field_matches(&self.executable_path_hash, &candidate.executable_path_hash)
-            && field_matches(&self.executable_name, &candidate.executable_name)
-            && field_matches(&self.package_family_name, &candidate.package_family_name)
-            && field_matches(&self.app_user_model_id, &candidate.app_user_model_id)
-            && field_matches(&self.display_name, &candidate.display_name)
+        if let Some(package) = self.package_family_name.as_deref() {
+            let executable = self
+                .executable_name
+                .as_deref()
+                .or(self.executable_path_hash.as_deref())?;
+            return Some(format!("package-family:{package}|executable:{executable}"));
+        }
+        self.executable_path_hash.clone()
+    }
+
+    /// Match this selector against a live candidate using the strongest
+    /// identity available. AUMID and package identity deliberately outrank
+    /// the executable path: package updates are allowed to move the binary
+    /// while preserving the application's durable identity. `display_name`
+    /// is retained as a UI hint and never gates activation.
+    pub fn matches(&self, candidate: &Self) -> bool {
+        if !self.is_stable() {
+            return false;
+        }
+        if let Some(expected) = self.app_user_model_id.as_deref() {
+            return candidate
+                .app_user_model_id
+                .as_deref()
+                .is_some_and(|actual| expected.eq_ignore_ascii_case(actual));
+        }
+        if let (Some(expected_package), Some(expected_name)) = (
+            self.package_family_name.as_deref(),
+            self.executable_name.as_deref(),
+        ) {
+            return candidate
+                .package_family_name
+                .as_deref()
+                .is_some_and(|actual| expected_package.eq_ignore_ascii_case(actual))
+                && candidate
+                    .executable_name
+                    .as_deref()
+                    .is_some_and(|actual| expected_name.eq_ignore_ascii_case(actual));
+        }
+        self.executable_path_hash
+            .as_deref()
+            .zip(candidate.executable_path_hash.as_deref())
+            .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
     }
 
     fn specificity(&self) -> usize {
@@ -161,10 +193,23 @@ impl WindowsApplicationSelector {
 #[serde(default)]
 pub struct WindowsApplicationRoute {
     pub application: WindowsApplicationSelector,
+    /// Stable endpoint identity introduced after the original route schema.
+    /// The older `destination_endpoint_id` and `destination_name` fields stay
+    /// readable so existing configurations can be upgraded lazily.
+    pub destination_stable_id: Option<String>,
+    pub destination_mmdevice_id: Option<String>,
     pub destination_endpoint_id: Option<String>,
     pub destination_name: Option<String>,
     pub virtualization_required: bool,
+    /// Legacy effect identifiers retained for old configuration files. They
+    /// are intentionally not enough to restore a route because they omit
+    /// parameters, bypass state, enabled state, and instance identity.
     pub effect_chain: Vec<String>,
+    /// Complete, ordered effect instances for a Windows application route.
+    /// This is separate from `effect_chain` so old TOML remains readable and
+    /// old callers do not accidentally restore an effect with defaults.
+    #[serde(default)]
+    pub effect_instances: Vec<EffectInstanceConfig>,
     pub gain: f32,
     pub enabled: bool,
 }
@@ -183,16 +228,49 @@ impl WindowsApplicationRoute {
     pub fn selector_specificity(&self) -> usize {
         self.application.specificity()
     }
+
+    /// Return the effect configuration that can be restored transactionally.
+    ///
+    /// A legacy route may contain only effect IDs in `effect_chain`; treating
+    /// those as a request to create default processors would silently change
+    /// the user's audio. Such routes are therefore rejected until they have
+    /// been upgraded with complete `effect_instances` data.
+    pub fn restorable_effect_instances(&self) -> Result<Vec<EffectInstanceConfig>, String> {
+        if self.effect_instances.is_empty() {
+            return if self.effect_chain.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err("saved route contains legacy effect IDs without instance configuration".into())
+            };
+        }
+
+        if !self.effect_chain.is_empty()
+            && (self.effect_chain.len() != self.effect_instances.len()
+                || self
+                    .effect_chain
+                    .iter()
+                    .zip(&self.effect_instances)
+                    .any(|(id, instance)| id != &instance.effect_id))
+        {
+            return Err(
+                "saved route effect ID list does not match its instance configuration".into(),
+            );
+        }
+        Ok(self.effect_instances.clone())
+    }
 }
 
 impl Default for WindowsApplicationRoute {
     fn default() -> Self {
         Self {
             application: WindowsApplicationSelector::default(),
+            destination_stable_id: None,
+            destination_mmdevice_id: None,
             destination_endpoint_id: None,
             destination_name: None,
             virtualization_required: true,
             effect_chain: Vec::new(),
+            effect_instances: Vec::new(),
             gain: 1.0,
             enabled: true,
         }
@@ -672,8 +750,21 @@ impl AppConfig {
     ) -> Option<&WindowsApplicationRoute> {
         self.windows_application_routes
             .iter()
-            .filter(|route| route.matches_application(candidate))
-            .max_by_key(|route| route.selector_specificity())
+            .enumerate()
+            .filter(|(_, route)| route.matches_application(candidate))
+            .fold(
+                None,
+                |best: Option<(usize, &WindowsApplicationRoute)>, current| {
+                    let replace = best.as_ref().is_none_or(|(best_index, best_route)| {
+                        current.1.selector_specificity() > best_route.selector_specificity()
+                            || (current.1.selector_specificity()
+                                == best_route.selector_specificity()
+                                && current.0 < *best_index)
+                    });
+                    replace.then_some(current).or(best)
+                },
+            )
+            .map(|(_, route)| route)
     }
 
     /// Set the canonical role and keep the legacy in-memory compatibility
@@ -1081,6 +1172,8 @@ enabled = true
         let mut config = AppConfig::default();
         config.windows.experimental_app_routing = true;
         config.windows.relay.receive_target = WindowsRelayReceiveTarget::VirtualMicrophone;
+        let mut effect_parameters = BTreeMap::new();
+        effect_parameters.insert("threshold-db".into(), -42.0);
         config
             .windows_application_routes
             .push(WindowsApplicationRoute {
@@ -1092,6 +1185,13 @@ enabled = true
                 destination_endpoint_id: Some("endpoint-instance-id".into()),
                 destination_name: Some("Speakers".into()),
                 effect_chain: vec!["builtin.noise-gate".into()],
+                effect_instances: vec![EffectInstanceConfig {
+                    instance_id: "route-gate".into(),
+                    effect_id: "builtin.noise-gate".into(),
+                    module_path: None,
+                    enabled: false,
+                    parameters: effect_parameters,
+                }],
                 ..WindowsApplicationRoute::default()
             });
         let text = toml::to_string_pretty(&config).unwrap();
@@ -1103,6 +1203,38 @@ enabled = true
             restored.windows_application_routes,
             config.windows_application_routes
         );
+        let route = restored.windows_application_routes.first().unwrap();
+        let restored_effect = route.restorable_effect_instances().unwrap().pop().unwrap();
+        assert_eq!(restored_effect.instance_id, "route-gate");
+        assert_eq!(restored_effect.parameters["threshold-db"], -42.0);
+        assert!(!restored_effect.enabled);
+    }
+
+    #[test]
+    fn legacy_route_effect_ids_fail_closed_until_upgraded() {
+        let route = WindowsApplicationRoute {
+            effect_chain: vec!["builtin.noise-gate".into()],
+            ..WindowsApplicationRoute::default()
+        };
+        let error = route.restorable_effect_instances().unwrap_err();
+        assert!(error.contains("legacy effect IDs"));
+    }
+
+    #[test]
+    fn route_effect_ids_must_match_complete_instances() {
+        let route = WindowsApplicationRoute {
+            effect_chain: vec!["builtin.noise-gate".into()],
+            effect_instances: vec![EffectInstanceConfig {
+                instance_id: "route-gate".into(),
+                effect_id: "builtin.adaptive-noise-suppressor".into(),
+                module_path: None,
+                enabled: true,
+                parameters: BTreeMap::new(),
+            }],
+            ..WindowsApplicationRoute::default()
+        };
+        let error = route.restorable_effect_instances().unwrap_err();
+        assert!(error.contains("does not match"));
     }
 
     #[test]
@@ -1139,6 +1271,73 @@ enabled = true
     }
 
     #[test]
+    fn package_family_runtime_key_keeps_executables_distinct() {
+        let first = WindowsApplicationSelector {
+            package_family_name: Some("Example_123".into()),
+            executable_name: Some("first.exe".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        let second = WindowsApplicationSelector {
+            package_family_name: Some("Example_123".into()),
+            executable_name: Some("second.exe".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        assert_ne!(first.runtime_key(), second.runtime_key());
+        assert_eq!(
+            first.runtime_key().as_deref(),
+            Some("package-family:Example_123|executable:first.exe")
+        );
+        assert!(!WindowsApplicationSelector {
+            package_family_name: Some("Example_123".into()),
+            ..WindowsApplicationSelector::default()
+        }
+        .is_stable());
+    }
+
+    #[test]
+    fn package_family_runtime_key_survives_executable_path_changes() {
+        let before = WindowsApplicationSelector {
+            executable_path_hash: Some("sha256:old".into()),
+            executable_name: Some("player.exe".into()),
+            package_family_name: Some("Example_123".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        let after = WindowsApplicationSelector {
+            executable_path_hash: Some("sha256:new".into()),
+            executable_name: Some("PLAYER.EXE".into()),
+            package_family_name: Some("example_123".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        assert_eq!(
+            before.runtime_key().as_deref(),
+            Some("package-family:Example_123|executable:player.exe")
+        );
+        assert_eq!(
+            before.runtime_key().map(|key| key.to_ascii_lowercase()),
+            after.runtime_key().map(|key| key.to_ascii_lowercase())
+        );
+    }
+
+    #[test]
+    fn durable_packaged_identity_survives_path_and_display_name_changes() {
+        let selector = WindowsApplicationSelector {
+            executable_path_hash: Some("sha256:old".into()),
+            executable_name: Some("player.exe".into()),
+            package_family_name: Some("Player_123".into()),
+            app_user_model_id: Some("Player_123!App".into()),
+            display_name: Some("Old Player".into()),
+        };
+        let candidate = WindowsApplicationSelector {
+            executable_path_hash: Some("sha256:new".into()),
+            executable_name: Some("player.exe".into()),
+            package_family_name: Some("player_123".into()),
+            app_user_model_id: Some("player_123!app".into()),
+            display_name: Some("New Player".into()),
+        };
+        assert!(selector.matches(&candidate));
+    }
+
+    #[test]
     fn most_specific_enabled_application_route_wins_without_a_pid() {
         let candidate = WindowsApplicationSelector {
             executable_path_hash: Some("sha256:abc".into()),
@@ -1160,6 +1359,7 @@ enabled = true
                     application: WindowsApplicationSelector {
                         executable_path_hash: Some("sha256:abc".into()),
                         package_family_name: Some("player_123!app".into()),
+                        executable_name: Some("player.exe".into()),
                         ..WindowsApplicationSelector::default()
                     },
                     destination_name: Some("specific".into()),

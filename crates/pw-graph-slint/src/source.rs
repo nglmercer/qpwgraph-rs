@@ -205,6 +205,34 @@ impl ApplicationDriver {
             .map_err(|error| error.to_string())
     }
 
+    /// Restore persisted Windows application routes and return their explicit
+    /// state-machine plans for diagnostics. Other backends reject the request
+    /// instead of pretending that a route was applied.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn reconcile_windows_application_routes(
+        &mut self,
+        routes: Vec<pw_graph_config::WindowsApplicationRoute>,
+    ) -> Result<Vec<pw_graph_backend::ApplicationRoutePlan>, String> {
+        match &mut self.backend {
+            BackendKind::Demo(_) => {
+                Err("Windows application routes are unavailable in demo mode".into())
+            }
+            BackendKind::Live(driver) => driver
+                .reconcile_windows_application_routes(routes)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn windows_application_route_rules(
+        &self,
+    ) -> Option<Vec<pw_graph_config::WindowsApplicationRoute>> {
+        match &self.backend {
+            BackendKind::Demo(_) => None,
+            BackendKind::Live(driver) => driver.windows_application_route_rules(),
+        }
+    }
+
     pub(crate) fn refresh_if_needed(&mut self) -> Result<(), String> {
         GraphDriver::refresh_if_needed(self)
             .map(|_| ())

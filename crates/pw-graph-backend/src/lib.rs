@@ -36,10 +36,15 @@ mod windows_relay;
 
 #[cfg(target_os = "windows")]
 pub use windows::{
-    classify_virtual_endpoint, AppRoutePolicy, AppRoutePolicySupport, AudioFlow, AudioRole,
-    ProcessIdentity, ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
-    QpwVirtualEndpointRole, UnsupportedAppRoutePolicy, VirtualAudioDriverHealth,
-    WindowsAudioDriver,
+    classify_driver_owned_endpoint, classify_virtual_endpoint, AppRoutePolicy,
+    AppRoutePolicySupport, ApplicationRouteActivation, ApplicationRouteCandidate,
+    ApplicationRouteEnvironment, ApplicationRoutePlan, ApplicationRouteReconciler,
+    ApplicationRouteState, AudioFlow, AudioRole, ProcessAudioCapabilities, ProcessCaptureConsumer,
+    ProcessCaptureKey, ProcessCaptureManager, ProcessCaptureReadiness, ProcessCaptureRequest,
+    ProcessCaptureState, ProcessCaptureStatus, ProcessIdentity, ProcessLoopbackCapability,
+    ProcessLoopbackMode, ProcessLoopbackSource, ProcessMeterReading, ProcessMeterTarget,
+    QpwVirtualEndpointIdentity, QpwVirtualEndpointRole, UnsupportedAppRoutePolicy,
+    VirtualAudioDriverHealth, WindowsAudioDriver, WindowsEndpointSelector,
 };
 #[cfg(target_os = "windows")]
 pub use windows_midi::WindowsMidiDriver;
@@ -639,19 +644,24 @@ mod tests {
         if driver.refresh().is_err() {
             return;
         }
-        let metered = driver
+        let endpoint_metered = driver
             .graph()
             .nodes
-            .keys()
-            .map(|node_id| driver.node_capabilities(*node_id))
+            .values()
+            .filter(|node| node.node_type == NodeType::WindowsAudioEndpoint)
+            .map(|node| driver.node_capabilities(node.id))
             .filter(|capabilities| capabilities.has_any_meter())
             .collect::<Vec<_>>();
-        if metered.is_empty() {
+        if endpoint_metered.is_empty() {
             return;
         }
-        assert!(metered.iter().all(|capabilities| capabilities.meter_peak));
+        assert!(endpoint_metered
+            .iter()
+            .all(|capabilities| capabilities.meter_peak));
         assert!(
-            metered.iter().all(|capabilities| !capabilities.meter_rms),
+            endpoint_metered
+                .iter()
+                .all(|capabilities| !capabilities.meter_rms),
             "Core Audio exposes no endpoint RMS"
         );
     }

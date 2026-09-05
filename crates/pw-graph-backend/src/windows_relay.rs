@@ -7,8 +7,8 @@
 //! instead:
 //!
 //! Emitter mode can capture a physical input with `eCapture`, loopback-record
-//! a selected playback endpoint with `eRender`, or drain a live process-loopback
-//! source that is already isolated on QPWGraph Virtual Output. Receiver mode
+//! a selected playback endpoint with `eRender`, or drain a live read-only
+//! process-loopback source. Receiver mode
 //! renders peer audio to an `eRender` endpoint. Exactly one worker is active
 //! for a relay instance; changing the mode or selector stops that worker
 //! before starting its replacement.
@@ -21,7 +21,10 @@
 
 use crate::api::{BackendError, BackendResult, RelayReceiveSink, RelaySendSource};
 use crate::router::{AudioFormat, AudioSource, RingSource, StreamHealth};
-use crate::windows::{ProcessLoopbackMode, ProcessLoopbackSource};
+use crate::windows::{
+    find_qpwgraph_endpoint, verify_live_process_identity, ProcessLoopbackMode,
+    ProcessLoopbackSource, QpwVirtualEndpointRole,
+};
 use pw_graph_relay::{EngineConfig, RelayEngine, RelayHandle, RelayMode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -30,9 +33,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use windows::core::PWSTR;
-use windows::Win32::Devices::FunctionDiscovery;
 use windows::Win32::Media::Audio;
-use windows::Win32::System::Com::{self, StructuredStorage, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{self, CLSCTX_ALL, COINIT_MULTITHREADED};
 
 /// The relay engine's PCM format. WASAPI is asked to convert to it, so the
 /// endpoint's own mix format never leaks into the wire format.
@@ -83,6 +85,9 @@ pub(crate) struct WindowsRelayDevices {
     /// Live PID resolved from a stable application selector. The PID is never
     /// persisted and is refreshed whenever the worker snapshot changes.
     application: Option<RelayApplicationSource>,
+    /// Generation of the process-loopback activation, mirrored into the
+    /// shared capture manager for diagnostics and consumer ownership.
+    process_capture_key: Option<crate::windows::ProcessCaptureKey>,
     /// The device id WASAPI actually opened. This differs from the requested
     /// id when a configured endpoint disappeared and the current default was
     /// used as the documented fallback.
@@ -148,14 +153,23 @@ impl WindowsRelayDevices {
     pub(crate) fn start_mode(
         config: EngineConfig,
         endpoints: RelayEndpoints,
-        mode: RelayMode,
-        send_source: RelaySendSource,
-        receive_sink: RelayReceiveSink,
-        application: Option<RelayApplicationSource>,
-        default_generation: u64,
+        selection: RelayWorkerSelection,
     ) -> BackendResult<Self> {
-        let (direction, target) =
-            endpoint_for_mode(mode, &send_source, &receive_sink, application.as_ref())?;
+        let RelayWorkerSelection {
+            mode,
+            send_source,
+            receive_sink,
+            application,
+            default_generation,
+            resolved_send_source,
+            resolved_receive_sink,
+        } = selection;
+        let (direction, target) = endpoint_for_mode(
+            mode,
+            &resolved_send_source,
+            &resolved_receive_sink,
+            application.as_ref(),
+        )?;
 
         let engine = RelayEngine::start(config)
             .map_err(|error| BackendError::native(format!("relay engine start failed: {error}")))?;
@@ -184,8 +198,8 @@ impl WindowsRelayDevices {
                 "Windows relay endpoint did not start in time",
             )),
         };
-        let resolved_endpoint = match start {
-            Ok(start) => start.resolved_id,
+        let (resolved_endpoint, capture_generation) = match start {
+            Ok(start) => (start.resolved_id, start.capture_generation),
             Err(error) => {
                 stop_threads(&stop, &mut vec![thread]);
                 engine.shutdown();
@@ -200,6 +214,7 @@ impl WindowsRelayDevices {
             mode,
             send_source,
             receive_sink,
+            process_capture_key: application_capture_key(application.as_ref(), capture_generation),
             application,
             resolved_endpoint: Some(resolved_endpoint),
             default_generation,
@@ -211,14 +226,23 @@ impl WindowsRelayDevices {
     /// switches therefore do not need to tear down the control connection.
     pub(crate) fn restart_endpoint(
         &mut self,
-        mode: RelayMode,
-        send_source: RelaySendSource,
-        receive_sink: RelayReceiveSink,
-        application: Option<RelayApplicationSource>,
-        default_generation: u64,
+        selection: RelayWorkerSelection,
     ) -> BackendResult<()> {
-        let (direction, target) =
-            endpoint_for_mode(mode, &send_source, &receive_sink, application.as_ref())?;
+        let RelayWorkerSelection {
+            mode,
+            send_source,
+            receive_sink,
+            application,
+            default_generation,
+            resolved_send_source,
+            resolved_receive_sink,
+        } = selection;
+        let (direction, target) = endpoint_for_mode(
+            mode,
+            &resolved_send_source,
+            &resolved_receive_sink,
+            application.as_ref(),
+        )?;
         self.stop.store(true, Ordering::Release);
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -243,8 +267,8 @@ impl WindowsRelayDevices {
                 "Windows relay endpoint did not start in time",
             )),
         };
-        let resolved_endpoint = match start {
-            Ok(start) => start.resolved_id,
+        let (resolved_endpoint, capture_generation) = match start {
+            Ok(start) => (start.resolved_id, start.capture_generation),
             Err(error) => {
                 stop_threads(&stop, &mut vec![thread]);
                 self.stop = stop;
@@ -256,6 +280,8 @@ impl WindowsRelayDevices {
         self.mode = mode;
         self.send_source = send_source;
         self.receive_sink = receive_sink;
+        self.process_capture_key =
+            application_capture_key(application.as_ref(), capture_generation);
         self.application = application;
         self.resolved_endpoint = Some(resolved_endpoint);
         self.default_generation = default_generation;
@@ -264,6 +290,10 @@ impl WindowsRelayDevices {
 
     pub(crate) fn handle(&self) -> RelayHandle {
         self.engine.handle()
+    }
+
+    pub(crate) fn process_capture_key(&self) -> Option<&crate::windows::ProcessCaptureKey> {
+        self.process_capture_key.as_ref()
     }
 
     /// Stop an application capture while retaining the authenticated relay
@@ -280,6 +310,7 @@ impl WindowsRelayDevices {
         }
         self.stop = Arc::new(AtomicBool::new(false));
         self.application = None;
+        self.process_capture_key = None;
         self.resolved_endpoint = None;
         self.engine.handle().report_error(message);
     }
@@ -302,6 +333,7 @@ impl std::fmt::Debug for WindowsRelayDevices {
             .field("mode", &self.mode)
             .field("resolved_endpoint", &self.resolved_endpoint)
             .field("application", &self.application)
+            .field("process_capture_key", &self.process_capture_key)
             .field("default_generation", &self.default_generation)
             .field("stopping", &self.stop.load(Ordering::Acquire))
             .finish()
@@ -316,7 +348,7 @@ enum Direction {
     Monitor,
     /// Play what the engine received on the selected playback endpoint.
     Render,
-    /// Capture one live process already isolated on QPWGraph Virtual Output.
+    /// Capture one live process without changing its normal local output.
     Application,
 }
 
@@ -326,6 +358,19 @@ pub(crate) struct RelayApplicationSource {
     pub(crate) pid: u32,
 }
 
+/// The durable relay selection plus the live WASAPI-bound selectors. Keeping
+/// these together prevents the restart path from accidentally comparing one
+/// identity while opening another endpoint.
+pub(crate) struct RelayWorkerSelection {
+    pub(crate) mode: RelayMode,
+    pub(crate) send_source: RelaySendSource,
+    pub(crate) receive_sink: RelayReceiveSink,
+    pub(crate) application: Option<RelayApplicationSource>,
+    pub(crate) default_generation: u64,
+    pub(crate) resolved_send_source: RelaySendSource,
+    pub(crate) resolved_receive_sink: RelayReceiveSink,
+}
+
 enum EndpointTarget {
     Device(Option<String>),
     Application(RelayApplicationSource),
@@ -333,9 +378,23 @@ enum EndpointTarget {
 
 struct EndpointStart {
     resolved_id: String,
+    capture_generation: Option<u64>,
 }
 
 type StartResult = Receiver<BackendResult<EndpointStart>>;
+
+fn application_capture_key(
+    application: Option<&RelayApplicationSource>,
+    generation: Option<u64>,
+) -> Option<crate::windows::ProcessCaptureKey> {
+    let application = application?;
+    Some(crate::windows::ProcessCaptureKey {
+        selector: application.selector_key.clone(),
+        pid: application.pid,
+        generation: generation?,
+        mode: ProcessLoopbackMode::IncludeProcessTree,
+    })
+}
 
 fn endpoint_for_mode(
     mode: RelayMode,
@@ -358,12 +417,12 @@ fn endpoint_for_mode(
             RelaySendSource::Application(selector) => {
                 let Some(application) = application else {
                     return Err(BackendError::unsupported(
-                        "selected application is not currently isolated on QPWGraph Virtual Output",
+                        "selected application is not currently available for process-loopback capture",
                     ));
                 };
-                if application.selector_key != *selector {
+                if !application.selector_key.eq_ignore_ascii_case(selector) {
                     return Err(BackendError::unsupported(
-                        "selected application is no longer available on QPWGraph Virtual Output",
+                        "selected application is no longer available for process-loopback capture",
                     ));
                 }
                 Ok((
@@ -463,15 +522,20 @@ fn run_endpoint(
             return;
         };
         let format = AudioFormat::new(RELAY_SAMPLE_RATE, RELAY_CHANNELS);
-        match ProcessLoopbackSource::open(
-            application.pid,
-            ProcessLoopbackMode::IncludeProcessTree,
-            format,
-            APPLICATION_RING_FRAMES,
+        match verify_live_process_identity(&application.selector_key, application.pid).and_then(
+            |_| {
+                ProcessLoopbackSource::open(
+                    application.pid,
+                    ProcessLoopbackMode::IncludeProcessTree,
+                    format,
+                    APPLICATION_RING_FRAMES,
+                )
+            },
         ) {
-            Ok((mut source, _activation)) => {
+            Ok((mut source, activation)) => {
                 let _ = started.send(Ok(EndpointStart {
                     resolved_id: format!("application:{}", application.selector_key),
+                    capture_generation: Some(activation.generation()),
                 }));
                 application_capture_loop(&mut source, handle, stop);
             }
@@ -515,7 +579,10 @@ fn run_endpoint(
                 let _ = started.send(Err(native("start audio client", error)));
                 return;
             }
-            let _ = started.send(Ok(EndpointStart { resolved_id }));
+            let _ = started.send(Ok(EndpointStart {
+                resolved_id,
+                capture_generation: None,
+            }));
             match service {
                 Service::Capture(capture) => capture_loop(&capture, handle, stop),
                 Service::Render(render) => render_loop(&client, &render, handle, stop),
@@ -567,14 +634,19 @@ fn open_endpoint(
         Direction::Monitor | Direction::Render => Audio::eRender,
         Direction::Application => unreachable!("process-loopback does not use MMDeviceEnumerator"),
     };
-    // A named device that has since been unplugged falls back to the current
-    // default of the required data flow rather than failing the whole relay.
+    // A physical device id that has since been unplugged falls back to the
+    // current default of the required data flow. The provider-owned relay
+    // target is different: it fails closed rather than sending peer audio to
+    // an unrelated physical endpoint.
     let device = match device_id {
-        Some("qpwgraph://relay-render") => Some(find_named_endpoint(
-            &enumerator,
-            flow,
-            "QPWGraph Relay Sink",
-        )?),
+        Some("qpwgraph://relay-render") => Some(
+            find_qpwgraph_endpoint(&enumerator, flow, QpwVirtualEndpointRole::RelayRender)?
+                .ok_or_else(|| {
+                    BackendError::unsupported(
+                        "QPWGraph Relay Sink requires the optional virtual audio driver",
+                    )
+                })?,
+        ),
         Some(id) => {
             let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
             unsafe { enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr())) }.ok()
@@ -614,35 +686,6 @@ fn open_endpoint(
     .map_err(|error| native("initialize audio client", error))?;
 
     Ok((client, resolved_id))
-}
-
-fn find_named_endpoint(
-    enumerator: &Audio::IMMDeviceEnumerator,
-    flow: Audio::EDataFlow,
-    friendly_name: &str,
-) -> BackendResult<Audio::IMMDevice> {
-    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }
-        .map_err(|error| native("enumerate qpwgraph virtual endpoints", error))?;
-    let count = unsafe { collection.GetCount() }
-        .map_err(|error| native("read qpwgraph virtual endpoint count", error))?;
-    for index in 0..count {
-        let device = unsafe { collection.Item(index) }
-            .map_err(|error| native("read qpwgraph virtual endpoint", error))?;
-        let store = unsafe { device.OpenPropertyStore(Com::STGM_READ) }
-            .map_err(|error| native("read qpwgraph virtual endpoint properties", error))?;
-        let key = FunctionDiscovery::PKEY_Device_FriendlyName;
-        let value = unsafe { store.GetValue(&key) }
-            .map_err(|error| native("read qpwgraph virtual endpoint name", error))?;
-        let name =
-            unsafe { value.Anonymous.Anonymous.Anonymous.pwszVal.to_string() }.unwrap_or_default();
-        unsafe { StructuredStorage::PropVariantClear(&value as *const _ as *mut _) }.ok();
-        if name.trim().eq_ignore_ascii_case(friendly_name) {
-            return Ok(device);
-        }
-    }
-    Err(BackendError::unsupported(
-        "QPWGraph Relay Microphone requires the optional virtual audio driver",
-    ))
 }
 
 fn take_pwstr(value: PWSTR) -> String {
@@ -968,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn application_sources_require_a_live_virtualized_process() {
+    fn application_sources_require_a_live_process_loopback_target() {
         let source = RelaySendSource::Application("sha256:abc".into());
         let missing = endpoint_for_mode(
             RelayMode::Emitter,

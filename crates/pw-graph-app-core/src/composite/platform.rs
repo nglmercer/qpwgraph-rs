@@ -4,6 +4,29 @@
 use super::*;
 
 impl CompositeDriver {
+    /// Restore persisted Windows application-route rules against the live
+    /// Core Audio snapshot. The backend returns explicit plans; it never
+    /// silently guesses a PID or mutates an unrelated process.
+    #[cfg(target_os = "windows")]
+    pub fn reconcile_windows_application_routes(
+        &mut self,
+        routes: Vec<pw_graph_config::WindowsApplicationRoute>,
+    ) -> BackendResult<Vec<pw_graph_backend::ApplicationRoutePlan>> {
+        self.windows_audio
+            .as_mut()
+            .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+            .reconcile_application_routes(routes)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn windows_application_route_rules(
+        &self,
+    ) -> Option<Vec<pw_graph_config::WindowsApplicationRoute>> {
+        self.windows_audio
+            .as_ref()
+            .map(WindowsAudioDriver::application_route_rules)
+    }
+
     /// Return the Windows-only audio diagnostics report without exposing the
     /// native driver object to the UI layer.  The report is text-only and
     /// bounded by the backend, so callers can safely place it on a clipboard

@@ -18,7 +18,7 @@ default = ["pipewire", "alsa", "relay", "tray"]
 pipewire = ["pw-graph-backend/pipewire", "pw-graph-app-core/pipewire"]
 alsa = ["dep:pw-graph-alsamidi", "pw-graph-alsamidi/alsa", "pw-graph-app-core/alsa"]
 relay = ["pw-graph-backend/relay", "pw-graph-app-core/relay"]
-tray = ["dep:ksni", "dep:windows"]
+tray = ["dep:ksni"]
 
 [dependencies]
 slint.workspace = true
@@ -42,11 +42,14 @@ pw-graph-alsamidi = { path = "../pw-graph-alsamidi", default-features = false, o
 # The notification-area tray. Only the window, menu, and shell-icon surfaces:
 # the tray runs its own hidden window and touches nothing else.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true, optional = true, features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Ole",
 ] }
 
 [build-dependencies]

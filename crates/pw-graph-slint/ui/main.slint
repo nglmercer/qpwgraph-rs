@@ -350,6 +350,12 @@ export component MainWindow inherits Window {
                         clicked => { root.action("shortcuts"); }
                         hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); }
                     }
+                    diagnostics_button := RailActionButton {
+                        icon: @image-url("../../../assets/icons/diagnostics.svg");
+                        label: UiI18n.localized("nav.diagnostics");
+                        clicked => { root.action("copy-windows-audio-report"); }
+                        hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); }
+                    }
 
                     Rectangle { width: 52px; x: -5px; height: 1px; background: #35414d; }
                     Rectangle { width: 42px; height: 7px; background: transparent; }

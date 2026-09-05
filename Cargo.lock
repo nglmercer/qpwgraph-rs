@@ -4099,6 +4099,7 @@ version = "0.1.0"
 dependencies = [
  "pw-graph-alsamidi",
  "pw-graph-backend",
+ "pw-graph-config",
  "pw-graph-core",
  "pw-graph-effects",
 ]
@@ -4108,6 +4109,7 @@ name = "pw-graph-backend"
 version = "0.1.0"
 dependencies = [
  "pipewire",
+ "pw-graph-config",
  "pw-graph-core",
  "pw-graph-effects",
  "pw-graph-relay",
