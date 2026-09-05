@@ -1,7 +1,7 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [Parameter(Mandatory = $false)]
-    [string] $PackageRoot = $PSScriptRoot,
+    [string] $PackageRoot,
     [Parameter(Mandatory = $false)]
     [switch] $AllowTestSigned,
     [Parameter(Mandatory = $false)]
@@ -14,6 +14,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
+    # Automatic variables are not reliably populated while PowerShell binds
+    # parameter defaults. Resolve the script directory after binding instead.
+    $PackageRoot = $PSScriptRoot
+}
 
 $packageRootPath = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path
 $inf = Join-Path $packageRootPath 'qpwgraph-audio.inf'

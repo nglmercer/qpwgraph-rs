@@ -163,7 +163,7 @@ function Invoke-Install {
     if (-not (Test-TestSigningEnabled)) {
         throw 'Windows test-signing is not enabled in the current boot. Run -Phase EnableTestMode and reboot first.'
     }
-    Invoke-PowerShellScript $installScript @('-AllowTestSigned', '-SmokeProbe', $smokePath, '-Verbose') 'Driver installation'
+    Invoke-PowerShellScript $installScript @('-PackageRoot', $packageRootPath, '-AllowTestSigned', '-SmokeProbe', $smokePath, '-Verbose') 'Driver installation'
     Write-Output 'Installation completed. Save the oemNN.inf name printed above before continuing.'
 }
 
