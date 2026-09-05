@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory = $false)]
     [string] $PackageRoot,
     [Parameter(Mandatory = $false)]
+    [string] $DevGenPath,
+    [Parameter(Mandatory = $false)]
     [switch] $AllowTestSigned,
     [Parameter(Mandatory = $false)]
     [string] $SmokeProbe,
@@ -20,6 +22,10 @@ if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
     # parameter defaults. Resolve the script directory after binding instead.
     $PackageRoot = $PSScriptRoot
 }
+
+$rootDeviceInstanceId = 'ROOT\QPWGRAPH_AUDIO'
+$rootDeviceHardwareId = 'Root\QPWGRAPH_AUDIO'
+$script:rootDeviceNeedsCleanup = $false
 
 $packageRootPath = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path
 $inf = Join-Path $packageRootPath 'qpwgraph-audio.inf'
@@ -65,6 +71,88 @@ function Assert-TestSigningEnabled {
         throw '-AllowTestSigned requires Windows test-signing mode to be enabled for the current boot entry.'
     }
     Write-Warning 'Installing a test-signed development package; this is not a release-signing proof.'
+}
+
+function Find-DevGen {
+    if (-not [string]::IsNullOrWhiteSpace($DevGenPath)) {
+        $resolved = (Resolve-Path -LiteralPath $DevGenPath -ErrorAction Stop).Path
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+            throw "DevGen.exe was not found at $DevGenPath."
+        }
+        return $resolved
+    }
+
+    $onPath = Get-Command 'devgen.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $onPath) {
+        return $onPath.Source
+    }
+
+    $roots = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:WDKContentRoot)) {
+        $roots += Join-Path $env:WDKContentRoot 'Tools'
+    }
+    $roots += 'C:\Program Files (x86)\Windows Kits\10\Tools'
+    $roots += 'C:\Program Files\Windows Kits\10\Tools'
+    foreach ($root in ($roots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            continue
+        }
+        foreach ($architecture in @('x64', 'x86', 'arm64')) {
+            $candidate = Get-ChildItem -LiteralPath $root -Filter 'devgen.exe' -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Directory.Name -ieq $architecture } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+            if ($null -ne $candidate) {
+                return $candidate.FullName
+            }
+        }
+    }
+    throw 'DevGen.exe was not found. Install the WDK Tools or pass -DevGenPath with the x64 devgen.exe path.'
+}
+
+function Test-QpwgraphRootDevice {
+    try {
+        return $null -ne (Get-PnpDevice -InstanceId $rootDeviceInstanceId -ErrorAction SilentlyContinue |
+            Select-Object -First 1)
+    } catch {
+        return $false
+    }
+}
+
+function Ensure-QpwgraphRootDevice {
+    if (Test-QpwgraphRootDevice) {
+        Write-Verbose "Using existing root device $rootDeviceInstanceId"
+        $script:rootDeviceNeedsCleanup = $true
+        return
+    }
+
+    $devgen = Find-DevGen
+    $output = @(& $devgen '/add' '/bus' 'ROOT' '/instanceid' 'QPWGRAPH_AUDIO' '/hardwareid' $rootDeviceHardwareId 2>&1)
+    $exitCode = $LASTEXITCODE
+    if (-not [string]::IsNullOrWhiteSpace(($output | Out-String))) {
+        Write-Verbose (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
+    }
+    if ($exitCode -ne 0) {
+        throw "DevGen failed to create $rootDeviceInstanceId with exit code $exitCode."
+    }
+    $script:rootDeviceNeedsCleanup = $true
+    Start-Sleep -Milliseconds 250
+}
+
+function Remove-QpwgraphRootDevice {
+    if (-not $script:rootDeviceNeedsCleanup) {
+        return
+    }
+
+    $output = @(& pnputil.exe /remove-device $rootDeviceInstanceId /subtree 2>&1)
+    $exitCode = $LASTEXITCODE
+    if (-not [string]::IsNullOrWhiteSpace(($output | Out-String))) {
+        Write-Verbose (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
+    }
+    $script:rootDeviceNeedsCleanup = $false
+    if ($exitCode -ne 0) {
+        Write-Warning "Could not remove $rootDeviceInstanceId with PnPUtil (exit code $exitCode). Remove the device manually before retrying."
+    }
 }
 
 function Invoke-SmokeCheck([string] $Argument) {
@@ -118,14 +206,17 @@ if (-not $PSCmdlet.ShouldProcess($inf, 'install the QPWGraph audio driver packag
     return
 }
 
-# PnPUtil is intentionally the only privileged installation operation. It does
-# not select a Windows default render or capture endpoint.
+# The installer uses only Microsoft driver tools and does not select a Windows
+# default render or capture endpoint. DevGen creates the development-only root
+# devnode that PnPUtil can then match to this INF.
+Ensure-QpwgraphRootDevice
 $pnputilOutput = (& pnputil.exe /add-driver $inf /install 2>&1 | Out-String)
 $pnputilExitCode = $LASTEXITCODE
 if (-not [string]::IsNullOrWhiteSpace($pnputilOutput)) {
     Write-Verbose ($pnputilOutput.TrimEnd())
 }
 if ($pnputilExitCode -ne 0) {
+    Remove-QpwgraphRootDevice
     throw "PnPUtil failed with exit code $pnputilExitCode. No Windows default device was changed."
 }
 
@@ -145,6 +236,7 @@ try {
         Wait-ForEndpointRoles
     }
 } catch {
+    Remove-QpwgraphRootDevice
     $rollbackOutput = (& pnputil.exe /delete-driver $publishedInf /uninstall 2>&1 | Out-String)
     $rollbackExitCode = $LASTEXITCODE
     if ($rollbackExitCode -ne 0) {

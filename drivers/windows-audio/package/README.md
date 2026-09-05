@@ -58,8 +58,9 @@ Set-Location drivers/windows-audio/target/qpwgraph-audio-package
 ```
 
 The runner requires Administrator elevation, builds the smoke probe during
-`Prepare`, imports only the public test certificate, performs role and
-round-trip verification, and never enables `-SkipEndpointVerification`.
+`Prepare`, imports only the public test certificate, creates the development
+root devnode through the WDK `devgen.exe` tool, performs role and round-trip
+verification, and never enables `-SkipEndpointVerification`.
 
 Build the smoke probe before installation:
 
@@ -151,8 +152,9 @@ device/circuit/stream bridge can be compiled. It does not prove that the
 driver loads, enumerates an endpoint, or passes shared-mode, verifier, HLK, or
 signing validation; the package remains fail-closed until those gates pass.
 
-`install.ps1` and `uninstall.ps1` use PnPUtil for the privileged operation but
-keep the lifecycle fail-closed. A release install requires the built
+`install.ps1` creates the development-only `ROOT\QPWGRAPH_AUDIO` devnode with
+WDK `devgen.exe`, then uses PnPUtil for package installation and removal while
+keeping the lifecycle fail-closed. A release install requires the built
 `qpwgraph-audio.inf`, `.cat`, `.sys`, a `ready` manifest with a driver version, and the
 `qpwgraph-audio-smoke` probe. It waits for and verifies all four provider-owned
 endpoint roles, and removes the exact published `oemNN.inf` automatically if

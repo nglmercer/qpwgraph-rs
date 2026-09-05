@@ -13,6 +13,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$rootDeviceInstanceId = 'ROOT\QPWGRAPH_AUDIO'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -60,6 +61,15 @@ function Wait-ForEndpointRemoval {
 }
 
 if ($PSCmdlet.ShouldProcess($PublishedInf, 'remove the QPWGraph audio driver package')) {
+    $removeDeviceOutput = (& pnputil.exe /remove-device $rootDeviceInstanceId /subtree 2>&1 | Out-String)
+    $removeDeviceExitCode = $LASTEXITCODE
+    if (-not [string]::IsNullOrWhiteSpace($removeDeviceOutput)) {
+        Write-Verbose ($removeDeviceOutput.TrimEnd())
+    }
+    if ($removeDeviceExitCode -ne 0 -and $removeDeviceOutput -notmatch '(?i)no matching devices|not found|does not exist') {
+        throw "PnPUtil could not remove the QPWGraph root device (exit code $removeDeviceExitCode). The driver package was left installed."
+    }
+
     $pnputilOutput = (& pnputil.exe /delete-driver $PublishedInf /uninstall 2>&1 | Out-String)
     $pnputilExitCode = $LASTEXITCODE
     if (-not [string]::IsNullOrWhiteSpace($pnputilOutput)) {

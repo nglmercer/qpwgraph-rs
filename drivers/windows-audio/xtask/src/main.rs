@@ -646,6 +646,9 @@ fn validate_package_metadata() {
         "Published\\s+Name",
         "driver_version",
         "SkipEndpointVerification",
+        "devgen.exe",
+        "Root\\QPWGRAPH_AUDIO",
+        "/remove-device",
     ] {
         assert!(
             install_script.contains(required),
@@ -664,6 +667,7 @@ fn validate_package_metadata() {
         "PublishedInf",
         "--verify-absent",
         "/delete-driver",
+        "/remove-device",
         "SkipEndpointVerification",
     ] {
         assert!(
