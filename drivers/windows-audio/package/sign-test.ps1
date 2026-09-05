@@ -96,15 +96,22 @@ function Find-WdkTool([string] $Name) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) {
             continue
         }
-        $candidate = Get-ChildItem -LiteralPath $root -Filter $Name -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\x64\\' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-        if ($null -ne $candidate) {
-            return $candidate.FullName
+        # The current WDK ships Inf2Cat.exe under x86, while signtool.exe is
+        # normally available under x64. Prefer x64 where present, but accept
+        # x86 for tools that are not shipped for every architecture.
+        foreach ($architecture in @('x64', 'x86', 'arm64')) {
+            $candidate = Get-ChildItem -LiteralPath $root -Filter $Name -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Directory.Name -ieq $architecture
+                } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+            if ($null -ne $candidate) {
+                return $candidate.FullName
+            }
         }
     }
-    throw "$Name was not found on PATH or below the WDK bin directory. Run from a WDK/eWDK developer prompt."
+    throw "$Name was not found on PATH or below the WDK bin directory. Install the WDK packaging tools or run from a WDK/eWDK developer prompt."
 }
 
 function Invoke-Tool([string] $Tool, [string[]] $Arguments, [string] $Name) {
