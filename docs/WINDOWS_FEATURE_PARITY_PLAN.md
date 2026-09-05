@@ -8,6 +8,27 @@ open.
 
 This document replaces the old “build everything from zero” roadmap with the next implementation steps after the Windows parity foundations landed.
 
+### Verification snapshot
+
+The repository-side evidence for this snapshot is complete:
+
+- `cargo test --workspace --all-features --locked` passed on 2026-09-05,
+  including the Windows backend, process-loopback integration tests, relay
+  tests, effect tests, and doc tests;
+- the WDK-initialized nested workspace passed `cargo test --workspace
+  --locked` (3 driver transport tests and 11 core timing/transport tests);
+- `--audit-toolchain` and `--build-package` passed with WDK 10.0.26100,
+  Visual Studio 2022, and LLVM 21.1.2; INF stamping and Inf2Cat reported no
+  errors or warnings, and the unsigned ACX package is staged under
+  `drivers/windows-audio/target/qpwgraph-audio-package`.
+
+The current machine has no installed QPWGraph endpoint, is not running an
+elevated PowerShell session, and cannot read the boot configuration store.
+Therefore the privileged test-signing/install/reboot step has not been
+attempted; the live endpoint, client, Verifier, HLK, signing, Secure Boot, and
+package lifecycle checks below remain unchecked until that external gate is
+authorized and performed on a disposable Windows test image.
+
 The main architectural rule stays unchanged:
 
 > Keep routing, mixing, effects, gain, resampling, relay policy, persistence, and meters in Rust user mode. Keep the optional kernel driver as a minimal virtual-endpoint transport.
