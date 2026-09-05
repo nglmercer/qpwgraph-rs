@@ -21,6 +21,8 @@ The repository-side evidence for this snapshot is complete:
   Visual Studio 2022, and LLVM 21.1.2; INF stamping and Inf2Cat reported no
   errors or warnings, and the unsigned ACX package is staged under
   `drivers/windows-audio/target/qpwgraph-audio-package`.
+- the user-mode smoke probe passed `--verify-absent`, confirming that no
+  provider-owned QPWGraph endpoint is currently installed on this machine.
 
 The current machine has no installed QPWGraph endpoint, is not running an
 elevated PowerShell session, and cannot read the boot configuration store.
