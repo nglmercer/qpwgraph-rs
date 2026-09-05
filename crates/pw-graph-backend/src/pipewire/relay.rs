@@ -774,7 +774,11 @@ impl RelayLocalRouter {
                         // ports.
                         Self::find_default_node(graph, registry, default_sink, true)?
                     }
-                    RelaySendSource::ManualGraph => return None,
+                    // Application selectors are a Windows process-loopback
+                    // concept. PipeWire already exposes application streams
+                    // as graph nodes, so an opaque Windows selector cannot be
+                    // resolved here.
+                    RelaySendSource::Application(_) | RelaySendSource::ManualGraph => return None,
                 };
                 let monitor = matches!(
                     &self.send_source,
@@ -798,7 +802,9 @@ impl RelayLocalRouter {
                     RelayReceiveSink::OutputDevice(selector) => {
                         Self::find_node(graph, registry, selector, false)?
                     }
-                    RelayReceiveSink::ManualGraph => return None,
+                    RelayReceiveSink::ManualGraph | RelayReceiveSink::VirtualMicrophone => {
+                        return None
+                    }
                 };
                 let (source_fl, source_fr) = Self::relay_source_ports(graph)?;
                 let (sink_fl, sink_fr) = Self::find_audio_ports(graph, sink.0, false, false)?;

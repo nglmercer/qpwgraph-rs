@@ -200,6 +200,30 @@ jobs:
         run: cargo check -p pw-graph-app --locked --all-features
       - name: Release build
         run: cargo build --release --locked -p pw-graph-app
+      - name: Windows driver ring-core tests
+        run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
+
+  # Kernel-driver compilation requires an eWDK environment and cannot run on
+  # the ordinary GitHub-hosted Windows image. A repository variable enables a
+  # dedicated/self-hosted runner without making the portable application CI
+  # depend on privileged machine state.
+  windows-driver:
+    name: Windows Rust driver (eWDK opt-in)
+    if: ${{ vars.QPWGRAPH_EWDK_CI == 'true' }}
+    runs-on: [self-hosted, windows, ewdk]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Verify the eWDK environment
+        shell: pwsh
+        run: cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked
+      - name: Test allocation-free driver core
+        run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
+      - name: Build and package the KMDF driver
+        shell: cmd
+        run: cargo make --cwd drivers/windows-audio
 
   ci:
     name: CI

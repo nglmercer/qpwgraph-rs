@@ -35,7 +35,12 @@ mod windows_midi;
 mod windows_relay;
 
 #[cfg(target_os = "windows")]
-pub use windows::WindowsAudioDriver;
+pub use windows::{
+    classify_virtual_endpoint, AppRoutePolicy, AppRoutePolicySupport, AudioFlow, AudioRole,
+    ProcessIdentity, ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
+    QpwVirtualEndpointRole, UnsupportedAppRoutePolicy, VirtualAudioDriverHealth,
+    WindowsAudioDriver,
+};
 #[cfg(target_os = "windows")]
 pub use windows_midi::WindowsMidiDriver;
 #[cfg(all(target_os = "windows", feature = "relay"))]

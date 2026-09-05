@@ -8,13 +8,13 @@ backends do.
 
 | Feature | Linux | Windows |
 | --- | --- | --- |
-| Audio devices | PipeWire | Core Audio |
+| Audio devices | PipeWire | Core Audio; optional qpwgraph virtual endpoints |
 | Audio sessions | PipeWire nodes | Core Audio sessions |
-| Arbitrary patch routing | Yes | No for Core Audio |
+| Arbitrary patch routing | Yes | User-mode carried routes; virtualized app routes with optional driver |
 | Volume, mute, and metering | Yes | Yes, peak metering where available |
 | Effects | Yes | Yes, hosted in the router on carried routes |
 | MIDI routing | ALSA Sequencer | WinMM, with fan-out and fan-in |
-| Relay | Yes, virtual nodes | Yes, direct eCapture/eRender-loopback emitters and eRender receivers |
+| Relay | Yes, virtual nodes | Direct eCapture/eRender-loopback; optional Relay Microphone driver path |
 
 The rest of this document breaks each of those rows down and says which of the
 differences are backlog items and which are facts about the operating system.
@@ -66,9 +66,10 @@ about what they cover:
 | --- | --- | --- |
 | a recording endpoint | a playback endpoint | a real route |
 | a playback endpoint's monitor | another playback endpoint | a real route |
-| an application session | anything | refused, with an explanation |
+| an ordinary application session | anything | refused, with an explanation |
+| a session already on QPWGraph Virtual Output | physical endpoint/effect | process-loopback PCM route |
 
-The last row is why `node_supports_routing` exists. A backend-wide capability
+The ordinary-session row is why `node_supports_routing` exists. A backend-wide capability
 is a union across what the backend owns, so asking it alone would light up a
 connect gesture on a session pin that could only ever fail. The canvas asks
 per node instead, and a session pin simply does not offer the gesture.
@@ -84,10 +85,10 @@ activation on the same terms as a PipeWire link, keyed by device name rather
 than by an id that will not survive a reboot. A snapshot taken while a
 microphone is routed to speakers restores that route on the next run.
 
-What remains out of reach from user mode is a qpwgraph-owned endpoint that
-*other* applications can select — the virtual microphone the relay needs, and
-the destination an arbitrary application could be pointed at. That needs a
-driver.
+The optional driver adds `QPWGraph Virtual Output`, `QPWGraph Virtual Monitor`,
+`QPWGraph Relay Sink`, and `QPWGraph Relay Microphone`. Without that package,
+the portable application remains fully usable but third-party applications
+cannot select a qpwgraph-owned endpoint.
 
 Windows MIDI is a separate native graph. WinMM `midiConnect` and
 `midiDisconnect` provide real mutable input-to-output links, so MIDI pins and
@@ -166,7 +167,7 @@ so it does not appear to collapse when an unrelated device changes.
 | --- | --- | --- | --- |
 | Meter a capture source | Yes | Yes | Equivalent |
 | Meter a playback sink | Yes, through its monitor | Yes | Equivalent |
-| Meter an application stream | Yes | Yes where the session exposes a native peak meter | Partial: Windows is peak-only |
+| Meter an application stream | Yes | Native peak fallback; true RMS when process PCM is captured | Partial unless virtualized |
 | RMS level | Yes | Yes on a routed node, peak-only otherwise | Equivalent where qpwgraph owns the audio |
 | Meter policies (off/on-demand/always) | Yes | Yes | Equivalent |
 | Meter-only / control-only nodes | Yes | Yes | Equivalent |
@@ -201,19 +202,13 @@ Capturing a process's actual PCM stream is *not* reachable by extending
 **process loopback capture**:
 `ActivateAudioInterfaceAsync` with
 `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, which records what one process
-tree renders, on build 20348 and newer. The driver already has the bridge it
-needs -- `IAudioSessionControl2::GetProcessId` is read for every session -- so
-one capture path would serve per-application relay, but it is not required for
-the session peak meter described above. It is *Missing*, not a platform
-limitation.
-
-An implementation was attempted and reverted: the activation reproducibly
-brought down the process with `STATUS_HEAP_CORRUPTION` on this machine, and a
-memory-safety fault is not something to ship behind a feature flag. The likely
-suspects are the `VT_BLOB` `PROPVARIANT` carrying
-`AUDIOCLIENT_ACTIVATION_PARAMS` and the lifetime of that blob across the
-asynchronous activation. Worth another attempt against Microsoft's
-ApplicationLoopback sample rather than from the API reference alone.
+tree renders, on build 20348 and newer. The Windows worker reads
+`IAudioSessionControl2::GetProcessId` for every session and exposes a process
+port only after the session is attached to QPWGraph Virtual Output. The
+`ProcessLoopbackSource` activation owns the blob, PROPVARIANT, completion
+handler, and async operation until the callback finishes, then feeds the same
+bounded router source used by physical endpoints. Capability probes are
+cached by PID/mode and can be cleared after an audio-service or device change.
 
 Metering is intentionally conservative on PipeWire. Measuring a node means
 attaching a real capture stream, which the session manager links like any other
@@ -228,9 +223,9 @@ are flagged passive, monitor-only, and non-reconnecting.
 | Effect nodes | Yes | Yes, hosted in the router | Equivalent |
 | Effect insertion into a link | Yes | Yes, on routes qpwgraph carries | Equivalent |
 | Relay: emit local audio | Yes, selected source to Relay Speaker | Yes, physical input or selected render monitor | Partial |
-| Relay: receive peer audio | Yes, Relay Microphone to selected sink | Yes, selected render endpoint | Partial |
-| Relay: peer audio as a system capture endpoint | Yes, virtual Relay Microphone | No, without an optional driver | Platform limitation |
-| Relay: send one application only | Yes | No | Missing (build 20348+) |
+| Relay: receive peer audio | Yes, Relay Microphone to selected sink | Selected render endpoint or optional Relay Microphone | Partial |
+| Relay: peer audio as a system capture endpoint | Yes, virtual Relay Microphone | Optional qpwgraph driver | Partial without driver |
+| Relay: send one application only | Yes | Process-loopback source is selectable for live sessions already isolated on QPWGraph Virtual Output | Partial: manual isolation/driver gate |
 | Relay: choose which endpoint | n/a | Yes, by stable endpoint ID | Partial |
 | MIDI | ALSA | WinMM, with routing, fan-out, and fan-in | Equivalent for MIDI 1.0 |
 
@@ -284,18 +279,25 @@ Microphone to the selected real sink. Default selectors follow WirePlumber's
 actual default source or sink, and only qpwgraph-owned automatic links move
 when that default changes.
 
-On Windows, Emitter mode opens either a physical input with WASAPI `eCapture`
-or a playback monitor with `eRender` loopback. Receiver mode opens an `eRender`
-stream for peer audio. The relay panel exposes independent source and sink
-lists and persists stable Core Audio IDs; default selectors follow the current
-endpoint and a removed explicit device falls back safely. Changing a selection
-restarts the one active WASAPI worker, and never leaves a second worker behind.
+On Windows, Emitter mode opens either a physical input with WASAPI `eCapture`,
+a playback monitor with `eRender` loopback, or the process-loopback ring for a
+live app already assigned to QPWGraph Virtual Output. Receiver mode opens an
+`eRender` stream for peer audio. The relay panel exposes independent source
+and sink lists and persists stable Core Audio IDs or app selectors; default
+selectors follow the current endpoint and a removed explicit device falls back
+safely. Changing a selection restarts the one active worker, and never leaves
+a second worker behind.
 
 Windows cannot present received audio as a **microphone** to other applications
 without an optional kernel-mode virtual-audio driver. Direct Receiver mode is
 still fully usable because it plays peer audio on the selected render endpoint.
-Individual applications cannot be selected as Windows relay sources; the
-loopback tap is whole-endpoint.
+The relay selector also exposes live `application:<selector>` sources for
+render sessions the user has already moved to QPWGraph Virtual Output. Those
+entries use process-loopback PCM and disappear when the session is no longer
+isolated; they never fall back to another process. The same source is
+available to qpwgraph-owned graph routes, where it can provide true RMS and
+effects. Automatic reassignment through the undocumented Windows audio-policy
+interface remains unsupported.
 
 ### Refresh and notification behavior
 
@@ -311,6 +313,12 @@ session display-name changes rebuild only that endpoint's session subgraph;
 device and endpoint notifications still request a full topology refresh. Pure
 volume and mute callbacks update the shared audio-state cache and do not mark
 the graph topology dirty.
+
+WASAPI workers report an invalidated source or sink to the Windows router's
+control plane. The next refresh transactionally reopens the current endpoint
+set, reinstalls the surviving owned links, and resets route buffers/effects at
+the discontinuity; if reopening fails, the notification remains queued for a
+later refresh instead of silently dropping the link.
 
 ## Roadmap
 
@@ -359,20 +367,23 @@ above the line has landed; what is left is blocked on something specific.
    `{2a59116d-…}` IID, not another guess, and every call should be gated on
    that exact IID so a build exposing a different one reports unsupported
    instead of calling into the wrong slots.
-2. **Relay a single application.** *Blocked on the OS build here.* Metering one
-   application no longer needs process loopback (see Metering), but capturing
-   its audio still does, and that requires build 20348 or newer; this machine
-   is 10.0.19045. An attempt from the API reference alone brought the process
-   down with `STATUS_HEAP_CORRUPTION`. Needs a newer machine and Microsoft's
-   ApplicationLoopback sample rather than the reference.
+2. **Automatic per-application relay policy.** The process-loopback capture
+   primitive and relay source adapter are landed for sessions already isolated
+   on QPWGraph Virtual Output. Process loopback requires build 20348 or newer;
+   the source list is operationally discovered, uses a stable executable-path
+   selector, resolves a live PID only while starting the worker, and fails
+   closed when the app is no longer isolated. Automatic reassignment through
+   the private Windows audio-policy interface remains intentionally
+   unsupported.
 3. **Linux param subscriptions.** PipeWire controls are read at each rebuild;
    Windows follows them by callback. Holding a `Props` subscription per node
    would close that gap.
-4. **Windows per-application effects and metering RMS.** An effect can sit on
-   any route qpwgraph carries, but not on an application session, because that
-   audio belongs to the Windows audio engine rather than to the router. The
-   same boundary applies to RMS: it is real for routed audio and unavailable
-   for a session, whose only level is Core Audio's peak-only meter.
+4. **Windows per-application effects and metering RMS outside owned routes.**
+   An effect can sit on any route qpwgraph carries, including a
+   process-loopback route for an app already isolated on QPWGraph Virtual
+   Output, but not on an ordinary observed application session. The same
+   boundary applies to RMS: it is real for routed PCM and unavailable for a
+   session whose only level is Core Audio's peak-only meter.
 
 ## Testing across platforms
 
@@ -394,7 +405,8 @@ compiles, and locked release builds. Native Linux development packages are
 installed in the Linux job. These checks do not require a live PipeWire daemon,
 physical MIDI hardware, or a Windows endpoint. The manual acceptance checklists
 remain separate live smoke tests and are not represented as passed by unit or
-CI results.
+CI results. A Windows relay application source additionally requires a live
+render session on QPWGraph Virtual Output and a process-loopback-capable OS.
 
 When adding a rule both backends rely on, put the rule in `api` and test it
 there. A shared rule tested only inside one driver is untested on the other

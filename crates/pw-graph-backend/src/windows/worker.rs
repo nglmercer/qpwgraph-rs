@@ -16,16 +16,21 @@ pub(super) struct WorkerSnapshot {
     pub(super) meterable: BTreeSet<NodeId>,
     /// Ports the router can open a real WASAPI stream for.
     ///
-    /// Session ports are deliberately absent: an application's stream cannot
-    /// be captured or re-pointed through a supported user-mode API, so a
-    /// connect naming one is refused rather than half-built.
+    /// Session ports are present only for render sessions already attached to
+    /// QPWGraph Virtual Output. That documented user action proves the dry
+    /// path is isolated; ordinary sessions remain observed-only.
     pub(super) endpoint_ports: BTreeMap<PortId, EndpointPort>,
+    pub(super) virtual_driver_health: VirtualAudioDriverHealth,
     /// Render endpoints as `(device id, display name)`, for relay selection.
     #[cfg(feature = "relay")]
     pub(super) playback_endpoints: Vec<(String, String)>,
     /// Capture endpoints as `(device id, display name)`, for relay selection.
     #[cfg(feature = "relay")]
     pub(super) capture_endpoints: Vec<(String, String)>,
+    /// Live render sessions already attached to QPWGraph Virtual Output as
+    /// `(stable process selector, display name, current PID)`.
+    #[cfg(feature = "relay")]
+    pub(super) application_sources: Vec<(String, String, u32)>,
     /// Current defaults and a monotonically changing notification generation.
     /// The relay uses the generation even when both requested ids are `None`,
     /// because `None` means "follow default", not "nothing changed".
@@ -54,6 +59,8 @@ pub(super) enum EndpointPortRole {
     Monitor,
     /// A playback device. Opens as a render sink.
     Render,
+    /// An application already isolated on QPWGraph Virtual Output.
+    Process { pid: u32 },
 }
 
 #[derive(Debug)]
@@ -166,6 +173,8 @@ pub(super) struct SessionRecord {
     pub(super) session_id: String,
     pub(super) flow: Audio::EDataFlow,
     pub(super) node_id: NodeId,
+    pub(super) port_id: PortId,
+    pub(super) process_id: u32,
     /// The session's own peak meter, kept so a level can be read without
     /// re-enumerating the endpoint every frame.
     ///
@@ -207,6 +216,7 @@ pub(super) struct CoreAudioWorker {
     )>,
     /// Incremented by `OnDefaultDeviceChanged`; read into each public
     /// snapshot so the driver can restart only default-following relay paths.
+    #[cfg(feature = "relay")]
     pub(super) default_generation: Arc<AtomicU64>,
 }
 
@@ -243,6 +253,7 @@ impl CoreAudioWorker {
             session_events: Vec::new(),
             audio_states,
             endpoint_volume_events: Vec::new(),
+            #[cfg(feature = "relay")]
             default_generation,
             endpoints: Vec::new(),
             sessions: Vec::new(),
@@ -456,9 +467,11 @@ impl CoreAudioWorker {
 
     /// Which graph ports the router can open a real stream for.
     ///
-    /// Only endpoints appear. A session port is left out on purpose, so the
-    /// driver refuses a connect naming one instead of drawing a link that
-    /// carries nothing.
+    /// Endpoint ports always appear. A render-session port appears only when
+    /// Windows reports that the application is already attached to
+    /// QPWGraph Virtual Output. That proves its dry path is isolated, so a
+    /// process-loopback source cannot accidentally create dry + processed
+    /// duplicate audio.
     pub(super) fn endpoint_ports(&self) -> BTreeMap<PortId, EndpointPort> {
         let mut ports = BTreeMap::new();
         for endpoint in &self.endpoints {
@@ -484,7 +497,68 @@ impl CoreAudioWorker {
                 );
             }
         }
+        for session in &self.sessions {
+            if session.flow != Audio::eRender || session.process_id == 0 {
+                continue;
+            }
+            let virtualized = self.session_is_virtualized(session);
+            if virtualized {
+                ports.insert(
+                    session.port_id,
+                    EndpointPort {
+                        device_id: session.endpoint_id.clone(),
+                        role: EndpointPortRole::Process {
+                            pid: session.process_id,
+                        },
+                    },
+                );
+            }
+        }
         ports
+    }
+
+    fn session_is_virtualized(&self, session: &SessionRecord) -> bool {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == session.endpoint_id)
+            .and_then(|endpoint| self.graph.nodes.get(&endpoint.node_id))
+            .and_then(|node| classify_virtual_endpoint(&node.name))
+            == Some(QpwVirtualEndpointRole::AppRender)
+    }
+
+    #[cfg(feature = "relay")]
+    fn application_sources(&self) -> Vec<(String, String, u32)> {
+        let mut sources = BTreeMap::new();
+        for session in &self.sessions {
+            if session.flow != Audio::eRender
+                || session.process_id == 0
+                || !self.session_is_virtualized(session)
+            {
+                continue;
+            }
+            let Ok(identity) = ProcessIdentity::from_pid(session.process_id) else {
+                continue;
+            };
+            let Some(selector) = identity.selector_key() else {
+                continue;
+            };
+            let name = self
+                .graph
+                .nodes
+                .get(&session.node_id)
+                .map(|node| node.name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+                .or(identity.display_name)
+                .or(identity.executable_name)
+                .unwrap_or_else(|| format!("Application ({})", session.process_id));
+            sources
+                .entry(selector)
+                .or_insert((name, session.process_id));
+        }
+        sources
+            .into_iter()
+            .map(|(selector, (name, pid))| (selector, name, pid))
+            .collect()
     }
 
     pub(super) fn snapshot(&self) -> WorkerSnapshot {
@@ -492,6 +566,15 @@ impl CoreAudioWorker {
             graph: self.graph.clone(),
             meterable: self.meterable_nodes(),
             endpoint_ports: self.endpoint_ports(),
+            virtual_driver_health: VirtualAudioDriverHealth::from_endpoint_names(
+                self.endpoints.iter().filter_map(|endpoint| {
+                    self.graph
+                        .nodes
+                        .get(&endpoint.node_id)
+                        .map(|node| node.name.as_str())
+                }),
+                None,
+            ),
             #[cfg(feature = "relay")]
             playback_endpoints: self
                 .endpoints
@@ -507,6 +590,7 @@ impl CoreAudioWorker {
                     (endpoint.id.clone(), name)
                 })
                 .collect(),
+            #[cfg(feature = "relay")]
             capture_endpoints: self
                 .endpoints
                 .iter()
@@ -521,8 +605,13 @@ impl CoreAudioWorker {
                     (endpoint.id.clone(), name)
                 })
                 .collect(),
+            #[cfg(feature = "relay")]
+            application_sources: self.application_sources(),
+            #[cfg(feature = "relay")]
             default_input: self.default_endpoint_id(Audio::eCapture),
+            #[cfg(feature = "relay")]
             default_output: self.default_endpoint_id(Audio::eRender),
+            #[cfg(feature = "relay")]
             default_generation: self.default_generation.load(Ordering::Acquire),
         }
     }
@@ -756,6 +845,8 @@ impl CoreAudioWorker {
                 session_id,
                 flow: endpoint.flow,
                 node_id,
+                port_id,
+                process_id,
                 meter,
             });
         }

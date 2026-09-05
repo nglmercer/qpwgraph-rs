@@ -59,6 +59,24 @@ cargo run -p pw-graph-app -- --demo
 cargo build --release --locked -p pw-graph-app
 ```
 
+The optional virtual-audio driver is not part of those portable commands. It
+has its own workspace and requires an eWDK prompt with KMDF/ACX headers:
+
+```powershell
+cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
+cargo make --cwd drivers/windows-audio
+```
+
+The deterministic process-loopback target is a normal user-mode build and
+does not require the driver:
+
+```powershell
+cargo run -p windows-audio-test-tone --release -- --duration-ms 30000
+```
+
+On a normal SDK-only machine the driver build fails closed with a missing WDK
+header error. Do not substitute a user-mode DLL for the kernel package.
+
 ## Nix
 
 ```bash

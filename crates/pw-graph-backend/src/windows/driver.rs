@@ -22,7 +22,9 @@ pub(super) const WINDOWS_AUDIO_CAPABILITIES: BackendCapabilities = BackendCapabi
     // at both ends. It is emphatically *not* true for application sessions --
     // Core Audio exposes no supported way to move one -- so `connect` refuses
     // them explicitly and `node_supports_routing` keeps the canvas from
-    // offering a gesture there at all.
+    // offering a gesture there at all. A session already isolated on the
+    // optional virtual sink is the documented exception and is captured via
+    // process loopback.
     connect: true,
     disconnect: true,
     volume: true,
@@ -78,6 +80,8 @@ pub struct WindowsAudioDriver {
     /// Which ports name a device the router can open a stream for. Rebuilt
     /// with the graph, because an unplugged endpoint takes its ports with it.
     pub(super) endpoint_ports: BTreeMap<PortId, EndpointPort>,
+    /// Health of the optional four-endpoint qpwgraph driver package.
+    pub(super) virtual_driver_health: VirtualAudioDriverHealth,
     /// The routes qpwgraph owns, and the audio behind them.
     ///
     /// Started on the first connect rather than at construction: a session
@@ -100,6 +104,10 @@ pub struct WindowsAudioDriver {
     /// Physical eCapture devices offered to an Emitter.
     #[cfg(feature = "relay")]
     pub(super) relay_input_choices: Vec<(String, String)>,
+    /// Live applications already isolated on QPWGraph Virtual Output, as
+    /// `(stable selector, display name, current PID)`.
+    #[cfg(feature = "relay")]
+    pub(super) relay_application_sources: Vec<(String, String, u32)>,
     /// Current local mode and source/sink selection. These are independent of
     /// the legacy `RelayEndpoints` pair retained for old callers.
     #[cfg(feature = "relay")]
@@ -169,6 +177,7 @@ impl WindowsAudioDriver {
             dirty,
             worker: Some(worker),
             endpoint_ports: snapshot.endpoint_ports,
+            virtual_driver_health: snapshot.virtual_driver_health,
             routing: None,
             effects: WindowsEffects::new(),
             effect_positions: BTreeMap::new(),
@@ -180,6 +189,8 @@ impl WindowsAudioDriver {
             relay_endpoint_choices: snapshot.playback_endpoints,
             #[cfg(feature = "relay")]
             relay_input_choices: snapshot.capture_endpoints,
+            #[cfg(feature = "relay")]
+            relay_application_sources: snapshot.application_sources,
             #[cfg(feature = "relay")]
             relay_mode: api::RelayMode::Receiver,
             #[cfg(feature = "relay")]
@@ -210,16 +221,59 @@ impl WindowsAudioDriver {
         let mode = self.relay_mode;
         let send_source = self.relay_send_source.clone();
         let receive_sink = self.relay_receive_sink.clone();
+        let application = if mode == api::RelayMode::Emitter {
+            match &send_source {
+                api::RelaySendSource::Application(selector) => Some(
+                    self.relay_application_source(selector)
+                        .ok_or_else(|| {
+                            BackendError::unsupported(
+                                "selected application is not currently isolated on QPWGraph Virtual Output",
+                            )
+                        })
+                        .and_then(|application| {
+                            // The snapshot deliberately stores a runtime PID,
+                            // but a PID can be reused between refreshes. Verify
+                            // the stable identity again immediately before
+                            // activation so a stale selector can never bind to
+                            // an unrelated process.
+                            let matches = ProcessIdentity::from_pid(application.pid)
+                                .ok()
+                                .and_then(|identity| identity.selector_key())
+                                .is_some_and(|key| key == application.selector_key);
+                            matches.then_some(application).ok_or_else(|| {
+                                BackendError::unsupported(
+                                    "selected application changed before process-loopback activation; refresh the Windows audio graph",
+                                )
+                            })
+                        })?,
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let default_generation = self.relay_default_generation;
         let restart = self.relay.as_ref().is_some_and(|devices| {
             devices.endpoints() != &wanted
-                || devices.needs_restart(mode, &send_source, &receive_sink, default_generation)
+                || devices.needs_restart(
+                    mode,
+                    &send_source,
+                    &receive_sink,
+                    application.as_ref(),
+                    default_generation,
+                )
         });
         if let Some(devices) = self.relay.as_mut() {
             if restart {
                 // Keep the authenticated engine/session table alive while
                 // replacing only the WASAPI worker.
-                devices.restart_endpoint(mode, send_source, receive_sink, default_generation)?;
+                devices.restart_endpoint(
+                    mode,
+                    send_source,
+                    receive_sink,
+                    application,
+                    default_generation,
+                )?;
             }
             devices.handle().update_config(config);
         } else {
@@ -229,10 +283,27 @@ impl WindowsAudioDriver {
                 mode,
                 send_source,
                 receive_sink,
+                application,
                 default_generation,
             )?);
         }
         Ok(self.relay.as_ref().expect("relay was just created"))
+    }
+
+    #[cfg(feature = "relay")]
+    fn relay_application_source(
+        &self,
+        selector: &str,
+    ) -> Option<crate::windows_relay::RelayApplicationSource> {
+        self.relay_application_sources
+            .iter()
+            .find(|(key, _, _)| key == selector)
+            .map(
+                |(selector_key, _, pid)| crate::windows_relay::RelayApplicationSource {
+                    selector_key: selector_key.clone(),
+                    pid: *pid,
+                },
+            )
     }
 
     #[cfg(feature = "relay")]
@@ -415,6 +486,98 @@ impl WindowsAudioDriver {
             .unwrap_or_default()
     }
 
+    /// Current optional-driver state for diagnostics and UI capability badges.
+    pub fn virtual_audio_driver_health(&self) -> &VirtualAudioDriverHealth {
+        &self.virtual_driver_health
+    }
+
+    /// Return the safe app-routing capability without attempting any
+    /// undocumented Windows ABI calls.  The manual fallback remains
+    /// actionable and can be shown even when the optional driver is absent.
+    pub fn app_route_policy_support(&self) -> AppRoutePolicySupport {
+        UnsupportedAppRoutePolicy.support()
+    }
+
+    /// Export a bounded, text-only Windows audio report for diagnostics.
+    ///
+    /// The report deliberately contains graph identities, capabilities, and
+    /// route counters only. It never includes PCM samples, endpoint property
+    /// blobs, pairing credentials, or other opaque native data, so it is safe
+    /// to copy into a bug report.
+    pub fn windows_audio_report(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut report = String::from("qpwgraph Windows audio report\n");
+        let _ = writeln!(
+            report,
+            "virtual_driver={:?}\nnodes={} ports={} observed_links={} managed_links={}",
+            self.virtual_driver_health,
+            self.graph.nodes.len(),
+            self.graph.ports.len(),
+            self.graph
+                .links
+                .values()
+                .filter(|link| !self.is_link_mutable(link.id))
+                .count(),
+            self.routing
+                .as_ref()
+                .map_or(0, |routing| routing.links().count()),
+        );
+        for node in self.graph.nodes.values() {
+            let capabilities = self.node_capabilities(node.id);
+            let _ = writeln!(
+                report,
+                "node id={} type={:?} name={:?} meter_peak={} meter_rms={} routable={}",
+                node.id.0,
+                node.node_type,
+                node.name,
+                capabilities.meter_peak,
+                capabilities.meter_rms,
+                self.node_supports_routing(node.id),
+            );
+        }
+        #[cfg(feature = "relay")]
+        for (selector, name, pid) in &self.relay_application_sources {
+            let _ = writeln!(
+                report,
+                "relay_application selector={selector:?} name={name:?} pid={pid} active=virtualized",
+            );
+        }
+        for (link, metrics) in self.route_metrics() {
+            let Some(record) = self.graph.links.get(&link) else {
+                continue;
+            };
+            let source = self
+                .graph
+                .ports
+                .get(&record.output_port)
+                .and_then(|port| self.graph.nodes.get(&port.node_id))
+                .map(|node| node.name.as_str())
+                .unwrap_or("<missing source>");
+            let destination = self
+                .graph
+                .ports
+                .get(&record.input_port)
+                .and_then(|port| self.graph.nodes.get(&port.node_id))
+                .map(|node| node.name.as_str())
+                .unwrap_or("<missing destination>");
+            let _ = writeln!(
+                report,
+                "route id={} source={:?} destination={:?} frames={} source_underruns={} sink_overruns={} discontinuities={} restarts={} fault={:?}",
+                link.0,
+                source,
+                destination,
+                metrics.frames_processed,
+                metrics.source_underruns,
+                metrics.sink_overruns,
+                metrics.discontinuities,
+                metrics.restarts,
+                metrics.fault,
+            );
+        }
+        report
+    }
+
     pub(super) fn response<T>(receiver: Receiver<BackendResult<T>>) -> BackendResult<T> {
         receiver
             .recv()
@@ -438,6 +601,7 @@ impl WindowsAudioDriver {
             }
         }
         self.endpoint_ports = snapshot.endpoint_ports;
+        self.virtual_driver_health = snapshot.virtual_driver_health;
         // Core Audio has never heard of an effect, so the rebuilt graph has
         // no effect nodes in it. Draw them again before the links, or the
         // links that pass through them would have nowhere to land.
@@ -463,6 +627,7 @@ impl WindowsAudioDriver {
         if let Some(routing) = self.routing.as_mut() {
             let live: BTreeSet<PortId> = graph.ports.keys().copied().collect();
             routing.reconcile(&live)?;
+            routing.recover_lost(&self.endpoint_ports)?;
             for link in routing.links() {
                 let _ = graph.insert_existing_link(link.clone());
             }
@@ -476,14 +641,46 @@ impl WindowsAudioDriver {
         self.restore_routed_gain();
         #[cfg(feature = "relay")]
         {
+            let application_sources_changed =
+                self.relay_application_sources != snapshot.application_sources;
             self.relay_endpoint_choices = snapshot.playback_endpoints;
             self.relay_input_choices = snapshot.capture_endpoints;
+            self.relay_application_sources = snapshot.application_sources;
             self.relay_default_input = snapshot.default_input;
             self.relay_default_output = snapshot.default_output;
             let default_generation = snapshot.default_generation;
-            if self.relay_default_generation != default_generation {
+            let default_changed = self.relay_default_generation != default_generation;
+            if default_changed {
                 self.relay_default_generation = default_generation;
-                self.reconcile_relay_worker()?;
+            }
+            let endpoint_inactive = self
+                .relay
+                .as_ref()
+                .is_some_and(|devices| !devices.endpoint_active());
+            if default_changed || application_sources_changed || endpoint_inactive {
+                // A process restart keeps the selector stable but changes its
+                // live PID. Rebind the capture worker to the new process. If
+                // the app has disappeared entirely, drop the worker rather
+                // than silently attaching to an unrelated process.
+                let selected_missing = matches!(
+                    (self.relay_mode, &self.relay_send_source),
+                    (
+                        api::RelayMode::Emitter,
+                        api::RelaySendSource::Application(selector)
+                    ) if !self
+                        .relay_application_sources
+                        .iter()
+                        .any(|(key, _, _)| key == selector)
+                );
+                if selected_missing {
+                    if let Some(devices) = self.relay.as_mut() {
+                        devices.deactivate_application(
+                            "Windows relay application source disappeared or left QPWGraph Virtual Output",
+                        );
+                    }
+                } else {
+                    self.reconcile_relay_worker()?;
+                }
             }
         }
         Ok(())
@@ -561,15 +758,21 @@ impl GraphDriver for WindowsAudioDriver {
             .is_some_and(|routing| routing.owns(link))
     }
 
-    /// Endpoints can be rewired; application sessions cannot.
-    ///
-    /// This is what keeps the canvas from offering a connect gesture on a
-    /// session pin that could only ever fail.
+    /// Endpoints can be rewired. An application session becomes routable only
+    /// after Windows reports it on QPWGraph Virtual Output, which proves the
+    /// original audible path has been isolated and prevents duplicate audio.
     fn node_supports_routing(&self, node: NodeId) -> bool {
-        self.graph
-            .nodes
-            .get(&node)
-            .is_some_and(|node| node.node_type == NodeType::WindowsAudioEndpoint)
+        self.graph.nodes.get(&node).is_some_and(|node_record| {
+            node_record.node_type == NodeType::WindowsAudioEndpoint
+                || (node_record.node_type == NodeType::WindowsAudioSession
+                    && self.graph.ports.values().any(|port| {
+                        port.node_id == node
+                            && matches!(
+                                self.endpoint_ports.get(&port.id).map(|port| port.role),
+                                Some(EndpointPortRole::Process { .. })
+                            )
+                    }))
+        })
     }
 
     fn set_node_position(&mut self, node: NodeId, position: [f32; 2]) -> BackendResult<()> {
@@ -824,9 +1027,10 @@ impl crate::api::EffectDriver for WindowsAudioDriver {
 /// Relay support on Windows.
 ///
 /// The engine is the same one PipeWire uses; only the audio endpoints differ.
-/// Direct mode supports physical input capture, playback-monitor loopback, and
-/// render output. A separate optional driver is needed only for a system-wide
-/// virtual capture endpoint.
+/// Direct mode supports physical input capture, playback-monitor loopback,
+/// process loopback for an app already isolated on QPWGraph Virtual Output,
+/// and render output. A separate optional driver is needed only for a
+/// system-wide virtual capture endpoint.
 #[cfg(feature = "relay")]
 impl api::RelayDriver for WindowsAudioDriver {
     fn relay_available(&self) -> bool {
@@ -841,7 +1045,9 @@ impl api::RelayDriver for WindowsAudioDriver {
     }
 
     fn relay_devices_active(&self) -> bool {
-        self.relay.is_some()
+        self.relay
+            .as_ref()
+            .is_some_and(crate::windows_relay::WindowsRelayDevices::endpoint_active)
     }
 
     fn relay_start_host(&mut self, request: api::RelayHostRequest) -> BackendResult<u16> {
@@ -1330,6 +1536,16 @@ impl api::RelayDriver for WindowsAudioDriver {
                     description: "WASAPI eCapture input device".into(),
                 }),
         );
+        sources.extend(
+            self.relay_application_sources
+                .iter()
+                .map(|(selector, name, _pid)| api::RelayEndpointInfo {
+                    id: format!("application:{selector}"),
+                    name: name.clone(),
+                    description: "Process-loopback source for an app on QPWGraph Virtual Output"
+                        .into(),
+                }),
+        );
         sources.push(api::RelayEndpointInfo {
             id: "default-output-monitor".into(),
             name: "Default output monitor".into(),
@@ -1360,6 +1576,19 @@ impl api::RelayDriver for WindowsAudioDriver {
                     description: "WASAPI eRender output device".into(),
                 }),
         );
+        let relay_render_present = self.relay_endpoint_choices.iter().any(|(_, name)| {
+            classify_virtual_endpoint(name) == Some(QpwVirtualEndpointRole::RelayRender)
+        });
+        let relay_capture_present = self.relay_input_choices.iter().any(|(_, name)| {
+            classify_virtual_endpoint(name) == Some(QpwVirtualEndpointRole::RelayCapture)
+        });
+        if relay_render_present && relay_capture_present {
+            sinks.push(api::RelayEndpointInfo {
+                id: "virtual-microphone".into(),
+                name: "QPWGraph Relay Microphone".into(),
+                description: "Optional driver capture endpoint for third-party applications".into(),
+            });
+        }
         sinks
     }
 
@@ -1385,7 +1614,10 @@ impl api::RelayDriver for WindowsAudioDriver {
             .and_then(|devices| devices.resolved_endpoint().map(str::to_owned));
         Ok(api::RelayLocalRouteState {
             mode: Some(mode),
-            active: self.relay.is_some(),
+            active: self
+                .relay
+                .as_ref()
+                .is_some_and(crate::windows_relay::WindowsRelayDevices::endpoint_active),
             source_id: (mode == api::RelayMode::Emitter)
                 .then(|| resolved.clone().unwrap_or_else(|| "default-input".into())),
             sink_id: (mode == api::RelayMode::Receiver)
@@ -1409,6 +1641,9 @@ fn normalize_windows_send_source(
         api::RelaySendSource::OutputMonitor(id) => Ok(api::RelaySendSource::OutputMonitor(
             id.strip_prefix("monitor:").unwrap_or(&id).to_owned(),
         )),
+        api::RelaySendSource::Application(id) => Ok(api::RelaySendSource::Application(
+            id.strip_prefix("application:").unwrap_or(&id).to_owned(),
+        )),
         api::RelaySendSource::ManualGraph => Err(BackendError::unsupported(
             "Windows direct relay cannot use a manual graph source",
         )),
@@ -1424,6 +1659,7 @@ fn normalize_windows_receive_sink(
         api::RelayReceiveSink::OutputDevice(id) => Ok(api::RelayReceiveSink::OutputDevice(
             id.strip_prefix("output:").unwrap_or(&id).to_owned(),
         )),
+        api::RelayReceiveSink::VirtualMicrophone => Ok(api::RelayReceiveSink::VirtualMicrophone),
         api::RelayReceiveSink::ManualGraph => Err(BackendError::unsupported(
             "Windows direct relay cannot use a manual graph sink",
         )),

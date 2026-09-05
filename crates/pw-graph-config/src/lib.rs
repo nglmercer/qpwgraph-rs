@@ -10,6 +10,195 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Windows-only behavior is persisted on every platform so a configuration
+/// remains portable, but non-Windows backends simply ignore this table.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct WindowsConfig {
+    pub enable_process_loopback: bool,
+    /// The AudioPolicyConfig ABI is undocumented and therefore opt-in.
+    pub experimental_app_routing: bool,
+    pub prefer_virtual_app_routes: bool,
+    pub virtual_audio: WindowsVirtualAudioConfig,
+    pub relay: WindowsRelayConfig,
+}
+
+impl Default for WindowsConfig {
+    fn default() -> Self {
+        Self {
+            enable_process_loopback: true,
+            experimental_app_routing: false,
+            prefer_virtual_app_routes: true,
+            virtual_audio: WindowsVirtualAudioConfig::default(),
+            relay: WindowsRelayConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct WindowsVirtualAudioConfig {
+    pub enabled: bool,
+}
+
+impl Default for WindowsVirtualAudioConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct WindowsRelayConfig {
+    pub receive_target: WindowsRelayReceiveTarget,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WindowsRelayReceiveTarget {
+    #[default]
+    Direct,
+    VirtualMicrophone,
+}
+
+impl WindowsRelayReceiveTarget {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::VirtualMicrophone => "virtual-microphone",
+        }
+    }
+}
+
+impl Serialize for WindowsRelayReceiveTarget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WindowsRelayReceiveTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "direct" => Ok(Self::Direct),
+            "virtual-microphone" => Ok(Self::VirtualMicrophone),
+            value => Err(D::Error::custom(format!(
+                "invalid Windows relay receive target '{value}'"
+            ))),
+        }
+    }
+}
+
+/// Stable application identity used by persisted Windows routes. A PID is
+/// intentionally absent: Windows may reuse it for an unrelated process.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct WindowsApplicationSelector {
+    pub executable_path_hash: Option<String>,
+    pub executable_name: Option<String>,
+    pub package_family_name: Option<String>,
+    pub app_user_model_id: Option<String>,
+    pub display_name: Option<String>,
+}
+
+impl WindowsApplicationSelector {
+    /// A persisted selector is safe to resolve only when it contains at least
+    /// one identity that survives a process restart. A display name alone is
+    /// intentionally not enough because unrelated applications may reuse it.
+    pub fn is_stable(&self) -> bool {
+        self.executable_path_hash.is_some()
+            || self.package_family_name.is_some()
+            || self.app_user_model_id.is_some()
+    }
+
+    pub fn stable_key(&self) -> Option<&str> {
+        self.executable_path_hash
+            .as_deref()
+            .or(self.package_family_name.as_deref())
+            .or(self.app_user_model_id.as_deref())
+    }
+
+    /// Match fields supplied by this selector against a live candidate. Empty
+    /// optional fields are wildcards; every supplied field must agree. This
+    /// keeps a name-only hint useful for display while requiring a stable
+    /// identity before a route is activated.
+    pub fn matches(&self, candidate: &Self) -> bool {
+        fn field_matches(expected: &Option<String>, actual: &Option<String>) -> bool {
+            expected.as_ref().is_none_or(|expected| {
+                actual
+                    .as_deref()
+                    .is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
+            })
+        }
+        self.is_stable()
+            && field_matches(&self.executable_path_hash, &candidate.executable_path_hash)
+            && field_matches(&self.executable_name, &candidate.executable_name)
+            && field_matches(&self.package_family_name, &candidate.package_family_name)
+            && field_matches(&self.app_user_model_id, &candidate.app_user_model_id)
+            && field_matches(&self.display_name, &candidate.display_name)
+    }
+
+    fn specificity(&self) -> usize {
+        [
+            &self.executable_path_hash,
+            &self.executable_name,
+            &self.package_family_name,
+            &self.app_user_model_id,
+            &self.display_name,
+        ]
+        .into_iter()
+        .filter(|field| field.is_some())
+        .count()
+    }
+}
+
+/// Persisted qpwgraph-owned application route.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct WindowsApplicationRoute {
+    pub application: WindowsApplicationSelector,
+    pub destination_endpoint_id: Option<String>,
+    pub destination_name: Option<String>,
+    pub virtualization_required: bool,
+    pub effect_chain: Vec<String>,
+    pub gain: f32,
+    pub enabled: bool,
+}
+
+impl WindowsApplicationRoute {
+    /// Whether this persisted route is eligible for a live candidate. A
+    /// disabled route or a selector with only a display name is never applied.
+    pub fn matches_application(&self, candidate: &WindowsApplicationSelector) -> bool {
+        self.enabled && self.application.matches(candidate)
+    }
+
+    /// More specific selectors win when a user has retained both a broad
+    /// executable rule and a package/display-name override.  Ties preserve
+    /// file order, making the result deterministic without inventing a
+    /// hidden priority field in the persisted format.
+    pub fn selector_specificity(&self) -> usize {
+        self.application.specificity()
+    }
+}
+
+impl Default for WindowsApplicationRoute {
+    fn default() -> Self {
+        Self {
+            application: WindowsApplicationSelector::default(),
+            destination_endpoint_id: None,
+            destination_name: None,
+            virtualization_required: true,
+            effect_chain: Vec::new(),
+            gain: 1.0,
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not read config: {0}")]
@@ -216,6 +405,10 @@ pub struct AppConfig {
     /// qpwgraph XML format, which has no portable representation for DSP
     /// modules.
     pub effects: Vec<PersistedEffect>,
+    #[serde(default)]
+    pub windows: WindowsConfig,
+    #[serde(default)]
+    pub windows_application_routes: Vec<WindowsApplicationRoute>,
     /// Stable identity for this installation. It is not a secret; it lets a
     /// peer recognize this device again after a Wi-Fi/USB address change.
     #[serde(default)]
@@ -262,7 +455,7 @@ pub struct AppConfig {
     pub relay_mode_generation: u64,
     /// Canonical local Emitter source selector. The value is an opaque
     /// backend id such as `default-input`, `default-output-monitor`,
-    /// `input:<id>`, or `monitor:<id>`.
+    /// `input:<id>`, `monitor:<id>`, or `application:<stable-selector>`.
     #[serde(default = "default_relay_send_source")]
     pub relay_send_source: String,
     /// Canonical local Receiver sink selector. The value is an opaque backend
@@ -428,6 +621,8 @@ impl Default for AppConfig {
             patchbay_profiles: std::collections::BTreeMap::new(),
             active_patchbay_profile: "default".into(),
             effects: Vec::new(),
+            windows: WindowsConfig::default(),
+            windows_application_routes: Vec::new(),
             relay_device_id: String::new(),
             relay_trusted_peers: Vec::new(),
             relay_auto_connect_trusted: true,
@@ -467,6 +662,20 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Resolve the most specific enabled persisted Windows application route
+    /// for a live stable selector.  A PID is deliberately absent from this
+    /// operation, so a process restart or PID reuse cannot select an
+    /// unrelated route.
+    pub fn matching_windows_application_route(
+        &self,
+        candidate: &WindowsApplicationSelector,
+    ) -> Option<&WindowsApplicationRoute> {
+        self.windows_application_routes
+            .iter()
+            .filter(|route| route.matches_application(candidate))
+            .max_by_key(|route| route.selector_specificity())
+    }
+
     /// Set the canonical role and keep the legacy in-memory compatibility
     /// fields aligned for older embedders.
     pub fn set_relay_mode(&mut self, mode: RelayMode, generation: u64) {
@@ -507,6 +716,18 @@ impl AppConfig {
             if let Some(endpoint) = self.relay_capture_endpoint_id.as_deref() {
                 self.relay_send_source = format!("monitor:{endpoint}");
             }
+        }
+        // Keep the explicit Windows table and the platform-neutral selector
+        // in lockstep. The neutral key is what the backend consumes, while
+        // the nested key makes the Windows capability visible to users and
+        // future frontends.
+        if self.relay_receive_sink == default_relay_receive_sink()
+            && self.windows.relay.receive_target == WindowsRelayReceiveTarget::VirtualMicrophone
+        {
+            self.relay_receive_sink = "virtual-microphone".into();
+        }
+        if self.relay_receive_sink == "virtual-microphone" {
+            self.windows.relay.receive_target = WindowsRelayReceiveTarget::VirtualMicrophone;
         }
         if self.relay_receive_sink == default_relay_receive_sink() {
             if let Some(endpoint) = self.relay_playback_endpoint_id.as_deref() {
@@ -853,5 +1074,105 @@ enabled = true
             config.extra.get("future_table")
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_capabilities_and_application_routes_round_trip() {
+        let mut config = AppConfig::default();
+        config.windows.experimental_app_routing = true;
+        config.windows.relay.receive_target = WindowsRelayReceiveTarget::VirtualMicrophone;
+        config
+            .windows_application_routes
+            .push(WindowsApplicationRoute {
+                application: WindowsApplicationSelector {
+                    executable_path_hash: Some("sha256:deadbeef".into()),
+                    executable_name: Some("tone.exe".into()),
+                    ..WindowsApplicationSelector::default()
+                },
+                destination_endpoint_id: Some("endpoint-instance-id".into()),
+                destination_name: Some("Speakers".into()),
+                effect_chain: vec!["builtin.noise-gate".into()],
+                ..WindowsApplicationRoute::default()
+            });
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("experimental_app_routing = true"));
+        assert!(text.contains("receive_target = \"virtual-microphone\""));
+        let restored: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(restored.windows, config.windows);
+        assert_eq!(
+            restored.windows_application_routes,
+            config.windows_application_routes
+        );
+    }
+
+    #[test]
+    fn windows_virtual_microphone_preference_migrates_to_backend_selector() {
+        let mut config: AppConfig =
+            toml::from_str("[windows.relay]\nreceive_target = 'virtual-microphone'\n").unwrap();
+        config.migrate_relay_mode();
+        assert_eq!(config.relay_receive_sink, "virtual-microphone");
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("receive_target = \"virtual-microphone\""));
+    }
+
+    #[test]
+    fn application_selector_requires_stable_identity() {
+        let selector = WindowsApplicationSelector {
+            executable_path_hash: Some("sha256:abc".into()),
+            executable_name: Some("player.exe".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        let candidate = WindowsApplicationSelector {
+            executable_path_hash: Some("SHA256:ABC".into()),
+            executable_name: Some("PLAYER.EXE".into()),
+            display_name: Some("Player".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        assert!(selector.is_stable());
+        assert_eq!(selector.stable_key(), Some("sha256:abc"));
+        assert!(selector.matches(&candidate));
+        assert!(!WindowsApplicationSelector {
+            display_name: Some("Player".into()),
+            ..WindowsApplicationSelector::default()
+        }
+        .is_stable());
+    }
+
+    #[test]
+    fn most_specific_enabled_application_route_wins_without_a_pid() {
+        let candidate = WindowsApplicationSelector {
+            executable_path_hash: Some("sha256:abc".into()),
+            executable_name: Some("player.exe".into()),
+            package_family_name: Some("Player_123!App".into()),
+            ..WindowsApplicationSelector::default()
+        };
+        let config = AppConfig {
+            windows_application_routes: vec![
+                WindowsApplicationRoute {
+                    application: WindowsApplicationSelector {
+                        executable_path_hash: Some("sha256:abc".into()),
+                        ..WindowsApplicationSelector::default()
+                    },
+                    destination_name: Some("broad".into()),
+                    ..WindowsApplicationRoute::default()
+                },
+                WindowsApplicationRoute {
+                    application: WindowsApplicationSelector {
+                        executable_path_hash: Some("sha256:abc".into()),
+                        package_family_name: Some("player_123!app".into()),
+                        ..WindowsApplicationSelector::default()
+                    },
+                    destination_name: Some("specific".into()),
+                    ..WindowsApplicationRoute::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            config
+                .matching_windows_application_route(&candidate)
+                .and_then(|route| route.destination_name.as_deref()),
+            Some("specific")
+        );
     }
 }

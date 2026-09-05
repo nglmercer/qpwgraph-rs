@@ -27,6 +27,7 @@ use super::app::{RelayAttempt, RelayDirectionSwitch};
 #[cfg(feature = "relay")]
 use super::config::save_config;
 use super::RelayRow;
+#[cfg(any(feature = "relay", test))]
 use pw_graph_config::AudioDirection;
 
 #[cfg(feature = "relay")]

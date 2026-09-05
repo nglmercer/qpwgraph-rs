@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "product": "qpwgraph-rs",
+  "driver": "qpwgraph-audio",
+  "driver_version": "0.1.0",
+  "implementation_status": "bootstrap-fail-closed",
+  "endpoint_roles": [
+    "app-render",
+    "app-monitor",
+    "relay-render",
+    "relay-capture"
+  ],
+  "changes_default_audio_device": false,
+  "signing": "microsoft-signed-release-required"
+}

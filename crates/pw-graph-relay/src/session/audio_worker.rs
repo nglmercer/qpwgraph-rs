@@ -79,7 +79,7 @@ pub(super) fn is_timeout(error: &std::io::Error) -> bool {
 }
 
 pub(super) fn is_recoverable_tcp_audio_error(error: &std::io::Error) -> bool {
-    matches!(
+    let kind_is_recoverable = matches!(
         error.kind(),
         std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
@@ -88,7 +88,14 @@ pub(super) fn is_recoverable_tcp_audio_error(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::TimedOut
             | std::io::ErrorKind::WouldBlock
-    )
+    );
+
+    // Winsock reports a local `shutdown(SD_BOTH)` as WSAESHUTDOWN (10058),
+    // which Rust currently exposes as `ErrorKind::Other`.  It is still a
+    // replaceable transport failure, not a fatal protocol error; treating it
+    // as recoverable keeps the reconnect path consistent with BrokenPipe and
+    // ConnectionReset on the other platforms.
+    kind_is_recoverable || cfg!(windows) && error.raw_os_error() == Some(10058)
 }
 
 /// Receive loop: datagrams → authenticate → jitter buffer → decoder →

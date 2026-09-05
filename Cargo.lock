@@ -4113,6 +4113,7 @@ dependencies = [
  "pw-graph-relay",
  "pw-graph-utils",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "windows",
  "windows-core",
@@ -6219,6 +6220,14 @@ dependencies = [
  "windows-core",
  "windows-future",
  "windows-numerics",
+]
+
+[[package]]
+name = "windows-audio-test-tone"
+version = "0.1.0"
+dependencies = [
+ "pw-graph-backend",
+ "windows",
 ]
 
 [[package]]

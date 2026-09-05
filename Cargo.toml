@@ -15,8 +15,10 @@ members = [
     "crates/pw-graph-relay",
     "crates/pw-graph-relay-sdk",
     "crates/pw-graph-relay-android",
+    "crates/windows-audio-test-tone",
     "vendor/nnnoiseless",
 ]
+exclude = ["drivers/windows-audio"]
 
 [patch.crates-io]
 audiopus_sys = { path = "vendor/audiopus_sys" }

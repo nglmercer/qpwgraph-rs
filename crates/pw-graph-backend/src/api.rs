@@ -1187,6 +1187,10 @@ pub enum RelaySendSource {
     InputDevice(String),
     DefaultOutputMonitor,
     OutputMonitor(String),
+    /// Capture a live application already isolated on QPWGraph Virtual
+    /// Output. Windows resolves the stable process selector to a PID only at
+    /// activation time; the selector never contains or persists a PID.
+    Application(String),
     ManualGraph,
 }
 
@@ -1196,6 +1200,9 @@ pub enum RelaySendSource {
 pub enum RelayReceiveSink {
     DefaultOutput,
     OutputDevice(String),
+    /// Render peer PCM into the optional driver's Relay Sink so third-party
+    /// applications can consume it from QPWGraph Relay Microphone.
+    VirtualMicrophone,
     ManualGraph,
 }
 

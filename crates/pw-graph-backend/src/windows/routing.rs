@@ -19,13 +19,13 @@
 //! | --- | --- | --- |
 //! | a recording endpoint | a playback endpoint | capture → render |
 //! | a playback endpoint's monitor | a playback endpoint | loopback → render |
-//! | an application session | anything | refused |
+//! | a virtualized application session | anything | process loopback → router |
 //!
-//! The last row is the honest one. Capturing a single application needs
-//! process loopback, which needs a newer Windows build than this backend
-//! targets, and re-pointing one needs an API Windows does not document. Both
-//! are refused with a message rather than drawn as a link that carries
-//! nothing.
+//! An ordinary application session is still refused: Windows does not expose
+//! a supported way to re-point it, and capturing it without first moving the
+//! stream to QPWGraph Virtual Output would produce dry + processed duplicate
+//! audio. A session already attached to that virtual endpoint is isolated and
+//! can use process-loopback capture on supported Windows builds.
 //!
 //! # Ownership
 //!
@@ -67,10 +67,24 @@ const BLOCK_FRAMES: usize = 480;
 
 /// One WASAPI stream, kept alive for as long as some link needs it.
 struct Device {
-    endpoint: WasapiEndpoint,
+    endpoint: DeviceEndpoint,
     /// Links currently using this device. The stream closes when it reaches
     /// zero, so unplugging the last route also releases the hardware.
     users: usize,
+}
+
+enum DeviceEndpoint {
+    Wasapi(WasapiEndpoint),
+    Process(ProcessLoopbackSource),
+}
+
+impl DeviceEndpoint {
+    fn stop(&mut self) {
+        match self {
+            Self::Wasapi(endpoint) => endpoint.stop(),
+            Self::Process(endpoint) => endpoint.stop(),
+        }
+    }
 }
 
 /// An effect node's two ports and the processor between them.
@@ -436,6 +450,203 @@ impl WindowsRouting {
         result
     }
 
+    /// Reopen every WASAPI worker used by a route that reported a lost
+    /// endpoint.
+    ///
+    /// The paced router deliberately reports device loss instead of trying to
+    /// open a replacement from its audio thread.  This method is the control
+    /// plane half of that boundary: it removes the old sources and sinks only
+    /// after the route table is empty, opens the current endpoint identities,
+    /// and installs the same link-derived table again.  Links, effects, gain,
+    /// and route ids stay intact throughout the recovery attempt.
+    pub(super) fn recover_lost(
+        &mut self,
+        endpoint_ports: &BTreeMap<PortId, EndpointPort>,
+    ) -> BackendResult<()> {
+        let lost = self.router.take_lost_routes();
+        if lost.is_empty() {
+            return Ok(());
+        }
+
+        // A route id is derived from its source port.  A source may fan out to
+        // several links, so recovering one id is enough to rebuild the shared
+        // device and route table; retain only ids that still have a live link
+        // after graph reconciliation.
+        let recovered: Vec<RouteId> = lost
+            .into_iter()
+            .filter(|route| {
+                self.links
+                    .values()
+                    .any(|link| RouteId(link.output_port.0) == *route)
+            })
+            .collect();
+        if recovered.is_empty() {
+            return Ok(());
+        }
+
+        // Recreate one worker per endpoint port, counting every surviving link
+        // that shares it.  Effect ports are software-only and therefore do not
+        // appear in endpoint_ports; the adjacent endpoint link supplies the
+        // real source or sink.
+        let links: Vec<Link> = self.links.values().cloned().collect();
+        // Validate the complete set before tearing down the working devices.
+        // A graph refresh can race endpoint removal; returning an explained
+        // error while the old route is still alive is safer than leaving a
+        // half-reopened route with no installed table.
+        let validate = || {
+            for link in &links {
+                if !self.effect_outputs.contains_key(&link.output_port) {
+                    routable(endpoint_ports, link.output_port, PortEnd::Output)?;
+                }
+                if !self.effects.contains_key(&link.input_port) {
+                    routable(endpoint_ports, link.input_port, PortEnd::Input)?;
+                }
+            }
+            Ok::<(), BackendError>(())
+        };
+        if let Err(error) = validate() {
+            self.router.requeue_lost_routes(&recovered);
+            return Err(error);
+        }
+
+        if let Err(error) = self.clear_devices() {
+            self.router.requeue_lost_routes(&recovered);
+            return Err(error);
+        }
+
+        for link in &links {
+            if !self.effect_outputs.contains_key(&link.output_port) {
+                let endpoint = match routable(endpoint_ports, link.output_port, PortEnd::Output) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        let _ = self.clear_devices();
+                        self.router.requeue_lost_routes(&recovered);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.ensure_source(link.output_port, endpoint) {
+                    let _ = self.clear_devices();
+                    self.router.requeue_lost_routes(&recovered);
+                    return Err(error);
+                }
+            }
+            if !self.effects.contains_key(&link.input_port) {
+                let endpoint = match routable(endpoint_ports, link.input_port, PortEnd::Input) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        let _ = self.clear_devices();
+                        self.router.requeue_lost_routes(&recovered);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.ensure_sink(link.input_port, endpoint) {
+                    let _ = self.clear_devices();
+                    self.router.requeue_lost_routes(&recovered);
+                    return Err(error);
+                }
+            }
+        }
+
+        if let Err(error) = self.install() {
+            let _ = self.clear_devices();
+            self.router.requeue_lost_routes(&recovered);
+            return Err(error);
+        }
+
+        // Every owned worker was replaced above, not just the one that first
+        // reported loss. A shared destination or source can carry another
+        // route, and its resampler/effect state is just as stale after the
+        // worker restart. Reset every installed route so no old PCM crosses
+        // the discontinuity.
+        let reset_routes = match self.router.with(|core| core.route_ids()) {
+            Ok(routes) => routes,
+            Err(error) => {
+                self.router.requeue_lost_routes(&recovered);
+                return Err(router_stopped(error));
+            }
+        };
+        let reset = self.router.with(move |core| {
+            for route in reset_routes {
+                core.reset_route(route)?;
+            }
+            Ok::<(), RouterError>(())
+        });
+        match reset {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.router.requeue_lost_routes(&recovered);
+                Err(router_error(error))
+            }
+            Err(error) => {
+                self.router.requeue_lost_routes(&recovered);
+                Err(router_stopped(error))
+            }
+        }
+    }
+
+    /// Remove all device workers after the router has stopped using them.
+    ///
+    /// The returned audio objects are dropped on this control thread, not on
+    /// the paced router thread, so a COM/WASAPI teardown cannot happen in the
+    /// middle of a block.
+    fn clear_devices(&mut self) -> BackendResult<()> {
+        let source_entries = std::mem::take(&mut self.sources);
+        let sink_entries = std::mem::take(&mut self.sinks);
+        let source_ids: Vec<SourceId> = source_entries.values().map(|(id, _)| *id).collect();
+        let sink_ids: Vec<SinkId> = sink_entries.values().map(|(id, _)| *id).collect();
+
+        let released = self.router.with(move |core| {
+            core.set_routes(&[])?;
+            let mut sources = Vec::with_capacity(source_ids.len());
+            for id in source_ids {
+                sources.push(core.remove_source(id)?);
+            }
+            let mut sinks = Vec::with_capacity(sink_ids.len());
+            for id in sink_ids {
+                sinks.push(core.remove_sink(id)?);
+            }
+            Ok::<_, RouterError>((sources, sinks))
+        });
+
+        match released {
+            Ok(Ok((sources, sinks))) => {
+                // Keep the explicit drops here: these boxes own the ring
+                // handles, and their destruction belongs outside the router
+                // thread's closure.
+                drop(sources);
+                drop(sinks);
+                for (_, (_, mut device)) in source_entries {
+                    device.endpoint.stop();
+                }
+                for (_, (_, mut device)) in sink_entries {
+                    device.endpoint.stop();
+                }
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                // This should only be reachable for an internal invariant
+                // violation (the table was emptied first), but do not leak a
+                // worker if the router reports one.
+                for (_, (_, mut device)) in source_entries {
+                    device.endpoint.stop();
+                }
+                for (_, (_, mut device)) in sink_entries {
+                    device.endpoint.stop();
+                }
+                Err(router_error(error))
+            }
+            Err(error) => {
+                for (_, (_, mut device)) in source_entries {
+                    device.endpoint.stop();
+                }
+                for (_, (_, mut device)) in sink_entries {
+                    device.endpoint.stop();
+                }
+                Err(router_stopped(error))
+            }
+        }
+    }
+
     /// Rebuild the route table from the current link set and install it.
     ///
     /// This is where the drawn graph becomes a route table. Starting at each
@@ -505,12 +716,25 @@ impl WindowsRouting {
             return Ok(());
         }
         let device_id = Some(endpoint.device_id.as_str());
-        let (source, wasapi) = match endpoint.role {
+        let (source, endpoint_worker) = match endpoint.role {
             EndpointPortRole::Capture => {
-                wasapi::open_capture_source(device_id, ROUTE_FORMAT, RING_FRAMES)?
+                let (source, worker) =
+                    wasapi::open_capture_source(device_id, ROUTE_FORMAT, RING_FRAMES)?;
+                (source, DeviceEndpoint::Wasapi(worker))
             }
             EndpointPortRole::Monitor => {
-                wasapi::open_loopback_source(device_id, ROUTE_FORMAT, RING_FRAMES)?
+                let (source, worker) =
+                    wasapi::open_loopback_source(device_id, ROUTE_FORMAT, RING_FRAMES)?;
+                (source, DeviceEndpoint::Wasapi(worker))
+            }
+            EndpointPortRole::Process { pid } => {
+                let (source, worker) = ProcessLoopbackSource::open(
+                    pid,
+                    ProcessLoopbackMode::IncludeProcessTree,
+                    ROUTE_FORMAT,
+                    RING_FRAMES,
+                )?;
+                (source, DeviceEndpoint::Process(worker))
             }
             EndpointPortRole::Render => {
                 return Err(BackendError::unsupported(
@@ -528,7 +752,7 @@ impl WindowsRouting {
             (
                 id,
                 Device {
-                    endpoint: wasapi,
+                    endpoint: endpoint_worker,
                     users: 1,
                 },
             ),
@@ -558,7 +782,7 @@ impl WindowsRouting {
             (
                 id,
                 Device {
-                    endpoint: wasapi,
+                    endpoint: DeviceEndpoint::Wasapi(wasapi),
                     users: 1,
                 },
             ),
@@ -669,9 +893,9 @@ fn routable(
         // rather than reporting a missing port the user can plainly see.
         BackendError::unsupported(match end {
             PortEnd::Output => {
-                "only a recording device or a playback device's monitor can be the source of a \
-                 Windows audio route; capturing one application needs process loopback, which \
-                 this backend does not provide"
+                "only a recording device, a playback device's monitor, or an application already \
+                 attached to QPWGraph Virtual Output can be the source of a Windows audio route; \
+                 move the application in Windows Volume Mixer before enabling process loopback"
             }
             PortEnd::Input => {
                 "only a playback device can be the destination of a Windows audio route; Windows \

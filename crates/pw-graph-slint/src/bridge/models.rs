@@ -602,17 +602,31 @@ fn relay_send_source_options(application: &Application) -> Vec<(String, String)>
         .into_iter()
         .map(|endpoint| (endpoint.id, endpoint.name))
         .collect::<Vec<_>>();
+    #[cfg(target_os = "windows")]
+    if !application.config.windows.enable_process_loopback {
+        options.retain(|(id, _)| !id.starts_with("application:"));
+    }
     if options.is_empty() {
         options.push((
             "default-input".into(),
             application.i18n.text("relay.default_input"),
         ));
     }
-    append_unavailable_selector(
-        &mut options,
-        &application.config.relay_send_source,
-        application,
-    );
+    #[cfg(target_os = "windows")]
+    let keep_unavailable = application.config.windows.enable_process_loopback
+        || !application
+            .config
+            .relay_send_source
+            .starts_with("application:");
+    #[cfg(not(target_os = "windows"))]
+    let keep_unavailable = true;
+    if keep_unavailable {
+        append_unavailable_selector(
+            &mut options,
+            &application.config.relay_send_source,
+            application,
+        );
+    }
     options
 }
 

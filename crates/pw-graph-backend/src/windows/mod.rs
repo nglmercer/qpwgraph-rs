@@ -53,11 +53,14 @@ use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows_core::BOOL;
 
+pub mod app_route_policy;
 mod callbacks;
 mod driver;
 mod effects;
 mod identity;
+pub mod process_loopback;
 mod routing;
+pub mod virtual_device;
 mod worker;
 
 #[cfg(test)]
@@ -65,10 +68,20 @@ mod tests;
 
 // One 2,100-line file before; `pub(super)` keeps the reach a bare item had
 // there, which is private to `windows`.
+pub use self::app_route_policy::{
+    AppRoutePolicy, AppRoutePolicySupport, AudioFlow, AudioRole, ProcessIdentity,
+    UnsupportedAppRoutePolicy,
+};
 use self::callbacks::*;
 pub use self::driver::WindowsAudioDriver;
 use self::driver::*;
 use self::effects::*;
 use self::identity::*;
+pub use self::process_loopback::{
+    ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
+};
 use self::routing::*;
+pub use self::virtual_device::{
+    classify_virtual_endpoint, QpwVirtualEndpointRole, VirtualAudioDriverHealth,
+};
 use self::worker::*;

@@ -239,6 +239,16 @@ pub(super) fn connect_control_tcp(
             "ADB transport requires a localhost forwarding target",
         ));
     }
+    // A loopback target already forces the kernel onto the loopback adapter.
+    // Avoid an explicit source bind here: Windows can reject a nonblocking
+    // socket bound to 127.0.0.1 with WSAEINVAL when many short-lived loopback
+    // listeners are active (the common parallel-test and ADB-forward case).
+    // Physical-link targets still use the policy-selected source address.
+    let bind = if target.ip().is_loopback() {
+        None
+    } else {
+        bind
+    };
     netlink::connect_tcp(target, bind, CONNECT_TIMEOUT).map_err(|error| {
         if transport == crate::TransportPreference::Adb && target.ip().is_loopback() {
             std::io::Error::new(

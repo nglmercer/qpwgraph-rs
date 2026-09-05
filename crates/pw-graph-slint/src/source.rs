@@ -102,6 +102,33 @@ impl ApplicationDriver {
         &self.backend_name
     }
 
+    /// Text-only Windows audio diagnostics for the support/clipboard path.
+    /// Non-Windows and demo backends return an explicit, non-sensitive
+    /// availability line rather than pretending a native report exists.
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    pub(crate) fn windows_audio_report(&self) -> String {
+        match &self.backend {
+            BackendKind::Demo(_) => {
+                "qpwgraph Windows audio backend unavailable (demo mode)\n".into()
+            }
+            BackendKind::Live(driver) => driver.windows_audio_report(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    pub(crate) fn windows_app_route_policy_support(
+        &self,
+    ) -> pw_graph_backend::AppRoutePolicySupport {
+        match &self.backend {
+            BackendKind::Demo(_) => pw_graph_backend::AppRoutePolicySupport::ManualOnly {
+                reason: "Windows app routing is unavailable in demo mode".into(),
+            },
+            BackendKind::Live(driver) => driver.windows_app_route_policy_support(),
+        }
+    }
+
     pub(crate) fn has_alsa(&self) -> bool {
         match &self.backend {
             BackendKind::Demo(_) => false,

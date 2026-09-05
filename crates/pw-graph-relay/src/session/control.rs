@@ -349,12 +349,31 @@ pub(super) fn watch_control(
             return ControlExit::Stopped;
         }
         if record.bye_requested.load(Ordering::Relaxed) {
-            let _ = cipher.send(
+            let sent = cipher.send(
                 &mut stream,
                 &ControlMessage::Bye {
                     reason: "user disconnected".into(),
                 },
             );
+            // A Windows close can abort a socket that still has unread data,
+            // causing the peer to miss an otherwise-flushed final frame.
+            // Keep the control stream alive until the peer echoes Bye (or a
+            // bounded timeout expires), so graceful disconnect is observable
+            // without weakening the reconnect grace period for real drops.
+            if sent.is_ok() {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    match cipher.receive(&mut stream) {
+                        Ok(ControlMessage::Bye { .. }) => break,
+                        Ok(_) => {}
+                        Err(error) if is_timeout(&error) && Instant::now() < deadline => {}
+                        Err(_) => break,
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
             return ControlExit::Stopped;
         }
         if let Err(error) = flush_pending_direction_offer(&record, &mut stream, &mut cipher) {
@@ -393,7 +412,15 @@ pub(super) fn watch_control(
             }
         }
         match cipher.receive(&mut stream) {
-            Ok(ControlMessage::Bye { reason }) => return ControlExit::PeerBye(reason),
+            Ok(ControlMessage::Bye { reason }) => {
+                let _ = cipher.send(
+                    &mut stream,
+                    &ControlMessage::Bye {
+                        reason: "bye acknowledged".into(),
+                    },
+                );
+                return ControlExit::PeerBye(reason);
+            }
             Ok(ControlMessage::TrustEnroll { peer_id, secret }) => {
                 let rejected = if !inner.config().trust_new_peers {
                     Some("this host requires explicit PIN pairing".to_string())

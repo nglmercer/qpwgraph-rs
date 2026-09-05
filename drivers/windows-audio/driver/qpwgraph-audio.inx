@@ -1,0 +1,52 @@
+; Development-only root-enumerated package. The production package must be
+; generated and Microsoft-signed; this template never changes defaults.
+[Version]
+Signature="$WINDOWS NT$"
+Class=MEDIA
+ClassGuid={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+DriverVer=*,*
+CatalogFile=qpwgraph-audio.cat
+PnpLockdown=1
+
+[Manufacturer]
+%ProviderName%=QPWGraph,NTamd64
+
+[QPWGraph.NTamd64]
+%DeviceName%=QPWGraph_Install,Root\QPWGRAPH_AUDIO
+
+[SourceDisksFiles]
+qpwgraph_audio.sys=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[DestinationDirs]
+DefaultDestDir=12
+
+[QPWGraph_Install.NT]
+CopyFiles=DriverCopyFiles
+
+[DriverCopyFiles]
+qpwgraph_audio.sys
+
+[QPWGraph_Install.NT.Services]
+AddService=qpwgraph_audio,0x00000002,QPWGraph_Service
+
+[QPWGraph_Service]
+DisplayName=%DeviceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\qpwgraph_audio.sys
+
+[QPWGraph_Install.NT.Wdf]
+KmdfService=qpwgraph_audio,QPWGraph_Wdf
+
+[QPWGraph_Wdf]
+KmdfLibraryVersion=$KMDFVERSION$
+
+[Strings]
+ProviderName="qpwgraph-rs contributors"
+DeviceName="QPWGraph Virtual Audio (development)"
+DiskName="QPWGraph Virtual Audio installation media"

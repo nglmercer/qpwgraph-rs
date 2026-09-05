@@ -77,9 +77,28 @@ pub(crate) fn read_window_state(window: &MainWindow, application: &mut Applicati
     #[cfg(feature = "relay")]
     {
         let send_options = application.source.relay_send_sources();
+        #[cfg(target_os = "windows")]
+        let send_options = if application.config.windows.enable_process_loopback {
+            send_options
+        } else {
+            send_options
+                .into_iter()
+                .filter(|choice| !choice.id.starts_with("application:"))
+                .collect()
+        };
         let receive_options = application.source.relay_receive_sinks();
         let mut send_changed = false;
         let mut receive_changed = false;
+        #[cfg(target_os = "windows")]
+        if !application.config.windows.enable_process_loopback
+            && application
+                .config
+                .relay_send_source
+                .starts_with("application:")
+        {
+            application.config.relay_send_source = "default-input".into();
+            send_changed = true;
+        }
         if !send_options.is_empty() {
             let selected = relay_selector_id(
                 window.get_relay_send_source_index(),
@@ -162,6 +181,11 @@ fn relay_send_source(selector: &str) -> RelaySendSource {
                     .strip_prefix("monitor:")
                     .map(|id| RelaySendSource::OutputMonitor(id.to_owned()))
             })
+            .or_else(|| {
+                selector
+                    .strip_prefix("application:")
+                    .map(|id| RelaySendSource::Application(id.to_owned()))
+            })
             .unwrap_or_else(|| RelaySendSource::InputDevice(selector.to_owned())),
     }
 }
@@ -187,6 +211,7 @@ fn relay_endpoint_id(
 fn relay_receive_sink(selector: &str) -> RelayReceiveSink {
     match selector {
         "default-output" | "" => RelayReceiveSink::DefaultOutput,
+        "virtual-microphone" => RelayReceiveSink::VirtualMicrophone,
         "manual" => RelayReceiveSink::ManualGraph,
         selector => RelayReceiveSink::OutputDevice(
             selector
@@ -259,7 +284,8 @@ pub(crate) fn save_config(application: &mut Application, report_success: bool) {
 
 #[cfg(all(test, feature = "relay", target_os = "windows"))]
 mod tests {
-    use super::relay_endpoint_id;
+    use super::{relay_endpoint_id, relay_send_source};
+    use pw_graph_backend::RelaySendSource;
 
     #[test]
     fn relay_endpoint_indices_round_trip_stable_ids() {
@@ -284,6 +310,14 @@ mod tests {
         assert_eq!(
             relay_endpoint_id(99, &choices, Some("removed-endpoint")),
             Some("removed-endpoint".into())
+        );
+    }
+
+    #[test]
+    fn application_relay_selector_round_trips_without_a_pid() {
+        assert_eq!(
+            relay_send_source("application:sha256:abc"),
+            RelaySendSource::Application("sha256:abc".into())
         );
     }
 }

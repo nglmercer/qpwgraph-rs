@@ -291,6 +291,15 @@ pub(super) fn host_peer_thread(
                 reason: "too many failed pairing attempts; wait and retry".into(),
             },
         );
+        #[cfg(windows)]
+        {
+            // Winsock may reset a socket when the server closes immediately
+            // after a final cleartext response. Keep the write half open for
+            // one bounded scheduling interval so the client can read the
+            // lockout reason instead of seeing WSAECONNABORTED.
+            let _ = stream.shutdown(Shutdown::Write);
+            std::thread::sleep(Duration::from_millis(100));
+        }
         return;
     }
 

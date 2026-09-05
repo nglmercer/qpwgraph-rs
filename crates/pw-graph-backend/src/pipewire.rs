@@ -1803,6 +1803,11 @@ impl RelayDriver for PipewireDriver {
     }
 
     fn relay_set_send_source(&mut self, source: RelaySendSource) -> BackendResult<()> {
+        if matches!(&source, RelaySendSource::Application(_)) {
+            return Err(BackendError::unsupported(
+                "application relay selectors are available only on Windows",
+            ));
+        }
         self.relay_send_source = source.clone();
         self.with_loop(|driver| {
             if let Some(set) = driver.relay.as_mut() {
@@ -1946,10 +1951,16 @@ impl PipewireDriver {
                 .set_receive_sink(self.relay_receive_sink.clone());
             let manual = match mode {
                 RelayMode::Emitter => {
-                    matches!(set.local_router.send_source, RelaySendSource::ManualGraph)
+                    matches!(
+                        set.local_router.send_source,
+                        RelaySendSource::ManualGraph | RelaySendSource::Application(_)
+                    )
                 }
                 RelayMode::Receiver => {
-                    matches!(set.local_router.receive_sink, RelayReceiveSink::ManualGraph)
+                    matches!(
+                        set.local_router.receive_sink,
+                        RelayReceiveSink::ManualGraph | RelayReceiveSink::VirtualMicrophone
+                    )
                 }
             };
             let mut previous_ids = set.local_router.link_ids.clone();

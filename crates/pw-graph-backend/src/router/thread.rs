@@ -15,11 +15,13 @@
 //! Anything the core hands back on removal is dropped by the *caller*, not
 //! here, so a device's teardown never happens between two blocks.
 
+use std::collections::BTreeSet;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::engine::{ProcessReport, RouterConfig, RouterCore};
+use super::engine::{ProcessReport, RouteId, RouterConfig, RouterCore};
 
 /// The router thread stopped, so the operation could not be run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -38,6 +40,11 @@ pub struct RouterThread {
     commands: Sender<Message>,
     worker: Option<JoinHandle<()>>,
     config: RouterConfig,
+    /// Routes whose source or destination reported a lost device. The paced
+    /// worker cannot reopen a WASAPI endpoint itself: doing so would block the
+    /// audio cycle. Control owners drain this set between blocks and perform a
+    /// transactional restart on their own thread.
+    lost_routes: Arc<Mutex<BTreeSet<RouteId>>>,
 }
 
 impl RouterThread {
@@ -48,6 +55,8 @@ impl RouterThread {
     /// after the fact.
     pub fn start(config: RouterConfig) -> std::io::Result<Self> {
         let (commands, inbox) = mpsc::channel::<Message>();
+        let lost_routes = Arc::new(Mutex::new(BTreeSet::new()));
+        let worker_lost_routes = Arc::clone(&lost_routes);
         let worker = thread::Builder::new()
             .name("qpwgraph-audio-router".into())
             .spawn(move || {
@@ -79,13 +88,19 @@ impl RouterThread {
                         Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {}
                     }
-                    core.process();
+                    let report = core.process();
+                    if !report.lost.is_empty() {
+                        if let Ok(mut lost_routes) = worker_lost_routes.lock() {
+                            lost_routes.extend(report.lost);
+                        }
+                    }
                 }
             })?;
         Ok(Self {
             commands,
             worker: Some(worker),
             config,
+            lost_routes,
         })
     }
 
@@ -120,6 +135,29 @@ impl RouterThread {
     /// an extra block rather than the only one.
     pub fn step(&self) -> Result<ProcessReport, RouterStopped> {
         self.with(|core| core.process())
+    }
+
+    /// Drain the route-loss notifications produced by the paced worker.
+    ///
+    /// This is intentionally a small control-plane queue: a route is reported
+    /// once until its owner has had a chance to recover it, even if several
+    /// audio blocks observe the same dead endpoint in the meantime.
+    pub fn take_lost_routes(&self) -> Vec<RouteId> {
+        self.lost_routes
+            .lock()
+            .map(|mut routes| std::mem::take(&mut *routes).into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Put route-loss notifications back when a control-plane recovery
+    /// attempt could not reopen the devices. The paced worker has no route to
+    /// report once the old workers have been removed, so retaining the ids is
+    /// what lets the next graph refresh retry instead of leaving a permanent
+    /// silent route.
+    pub fn requeue_lost_routes(&self, routes: &[RouteId]) {
+        if let Ok(mut pending) = self.lost_routes.lock() {
+            pending.extend(routes.iter().copied());
+        }
     }
 
     /// Stop the thread and wait for it.
@@ -236,6 +274,42 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(captured.lock().unwrap().iter().all(|&s| s == 0.5));
+    }
+
+    #[test]
+    fn the_paced_loop_publishes_a_lost_route_for_control_plane_recovery() {
+        let router = RouterThread::start(config()).expect("the router thread starts");
+        let (sink, _captured) = CaptureSink::lost(MONO);
+        router
+            .with(move |core| {
+                core.add_source(
+                    SourceId(1),
+                    Box::new(BufferSource::looping(MONO, vec![0.5])),
+                )
+                .expect("a fresh source id");
+                core.add_sink(SinkId(1), Box::new(sink))
+                    .expect("a fresh sink id");
+                core.set_routes(&[RouteSpec::direct(RouteId(1), SourceId(1), SinkId(1))])
+                    .expect("a valid route");
+            })
+            .expect("the router is running");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut lost = Vec::new();
+        while lost.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the paced loop never reported the lost route"
+            );
+            lost = router.take_lost_routes();
+            if lost.is_empty() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(lost, vec![RouteId(1)]);
+
+        router.requeue_lost_routes(&lost);
+        assert_eq!(router.take_lost_routes(), lost);
     }
 
     #[test]

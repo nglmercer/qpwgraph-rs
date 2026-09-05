@@ -30,6 +30,10 @@ Three further crates carry the relay:
 - `pw-graph-relay-sdk`: the stable third-party API over that engine.
 - `pw-graph-relay-android`: the JNI bindings that expose the SDK to Android.
 
+The optional Windows driver is a separate nested workspace at
+`drivers/windows-audio`; it is deliberately excluded from normal application
+builds and never replaces the user-mode router.
+
 ## Layering
 
 The `pw-graph-app-core` crate owns the framework-neutral composite backend
@@ -50,6 +54,8 @@ mutable; Windows Core Audio endpoint/session relationships are observed, so
 their connection, disconnection, and rerouting requests report unsupported.
 WinMM device indices are used only for the current native open; stable device
 interface identities keep graph IDs from following enumeration order changes.
+Windows virtual endpoint names are classified into semantic roles, and
+persisted application routes use process selectors rather than transient PIDs.
 
 ## Assets
 

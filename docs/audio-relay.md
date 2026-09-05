@@ -8,11 +8,12 @@ format is documented separately in
 ## The panel
 
 The relay panel exposes two generic modes. **Emitter** selects a local source
-(the default input, a physical input, or a playback monitor) and connects to a
-peer. **Receiver** starts a local host, accepts a peer, and selects the output
-that should play the received audio. Advanced settings cover codec, frame
-duration, transport, pairing, trusted peers, and QR endpoint information.
-Linux also exposes the relay's virtual graph nodes.
+(the default input, a physical input, a playback monitor, or—on Windows—a
+live app already isolated on QPWGraph Virtual Output) and connects to a peer.
+**Receiver** starts a local host, accepts a peer, and selects the output that
+should play the received audio. Advanced settings cover codec, frame duration,
+transport, pairing, trusted peers, and QR endpoint information. Linux also
+exposes the relay's virtual graph nodes.
 
 An active session is always one-way: one Emitter sends and one Receiver plays.
 There is no `both` mode and switching modes stops the old worker and route
@@ -93,11 +94,18 @@ call on the other endpoint itself.
 
 On Windows, Emitter mode can capture a physical input with WASAPI `eCapture` or
 the selected output monitor with `eRender` loopback. Receiver mode renders
-peer audio to a selected `eRender` output. Choices use stable Core Audio IDs,
-follow the system default when requested, and restart only the active worker
-when the resolved device or default generation changes. Direct mode is
-whole-endpoint; an optional virtual-audio driver is required only when other
-applications must see received audio as a capture device.
+peer audio to a selected `eRender` output or the driver's Relay Sink. Choices
+use stable Core Audio IDs, follow the system default when requested, and
+restart only the active worker when the resolved device or default generation
+changes. Install the optional `drivers/windows-audio` package to expose Relay
+Sink/Relay Microphone and select the `virtual-microphone` receive target;
+without it, direct physical output remains available and the virtual selector
+is absent. A live session already assigned to **QPWGraph Virtual Output** also
+appears as an `application:<stable-selector>` Emitter source. Starting that
+choice resolves the current PID, captures it with documented process loopback,
+and feeds the same bounded PCM hand-off as other sources; a process exit or
+loss of isolation stops the source instead of falling back to another app.
+The selector is stable across app restarts, while the PID is runtime-only.
 
 ## Local endpoint routing
 

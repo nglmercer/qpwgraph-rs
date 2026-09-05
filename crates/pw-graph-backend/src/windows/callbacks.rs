@@ -15,6 +15,9 @@ pub(super) fn mark_session_endpoint_dirty(
         endpoints.insert(endpoint_id.to_owned());
     }
     dirty.store(true, Ordering::Release);
+    // A process can exit and its PID can be reused without any endpoint
+    // topology event. Invalidate capability probes on session churn as well.
+    ProcessLoopbackSource::clear_capability_cache();
 }
 
 pub(super) fn take_session_dirty_endpoints(
@@ -37,6 +40,9 @@ impl EndpointNotificationClient {
     pub(super) fn mark_topology_dirty(&self) {
         self.topology_dirty.store(true, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
+        // Device/service changes can invalidate a cached process-loopback
+        // activation result, so the next capability query must be live.
+        ProcessLoopbackSource::clear_capability_cache();
     }
 }
 

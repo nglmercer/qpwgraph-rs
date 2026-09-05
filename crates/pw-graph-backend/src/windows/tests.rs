@@ -85,6 +85,7 @@ fn endpoint_notifications_mark_the_graph_dirty() {
     let callback: Audio::IMMNotificationClient = EndpointNotificationClient {
         dirty: Arc::clone(&dirty),
         topology_dirty: Arc::clone(&topology_dirty),
+        #[cfg(feature = "relay")]
         default_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
     .into();
@@ -191,9 +192,22 @@ fn only_endpoints_offer_a_connect_gesture() {
         let routable = driver.node_supports_routing(node.id);
         match node.node_type {
             // An application session is drawn, selectable, and metered, but
-            // Windows exposes no supported way to move one, so the canvas
-            // must not offer a gesture that could only fail.
-            NodeType::WindowsAudioSession => assert!(!routable, "{} was routable", node.name),
+            // Windows exposes no supported way to move one.  The one
+            // documented exception is an app that the user already moved to
+            // QPWGraph Virtual Output; its process-loopback port is a real
+            // qpwgraph-owned source.
+            NodeType::WindowsAudioSession => {
+                let has_process_port = node.ports.iter().any(|port| {
+                    matches!(
+                        driver
+                            .endpoint_ports
+                            .get(port)
+                            .map(|endpoint| endpoint.role),
+                        Some(EndpointPortRole::Process { .. })
+                    )
+                });
+                assert_eq!(routable, has_process_port, "{} routing mismatch", node.name);
+            }
             _ => assert!(routable, "{} was not routable", node.name),
         }
     }

@@ -416,7 +416,10 @@ fn capture_loop(
     while !stop.load(Ordering::Acquire) {
         let mut pending = match unsafe { capture.GetNextPacketSize() } {
             Ok(pending) => pending,
-            Err(_) => break,
+            Err(_) => {
+                feed.mark_lost();
+                return;
+            }
         };
         if pending == 0 {
             thread::sleep(POLL_INTERVAL);
@@ -429,6 +432,7 @@ fn capture_loop(
             if unsafe { capture.GetBuffer(&mut data, &mut frames, &mut buffer_flags, None, None) }
                 .is_err()
             {
+                feed.mark_lost();
                 return;
             }
             if frames > 0 {
@@ -459,11 +463,15 @@ fn capture_loop(
                 }
             }
             if unsafe { capture.ReleaseBuffer(frames) }.is_err() {
+                feed.mark_lost();
                 return;
             }
             pending = match unsafe { capture.GetNextPacketSize() } {
                 Ok(pending) => pending,
-                Err(_) => return,
+                Err(_) => {
+                    feed.mark_lost();
+                    return;
+                }
             };
         }
     }
@@ -479,7 +487,10 @@ fn render_loop(
 ) {
     let buffer_frames = match unsafe { client.GetBufferSize() } {
         Ok(frames) if frames > 0 => frames,
-        _ => return,
+        _ => {
+            drain.mark_lost();
+            return;
+        }
     };
     let channels = usize::from(format.channels);
     let mut scratch = vec![0.0f32; buffer_frames as usize * channels];
@@ -487,7 +498,10 @@ fn render_loop(
     while !stop.load(Ordering::Acquire) {
         let padding = match unsafe { client.GetCurrentPadding() } {
             Ok(padding) => padding,
-            Err(_) => return,
+            Err(_) => {
+                drain.mark_lost();
+                return;
+            }
         };
         let available = buffer_frames.saturating_sub(padding);
         if available == 0 {
@@ -505,7 +519,10 @@ fn render_loop(
 
         let data = match unsafe { render.GetBuffer(available) } {
             Ok(data) if !data.is_null() => data,
-            _ => return,
+            _ => {
+                drain.mark_lost();
+                return;
+            }
         };
         // Safety: WASAPI just handed back a buffer for exactly `available`
         // frames in the client's float format, and `wanted` is that many
@@ -513,6 +530,7 @@ fn render_loop(
         unsafe {
             std::ptr::copy_nonoverlapping(scratch.as_ptr(), data.cast::<f32>(), wanted);
             if render.ReleaseBuffer(available, 0).is_err() {
+                drain.mark_lost();
                 return;
             }
         }
