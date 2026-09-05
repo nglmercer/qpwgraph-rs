@@ -1604,7 +1604,7 @@ Call **Windows parity milestone 2** complete when all of these work:
 [x] true RMS for a normal application without driver (opt-in helper smoke test passed locally)
 [x] stable app selectors survive restart (opt-in helper smoke test passed locally)
 [ ] stable endpoint selectors survive normal endpoint churn
-[ ] saved application route has an explicit reconciler state
+[x] saved application route has an explicit reconciler state (reconciler unit tests passed locally)
 [ ] one real Rust ACX render endpoint enumerates and streams
 [ ] virtual render/capture cable carries deterministic PCM
 [ ] Relay Microphone works in an ordinary Windows capture client
