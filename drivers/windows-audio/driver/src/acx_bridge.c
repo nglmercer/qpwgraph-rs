@@ -534,19 +534,11 @@ static NTSTATUS QpwgraphEvtStreamAllocateRtPackets(ACXSTREAM Stream,
   }
 
   // ACX permits one packet for timer-driven streams and two packets for
-  // notification-driven streams.  A one-packet buffer must be wholly
-  // page-aligned; the two-packet layout reserves the tail of the first
-  // allocation so the packet begins at the same offset ACX samples use.
-  if (PacketCount == 1) {
-    if ((PacketSize % PAGE_SIZE) != 0) {
-      return STATUS_INVALID_PARAMETER;
-    }
-    packetAllocationSize = PacketSize;
-    firstPacketOffset = 0;
-  } else {
-    packetAllocationSize = (PacketSize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    firstPacketOffset = packetAllocationSize - PacketSize;
-  }
+  // notification-driven streams.  The backing MDL allocation is rounded to
+  // a page-sized byte count; the first packet starts at the tail offset used
+  // by Microsoft's ACX sample so each packet boundary is page-aligned.
+  packetAllocationSize = (PacketSize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  firstPacketOffset = packetAllocationSize - PacketSize;
   packetArray = (PACX_RTPACKET)ExAllocatePool2(
       POOL_FLAG_NON_PAGED, sizeof(ACX_RTPACKET) * PacketCount,
       QPWGRAPH_DRIVER_TAG);
