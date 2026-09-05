@@ -7,6 +7,26 @@
 
 #include "acx_wrapper.h"
 
+// The kernel-mode C headers declare these KS GUIDs through DEFINE_GUIDEX,
+// which intentionally leaves storage to the driver.  User-mode libraries
+// normally provide the definitions, but a KMDF/ACX driver links only the
+// kernel and ACX import libraries, so define the three topology GUIDs here.
+const GUID KSCATEGORY_AUDIO = {
+    0x6994AD04L,
+    0x93EF,
+    0x11D0,
+    {0xA3, 0xCC, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96}};
+const GUID KSNODETYPE_MICROPHONE = {
+    0xDFF21BE1L,
+    0xF70F,
+    0x11D0,
+    {0xB9, 0x17, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96}};
+const GUID KSNODETYPE_SPEAKER = {
+    0xDFF21CE1L,
+    0xF70F,
+    0x11D0,
+    {0xB9, 0x17, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96}};
+
 #define QPWGRAPH_DRIVER_TAG ((ULONG)'aPWQ')
 #define QPWGRAPH_MAX_PACKET_COUNT 8
 #define QPWGRAPH_HNS_PER_SEC 10000000ULL

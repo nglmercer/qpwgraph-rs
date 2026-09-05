@@ -47,9 +47,16 @@ $env:Path = "$env:LIBCLANG_PATH;$env:Path"
 cargo test -p qpwgraph-audio-core --locked
 cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
 cargo check -p qpwgraph-audio --features acx --locked
-cargo make
+cargo run -p qpwgraph-audio-xtask --locked -- --build-package
 Pop-Location
 ```
+
+`--build-package` produces the ACX-enabled `.sys`, stamps the INF, generates
+the catalog, and stages an unsigned package at
+`drivers/windows-audio/target/qpwgraph-audio-package`. The source manifest
+stays fail-closed; the generated package is marked ready only after the build
+and package-tool gates pass, and installation still requires test or Microsoft
+signing.
 
 The installer must never take over Windows defaults. Development packages may
 be test-signed; public Windows 10/11 packages require the Microsoft signing

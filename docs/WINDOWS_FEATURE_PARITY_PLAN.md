@@ -1,9 +1,10 @@
 # Windows next-feature plan
 
 Status snapshot: 2026-09-05. The repository now contains the P0 user-mode
-implementation slices below. The WDK/ACX header-and-link compile gate has
-also passed locally with WDK 10.0.26100 and released LLVM 21.1.2; live
-endpoint, HLK, and signing gates remain explicitly open.
+implementation slices below. The ACX-enabled release driver links locally and
+the WDK `stampinf`/`Inf2Cat` package stage passes with WDK 10.0.26100 and
+released LLVM 21.1.2; live endpoint, HLK, and signing gates remain explicitly
+open.
 
 This document replaces the old “build everything from zero” roadmap with the next implementation steps after the Windows parity foundations landed.
 
@@ -74,7 +75,7 @@ Do not reimplement these items.
 - [x] `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
 - [x] include/exclude process-tree modes
 - [x] async activation lifetime ownership
-- [x] boxed activation parameters
+- [x] COM-task-allocated activation parameters
 - [x] owned `VT_BLOB` / `PROPVARIANT`
 - [x] completion handler lifetime
 - [x] activation operation lifetime
@@ -686,8 +687,8 @@ EvtDeviceAdd -> STATUS_NOT_SUPPORTED
 
 The opt-in `acx` build now contains the app and relay endpoint transactions in
 the C-side ACX bridge, while the Rust entry point keeps the opaque ACX ABI
-isolated. The structural blocker is no longer missing source scaffolding; it
-is the unverified eWDK build, test-signed load, endpoint enumeration, and
+isolated. The release build and unsigned package stage are verified locally;
+the remaining blocker is the test-signed load, endpoint enumeration, and
 streaming validation pass.
 
 ---
@@ -714,8 +715,16 @@ Once that preflight passes, the opt-in binding compilation is:
     cargo check -p qpwgraph-audio --features acx --locked
     Pop-Location
 
-This is a header/ABI and feature-bridge compilation gate. It does not close
-the endpoint milestone or authorize installing the package.
+This is a header/ABI and feature-bridge compilation gate. The release package
+stage is:
+
+    Push-Location drivers/windows-audio
+    cargo run -p qpwgraph-audio-xtask --locked -- --build-package
+    Pop-Location
+
+It builds the ACX `.sys`, stamps the INF, generates the catalog, and stages an
+unsigned package under `target/qpwgraph-audio-package`. It does not close the
+endpoint milestone or authorize installing the package.
 
 Create:
 
@@ -734,8 +743,10 @@ The opt-in bridge exercises `AcxDeviceInitialize`, `AcxCircuitCreate`,
 and relay sink/microphone circuit pairs, bounded RT packet allocation,
 timer-driven packet completion, and monotonic presentation position. Each
 pair crosses the narrow C ABI into its own Rust `SpscSampleRing`, and capture
-underflow is filled with silence. The small bindgen wrappers remain compile
-probes; the production bridge is still gated on the eWDK and Windows tests.
+underflow is filled with silence. The small bindgen wrappers remain narrow ABI
+boundaries; the production bridge now also links as a release kernel driver.
+Test-signed Windows endpoint and stream tests are still required before the
+package is considered ready.
 
 The opt-in eWDK CI job runs both `--audit-toolchain` and
 `cargo check -p qpwgraph-audio --features acx` before attempting the package
@@ -761,6 +772,8 @@ Do not claim four-endpoint readiness until this succeeds:
 [x] ACX circuit creation compiles
 [x] ACX pin/format config compiles
 [x] ACX stream callback config compiles
+[x] ACX-enabled release driver links
+[x] unsigned INF/CAT package stages
 [ ] test-signed package loads
 ```
 
@@ -1383,7 +1396,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 ## Process capture
 
 ```text
-[ ] ordinary Win32 app
+[x] ordinary Win32 app (deterministic helper; opt-in live smoke test passed locally)
 [ ] packaged/MSIX app
 [ ] browser with child processes
 [ ] multiple audio sessions in same process
@@ -1612,7 +1625,8 @@ remaining work is live validation plus the explicitly deferred automatic
 routing work:
 
 ```text
-1. Run the eWDK/WDK toolchain audit and compile the opt-in ACX feature.
+1. [x] Run the eWDK/WDK toolchain audit, compile the opt-in ACX feature, and
+   stage the unsigned release package.
 2. Enumerate and stream-test the app render/monitor pair on a test-signed
    Windows image.
 3. Validate the independent Relay Sink/Microphone cable with ordinary clients.

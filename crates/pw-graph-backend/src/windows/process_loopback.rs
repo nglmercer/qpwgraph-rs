@@ -346,10 +346,11 @@ fn activation_result(
 }
 
 /// Owns everything referenced by the activation call until its callback has
-/// completed. Field order is not relied on; `params` is boxed so the blob's
-/// pointer stays stable when this value moves.
+/// completed. The blob allocation uses the COM task allocator because
+/// `PROPVARIANT::drop` calls `PropVariantClear`, which releases `VT_BLOB`
+/// storage with `CoTaskMemFree`.
 struct ProcessLoopbackActivation {
-    params: Box<Audio::AUDIOCLIENT_ACTIVATION_PARAMS>,
+    params: *mut Audio::AUDIOCLIENT_ACTIVATION_PARAMS,
     propvariant: PROPVARIANT,
     operation: Option<Audio::IActivateAudioInterfaceAsyncOperation>,
     completion: Audio::IActivateAudioInterfaceCompletionHandler,
@@ -368,15 +369,27 @@ fn activate_process_audio_client(
             Audio::PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
         }
     };
-    let mut params = Box::new(Audio::AUDIOCLIENT_ACTIVATION_PARAMS {
-        ActivationType: Audio::AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-        Anonymous: Audio::AUDIOCLIENT_ACTIVATION_PARAMS_0 {
-            ProcessLoopbackParams: Audio::AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                TargetProcessId: pid,
-                ProcessLoopbackMode: process_mode,
+    let params = unsafe {
+        Com::CoTaskMemAlloc(size_of::<Audio::AUDIOCLIENT_ACTIVATION_PARAMS>())
+            as *mut Audio::AUDIOCLIENT_ACTIVATION_PARAMS
+    };
+    if params.is_null() {
+        return Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_OUTOFMEMORY,
+            "could not allocate process-loopback activation parameters",
+        ));
+    }
+    unsafe {
+        params.write(Audio::AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: Audio::AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: Audio::AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: Audio::AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                    TargetProcessId: pid,
+                    ProcessLoopbackMode: process_mode,
+                },
             },
-        },
-    });
+        });
+    }
     let propvariant = PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
@@ -387,8 +400,7 @@ fn activate_process_audio_client(
                 Anonymous: PROPVARIANT_0_0_0 {
                     blob: BLOB {
                         cbSize: size_of::<Audio::AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                        pBlobData: (&mut *params as *mut Audio::AUDIOCLIENT_ACTIVATION_PARAMS)
-                            .cast(),
+                        pBlobData: params.cast(),
                     },
                 },
             }),
@@ -416,7 +428,7 @@ fn activate_process_audio_client(
     // Keep every owned field live through the callback. Reading the params is
     // intentional: it also makes this invariant visible to dead-code analysis.
     debug_assert_eq!(
-        activation.params.ActivationType,
+        unsafe { (*activation.params).ActivationType },
         Audio::AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
     );
     let callback_result = match activation.completed.recv_timeout(START_TIMEOUT) {

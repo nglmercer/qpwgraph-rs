@@ -8,13 +8,14 @@ and an include/exclude process-tree mode are explicit; a source activation also
 gets a monotonic generation so a restarted process cannot inherit a stale
 route merely because Windows reused its numeric PID.
 
-The activation is deliberately fail-closed. The `AUDIOCLIENT_ACTIVATION_PARAMS`
-value is boxed, the `VT_BLOB` points into that box, and the owning
-`PROPVARIANT`, completion handler, async operation, and result channel remain
-live until the completion callback signals the activating thread. That thread
-then calls `GetActivateResult` in its own COM apartment, so the
+The activation is deliberately fail-closed. The
+`AUDIOCLIENT_ACTIVATION_PARAMS` value is allocated with the COM task allocator
+because `PROPVARIANT` releases `VT_BLOB` storage with `CoTaskMemFree`. The
+owning `PROPVARIANT`, completion handler, async operation, and result channel
+remain live until the completion callback signals the activating thread. That
+thread then calls `GetActivateResult` in its own COM apartment, so the
 `IAudioClient` is never sent across the callback's MTA boundary. No stack blob
-is passed to asynchronous Windows code.
+or Rust-heap pointer is passed to asynchronous Windows code.
 
 After activation, the source is initialized as shared-mode float32 loopback
 audio and feeds the same bounded `RingSource` used by physical WASAPI
@@ -53,9 +54,10 @@ offers a process session as a route after the app is already on QPWGraph
 Virtual Output; automatic policy restoration is not implied by this setting.
 
 The low-level source is covered by layout/lifetime unit tests. End-to-end
-activation should be run on a Windows 10 build 20348+ test machine with
+activation is an opt-in test on a Windows 10 build 20348+ host with
 `PW_GRAPH_TEST_PROCESS_LOOPBACK=1`; it requires a real target process and an
-active audio session, so it is not run on headless CI.
+active audio session, so it is not run on headless CI. The deterministic helper
+path passed on the local Windows 10 host on 2026-09-05.
 
 The repository includes a deterministic target-process helper. Build and run
 it for a manual smoke test (the first line prints the PID to capture):

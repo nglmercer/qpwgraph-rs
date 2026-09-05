@@ -20,6 +20,13 @@ fn main() {
     }
     if arguments
         .iter()
+        .any(|argument| argument == "--build-package")
+    {
+        build_package();
+        return;
+    }
+    if arguments
+        .iter()
         .any(|argument| argument == "--help" || argument == "-h")
     {
         print_help();
@@ -38,11 +45,199 @@ fn main() {
 
 fn print_help() {
     println!(
-        "Usage: qpwgraph-audio-xtask [--validate-package | --audit-toolchain]\n\n\
+        "Usage: qpwgraph-audio-xtask [--validate-package | --audit-toolchain | --build-package]\n\n\
          --validate-package   validate INF/manifest package markers without a WDK\n\
          --audit-toolchain    report the ACX/eWDK prerequisites and fail if any are absent\n\
+         --build-package      build the ACX driver and stage an unsigned package\n\
          (no option)          validate the package and require WDKContentRoot"
     );
+}
+
+fn build_package() {
+    audit_toolchain();
+    let workspace = workspace_root();
+    let package_source = workspace.join("package");
+    let target_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        })
+        .unwrap_or_else(|| workspace.join("target"));
+    let output = target_root.join("qpwgraph-audio-package");
+
+    println!("Building the ACX-enabled release driver");
+    let status = Command::new("cargo")
+        .current_dir(&workspace)
+        .args([
+            "build",
+            "--package",
+            "qpwgraph-audio",
+            "--features",
+            "acx",
+            "--release",
+            "--locked",
+        ])
+        .status()
+        .unwrap_or_else(|error| {
+            eprintln!("could not start the ACX driver build: {error}");
+            std::process::exit(2);
+        });
+    if !status.success() {
+        eprintln!("the ACX driver build failed with {status}");
+        std::process::exit(2);
+    }
+
+    let driver_binary = target_root.join("release").join("qpwgraph_audio.dll");
+    if !driver_binary.is_file() {
+        eprintln!(
+            "the ACX build succeeded but did not produce {}",
+            driver_binary.display()
+        );
+        std::process::exit(2);
+    }
+
+    if let Err(error) = stage_package(&workspace, &package_source, &output, &driver_binary) {
+        eprintln!("could not stage the ACX package: {error}");
+        std::process::exit(2);
+    }
+    println!(
+        "ACX package staged at {} (unsigned; install only on an explicitly configured test machine)",
+        output.display()
+    );
+}
+
+fn stage_package(
+    workspace: &Path,
+    package_source: &Path,
+    output: &Path,
+    driver_binary: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    for filename in [
+        "qpwgraph_audio.sys",
+        "qpwgraph-audio.inf",
+        "qpwgraph-audio.cat",
+        "manifest.json",
+        "install.ps1",
+        "uninstall.ps1",
+        "README.md",
+    ] {
+        let path = output.join(filename);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove {}: {error}", path.display())),
+        }
+    }
+
+    fs::copy(driver_binary, output.join("qpwgraph_audio.sys"))
+        .map_err(|error| format!("copy {}: {error}", driver_binary.display()))?;
+    let source_inx = package_source.join("qpwgraph-audio.inx");
+    let output_inf = output.join("qpwgraph-audio.inf");
+    fs::copy(&source_inx, &output_inf)
+        .map_err(|error| format!("copy {}: {error}", source_inx.display()))?;
+
+    let stampinf = find_wdk_tool("stampinf.exe").ok_or(
+        "stampinf.exe was not found below WDKContentRoot\\bin; run from a WDK/eWDK developer prompt",
+    )?;
+    run_tool(
+        &stampinf,
+        [
+            "-f".to_owned(),
+            output_inf.display().to_string(),
+            "-d".to_owned(),
+            "*".to_owned(),
+            "-a".to_owned(),
+            "amd64".to_owned(),
+            "-c".to_owned(),
+            "qpwgraph-audio.cat".to_owned(),
+            "-v".to_owned(),
+            "*".to_owned(),
+            "-k".to_owned(),
+            "1.33".to_owned(),
+        ],
+        output,
+        "stampinf",
+    )?;
+
+    let inf2cat = find_wdk_tool("Inf2Cat.exe").ok_or(
+        "Inf2Cat.exe was not found below WDKContentRoot\\bin; install the WDK packaging tools",
+    )?;
+    run_tool(
+        &inf2cat,
+        [
+            format!("/driver:{}", output.display()),
+            "/os:10_X64".to_owned(),
+        ],
+        workspace,
+        "Inf2Cat",
+    )?;
+
+    let manifest = package_source.join("manifest.json");
+    let manifest_text = fs::read_to_string(&manifest)
+        .map_err(|error| format!("read {}: {error}", manifest.display()))?;
+    let ready_manifest = manifest_text.replace(
+        "\"implementation_status\": \"bootstrap-fail-closed\"",
+        "\"implementation_status\": \"ready\"",
+    );
+    if ready_manifest == manifest_text {
+        return Err(format!(
+            "{} does not contain the bootstrap implementation marker",
+            manifest.display()
+        ));
+    }
+    fs::write(output.join("manifest.json"), ready_manifest)
+        .map_err(|error| format!("write staged manifest: {error}"))?;
+
+    for filename in ["install.ps1", "uninstall.ps1", "README.md"] {
+        let source = package_source.join(filename);
+        fs::copy(&source, output.join(filename))
+            .map_err(|error| format!("copy {}: {error}", source.display()))?;
+    }
+    Ok(())
+}
+
+fn run_tool<I>(tool: &Path, arguments: I, current_dir: &Path, name: &str) -> Result<(), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let status = Command::new(tool)
+        .args(arguments)
+        .current_dir(current_dir)
+        .status()
+        .map_err(|error| format!("start {name} ({}): {error}", tool.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{name} failed with {status}"))
+    }
+}
+
+fn find_wdk_tool(name: &str) -> Option<PathBuf> {
+    let root = std::env::var_os("WDKContentRoot")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)?;
+    let bin = root.join("bin");
+    let preferred = [
+        bin.join("x64").join(name),
+        bin.join("x86").join(name),
+        bin.join("arm64").join(name),
+    ];
+    preferred
+        .into_iter()
+        .find(|path| path.is_file())
+        .or_else(|| find_file(&bin, name))
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask workspace has a parent directory")
+        .to_path_buf()
 }
 
 fn audit_toolchain() {

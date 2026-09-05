@@ -9,14 +9,19 @@ WDK layout generation:
 Push-Location drivers/windows-audio
 $env:LIBCLANG_PATH = 'C:\LLVM21\bin' # adjust to your LLVM 17--21 installation
 $env:Path = "$env:LIBCLANG_PATH;$env:Path"
-cargo test -p qpwgraph-audio-core
-cargo run -p qpwgraph-audio-xtask -- --validate-package
-cargo run -p qpwgraph-audio-xtask -- --audit-toolchain
-cargo run -p qpwgraph-audio-xtask
-cargo make
+cargo test -p qpwgraph-audio-core --locked
+cargo run -p qpwgraph-audio-xtask --locked -- --validate-package
+cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
+cargo run -p qpwgraph-audio-xtask --locked -- --build-package
 cargo run -p qpwgraph-audio-smoke -- --list
 Pop-Location
 ```
+
+`--build-package` builds the ACX-enabled release driver, stamps the INF,
+generates `qpwgraph-audio.cat`, and stages the installable file set under
+`drivers/windows-audio/target/qpwgraph-audio-package`. The source manifest in
+this directory remains `bootstrap-fail-closed`; the generated manifest is
+marked `ready` only after the real `.sys` and catalog have been produced.
 
 The default driver build intentionally returns `STATUS_NOT_SUPPORTED` from
 device-add. The opt-in `acx` build now contains the ACX app and relay endpoint
@@ -42,7 +47,7 @@ properties with INF `AddProperty` sections: `app-render` for Virtual Output,
 relay pair independent bounded PCM cables; live endpoint enumeration and
 verifier gates are still required before the package can become installable.
 
-The --audit-toolchain command is the explicit ACX gate. It checks
+The `--audit-toolchain` command is the explicit ACX gate. It checks
 WDKContentRoot, the versioned KM CRT headers, acx.h, the target-architecture
 `acxstub.lib`, and the compiler/LLVM executables before a driver build is
 attempted. A nonzero result means the bootstrap driver remains fail-closed;

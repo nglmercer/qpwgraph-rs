@@ -72,9 +72,16 @@ $env:Path = "$env:LIBCLANG_PATH;$env:Path"
 cargo test -p qpwgraph-audio-core --locked
 cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
 cargo check -p qpwgraph-audio --features acx --locked
-cargo make
+cargo run -p qpwgraph-audio-xtask --locked -- --build-package
 Pop-Location
 ```
+
+`--build-package` builds the ACX-enabled release driver, stamps the INF,
+generates the catalog, and stages an unsigned package under
+`drivers/windows-audio/target/qpwgraph-audio-package`. The checked-in manifest
+remains fail-closed; only the generated package receives
+`implementation_status: ready`, and it still requires explicit test signing or
+Microsoft signing before installation.
 
 The deterministic process-loopback target is a normal user-mode build and
 does not require the driver:

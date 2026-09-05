@@ -235,8 +235,9 @@ jobs:
         working-directory: drivers/windows-audio
         run: cargo test -p qpwgraph-audio-core --locked
       - name: Build and package the KMDF driver
-        shell: cmd
-        run: cargo make --cwd drivers/windows-audio
+        shell: pwsh
+        working-directory: drivers/windows-audio
+        run: cargo run -p qpwgraph-audio-xtask --locked -- --build-package
 
   ci:
     name: CI
