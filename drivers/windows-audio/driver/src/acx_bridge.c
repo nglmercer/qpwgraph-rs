@@ -28,7 +28,7 @@ const GUID KSNODETYPE_SPEAKER = {
     {0xB9, 0x17, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96}};
 
 #define QPWGRAPH_DRIVER_TAG ((ULONG)'aPWQ')
-#define QPWGRAPH_MAX_PACKET_COUNT 8
+#define QPWGRAPH_MAX_PACKET_COUNT 2
 #define QPWGRAPH_HNS_PER_SEC 10000000ULL
 #ifndef KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM
 #define KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM 0x00000200UL
@@ -533,8 +533,20 @@ static NTSTATUS QpwgraphEvtStreamAllocateRtPackets(ACXSTREAM Stream,
     return STATUS_INVALID_PARAMETER;
   }
 
-  packetAllocationSize = (PacketSize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-  firstPacketOffset = packetAllocationSize - PacketSize;
+  // ACX permits one packet for timer-driven streams and two packets for
+  // notification-driven streams.  A one-packet buffer must be wholly
+  // page-aligned; the two-packet layout reserves the tail of the first
+  // allocation so the packet begins at the same offset ACX samples use.
+  if (PacketCount == 1) {
+    if ((PacketSize % PAGE_SIZE) != 0) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    packetAllocationSize = PacketSize;
+    firstPacketOffset = 0;
+  } else {
+    packetAllocationSize = (PacketSize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    firstPacketOffset = packetAllocationSize - PacketSize;
+  }
   packetArray = (PACX_RTPACKET)ExAllocatePool2(
       POOL_FLAG_NON_PAGED, sizeof(ACX_RTPACKET) * PacketCount,
       QPWGRAPH_DRIVER_TAG);
@@ -1102,7 +1114,10 @@ static NTSTATUS QpwgraphCreateCircuit(WDFDEVICE Device, BOOLEAN IsCapture,
     return status;
   }
 
-  formatList = AcxPinGetRawDataFormatList(pins[0]);
+  // The endpoint-facing pin owns the device format list: Source for render
+  // circuits and Sink for capture circuits.  The circuit-side pin is the
+  // stream connection and is not the endpoint format authority.
+  formatList = AcxPinGetRawDataFormatList(pins[1]);
   if (formatList == NULL) {
     return STATUS_INSUFFICIENT_RESOURCES;
   }
