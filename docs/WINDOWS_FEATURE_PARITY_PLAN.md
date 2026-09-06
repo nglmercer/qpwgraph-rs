@@ -100,6 +100,9 @@ The repository-side evidence for this snapshot is complete:
   (`PW_GRAPH_TEST_BROWSER_RELAY=1` plus the live Firefox PID) verified
   process-tree identity matching, an active application relay, and a
   non-silent `0.1500` Firefox session peak while the relay was running;
+  the same test now accepts `PW_GRAPH_TEST_APPLICATION_RELAY=1` with an
+  application PID/name, so Chrome and VLC can use the identical acceptance
+  path when those clients are available;
 - the opt-in live relay endpoint-switch test changed the selected playback
   endpoint while hosting and confirmed that the authenticated host stayed
   active; both relay directions also passed their WASAPI endpoint-start gate;

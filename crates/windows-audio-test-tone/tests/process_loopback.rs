@@ -5,11 +5,12 @@
 //! output endpoint to validate the complete helper → WASAPI process-loopback
 //! → router source path.
 //!
-//! A browser application-relay check is opt-in as well:
-//! `PW_GRAPH_TEST_BROWSER_RELAY=1 PW_GRAPH_TEST_BROWSER_PID=<pid>` selects a
-//! live browser process (Firefox by default; override
-//! `PW_GRAPH_TEST_BROWSER_NAME`) and verifies its stable selector, relay
-//! activation, and non-silent session meter while capture is running.
+//! An ordinary-application relay check is opt-in as well. The generic form is
+//! `PW_GRAPH_TEST_APPLICATION_RELAY=1 PW_GRAPH_TEST_APPLICATION_PID=<pid>`
+//! with `PW_GRAPH_TEST_APPLICATION_NAME=<friendly name>`; the legacy browser
+//! variables remain accepted (Firefox is the default name). It verifies the
+//! stable selector, relay activation, and non-silent local session meter while
+//! capture is running, so the same probe can cover Firefox, Chrome, or VLC.
 
 #![cfg(target_os = "windows")]
 
@@ -1031,21 +1032,29 @@ fn application_relay_keeps_the_authenticated_control_session_when_target_exits()
 
 #[cfg(feature = "relay-tests")]
 #[test]
-fn browser_application_relay_keeps_local_session_audio_alive() {
-    if std::env::var("PW_GRAPH_TEST_BROWSER_RELAY").ok().as_deref() != Some("1") {
+fn ordinary_application_relay_keeps_local_session_audio_alive() {
+    let generic_enabled = std::env::var("PW_GRAPH_TEST_APPLICATION_RELAY")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let legacy_enabled = std::env::var("PW_GRAPH_TEST_BROWSER_RELAY").ok().as_deref() == Some("1");
+    if !generic_enabled && !legacy_enabled {
         return;
     }
-    let pid = std::env::var("PW_GRAPH_TEST_BROWSER_PID")
-        .expect("PW_GRAPH_TEST_BROWSER_PID is required for browser relay smoke")
+    let pid_text = std::env::var("PW_GRAPH_TEST_APPLICATION_PID")
+        .or_else(|_| std::env::var("PW_GRAPH_TEST_BROWSER_PID"))
+        .expect("PW_GRAPH_TEST_APPLICATION_PID is required for application relay smoke");
+    let pid = pid_text
         .parse::<u32>()
-        .expect("PW_GRAPH_TEST_BROWSER_PID is numeric");
-    let browser_name =
-        std::env::var("PW_GRAPH_TEST_BROWSER_NAME").unwrap_or_else(|_| "Mozilla Firefox".into());
+        .expect("PW_GRAPH_TEST_APPLICATION_PID is numeric");
+    let application_name = std::env::var("PW_GRAPH_TEST_APPLICATION_NAME")
+        .or_else(|_| std::env::var("PW_GRAPH_TEST_BROWSER_NAME"))
+        .unwrap_or_else(|_| "Mozilla Firefox".into());
     let result = (|| -> Result<(), String> {
         let identity = ProcessIdentity::from_pid(pid).map_err(|error| error.to_string())?;
         let expected_selector = identity
             .selector_key()
-            .ok_or_else(|| "browser process has no stable application selector".to_owned())?;
+            .ok_or_else(|| "application process has no stable application selector".to_owned())?;
         let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
         driver
             .set_meter_policy(MeterPolicy::OnDemand)
@@ -1058,12 +1067,14 @@ fn browser_application_relay_keeps_local_session_audio_alive() {
                     .graph()
                     .nodes
                     .values()
-                    .find(|node| node.name.eq_ignore_ascii_case(&browser_name))
+                    .find(|node| node.name.eq_ignore_ascii_case(&application_name))
                 {
                     break node.id;
                 }
                 if Instant::now() >= deadline {
-                    return Err(format!("{browser_name} audio session node did not appear"));
+                    return Err(format!(
+                        "{application_name} audio session node did not appear"
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -1086,7 +1097,9 @@ fn browser_application_relay_keeps_local_session_audio_alive() {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(format!("{browser_name} native session meter stayed silent"))
+            Err(format!(
+                "{application_name} native session meter stayed silent"
+            ))
         };
         let selector = {
             let deadline = Instant::now() + Duration::from_secs(8);
@@ -1095,23 +1108,25 @@ fn browser_application_relay_keeps_local_session_audio_alive() {
                 if let Some(source) = driver
                     .relay_send_sources()
                     .into_iter()
-                    .find(|source| source.name.eq_ignore_ascii_case(&browser_name))
+                    .find(|source| source.name.eq_ignore_ascii_case(&application_name))
                 {
                     let selector = source
                         .id
                         .strip_prefix("application:")
-                        .ok_or_else(|| "browser source had an invalid application ID".to_owned())?
+                        .ok_or_else(|| {
+                            "application source had an invalid application ID".to_owned()
+                        })?
                         .to_owned();
                     if !selector.eq_ignore_ascii_case(&expected_selector) {
                         return Err(format!(
-                            "browser source selector {selector:?} did not match PID {pid} identity"
+                            "application source selector {selector:?} did not match PID {pid} identity"
                         ));
                     }
                     break selector;
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "{browser_name} was not listed as an application relay source"
+                        "{application_name} was not listed as an application relay source"
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -1137,17 +1152,19 @@ fn browser_application_relay_keeps_local_session_audio_alive() {
             std::thread::sleep(Duration::from_millis(50));
         }
         if !driver.relay_devices_active() {
-            return Err("browser application relay worker did not start".into());
+            return Err("ordinary application relay worker did not start".into());
         }
         driver
             .request_meters(&BTreeSet::from([node]))
             .map_err(|error| error.to_string())?;
         let during = observe_native_peak(&mut driver)?;
-        println!("browser application relay selector={selector} local_peak_during={during:.4}");
+        println!(
+            "ordinary application relay name={application_name} selector={selector} local_peak_during={during:.4}"
+        );
         driver
             .relay_disconnect(session)
             .map_err(|error| error.to_string())?;
         Ok(())
     })();
-    result.expect("browser application relay local-output smoke test failed");
+    result.expect("ordinary application relay local-output smoke test failed");
 }
