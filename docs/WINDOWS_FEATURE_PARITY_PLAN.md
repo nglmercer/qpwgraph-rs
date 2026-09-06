@@ -231,6 +231,7 @@ The main architectural rule stays unchanged:
 - [x] complete persisted application-route effect instances restore transactionally with parameters and bypass/enabled state, while legacy ID-only chains fail closed;
 - [x] rejected Windows route/effect/gain replacements restore the prior router tables and control-plane ownership instead of leaving half-applied state;
 - [x] Windows rejects module-backed effects until a matching realtime host exists, and the ACX bridge enforces one render producer and one capture consumer per bounded cable;
+- [x] ACX device and circuit power callbacks clear idle app/relay cables without touching counted live streams;
 - [x] a test-signed Windows 10 pass enumerates and streams the four ACX endpoints, verifies the relay-microphone role, and proves the install-ready development package lifecycle without changing defaults;
 - [ ] Driver Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client relay/effects evidence remain release gates.
 
