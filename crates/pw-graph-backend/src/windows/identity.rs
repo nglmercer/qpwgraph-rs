@@ -146,10 +146,20 @@ impl WindowsEndpointSelector {
             let current_mmdevice_id = unsafe { device.GetId() }
                 .map(take_pwstr)
                 .map_err(|error| native_error("read endpoint selector ID", error))?;
+            let mut stable_id = endpoint_stable_id(&device);
+            if stable_id.is_none() {
+                let provider_identity =
+                    qpwgraph_virtual_endpoint_identity(&device, &current_mmdevice_id);
+                if provider_identity.as_ref().is_some_and(|identity| {
+                    qpwgraph_endpoint_role_matches_flow(flow, identity.role)
+                }) {
+                    stable_id = provider_identity.map(|identity| identity.role.stable_selector());
+                }
+            }
             candidates.push((
                 device.clone(),
                 EndpointCandidateIdentity {
-                    stable_id: endpoint_stable_id(&device),
+                    stable_id,
                     current_mmdevice_id,
                     friendly_name: endpoint_name(&device),
                 },
@@ -703,6 +713,55 @@ mod tests {
                 println!(
                     "provider role={:?} pkey_stable_id={} selector={:?} mmdevice_id={}",
                     identity.role, had_windows_stable_id, selector.stable_id, id
+                );
+                found += 1;
+            }
+        }
+        assert_eq!(found, 4, "all four provider endpoint roles must be present");
+        unsafe { Com::CoUninitialize() };
+    }
+
+    #[test]
+    #[ignore = "requires the installed QPWGraph virtual audio driver"]
+    fn installed_provider_selectors_resolve_after_mmdevice_id_replacement() {
+        unsafe { Com::CoInitializeEx(None, Com::COINIT_MULTITHREADED) }
+            .ok()
+            .unwrap();
+        let enumerator: Audio::IMMDeviceEnumerator =
+            unsafe { Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, Com::CLSCTX_ALL) }
+                .unwrap();
+        let mut found = 0;
+        for flow in [Audio::eRender, Audio::eCapture] {
+            let collection =
+                unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }.unwrap();
+            for index in 0..unsafe { collection.GetCount() }.unwrap() {
+                let device = unsafe { collection.Item(index) }.unwrap();
+                let id = unsafe { device.GetId() }.map(take_pwstr).unwrap();
+                let Some(identity) = qpwgraph_virtual_endpoint_identity(&device, &id) else {
+                    continue;
+                };
+                let data_flow = if flow == Audio::eRender {
+                    AudioFlow::Render
+                } else {
+                    AudioFlow::Capture
+                };
+                let mut selector = WindowsEndpointSelector::from_device(&device, data_flow)
+                    .expect("provider endpoint should expose a selector");
+                apply_provider_selector_fallback(&mut selector, Some(&identity));
+                let original_id = selector
+                    .current_mmdevice_id
+                    .clone()
+                    .expect("provider endpoint should expose its current MMDevice ID");
+                selector.current_mmdevice_id = Some("qpwgraph-stale-mmdevice-id".into());
+                let resolved = selector
+                    .resolve(&enumerator)
+                    .expect("durable provider selector resolution should succeed")
+                    .expect("durable provider selector should resolve an active endpoint");
+                let resolved_id = unsafe { resolved.GetId() }.map(take_pwstr).unwrap();
+                assert_eq!(resolved_id, original_id);
+                println!(
+                    "provider role={:?} selector={:?} resolved stale current ID to {}",
+                    identity.role, selector.stable_id, resolved_id
                 );
                 found += 1;
             }

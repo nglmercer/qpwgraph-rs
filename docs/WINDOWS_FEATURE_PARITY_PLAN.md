@@ -147,6 +147,12 @@ The repository-side evidence for this snapshot is complete:
   (`installed_provider_endpoints_expose_durable_selectors_after_refresh`)
   passed as well. The fallback is ownership-gated and never applies to a
   physical endpoint.
+- A live COM resolver probe replaced each provider endpoint's current
+  MMDevice ID with a stale token and still resolved all four endpoints through
+  their ownership-gated semantic selectors
+  (`installed_provider_selectors_resolve_after_mmdevice_id_replacement`).
+  This proves the resolver path used by persisted provider selectors; actual
+  physical remove/re-add churn remains a separate lifecycle gate.
 - `PW_GRAPH_TEST_WINDOWS_EFFECTS=1 cargo test -p windows-audio-test-tone
   --features relay-tests --test relay_microphone
   isolated_application_effect_applies_and_bypass_restores_audio -- --nocapture`
@@ -1832,7 +1838,7 @@ Call **Windows parity milestone 2** complete when all of these work:
 [x] stable app selectors survive restart (opt-in helper smoke test passed locally)
 [ ] stable endpoint selectors survive normal endpoint churn
     (provider-owned semantic-role fallback is implemented and unit-tested;
-    live physical-endpoint churn remains)
+    live stale-MMDevice-ID resolution passed; physical endpoint churn remains)
 [x] saved application route has an explicit reconciler state (reconciler unit tests passed locally)
 [x] one real Rust ACX render endpoint enumerates and streams (test-signed live app cable pass)
 [x] virtual render/capture cable carries deterministic PCM (distinct-tone isolation and silence pass)
