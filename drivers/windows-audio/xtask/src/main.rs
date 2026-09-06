@@ -131,6 +131,7 @@ fn stage_package(
         "run-validation-elevated.ps1",
         "run-validation.cmd",
         "release-audit.ps1",
+        "lifecycle-validation.ps1",
         "README.md",
     ] {
         let path = output.join(filename);
@@ -218,6 +219,7 @@ fn stage_package(
         "run-validation-elevated.ps1",
         "run-validation.cmd",
         "release-audit.ps1",
+        "lifecycle-validation.ps1",
         "README.md",
     ] {
         let source = package_source.join(filename);
@@ -787,6 +789,32 @@ fn validate_package_metadata() {
             release_audit_script.contains(required),
             "{} is missing read-only release-audit marker {required}",
             package.join("release-audit.ps1").display()
+        );
+    }
+    let lifecycle_validation_script = fs::read_to_string(package.join("lifecycle-validation.ps1"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "could not read {}: {error}",
+                package.join("lifecycle-validation.ps1").display()
+            );
+        });
+    for required in [
+        "#requires -Version 5.1",
+        "ROOT\\DEVGEN\\QPWGRAPH_AUDIO",
+        "--verify-roles",
+        "--verify-absent",
+        "--verify-cables",
+        "Disable-PnpDevice",
+        "Enable-PnpDevice",
+        "SetSuspendState",
+        "-Execute",
+        "-AllowSuspend",
+        "never searches for or disables an unrelated device",
+    ] {
+        assert!(
+            lifecycle_validation_script.contains(required),
+            "{} is missing lifecycle-validation marker {required}",
+            package.join("lifecycle-validation.ps1").display()
         );
     }
     println!("driver package metadata validated");

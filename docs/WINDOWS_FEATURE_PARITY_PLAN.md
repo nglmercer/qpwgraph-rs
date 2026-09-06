@@ -1720,6 +1720,14 @@ circuit power transitions, so a suspend/resume path cannot replay queued PCM
 when no stream remains active. A live sleep/resume cycle is still required to
 close the hardware lifecycle row.
 
+The staged package also includes `lifecycle-validation.ps1`. It is plan-only by
+default, requires explicit `-Execute` for mutations, targets only the exact
+`ROOT\DEVGEN\QPWGRAPH_AUDIO` devnode, and verifies roles, cable isolation, and
+endpoint absence around disable/enable and suspend/resume. Suspend/resume adds
+the separate `-AllowSuspend` acknowledgment. This makes the remaining live
+lifecycle rows reproducible without weakening the requirement for actual
+Windows evidence.
+
 ---
 
 # 22. New PR sequence

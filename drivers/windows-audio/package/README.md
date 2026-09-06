@@ -173,6 +173,28 @@ Pop-Location
 When a staged package exists, the script audits it automatically; otherwise it
 audits the source package and reports the expected missing build artifacts.
 
+`lifecycle-validation.ps1` supplies the remaining power and PnP lifecycle
+procedure without broad device searches. It is plan-only unless `-Execute` is
+provided, targets only `ROOT\DEVGEN\QPWGRAPH_AUDIO`, and runs role, cable, and
+endpoint-absence smoke checks before and after each transition. Disable/enable
+can be exercised with:
+
+```powershell
+.\lifecycle-validation.ps1 -Phase DisableEnable -Execute -Verbose
+```
+
+Suspend/resume is separately guarded by `-AllowSuspend` because it changes the
+machine power state:
+
+```powershell
+.\lifecycle-validation.ps1 -Phase SleepResume -Execute -AllowSuspend -Verbose
+```
+
+`-Phase All` runs both procedures. A failed disable/enable pass attempts to
+re-enable the exact devnode in a `finally` block. The script never changes boot
+configuration, installs or removes a package, or disables an unrelated device;
+preserve its output as the lifecycle acceptance record.
+
 After a passing audit, the opt-in binding compilation is:
 
     Push-Location drivers/windows-audio

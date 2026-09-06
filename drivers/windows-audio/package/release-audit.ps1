@@ -157,7 +157,8 @@ $requiredPackageFiles = @(
     'qpwgraph-audio.cat',
     'install.ps1',
     'uninstall.ps1',
-    'sign-test.ps1'
+    'sign-test.ps1',
+    'lifecycle-validation.ps1'
 )
 $missingFiles = @(
     $requiredPackageFiles |
