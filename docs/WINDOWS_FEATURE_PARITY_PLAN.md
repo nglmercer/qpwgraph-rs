@@ -450,8 +450,9 @@ Do these before spending the whole development cycle on ACX.
 
 The relay source adapter now enumerates active render sessions independently of
 `QPWGraph Virtual Output`. Live process-loopback activation and identity
-verification still need the Windows acceptance checks below, but the user-mode
-path no longer depends on the virtual driver.
+verification passed the helper and Firefox acceptance probes; the remaining
+Chrome/VLC client-matrix row is called out below. The user-mode path no longer
+depends on the virtual driver.
 
 ### New behavior
 
