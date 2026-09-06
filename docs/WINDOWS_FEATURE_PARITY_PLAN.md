@@ -496,7 +496,9 @@ crates/pw-graph-slint/src/source.rs
 ### Acceptance
 
 ```text
-[ ] Chrome/Firefox/VLC on normal speakers appears as an application relay source
+[x] Firefox on normal speakers appears as an application relay source (the
+    disposable Web Audio/browser relay smoke passed locally)
+[ ] Chrome and VLC on normal speakers appear as application relay sources
 [x] starting app relay does not change the application's local output (Firefox session meter remained non-silent during the live application-relay smoke)
 [x] only target-process audio reaches the relay (opt-in two-helper process-loopback isolation smoke test passed locally)
 [x] another application on the same endpoint is excluded (opt-in two-helper process-loopback isolation smoke test passed locally)
