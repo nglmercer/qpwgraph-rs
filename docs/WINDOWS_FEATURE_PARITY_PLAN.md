@@ -1698,6 +1698,11 @@ removes and restores an actual destination endpoint. The reconciler's
 missing/returning transition is covered by deterministic tests; those tests do
 not substitute for physically disappearing and returning endpoint evidence.
 
+The ACX bridge now defensively clears idle app and relay cables on device and
+circuit power transitions, so a suspend/resume path cannot replay queued PCM
+when no stream remains active. A live sleep/resume cycle is still required to
+close the hardware lifecycle row.
+
 ---
 
 # 22. New PR sequence

@@ -354,6 +354,25 @@ static VOID QpwgraphClearCable(QPWGRAPH_CABLE Cable) {
   }
 }
 
+// Power transitions normally pause every ACX stream before the device reaches
+// D0Exit, but keep the transport boundary defensive: if a callback is skipped
+// during a surprise power transition, an idle cable must not replay the
+// packets that were queued before the transition.  Never clear a cable while
+// either endpoint is still counted as running; the RT callback may still own
+// the SPSC ring in that case.
+static VOID
+QpwgraphClearIdleCables(PQPWGRAPH_DEVICE_CONTEXT DeviceContext) {
+  if (DeviceContext == NULL) {
+    return;
+  }
+  if (!QpwgraphCableHasActiveStreams(DeviceContext, QpwgraphAppCable)) {
+    QpwgraphClearCable(QpwgraphAppCable);
+  }
+  if (!QpwgraphCableHasActiveStreams(DeviceContext, QpwgraphRelayCable)) {
+    QpwgraphClearCable(QpwgraphRelayCable);
+  }
+}
+
 static VOID QpwgraphStopCountedStream(PQPWGRAPH_STREAM_CONTEXT Context) {
   LONG remainingRender;
   LONG remainingCapture;
@@ -1320,37 +1339,49 @@ QpwgraphEvtDeviceReleaseHardware(WDFDEVICE Device,
 
 static NTSTATUS QpwgraphEvtDeviceD0Entry(WDFDEVICE Device,
                                          WDF_POWER_DEVICE_STATE PreviousState) {
-  UNREFERENCED_PARAMETER(Device);
+  PQPWGRAPH_DEVICE_CONTEXT Context;
+
   UNREFERENCED_PARAMETER(PreviousState);
   PAGED_CODE();
+  Context = QpwgraphGetDeviceContext(Device);
+  QpwgraphClearIdleCables(Context);
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS QpwgraphEvtDeviceD0Exit(WDFDEVICE Device,
                                         WDF_POWER_DEVICE_STATE TargetState) {
-  UNREFERENCED_PARAMETER(Device);
+  PQPWGRAPH_DEVICE_CONTEXT Context;
+
   UNREFERENCED_PARAMETER(TargetState);
   PAGED_CODE();
+  Context = QpwgraphGetDeviceContext(Device);
+  QpwgraphClearIdleCables(Context);
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS QpwgraphEvtCircuitPowerUp(WDFDEVICE Device,
                                           ACXCIRCUIT Circuit,
                                           WDF_POWER_DEVICE_STATE PreviousState) {
-  UNREFERENCED_PARAMETER(Device);
+  PQPWGRAPH_DEVICE_CONTEXT Context;
+
   UNREFERENCED_PARAMETER(Circuit);
   UNREFERENCED_PARAMETER(PreviousState);
   PAGED_CODE();
+  Context = QpwgraphGetDeviceContext(Device);
+  QpwgraphClearIdleCables(Context);
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS QpwgraphEvtCircuitPowerDown(WDFDEVICE Device,
                                             ACXCIRCUIT Circuit,
                                             WDF_POWER_DEVICE_STATE TargetState) {
-  UNREFERENCED_PARAMETER(Device);
+  PQPWGRAPH_DEVICE_CONTEXT Context;
+
   UNREFERENCED_PARAMETER(Circuit);
   UNREFERENCED_PARAMETER(TargetState);
   PAGED_CODE();
+  Context = QpwgraphGetDeviceContext(Device);
+  QpwgraphClearIdleCables(Context);
   return STATUS_SUCCESS;
 }
 
