@@ -226,6 +226,9 @@ jobs:
             throw 'The release audit returned no checks.'
           }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scripts[1] -Phase Plan
+      - name: Test release audit evidence overlay
+        shell: pwsh
+        run: ./drivers/windows-audio/tests/release-audit.ps1
       - name: Windows driver ring-core tests
         run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
 
