@@ -365,8 +365,12 @@ $bcdeditPath = Find-Executable 'bcdedit.exe'
 if ($null -eq $bcdeditPath) {
     Add-Check 'Windows test-signing disabled' 'unknown' 'bcdedit.exe was not found'
 } else {
-    $bootOutput = @(& $bcdeditPath '/enum' 2>&1) | ForEach-Object { $_.ToString() }
+    $bootOutput = @(& $bcdeditPath '/enum' '{current}' 2>&1) | ForEach-Object { $_.ToString() }
     $bootText = $bootOutput -join [Environment]::NewLine
+    if ($bootText -notmatch '(?im)^\s*testsigning\s+(Yes|No)\s*$') {
+        $bootOutput = @(& $bcdeditPath '/enum' 'all' 2>&1) | ForEach-Object { $_.ToString() }
+        $bootText = $bootOutput -join [Environment]::NewLine
+    }
     if ($bootText -match '(?im)^\s*testsigning\s+Yes\s*$') {
         Add-Check 'Windows test-signing disabled' 'blocked' 'test-signing is enabled; public release validation requires it to be off'
     } elseif ($bootText -match '(?im)^\s*testsigning\s+No\s*$') {
