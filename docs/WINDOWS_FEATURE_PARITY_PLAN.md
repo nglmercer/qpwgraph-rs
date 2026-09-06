@@ -41,8 +41,10 @@ endpoint-removal, and basic stream-reopen evidence for the development image.
 The earlier restricted-context capture initialization error `0x80070057` was
 specific to the sandbox; the normal user context passes both round trips.
 The prior `oem19.inf` result and first intermittent cross-cable observation
-are historical evidence, not the current installation state. Full
-disconnect/reconnect reliability remains an open gate.
+are historical evidence, not the current installation state. The ordinary
+client probe below now repeats authenticated disconnect, silence, and
+reconnect three times; longer stress and driver-lifecycle coverage remain
+separate gates.
 
 Current revalidation (2026-09-06): the current machine has all four
 provider-owned endpoints installed from `oem20.inf`; `qpwgraph-audio-smoke
@@ -76,10 +78,11 @@ WDK-initialized nested workspace after this fix (existing unused binding
 warnings remain). A final 2026-09-06 `--build-package`, test-sign, and
 `--validate-package` pass reproduced the same SYS hash and staged the updated
 README/manifest package. The upgraded-build pass above verifies the new
-package's basic cable operation. Full disconnect/reconnect reliability and
+package's basic cable operation. Longer full disconnect/reconnect stress and
 ordinary third-party capture-client acceptance remain separate open gates; the
 opt-in ordinary shared-mode WASAPI capture-client probe now covers the
-provider-owned Relay Microphone endpoint itself.
+provider-owned Relay Microphone endpoint itself, including a three-cycle
+disconnect/silence/reconnect pass.
 
 The repository-side evidence for this snapshot is complete:
 
@@ -108,6 +111,13 @@ The repository-side evidence for this snapshot is complete:
   authenticated session delivered peer audio again without a driver restart;
   the helper explicitly selected a non-QPWGraph render endpoint so the test is
   independent of the user's default output.
+- The same ordinary-client probe with
+  `PW_GRAPH_TEST_RELAY_MICROPHONE_CYCLES=3` passed three authenticated
+  disconnect -> silence -> reconnect cycles. Each cycle drained roughly
+  48,000 silent frames (48,000–48,480) with a `0.000031` peak, then
+  reacquired a non-silent 1 kHz peer tone (roughly `0.1572`–`0.2305`
+  amplitude) with no 2 kHz app-cable leakage; the driver stayed running
+  throughout.
 - OBS Studio 32.2.2 was validated as a real Relay Microphone client through
   its `wasapi_input_capture` source: `Mic/Aux` was bound to the exact
   `relay-capture` MMDevice, and a concurrent peer-stream run produced 224 OBS

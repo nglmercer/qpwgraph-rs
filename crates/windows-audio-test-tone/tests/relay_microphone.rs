@@ -7,6 +7,9 @@
 //!
 //! The test is deliberately opt-in. Set `PW_GRAPH_TEST_RELAY_MICROPHONE=1` on
 //! a Windows host with the signed QPWGraph audio package installed.
+//! Set `PW_GRAPH_TEST_RELAY_MICROPHONE_CYCLES=3` (bounded to 1..=8) to repeat
+//! the authenticated disconnect/silence/reconnect cycle; the default is one
+//! cycle for a short smoke test.
 //! Additional opt-in probes cover local-output preservation during ordinary
 //! app relay, isolated-application effects and bypass, and persisted route
 //! rebind after the helper restarts with a new PID.
@@ -747,6 +750,20 @@ mod live {
             client
                 .relay_set_send_source(RelaySendSource::Application(selector.clone()))
                 .map_err(|error| format!("select helper process source: {error}"))?;
+            let cycles = std::env::var("PW_GRAPH_TEST_RELAY_MICROPHONE_CYCLES")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().map_err(|error| {
+                        format!("invalid relay microphone cycle count {value:?}: {error}")
+                    })
+                })
+                .transpose()?
+                .unwrap_or(1);
+            if !(1..=8).contains(&cycles) {
+                return Err(format!(
+                    "relay microphone cycle count must be between 1 and 8, got {cycles}"
+                ));
+            }
             let first_session = client
                 .relay_connect_mode(
                     format!("127.0.0.1:{port}")
@@ -786,66 +803,16 @@ mod live {
                 peer_probe.amplitude(1)
             );
 
-            client
-                .relay_disconnect(first_session)
-                .map_err(|error| format!("disconnect first relay session: {error}"))?;
-            wait_for_disconnected(
-                &mut host,
-                &mut client,
-                first_session,
-                Duration::from_secs(5),
-            )?;
-            // Give the render worker and the driver cable time to retire any
-            // in-flight packets, then keep the app cable active while testing
-            // that a disconnected relay is silent and isolated.
-            let mut settle_probe = ToneProbe::new(capture.sample_rate);
-            let settle_deadline = Instant::now() + Duration::from_secs(1);
-            while Instant::now() < settle_deadline {
-                fill_tone(&render, &render_client, &mut app_phase, 2_000.0)?;
-                // Keep the ordinary capture client draining while the
-                // endpoint's in-flight render/cable packets retire. A
-                // WASAPI client that is not drained would merely accumulate
-                // those old packets and make the subsequent measurement
-                // report stale audio as if it were current.
-                let _ = drain_capture(&capture, &capture_client, Some(&mut settle_probe))?;
-                std::thread::sleep(Duration::from_millis(2));
+            RelayProbeContext {
+                host: &mut host,
+                client: &mut client,
+                capture: &capture,
+                capture_client: &capture_client,
+                render: &render,
+                render_client: &render_client,
+                app_phase: &mut app_phase,
             }
-            println!(
-                "disconnect settle: {} frames, peak {:.4}, 1 kHz {:.4}, 2 kHz {:.4}",
-                settle_probe.sample_count,
-                settle_probe.peak,
-                settle_probe.amplitude(0),
-                settle_probe.amplitude(1)
-            );
-            let mut silent_probe = ToneProbe::new(capture.sample_rate);
-            let mut silent_frames = 0_u64;
-            let silent_deadline = Instant::now() + Duration::from_secs(1);
-            while Instant::now() < silent_deadline {
-                fill_tone(&render, &render_client, &mut app_phase, 2_000.0)?;
-                silent_frames += u64::from(drain_capture(
-                    &capture,
-                    &capture_client,
-                    Some(&mut silent_probe),
-                )?);
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            if silent_frames == 0
-                || silent_probe.peak > 0.001
-                || silent_probe.amplitude(0) > 0.001
-                || silent_probe.amplitude(1) > 0.001
-                || silent_probe.invalid_samples != 0
-            {
-                return Err(format!(
-                    "relay disconnect was not silent/isolated: {silent_frames} frames, peak {:.6}, 1 kHz {:.6}, 2 kHz {:.6}",
-                    silent_probe.peak,
-                    silent_probe.amplitude(0),
-                    silent_probe.amplitude(1)
-                ));
-            }
-            println!(
-                "disconnect silence: {silent_frames} frames, peak {:.6}",
-                silent_probe.peak
-            );
+            .disconnect_and_assert_silence(first_session, "cycle 1")?;
 
             let second_session = client
                 .relay_connect_mode(
@@ -889,7 +856,59 @@ mod live {
                 reconnect_probe.amplitude(0),
                 reconnect_probe.amplitude(1)
             );
-            let _ = client.relay_disconnect(second_session);
+            let mut current_session = second_session;
+            for cycle in 2..=cycles {
+                RelayProbeContext {
+                    host: &mut host,
+                    client: &mut client,
+                    capture: &capture,
+                    capture_client: &capture_client,
+                    render: &render,
+                    render_client: &render_client,
+                    app_phase: &mut app_phase,
+                }
+                .disconnect_and_assert_silence(current_session, &format!("cycle {cycle}"))?;
+                current_session = client
+                    .relay_connect_mode(
+                        format!("127.0.0.1:{port}")
+                            .parse()
+                            .map_err(|error| format!("invalid stress reconnect target: {error}"))?,
+                        "123456",
+                        RelayMode::Emitter,
+                        cycle as u64 + 1,
+                    )
+                    .map_err(|error| format!("stress reconnect local relay emitter: {error}"))?;
+                wait_for_active_session(
+                    &mut host,
+                    &mut client,
+                    current_session,
+                    Duration::from_secs(10),
+                )?;
+                let mut cycle_probe = ToneProbe::new(capture.sample_rate);
+                let mut cycle_frames = 0_u64;
+                let cycle_deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < cycle_deadline {
+                    fill_tone(&render, &render_client, &mut app_phase, 2_000.0)?;
+                    cycle_frames += u64::from(drain_capture(
+                        &capture,
+                        &capture_client,
+                        Some(&mut cycle_probe),
+                    )?);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                require_peer_signal(
+                    &format!("reconnect cycle {cycle}"),
+                    cycle_frames,
+                    &cycle_probe,
+                )?;
+                println!(
+                    "reconnect cycle {cycle}: {cycle_frames} frames, peak {:.4}, 1 kHz {:.4}, 2 kHz {:.4}; driver stayed running",
+                    cycle_probe.peak,
+                    cycle_probe.amplitude(0),
+                    cycle_probe.amplitude(1)
+                );
+            }
+            let _ = client.relay_disconnect(current_session);
             let _ = host.relay_stop_host();
             Ok(())
         })();
@@ -996,6 +1015,80 @@ mod live {
             ));
         }
         Ok(())
+    }
+
+    struct RelayProbeContext<'a> {
+        host: &'a mut WindowsAudioDriver,
+        client: &'a mut WindowsAudioDriver,
+        capture: &'a AudioStream,
+        capture_client: &'a Audio::IAudioCaptureClient,
+        render: &'a AudioStream,
+        render_client: &'a Audio::IAudioRenderClient,
+        app_phase: &'a mut f64,
+    }
+
+    impl RelayProbeContext<'_> {
+        fn disconnect_and_assert_silence(
+            &mut self,
+            session: pw_graph_backend::RelaySessionId,
+            label: &str,
+        ) -> Result<(), String> {
+            self.client
+                .relay_disconnect(session)
+                .map_err(|error| format!("disconnect relay {label}: {error}"))?;
+            wait_for_disconnected(self.host, self.client, session, Duration::from_secs(5))?;
+
+            // Give the render worker and the driver cable time to retire any
+            // in-flight packets, then keep the app cable active while testing
+            // that a disconnected relay is silent and isolated. Keep draining
+            // during this interval so stale packets cannot pollute the next
+            // measurement.
+            let mut settle_probe = ToneProbe::new(self.capture.sample_rate);
+            let settle_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < settle_deadline {
+                fill_tone(self.render, self.render_client, self.app_phase, 2_000.0)?;
+                let _ = drain_capture(self.capture, self.capture_client, Some(&mut settle_probe))?;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            println!(
+                "disconnect settle ({label}): {} frames, peak {:.4}, 1 kHz {:.4}, 2 kHz {:.4}",
+                settle_probe.sample_count,
+                settle_probe.peak,
+                settle_probe.amplitude(0),
+                settle_probe.amplitude(1)
+            );
+
+            let mut silent_probe = ToneProbe::new(self.capture.sample_rate);
+            let mut silent_frames = 0_u64;
+            let silent_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < silent_deadline {
+                fill_tone(self.render, self.render_client, self.app_phase, 2_000.0)?;
+                silent_frames += u64::from(drain_capture(
+                    self.capture,
+                    self.capture_client,
+                    Some(&mut silent_probe),
+                )?);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if silent_frames == 0
+                || silent_probe.peak > 0.001
+                || silent_probe.amplitude(0) > 0.001
+                || silent_probe.amplitude(1) > 0.001
+                || silent_probe.invalid_samples != 0
+            {
+                return Err(format!(
+                    "relay disconnect {label} was not silent/isolated: {silent_frames} frames, peak {:.6}, 1 kHz {:.6}, 2 kHz {:.6}",
+                    silent_probe.peak,
+                    silent_probe.amplitude(0),
+                    silent_probe.amplitude(1)
+                ));
+            }
+            println!(
+                "disconnect silence ({label}): {silent_frames} frames, peak {:.6}",
+                silent_probe.peak
+            );
+            Ok(())
+        }
     }
 
     fn stop_child(child: &mut Child) {
