@@ -170,6 +170,33 @@ Push-Location drivers/windows-audio/package
 Pop-Location
 ```
 
+After the live acceptance work, a reviewer may provide a separately retained
+evidence record with `-EvidencePath`. Only named manual rows are read from the
+record; automatic machine checks still run normally. The record is deliberately
+small and auditable:
+
+```json
+{
+  "schema": 1,
+  "gates": {
+    "HLK audio tests complete": {
+      "status": "pass",
+      "evidence": "HLK result bundle: \\share\\qpwgraph\\hlk-2026-09-06.zip"
+    },
+    "Chrome/VLC ordinary relay acceptance": {
+      "status": "pass",
+      "evidence": "client-matrix log: chrome-vlc-relay-2026-09-06.txt"
+    }
+  }
+}
+```
+
+Run the report with that record using
+`.\release-audit.ps1 -EvidencePath .\acceptance-evidence.json -Strict -Json`.
+The script validates the status/evidence shape but does not claim to validate
+the truth of an externally supplied result; retain the referenced HLK, client,
+power, and signing artifacts with the release record.
+
 When a staged package exists, the script audits it automatically; otherwise it
 audits the source package and reports the expected missing build artifacts.
 

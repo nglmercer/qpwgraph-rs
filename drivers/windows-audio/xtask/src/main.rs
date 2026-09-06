@@ -783,6 +783,9 @@ fn validate_package_metadata() {
         "verifier.exe",
         "[switch] $Strict",
         "[switch] $Json",
+        "[string] $EvidencePath",
+        "top-level 'gates' object",
+        "recorded evidence",
         "never changes boot",
     ] {
         assert!(

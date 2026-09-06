@@ -1551,7 +1551,10 @@ Secure Boot state, test-signing state, provider-device presence, and client
 availability, then keeps the manual HLK, Microsoft-signing, lifecycle, and
 ordinary-client rows explicitly open. It never changes boot, device, signing,
 or installation state; `-Strict` is suitable for a release gate and `-Json`
-produces CI-consumable evidence.
+produces CI-consumable evidence. After live acceptance, `-EvidencePath` can
+overlay named manual rows from a separately retained JSON evidence record;
+automatic machine checks still run and the referenced artifacts remain part of
+the release record.
 
 Portable user-mode ZIP remains independent.
 

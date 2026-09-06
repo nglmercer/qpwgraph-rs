@@ -7,6 +7,8 @@ param(
     [Parameter(Mandatory = $false)]
     [switch] $Json,
     [Parameter(Mandatory = $false)]
+    [string] $EvidencePath,
+    [Parameter(Mandatory = $false)]
     [switch] $Strict
 )
 
@@ -28,6 +30,35 @@ function Resolve-AuditPackageRoot([string] $RequestedRoot) {
 
 $packageRootPath = Resolve-AuditPackageRoot $PackageRoot
 $checks = New-Object 'System.Collections.Generic.List[object]'
+$evidenceRecords = @{}
+$evidencePathResolved = $null
+
+if (-not [string]::IsNullOrWhiteSpace($EvidencePath)) {
+    $evidencePathResolved = (Resolve-Path -LiteralPath $EvidencePath -ErrorAction Stop).Path
+    try {
+        $evidenceDocument = Get-Content -LiteralPath $evidencePathResolved -Raw | ConvertFrom-Json
+    } catch {
+        throw "Could not parse release evidence ${evidencePathResolved}: $($_.Exception.Message)"
+    }
+    if ($null -eq $evidenceDocument.gates) {
+        throw "Release evidence ${evidencePathResolved} must contain a top-level 'gates' object."
+    }
+    foreach ($property in @($evidenceDocument.gates.PSObject.Properties)) {
+        $record = $property.Value
+        $status = [string] $record.status
+        $evidence = [string] $record.evidence
+        if ($status -notin @('pass', 'blocked', 'unknown')) {
+            throw "Release evidence gate '$($property.Name)' has invalid status '$status'."
+        }
+        if ([string]::IsNullOrWhiteSpace($evidence)) {
+            throw "Release evidence gate '$($property.Name)' must include non-empty evidence."
+        }
+        $evidenceRecords[$property.Name] = [pscustomobject]@{
+            Status   = $status
+            Evidence = $evidence
+        }
+    }
+}
 
 function Add-Check {
     param(
@@ -146,7 +177,12 @@ function Add-SignatureCheck([string] $Gate, [string] $Path) {
 }
 
 function Add-ManualGate([string] $Gate, [string] $Evidence) {
-    Add-Check $Gate 'unknown' $Evidence
+    if ($evidenceRecords.ContainsKey($Gate)) {
+        $record = $evidenceRecords[$Gate]
+        Add-Check $Gate $record.Status "recorded evidence: $($record.Evidence)"
+    } else {
+        Add-Check $Gate 'unknown' $Evidence
+    }
 }
 
 # Package shape and local signing state.
@@ -440,6 +476,7 @@ $blockedCount = @($checks | Where-Object { $_.Status -eq 'blocked' }).Count
 $unknownCount = @($checks | Where-Object { $_.Status -eq 'unknown' }).Count
 $summary = [pscustomobject]@{
     PackageRoot = $packageRootPath
+    EvidencePath = $evidencePathResolved
     Pass        = $passCount
     Blocked     = $blockedCount
     Unknown     = $unknownCount
@@ -454,6 +491,9 @@ if ($Json) {
     } | ConvertTo-Json -Depth 6
 } else {
     Write-Output "QPWGraph Windows audio release-gate audit: $packageRootPath"
+    if ($null -ne $evidencePathResolved) {
+        Write-Output "Manual evidence record: $evidencePathResolved"
+    }
     foreach ($check in $checks) {
         Write-Output ('[{0,-7}] {1}: {2}' -f $check.Status.ToUpperInvariant(), $check.Gate, $check.Evidence)
     }
