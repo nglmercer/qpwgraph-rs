@@ -189,8 +189,16 @@ function Invoke-Smoke {
     Invoke-Native $smokePath @(
         '--round-trip',
         '--duration-ms', $RoundTripDurationMs.ToString()
-    ) 'Render/capture round-trip'
-    Write-Output 'Basic ACX endpoint smoke validation passed.'
+    ) 'App render/monitor round-trip'
+    Invoke-Native $smokePath @(
+        '--relay-round-trip',
+        '--duration-ms', $RoundTripDurationMs.ToString()
+    ) 'Relay Sink/Microphone round-trip'
+    Invoke-Native $smokePath @(
+        '--verify-cables',
+        '--duration-ms', $RoundTripDurationMs.ToString()
+    ) 'Cable isolation and stopped-render silence'
+    Write-Output 'ACX app cable and independent Relay Sink/Microphone cable smoke validation passed.'
     Write-Output 'Next: test Relay Microphone with OBS/browser/Discord, then run Verifier and lifecycle tests.'
 }
 

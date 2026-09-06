@@ -8,6 +8,9 @@
 //! missing endpoint is an expected fail-closed result until the ACX package
 //! has been installed on the test machine.
 
+#[cfg(any(windows, test))]
+mod signal;
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("qpwgraph-audio-smoke requires a Windows test machine");
@@ -16,6 +19,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_smoke {
+    use crate::signal::{ToneProbe, APP_TONE_HZ, RELAY_TONE_HZ};
     use std::ffi::c_void;
     use std::time::{Duration, Instant};
 
@@ -69,9 +73,16 @@ mod windows_smoke {
         capture: Option<Selector>,
         duration: Duration,
         list: bool,
-        round_trip: bool,
+        round_trip: Option<RoundTripCable>,
         verify_roles: bool,
         verify_absent: bool,
+        verify_cables: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RoundTripCable {
+        App,
+        Relay,
     }
 
     #[derive(Debug)]
@@ -127,24 +138,63 @@ mod windows_smoke {
             return Ok(());
         }
 
-        let render = select(Flow::Render, &renders, &options.render)?;
+        if options.verify_cables {
+            verify_provider_endpoints(&renders, &captures, false)?;
+            for (render_role, capture_role, other_role) in [
+                ("app-render", "app-monitor", "relay-capture"),
+                ("relay-render", "relay-capture", "app-monitor"),
+            ] {
+                let render = select(Flow::Render, &renders, &Selector::Role(render_role.into()))?;
+                let capture = select(
+                    Flow::Capture,
+                    &captures,
+                    &Selector::Role(capture_role.into()),
+                )?;
+                let other = select(Flow::Capture, &captures, &Selector::Role(other_role.into()))?;
+                println!("verifying {render_role} -> {capture_role}, isolated from {other_role}");
+                verify_cable_isolation(
+                    &render.device,
+                    &capture.device,
+                    &other.device,
+                    options.duration,
+                    if render_role == "app-render" {
+                        APP_TONE_HZ
+                    } else {
+                        RELAY_TONE_HZ
+                    },
+                )?;
+            }
+            println!("Both virtual cables passed isolation and stopped-render silence checks");
+            return Ok(());
+        }
+
+        let render = if let Some(cable) = options.round_trip {
+            let role = match cable {
+                RoundTripCable::App => "app-render",
+                RoundTripCable::Relay => "relay-render",
+            };
+            select(Flow::Render, &renders, &Selector::Role(role.into()))?
+        } else {
+            select(Flow::Render, &renders, &options.render)?
+        };
         println!("opening render endpoint {:?} ({})", render.name, render.id);
 
-        if options.round_trip {
-            let selector = options.capture.as_ref().ok_or_else(|| {
-                SmokeError::Failure("--round-trip requires a capture endpoint".into())
-            })?;
-            let capture = select(Flow::Capture, &captures, selector)?;
+        if let Some(cable) = options.round_trip {
+            let role = match cable {
+                RoundTripCable::App => "app-monitor",
+                RoundTripCable::Relay => "relay-capture",
+            };
+            let capture = select(Flow::Capture, &captures, &Selector::Role(role.into()))?;
             println!(
-                "opening round-trip capture endpoint {:?} ({})",
-                capture.name, capture.id
+                "opening {:?} round-trip capture endpoint {:?} ({})",
+                cable, capture.name, capture.id
             );
             open_round_trip(&render.device, &capture.device, options.duration)?;
         } else {
             open_start_stop(&render.device, Flow::Render, options.duration)?;
         }
 
-        if !options.round_trip {
+        if options.round_trip.is_none() {
             if let Some(selector) = &options.capture {
                 let capture = select(Flow::Capture, &captures, selector)?;
                 println!(
@@ -171,9 +221,10 @@ mod windows_smoke {
             .map(Selector::Name);
         let mut duration = Duration::from_millis(500);
         let mut list = false;
-        let mut round_trip = false;
+        let mut round_trip = None;
         let mut verify_roles = false;
         let mut verify_absent = false;
+        let mut verify_cables = false;
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -185,10 +236,16 @@ mod windows_smoke {
                 "--round-trip" => {
                     render = Selector::Role("app-render".into());
                     capture = Some(Selector::Role("app-monitor".into()));
-                    round_trip = true;
+                    round_trip = Some(RoundTripCable::App);
+                }
+                "--relay-round-trip" => {
+                    render = Selector::Role("relay-render".into());
+                    capture = Some(Selector::Role("relay-capture".into()));
+                    round_trip = Some(RoundTripCable::Relay);
                 }
                 "--verify-roles" => verify_roles = true,
                 "--verify-absent" => verify_absent = true,
+                "--verify-cables" => verify_cables = true,
                 "--render-name" => {
                     render = Selector::Name(next_value(&mut args, "--render-name")?);
                 }
@@ -225,6 +282,7 @@ mod windows_smoke {
             round_trip,
             verify_roles,
             verify_absent,
+            verify_cables,
         })
     }
 
@@ -246,8 +304,10 @@ mod windows_smoke {
              --capture-name NAME         also open a capture endpoint by name\n\
              --capture-id ID             also open a capture endpoint by MMDevice id\n\
              --round-trip                use app roles, write a tone, verify captured PCM\n\
+             --relay-round-trip          use relay roles, write a tone, verify captured PCM\n\
              --verify-roles              require all four provider-owned QPWGraph endpoints\n\
              --verify-absent             require no provider-owned QPWGraph endpoints\n\
+             --verify-cables             test both cables for cross-talk and silence after stop\n\
              --duration-ms N             start each client for N milliseconds (max 60000)"
         );
     }
@@ -692,7 +752,7 @@ mod windows_smoke {
         sample_rate: u32,
         channels: u16,
         bits: u16,
-        format_tag: u16,
+        is_float: bool,
         block_align: u16,
     }
 
@@ -745,6 +805,33 @@ mod windows_smoke {
             )
         };
         let summary = format!("{sample_rate} Hz, {channels} channels, {bits} bits");
+        // GetMixFormat owns a WAVEFORMATEX followed by cbSize extension bytes.
+        // Read the extensible subtype only after checking that declared size.
+        let subtype = if format_tag == KernelStreaming::WAVE_FORMAT_EXTENSIBLE as u16
+            && unsafe { (*format).cbSize } >= 22
+        {
+            Some(unsafe {
+                std::ptr::read_unaligned(std::ptr::addr_of!(
+                    (*format.cast::<Audio::WAVEFORMATEXTENSIBLE>()).SubFormat
+                ))
+            })
+        } else {
+            None
+        };
+        let is_float = match validate_pcm_format(
+            format_tag,
+            subtype,
+            sample_rate,
+            channels,
+            bits,
+            block_align,
+        ) {
+            Ok(is_float) => is_float,
+            Err(error) => {
+                unsafe { Com::CoTaskMemFree(Some(format.cast())) };
+                return Err(error);
+            }
+        };
         let initialized = unsafe {
             client.Initialize(
                 Audio::AUDCLNT_SHAREMODE_SHARED,
@@ -779,7 +866,7 @@ mod windows_smoke {
             sample_rate,
             channels,
             bits,
-            format_tag,
+            is_float,
             block_align,
         })
     }
@@ -815,8 +902,8 @@ mod windows_smoke {
             let mut captured_frames = 0_u64;
             let mut captured_peak = 0.0_f32;
             while Instant::now() < deadline {
-                fill_render(&render, &render_client, &mut phase)?;
-                let (frames, peak) = drain_capture(&capture, &capture_client)?;
+                fill_render(&render, &render_client, &mut phase, 440.0)?;
+                let (frames, peak) = drain_capture(&capture, &capture_client, None)?;
                 captured_frames += u64::from(frames);
                 captured_peak = captured_peak.max(peak);
                 std::thread::sleep(Duration::from_millis(2));
@@ -849,10 +936,120 @@ mod windows_smoke {
         result
     }
 
+    fn verify_cable_isolation(
+        render_device: &Audio::IMMDevice,
+        capture_device: &Audio::IMMDevice,
+        other_device: &Audio::IMMDevice,
+        duration: Duration,
+        frequency: f64,
+    ) -> Result<(), SmokeError> {
+        let render = open_stream(render_device, Flow::Render)?;
+        let capture = open_stream(capture_device, Flow::Capture)?;
+        let other = open_stream(other_device, Flow::Capture)?;
+        let render_client = unsafe { render.client.GetService::<Audio::IAudioRenderClient>() }
+            .map_err(|error| SmokeError::Failure(format!("render service: {error}")))?;
+        let capture_client =
+            unsafe { capture.client.GetService::<Audio::IAudioCaptureClient>() }
+                .map_err(|error| SmokeError::Failure(format!("capture service: {error}")))?;
+        let other_client = unsafe { other.client.GetService::<Audio::IAudioCaptureClient>() }
+            .map_err(|error| {
+                SmokeError::Failure(format!("other cable capture service: {error}"))
+            })?;
+        // AudioStream drops stop/reset every successfully opened client on all exits.
+        unsafe {
+            capture
+                .client
+                .Start()
+                .map_err(|error| SmokeError::Failure(format!("capture start: {error}")))?;
+            other
+                .client
+                .Start()
+                .map_err(|error| SmokeError::Failure(format!("other capture start: {error}")))?;
+            render
+                .client
+                .Start()
+                .map_err(|error| SmokeError::Failure(format!("render start: {error}")))?;
+        }
+        let deadline = Instant::now() + duration.max(Duration::from_secs(1));
+        let mut phase = 0.0;
+        let mut target_frames = 0_u64;
+        let mut other_frames = 0_u64;
+        let mut target_peak = 0.0_f32;
+        let mut other_peak = 0.0_f32;
+        let mut target_tones = ToneProbe::new(capture.sample_rate);
+        let mut other_tones = ToneProbe::new(other.sample_rate);
+        while Instant::now() < deadline {
+            fill_render(&render, &render_client, &mut phase, frequency)?;
+            let (frames, peak) = drain_capture(&capture, &capture_client, Some(&mut target_tones))?;
+            target_frames += u64::from(frames);
+            target_peak = target_peak.max(peak);
+            let (frames, peak) = drain_capture(&other, &other_client, Some(&mut other_tones))?;
+            other_frames += u64::from(frames);
+            other_peak = other_peak.max(peak);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!(
+            "  tone amplitudes [app 1 kHz, relay 2 kHz]: target {:?}, other {:?}",
+            target_tones.amplitudes, other_tones.amplitudes
+        );
+        let tone_index = usize::from(frequency == RELAY_TONE_HZ);
+        if target_frames == 0
+            || target_peak < 0.01
+            || other_frames == 0
+            || other_peak > 0.001
+            || target_tones.amplitudes[tone_index] < 0.01
+            || target_tones.invalid_samples != 0
+            || other_tones.invalid_samples != 0
+        {
+            return Err(SmokeError::Failure(format!(
+                "cable isolation failed: target {target_frames} frames peak {target_peak:.6}, other {other_frames} frames peak {other_peak:.6}"
+            )));
+        }
+        println!("  isolation passed: target {target_frames} frames peak {target_peak:.6}, other {other_frames} frames peak {other_peak:.6}");
+        unsafe {
+            render
+                .client
+                .Stop()
+                .map_err(|error| SmokeError::Failure(format!("render stop: {error}")))?;
+            render
+                .client
+                .Reset()
+                .map_err(|error| SmokeError::Failure(format!("render reset: {error}")))?;
+        }
+        // Drain in-flight engine/cable data for one second, then require an
+        // additional half-second of actual silent packets (no packets fails).
+        let settle_until = Instant::now() + Duration::from_secs(1);
+        let deadline = settle_until + Duration::from_millis(500);
+        let mut silent_frames = 0_u64;
+        let mut stopped_peak = 0.0_f32;
+        let mut stopped_other_peak = 0.0_f32;
+        while Instant::now() < deadline {
+            let measuring = Instant::now() >= settle_until;
+            let (frames, peak) = drain_capture(&capture, &capture_client, None)?;
+            let (_, other_peak) = drain_capture(&other, &other_client, None)?;
+            if measuring {
+                silent_frames += u64::from(frames);
+                stopped_peak = stopped_peak.max(peak);
+                stopped_other_peak = stopped_other_peak.max(other_peak);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if silent_frames == 0 || stopped_peak > 0.001 || stopped_other_peak > 0.001 {
+            return Err(SmokeError::Failure(format!(
+                "stopped-render silence failed: {silent_frames} frames, target peak {stopped_peak:.6}, other peak {stopped_other_peak:.6}"
+            )));
+        }
+        println!(
+            "  stopped-render silence passed: {silent_frames} frames, target peak {stopped_peak:.6}, other peak {stopped_other_peak:.6}"
+        );
+        Ok(())
+    }
+
     fn fill_render(
         stream: &AudioStream,
         client: &Audio::IAudioRenderClient,
         phase: &mut f64,
+        frequency: f64,
     ) -> Result<u32, SmokeError> {
         let padding = unsafe { stream.client.GetCurrentPadding() }.map_err(|error| {
             SmokeError::Failure(format!("could not query render padding: {error}"))
@@ -870,7 +1067,7 @@ mod windows_smoke {
             ));
         }
         unsafe {
-            write_tone(buffer, stream, frames, phase);
+            write_tone(buffer, stream, frames, phase, frequency);
             client.ReleaseBuffer(frames, 0).map_err(|error| {
                 SmokeError::Failure(format!("could not release render buffer: {error}"))
             })?;
@@ -881,6 +1078,7 @@ mod windows_smoke {
     fn drain_capture(
         stream: &AudioStream,
         client: &Audio::IAudioCaptureClient,
+        mut tones: Option<&mut ToneProbe>,
     ) -> Result<(u32, f32), SmokeError> {
         let mut total_frames = 0_u32;
         let mut peak = 0.0_f32;
@@ -900,8 +1098,22 @@ mod windows_smoke {
                     .map_err(|error| {
                         SmokeError::Failure(format!("could not acquire capture buffer: {error}"))
                     })?;
-                if flags & (Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) == 0 && !data.is_null() {
-                    peak = peak.max(read_peak(data, stream, frames));
+                if flags & (Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) == 0 {
+                    if data.is_null() {
+                        client.ReleaseBuffer(frames).map_err(|error| {
+                            SmokeError::Failure(format!(
+                                "could not release malformed capture buffer: {error}"
+                            ))
+                        })?;
+                        return Err(SmokeError::Failure(
+                            "capture endpoint returned a null non-silent buffer".into(),
+                        ));
+                    }
+                    peak = peak.max(read_peak(data, stream, frames, tones.as_deref_mut()));
+                } else if let Some(probe) = tones.as_deref_mut() {
+                    for _ in 0..frames {
+                        probe.push(0.0);
+                    }
                 }
                 client.ReleaseBuffer(frames).map_err(|error| {
                     SmokeError::Failure(format!("could not release capture buffer: {error}"))
@@ -912,18 +1124,22 @@ mod windows_smoke {
         Ok((total_frames, peak))
     }
 
-    unsafe fn write_tone(buffer: *mut u8, stream: &AudioStream, frames: u32, phase: &mut f64) {
+    unsafe fn write_tone(
+        buffer: *mut u8,
+        stream: &AudioStream,
+        frames: u32,
+        phase: &mut f64,
+        frequency: f64,
+    ) {
         let bytes_per_frame = usize::from(stream.block_align);
         let bytes_per_sample = usize::from(stream.bits).div_ceil(8);
         std::ptr::write_bytes(buffer, 0, frames as usize * bytes_per_frame);
         if bytes_per_sample == 0 || stream.channels == 0 || stream.sample_rate == 0 {
             return;
         }
-        let is_float = stream.format_tag == Multimedia::WAVE_FORMAT_IEEE_FLOAT as u16
-            || (stream.format_tag == KernelStreaming::WAVE_FORMAT_EXTENSIBLE as u16
-                && stream.bits == 32);
+        let is_float = stream.is_float;
         for frame in 0..frames as usize {
-            let value = (*phase * std::f64::consts::TAU * 440.0).sin() as f32 * 0.25;
+            let value = (*phase * std::f64::consts::TAU * frequency).sin() as f32 * 0.25;
             *phase += 1.0 / f64::from(stream.sample_rate);
             for channel in 0..usize::from(stream.channels) {
                 let offset = frame * bytes_per_frame + channel * bytes_per_sample;
@@ -953,25 +1169,28 @@ mod windows_smoke {
         }
     }
 
-    unsafe fn read_peak(buffer: *const u8, stream: &AudioStream, frames: u32) -> f32 {
+    unsafe fn read_peak(
+        buffer: *const u8,
+        stream: &AudioStream,
+        frames: u32,
+        mut tones: Option<&mut ToneProbe>,
+    ) -> f32 {
         let bytes_per_frame = usize::from(stream.block_align);
         let bytes_per_sample = usize::from(stream.bits).div_ceil(8);
         if bytes_per_sample == 0 || stream.channels == 0 {
             return 0.0;
         }
-        let is_float = stream.format_tag == Multimedia::WAVE_FORMAT_IEEE_FLOAT as u16
-            || (stream.format_tag == KernelStreaming::WAVE_FORMAT_EXTENSIBLE as u16
-                && stream.bits == 32);
+        let is_float = stream.is_float;
         let mut peak = 0.0_f32;
         for frame in 0..frames as usize {
             for channel in 0..usize::from(stream.channels) {
                 let sample = buffer.add(frame * bytes_per_frame + channel * bytes_per_sample);
                 let value = if is_float && bytes_per_sample >= 4 {
-                    sample.cast::<f32>().read_unaligned().abs()
+                    sample.cast::<f32>().read_unaligned()
                 } else if bytes_per_sample == 1 {
                     (f32::from(sample.read()) - 128.0) / 128.0
                 } else if bytes_per_sample == 2 {
-                    f32::from(sample.cast::<i16>().read_unaligned()).abs() / 32_768.0
+                    f32::from(sample.cast::<i16>().read_unaligned()) / 32_768.0
                 } else if bytes_per_sample == 3 {
                     let raw = i32::from(sample.read())
                         | (i32::from(sample.add(1).read()) << 8)
@@ -981,14 +1200,84 @@ mod windows_smoke {
                     } else {
                         raw
                     };
-                    (signed as f32).abs() / 8_388_608.0
+                    (signed as f32) / 8_388_608.0
                 } else {
-                    (sample.cast::<i32>().read_unaligned() as f32).abs() / 2_147_483_648.0
+                    (sample.cast::<i32>().read_unaligned() as f32) / 2_147_483_648.0
                 };
-                peak = peak.max(value);
+                if channel == 0 {
+                    if let Some(probe) = tones.as_deref_mut() {
+                        probe.push(value);
+                    }
+                }
+                peak = peak.max(if value.is_finite() {
+                    value.abs()
+                } else {
+                    f32::INFINITY
+                });
             }
         }
         peak
+    }
+
+    fn validate_pcm_format(
+        tag: u16,
+        subtype: Option<GUID>,
+        rate: u32,
+        channels: u16,
+        bits: u16,
+        align: u16,
+    ) -> Result<bool, SmokeError> {
+        const PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+        const FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+        let encoding = if tag == KernelStreaming::WAVE_FORMAT_EXTENSIBLE as u16 {
+            subtype
+        } else if tag == Multimedia::WAVE_FORMAT_IEEE_FLOAT as u16 {
+            Some(FLOAT)
+        } else if tag == 1 {
+            Some(PCM)
+        } else {
+            None
+        };
+        let supported = (encoding == Some(FLOAT) && bits == 32)
+            || (encoding == Some(PCM) && matches!(bits, 8 | 16 | 24 | 32));
+        let frame_bytes = u32::from(channels) * u32::from(bits / 8);
+        if !supported || rate == 0 || channels == 0 || frame_bytes != u32::from(align) {
+            return Err(SmokeError::Failure(format!(
+                "unsupported or malformed PCM format: tag={tag:#x}, subtype={subtype:?}, {rate} Hz, {channels} channels, {bits} bits, alignment={align}"
+            )));
+        }
+        Ok(encoding == Some(FLOAT))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn extensible_integer_pcm_is_not_float() {
+            let pcm = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+            let float = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+            assert!(!validate_pcm_format(0xfffe, Some(pcm), 48000, 2, 32, 8).unwrap());
+            assert!(validate_pcm_format(0xfffe, Some(float), 48000, 2, 32, 8).unwrap());
+            assert!(validate_pcm_format(0xfffe, None, 48000, 2, 32, 8).is_err());
+            assert!(validate_pcm_format(0xfffe, Some(GUID::zeroed()), 48000, 2, 32, 8).is_err());
+        }
+
+        #[test]
+        fn malformed_layouts_fail_before_buffer_access() {
+            for (rate, channels, bits, align) in [
+                (0, 2, 16, 4),
+                (48000, 0, 16, 0),
+                (48000, 2, 16, 2),
+                (48000, 2, 12, 4),
+                (48000, 2, 64, 16),
+            ] {
+                assert!(validate_pcm_format(1, None, rate, channels, bits, align).is_err());
+            }
+            for bits in [8, 16, 24, 32] {
+                assert!(!validate_pcm_format(1, None, 48000, 2, bits, bits / 4).unwrap());
+            }
+        }
     }
 
     #[derive(Debug)]

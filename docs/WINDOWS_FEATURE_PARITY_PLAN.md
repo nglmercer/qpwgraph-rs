@@ -1,6 +1,6 @@
 # Windows next-feature plan
 
-Status snapshot: 2026-09-05. The repository now contains the P0 user-mode
+Status snapshot: 2026-09-06. The repository now contains the P0 user-mode
 implementation slices below. The ACX-enabled release driver links locally and
 the WDK `stampinf`/`Inf2Cat` package stage passes with WDK 10.0.26100 and
 released LLVM 21.1.2. A live Windows 10 version 2004 test-signed pass now
@@ -13,11 +13,90 @@ This document replaces the old “build everything from zero” roadmap with the
 
 ### Verification snapshot
 
+Latest upgraded-build pass (2026-09-05): the EOS fix was release-built,
+INF-stamped, catalog-validated without errors/warnings, and test-signed with
+the existing trusted development certificate. The elevated install runner
+successfully upgraded to `oem20.inf`, DriverVer `17.12.35.834`, without a
+reboot. The installed SYS SHA256 matches the staged signed artifact:
+`C097A4C14E4EB528A409D038B8CF9E581879CD3D119A8A54CAE220E59A91B3AD`.
+Both cables passed the distinct-tone isolation and stopped-render silence
+probe for five seconds each (240000 target frames per cable; zero opposite
+cable peak; 24000 silent frames after stop). All four semantic roles resolve
+after their MMDevice IDs changed during upgrade. Saved endpoint selector
+reconciliation still requires its own live validation; role resolution alone
+does not establish that gate. The installer now verifies the exact bound INF
+and zero device problem code before accepting endpoint roles, with six
+non-mutating regression cases passing.
+
+The exact-package lifecycle was then exercised: `oem20.inf` was removed with
+the elevated uninstaller, provider-role absence verification passed, and the
+same signed package was installed again as `oem20.inf` without a reboot or a
+Windows default-device change. The reinstall generated new MMDevice IDs;
+role verification, app and relay round trips (240000 frames each), and the
+five-second distinct-tone isolation/silence probe all passed against the
+reinstalled binary. This closes repository-side install, upgrade, uninstall,
+endpoint-removal, and basic stream-reopen evidence for the development image.
+
+The earlier restricted-context capture initialization error `0x80070057` was
+specific to the sandbox; the normal user context passes both round trips.
+The prior `oem19.inf` result and first intermittent cross-cable observation
+are historical evidence, not the current installation state. Full
+disconnect/reconnect reliability remains an open gate.
+
+Current revalidation (2026-09-06): the current machine has all four
+provider-owned endpoints installed from `oem20.inf`; `qpwgraph-audio-smoke
+--verify-roles` passes and `--verify-absent` was used successfully after the
+exact-package uninstall. Both `--round-trip` and `--relay-round-trip
+--duration-ms 5000` capture 240000 frames at 48 kHz stereo. The staged and
+installed signed SYS SHA256 is
+`C097A4C14E4EB528A409D038B8CF9E581879CD3D119A8A54CAE220E59A91B3AD`.
+The new `--verify-cables` check tests both cable directions with the opposite
+capture endpoint open and checks silence after render stop. The updated build
+passes both directions with zero opposite-cable peaks and zero stopped-render
+peaks. The smoke probe now validates PCM subtype and frame layout
+before buffer access; its two format regression tests pass. In particular,
+32-bit extensible integer PCM is no longer interpreted as float PCM.
+The strengthened cable probe uses distinct 1 kHz app and 2 kHz relay tones,
+requires the expected frequency, and reports both tone amplitudes to help
+distinguish cross-talk from previous-stream audio. Four probe regression
+tests pass, including phase-independent tone separation at 44.1/48 kHz and
+silence/DC rejection. One five-second-per-cable pass and eight consecutive
+one-second-per-cable restart passes succeeded on the installed build, with
+zero opposite-cable peaks and zero stopped-render peaks across eight
+consecutive restart passes. Code review also identified that the render callback validated but
+did not apply the final packet's `EosPacketLength`. The bridge now publishes
+the final packet index/length atomically, copies only that prefix, and stops
+copying circular-buffer contents after EOS while notifications continue.
+Non-EOS lengths are ignored per the ACX contract; EOS lengths must fit a
+48 kHz stereo PCM16 frame. Native regression checks cover empty, partial,
+full, skipped, malformed, and wrapping EOS packets and are wired into eWDK CI.
+`cargo check -p qpwgraph-audio --features acx --locked` passed from the
+WDK-initialized nested workspace after this fix (existing unused binding
+warnings remain). A final 2026-09-06 `--build-package`, test-sign, and
+`--validate-package` pass reproduced the same SYS hash and staged the updated
+README/manifest package. The upgraded-build pass above verifies the new
+package's basic cable operation. Full disconnect/reconnect reliability and
+ordinary third-party capture-client acceptance remain separate open gates.
+
 The repository-side evidence for this snapshot is complete:
 
-- `cargo test --workspace --all-features --locked` passed on 2026-09-05,
-  including the Windows backend, process-loopback integration tests, relay
-  tests, effect tests, and doc tests;
+- `cargo test --workspace --all-features --locked` passed on 2026-09-06,
+  including the Windows backend, the opt-in-disabled process-loopback test
+  harness, relay tests, effect tests, and doc tests;
+- the serialized live process-loopback sweep passed all 12 non-fault cases
+  (relay source/rebind, process-tree isolation, RMS, multi-session metering,
+  policy lifetime, exit, restart, and 1000 activation cycles); the
+  fault-injected native-peak fallback case passed separately because its
+  opt-in switch intentionally disables every process-loopback activation;
+- a disposable Firefox Web Audio tone was enumerated as the stable
+  `application:sha256:016ac9991f185d67b8c830c7c4016b0d37b925331112dd9e1a40a28c5961c9fd`
+  relay source. The durable opt-in browser smoke
+  (`PW_GRAPH_TEST_BROWSER_RELAY=1` plus the live Firefox PID) verified
+  process-tree identity matching, an active application relay, and a
+  non-silent `0.1500` Firefox session peak while the relay was running;
+- the opt-in live relay endpoint-switch test changed the selected playback
+  endpoint while hosting and confirmed that the authenticated host stayed
+  active; both relay directions also passed their WASAPI endpoint-start gate;
 - the WDK-initialized nested workspace passed `cargo test --workspace
   --locked` (3 driver transport tests and 11 core timing/transport tests);
 - `--audit-toolchain` and `--build-package` passed with WDK 10.0.26100,
@@ -28,13 +107,15 @@ The repository-side evidence for this snapshot is complete:
   `signtool verify /pa` check for the catalog itself and the catalog's INF/SYS
   membership; the signing helper performs the same verification immediately
   after test-signing.
-- the user-mode smoke probe passed `--verify-absent`, confirming that no
-  provider-owned QPWGraph endpoint is currently installed on this machine.
-- the live Windows 10 version 2004 validation pass installed `oem19.inf`,
+- the exact-package lifecycle removed `oem20.inf` and passed
+  `--verify-absent`, then reinstalled the same package; the current machine
+  has the verified `oem20.inf` endpoints installed.
+- the live Windows 10 version 2004 validation pass installed `oem20.inf`,
   verified `app-render`, `app-monitor`, `relay-render`, and `relay-capture`,
   passed the 48 kHz stereo shared-mode round trip with non-silent PCM, and
   removed the exact package again without changing Windows defaults; the
-  machine is clean after that pass.
+  exact-package uninstall/reinstall pass likewise did not change Windows
+  defaults.
 
 The first authorized live attempts on the Windows 10 version 2004 test image
 exposed two packaging defects: the driver was initially built for KMDF 1.33
@@ -42,7 +123,7 @@ while the image loaded KMDF 1.31, and a later catalog was not trusted by Code
 Integrity. The package is now retargeted to KMDF 1.31, targets the ACX 1.1
 surface supported by Windows 10 version 2004, and both signing/install helpers
 verify the exact staged artifacts before PnPUtil is called. The successful
-`oem19.inf` pass then proved the endpoint and stream gates locally. Release
+`oem20.inf` pass then proved the endpoint and stream gates locally. Release
 Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client evidence
 remain external gates.
 
@@ -337,7 +418,7 @@ crates/pw-graph-slint/src/source.rs
 
 ```text
 [ ] Chrome/Firefox/VLC on normal speakers appears as an application relay source
-[ ] starting app relay does not change the application's local output
+[x] starting app relay does not change the application's local output (Firefox session meter remained non-silent during the live application-relay smoke)
 [x] only target-process audio reaches the relay (opt-in two-helper process-loopback isolation smoke test passed locally)
 [x] another application on the same endpoint is excluded (opt-in two-helper process-loopback isolation smoke test passed locally)
 [x] child-process mode behaves as documented (opt-in child-tree process-loopback smoke test passed locally)
@@ -1044,6 +1125,13 @@ image does not expose `PKEY_AudioEndpoint_StableId`, so the selector continues
 to fall back to the opaque MMDevice ID and then a unique friendly name on that
 OS.
 
+The backend now resolves the parent devnode service with the Configuration
+Manager API, matching the provider proof used by the smoke probe. The ignored
+live backend test `installed_virtual_endpoints_have_backend_ownership_identity`
+passes against the upgraded `oem20.inf` installation and recognizes all four
+roles after their MMDevice IDs changed. A friendly-name-only endpoint still
+cannot satisfy this proof.
+
 ### Required behavior
 
 ```text
@@ -1350,7 +1438,7 @@ Release-driver gate:
 [x] INF/package validation clean (WDK stampinf/Inf2Cat completed with no errors or warnings locally)
 [ ] Microsoft signing pipeline established
 [ ] Secure Boot installation verified
-[ ] upgrade and uninstall verified
+[x] upgrade and uninstall verified (exact package binding, endpoint removal, and reinstall pass)
 ```
 
 Portable user-mode ZIP remains independent.
@@ -1445,13 +1533,13 @@ That is why private AudioPolicyConfig work belongs near the end.
 ```text
 [x] ordinary Win32 app (deterministic helper; opt-in live smoke test passed locally)
 [ ] packaged/MSIX app
-[ ] browser with child processes
+[x] browser with child processes (Firefox Web Audio tone; opt-in browser application-relay smoke passed locally)
 [x] multiple audio sessions in same process (opt-in helper live smoke test passed locally)
 [x] silent process (opt-in helper live smoke test passed locally)
 [x] process starts after qpwgraph (opt-in helper live smoke test passed locally)
 [x] process exits during capture (opt-in live smoke test passed locally)
 [x] process restarts with new PID (opt-in helper relay smoke test passed locally)
-[ ] PID reused by unrelated executable
+[x] PID reused by unrelated executable (reconciler and activation identity tests fail closed)
 [x] 1000 activation/start/stop cycles (opt-in live process-loopback cycle test passed locally)
 ```
 
@@ -1461,7 +1549,7 @@ That is why private AudioPolicyConfig work belongs near the end.
 [x] normal app -> single-app relay without driver (opt-in helper smoke test passed locally)
 [x] app exits -> control session remains (opt-in local host/client smoke test passed locally)
 [x] app returns -> source can recover (opt-in helper smoke test passed locally)
-[ ] output endpoint changes while app relay active
+[x] output endpoint changes while app relay active (opt-in live Windows relay endpoint-switch test passed locally)
 ```
 
 ## Metering
@@ -1477,16 +1565,16 @@ That is why private AudioPolicyConfig work belongs near the end.
 ## Virtual driver
 
 ```text
-[ ] render endpoint enumerate
-[ ] render stream start/stop
-[ ] capture endpoint enumerate
-[ ] render -> capture deterministic tone
-[ ] underflow -> silence
-[ ] overflow counted
-[ ] timestamp monotonic
+[x] render endpoint enumerate (live four-role smoke pass)
+[x] render stream start/stop (live app and relay round trips)
+[x] capture endpoint enumerate (live four-role smoke pass)
+[x] render -> capture deterministic tone (live app cable probe)
+[x] underflow -> silence (ACX/Rust transport tests; live cable probe drains silence)
+[x] overflow counted (bounded cable unit tests)
+[x] timestamp monotonic (stream clock/timeline unit tests)
 [ ] sleep/resume
 [ ] disable/enable
-[ ] uninstall/reinstall
+[x] uninstall/reinstall (exact `oem20.inf` lifecycle pass without reboot/default changes)
 ```
 
 ## Relay microphone
@@ -1502,9 +1590,9 @@ That is why private AudioPolicyConfig work belongs near the end.
 ## App reroute/effects
 
 ```text
-[ ] manual isolation recognized
-[ ] process identity reverified
-[ ] dry+processed duplication impossible
+[x] manual isolation recognized (reconciler's virtual-output isolation gate is unit-tested)
+[x] process identity reverified (live activation and PID-reuse identity tests pass)
+[x] dry+processed duplication impossible (ordinary capture-only sessions remain read-only until isolation)
 [ ] effect chain applies
 [ ] effect bypass restores
 [ ] destination disappears
@@ -1652,8 +1740,8 @@ Call **Windows parity milestone 2** complete when all of these work:
 [x] stable app selectors survive restart (opt-in helper smoke test passed locally)
 [ ] stable endpoint selectors survive normal endpoint churn
 [x] saved application route has an explicit reconciler state (reconciler unit tests passed locally)
-[ ] one real Rust ACX render endpoint enumerates and streams
-[ ] virtual render/capture cable carries deterministic PCM
+[x] one real Rust ACX render endpoint enumerates and streams (test-signed live app cable pass)
+[x] virtual render/capture cable carries deterministic PCM (distinct-tone isolation and silence pass)
 [ ] Relay Microphone works in an ordinary Windows capture client
 [ ] per-app effects work after manual isolation (repository restore path is in place;
     live processor validation remains)

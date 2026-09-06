@@ -231,6 +231,17 @@ jobs:
         shell: pwsh
         working-directory: drivers/windows-audio
         run: cargo check -p qpwgraph-audio --features acx --locked
+      - name: Test ACX end-of-stream packet boundaries
+        shell: pwsh
+        working-directory: drivers/windows-audio
+        run: |
+          clang tests/render_eos.c -o target/render-eos-test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./target/render-eos-test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test installer package binding gate
+        shell: pwsh
+        run: ./drivers/windows-audio/tests/install-binding.ps1
       - name: Test allocation-free driver core
         working-directory: drivers/windows-audio
         run: cargo test -p qpwgraph-audio-core --locked

@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     println!("cargo:rerun-if-changed=src/acx_wrapper.h");
     println!("cargo:rerun-if-changed=src/acx_bridge.c");
+    println!("cargo:rerun-if-changed=src/render_eos.h");
 
     if env::var_os("CARGO_FEATURE_ACX").is_some() {
         generate_acx_bindings()?;

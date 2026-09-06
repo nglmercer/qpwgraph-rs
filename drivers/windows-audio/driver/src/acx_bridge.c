@@ -6,6 +6,7 @@
 #include <ksmedia.h>
 
 #include "acx_wrapper.h"
+#include "render_eos.h"
 
 // The kernel-mode C headers declare these KS GUIDs through DEFINE_GUIDEX,
 // which intentionally leaves storage to the driver.  User-mode libraries
@@ -121,7 +122,11 @@ typedef struct _QPWGRAPH_STREAM_CONTEXT {
   volatile LONG64 LastPacketStart;
   LARGE_INTEGER PerformanceCounterFrequency;
   PVOID PacketBuffers[QPWGRAPH_MAX_PACKET_COUNT];
-  BOOLEAN RenderEndOfStream;
+  // Publish the packet/length before setting state=1; state=2 means the EOS
+  // packet has been consumed and all subsequent transport writes are silent.
+  volatile LONG RenderEndOfStream;
+  ULONG RenderEosPacket;
+  ULONG RenderEosBytes;
 } QPWGRAPH_STREAM_CONTEXT, *PQPWGRAPH_STREAM_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QPWGRAPH_STREAM_CONTEXT,
@@ -410,12 +415,23 @@ static VOID QpwgraphStreamPass(PQPWGRAPH_STREAM_CONTEXT Context) {
                                                   Context->PacketSize);
       }
     } else {
+      LONG eosState = InterlockedCompareExchange(&Context->RenderEndOfStream, 0, 0);
+      QPWGRAPH_RENDER_PAYLOAD payload = QpwgraphRenderPayload(
+          (ULONG)activePacket, Context->PacketSize, eosState,
+          eosState == 1 ? Context->RenderEosPacket : 0,
+          eosState == 1 ? Context->RenderEosBytes : 0);
+      if (payload.EosState == 2 && eosState == 1) {
+        InterlockedExchange(&Context->RenderEndOfStream, 2);
+      }
+      // The remaining bytes of the EOS packet, and later circular-buffer
+      // contents, are not audio. Never copy them into the cable. Capture
+      // underflow supplies silence while packet notifications keep advancing.
       if (Context->Cable == QpwgraphRelayCable) {
         (VOID) qpwgraph_audio_transport_push_relay_pcm16(
-            (const UCHAR *)packetBuffer, Context->PacketSize);
+            (const UCHAR *)packetBuffer, payload.Bytes);
       } else {
         (VOID) qpwgraph_audio_transport_push_pcm16((const UCHAR *)packetBuffer,
-                                                   Context->PacketSize);
+                                                   payload.Bytes);
       }
     }
   }
@@ -792,13 +808,11 @@ static NTSTATUS QpwgraphEvtStreamSetRenderPacket(ACXSTREAM Stream, ULONG Packet,
     return STATUS_INVALID_PARAMETER;
   }
   if ((Flags & ~KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) != 0 ||
-      (!(Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) &&
-       EosPacketLength != 0) ||
       ((Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) &&
-       EosPacketLength > Context->PacketSize)) {
+       (EosPacketLength > Context->PacketSize || EosPacketLength % 4 != 0))) {
     return STATUS_INVALID_PARAMETER;
   }
-  if (Context->RenderEndOfStream) {
+  if (InterlockedCompareExchange(&Context->RenderEndOfStream, 0, 0) != 0) {
     return STATUS_INVALID_DEVICE_STATE;
   }
 
@@ -811,7 +825,9 @@ static NTSTATUS QpwgraphEvtStreamSetRenderPacket(ACXSTREAM Stream, ULONG Packet,
     return STATUS_DATA_OVERRUN;
   }
   if (Flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM) {
-    Context->RenderEndOfStream = TRUE;
+    Context->RenderEosPacket = Packet;
+    Context->RenderEosBytes = EosPacketLength;
+    InterlockedExchange(&Context->RenderEndOfStream, 1);
   }
   return STATUS_SUCCESS;
 }

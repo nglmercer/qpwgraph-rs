@@ -6,6 +6,11 @@
 //! every refresh.
 
 use super::*;
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_DevNode_PropertyW, CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
+};
+use windows::Win32::Devices::Properties::{DEVPROPTYPE, DEVPROP_TYPE_STRING};
+use windows::Win32::Foundation::DEVPROPKEY;
 
 /// `PKEY_AudioEndpoint_StableId` was added to the Windows 11 24H2 SDK after
 /// the `windows` crate version currently used by this project. The property is
@@ -26,6 +31,7 @@ const PKEY_QPWGRAPH_ENDPOINT_ROLE: PROPERTYKEY = PROPERTYKEY {
 };
 
 const QPWGRAPH_DRIVER_SERVICE: &str = "qpwgraph_audio";
+const QPWGRAPH_ROOT_DEVICE_INSTANCE_ID: &str = "ROOT\\DEVGEN\\QPWGRAPH_AUDIO";
 
 /// The durable selector used when Windows exposes a stable endpoint id.
 /// `current_mmdevice_id` and `friendly_name` are fallbacks and diagnostics,
@@ -170,13 +176,26 @@ pub(super) fn qpwgraph_virtual_endpoint_identity(
     device: &Audio::IMMDevice,
     mmdevice_id: &str,
 ) -> Option<QpwVirtualEndpointIdentity> {
-    let service = unsafe {
-        property_string(
-            device,
-            &Properties::DEVPKEY_Device_Service as *const _ as *const _,
-        )
-    }?;
-    if !service.eq_ignore_ascii_case(QPWGRAPH_DRIVER_SERVICE) {
+    let endpoint_instance = format!("SWD\\MMDEVAPI\\{mmdevice_id}");
+    let parent = devnode_property_string(&endpoint_instance, &Properties::DEVPKEY_Device_Parent);
+    let service = parent
+        .as_deref()
+        .and_then(|parent_id| {
+            devnode_property_string_for_instance(parent_id, &Properties::DEVPKEY_Device_Service)
+        })
+        .or_else(|| unsafe {
+            property_string(
+                device,
+                &Properties::DEVPKEY_Device_Service as *const _ as *const _,
+            )
+        });
+    if !service
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case(QPWGRAPH_DRIVER_SERVICE))
+        || !parent
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(QPWGRAPH_ROOT_DEVICE_INSTANCE_ID))
+    {
         return None;
     }
     let role = unsafe { property_string(device, &PKEY_QPWGRAPH_ENDPOINT_ROLE) }
@@ -193,6 +212,63 @@ pub(super) fn qpwgraph_virtual_endpoint_identity(
         },
         true,
     )
+}
+
+fn devnode_property_string(endpoint_instance: &str, key: &DEVPROPKEY) -> Option<String> {
+    devnode_property_string_for_instance(endpoint_instance, key)
+}
+
+fn devnode_property_string_for_instance(instance_id: &str, key: &DEVPROPKEY) -> Option<String> {
+    let instance_id_wide: Vec<u16> = instance_id
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut devinst = 0u32;
+    let result = unsafe {
+        CM_Locate_DevNodeW(
+            &mut devinst,
+            PCWSTR(instance_id_wide.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    if result != CR_SUCCESS {
+        return None;
+    }
+    let mut property_type = DEVPROPTYPE(0);
+    let mut property_size = 0u32;
+    unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            key,
+            &mut property_type,
+            None,
+            &mut property_size,
+            0,
+        );
+    }
+    if property_size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; property_size as usize];
+    let result = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            key,
+            &mut property_type,
+            Some(buffer.as_mut_ptr()),
+            &mut property_size,
+            0,
+        )
+    };
+    if result != CR_SUCCESS || property_type != DEVPROP_TYPE_STRING {
+        return None;
+    }
+    let utf16: Vec<u16> = buffer
+        .chunks_exact(2)
+        .map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]]))
+        .take_while(|character| *character != 0)
+        .collect();
+    (!utf16.is_empty()).then(|| String::from_utf16_lossy(&utf16))
 }
 
 pub(super) fn qpwgraph_endpoint_role_matches_flow(
@@ -464,6 +540,42 @@ mod tests {
             current_mmdevice_id: current_id.to_owned(),
             friendly_name: name.map(str::to_owned),
         }
+    }
+
+    #[test]
+    #[ignore = "requires the installed QPWGraph virtual audio driver"]
+    fn installed_virtual_endpoints_have_backend_ownership_identity() {
+        unsafe { Com::CoInitializeEx(None, Com::COINIT_MULTITHREADED) }
+            .ok()
+            .unwrap();
+        let enumerator: Audio::IMMDeviceEnumerator =
+            unsafe { Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, Com::CLSCTX_ALL) }
+                .unwrap();
+        let mut roles = Vec::new();
+        for flow in [Audio::eRender, Audio::eCapture] {
+            let collection =
+                unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }.unwrap();
+            for index in 0..unsafe { collection.GetCount() }.unwrap() {
+                let device = unsafe { collection.Item(index) }.unwrap();
+                if let Some(role) =
+                    unsafe { property_string(&device, &PKEY_QPWGRAPH_ENDPOINT_ROLE) }
+                {
+                    let id = unsafe { device.GetId() }.map(take_pwstr).unwrap();
+                    assert!(
+                        qpwgraph_virtual_endpoint_identity(&device, &id).is_some(),
+                        "backend does not recognize provider endpoint {role} ({id})"
+                    );
+                    roles.push(role);
+                }
+            }
+        }
+        roles.sort();
+        assert_eq!(
+            roles,
+            ["app-monitor", "app-render", "relay-capture", "relay-render"]
+        );
+        drop(enumerator);
+        unsafe { Com::CoUninitialize() };
     }
 
     #[test]

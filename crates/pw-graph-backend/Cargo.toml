@@ -29,6 +29,7 @@ pipewire = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",

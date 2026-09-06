@@ -4,12 +4,19 @@
 //! `PW_GRAPH_TEST_PROCESS_LOOPBACK=1` on a Windows test host with an active
 //! output endpoint to validate the complete helper → WASAPI process-loopback
 //! → router source path.
+//!
+//! A browser application-relay check is opt-in as well:
+//! `PW_GRAPH_TEST_BROWSER_RELAY=1 PW_GRAPH_TEST_BROWSER_PID=<pid>` selects a
+//! live browser process (Firefox by default; override
+//! `PW_GRAPH_TEST_BROWSER_NAME`) and verifies its stable selector, relay
+//! activation, and non-silent session meter while capture is running.
 
 #![cfg(target_os = "windows")]
 
 use pw_graph_backend::router::{AudioFormat, AudioSource, StreamHealth};
 use pw_graph_backend::{
-    GraphDriver, MeterPolicy, ProcessLoopbackMode, ProcessLoopbackSource, WindowsAudioDriver,
+    GraphDriver, MeterPolicy, ProcessIdentity, ProcessLoopbackMode, ProcessLoopbackSource,
+    WindowsAudioDriver,
 };
 #[cfg(feature = "relay-tests")]
 use pw_graph_backend::{
@@ -925,4 +932,127 @@ fn application_relay_keeps_the_authenticated_control_session_when_target_exits()
     })();
     stop_child(&mut child);
     result.expect("application relay control-session smoke test failed");
+}
+
+#[cfg(feature = "relay-tests")]
+#[test]
+fn browser_application_relay_keeps_local_session_audio_alive() {
+    if std::env::var("PW_GRAPH_TEST_BROWSER_RELAY").ok().as_deref() != Some("1") {
+        return;
+    }
+    let pid = std::env::var("PW_GRAPH_TEST_BROWSER_PID")
+        .expect("PW_GRAPH_TEST_BROWSER_PID is required for browser relay smoke")
+        .parse::<u32>()
+        .expect("PW_GRAPH_TEST_BROWSER_PID is numeric");
+    let browser_name =
+        std::env::var("PW_GRAPH_TEST_BROWSER_NAME").unwrap_or_else(|_| "Mozilla Firefox".into());
+    let result = (|| -> Result<(), String> {
+        let identity = ProcessIdentity::from_pid(pid).map_err(|error| error.to_string())?;
+        let expected_selector = identity
+            .selector_key()
+            .ok_or_else(|| "browser process has no stable application selector".to_owned())?;
+        let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
+        driver
+            .set_meter_policy(MeterPolicy::OnDemand)
+            .map_err(|error| error.to_string())?;
+        let node = {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                driver.refresh().map_err(|error| error.to_string())?;
+                if let Some(node) = driver
+                    .graph()
+                    .nodes
+                    .values()
+                    .find(|node| node.name.eq_ignore_ascii_case(&browser_name))
+                {
+                    break node.id;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("{browser_name} audio session node did not appear"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let observe_native_peak = |driver: &mut WindowsAudioDriver| -> Result<f32, String> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut peak = 0.0f32;
+            while Instant::now() < deadline {
+                driver.refresh().map_err(|error| error.to_string())?;
+                if let Some(reading) = driver
+                    .audio_meters()
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .find(|reading| reading.node_id == node && reading.available)
+                {
+                    peak = peak.max(reading.peak);
+                    if peak > 0.01 {
+                        return Ok(peak);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(format!("{browser_name} native session meter stayed silent"))
+        };
+        let selector = {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                driver.refresh().map_err(|error| error.to_string())?;
+                if let Some(source) = driver
+                    .relay_send_sources()
+                    .into_iter()
+                    .find(|source| source.name.eq_ignore_ascii_case(&browser_name))
+                {
+                    let selector = source
+                        .id
+                        .strip_prefix("application:")
+                        .ok_or_else(|| "browser source had an invalid application ID".to_owned())?
+                        .to_owned();
+                    if !selector.eq_ignore_ascii_case(&expected_selector) {
+                        return Err(format!(
+                            "browser source selector {selector:?} did not match PID {pid} identity"
+                        ));
+                    }
+                    break selector;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "{browser_name} was not listed as an application relay source"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        driver
+            .relay_set_send_source(RelaySendSource::Application(selector.clone()))
+            .map_err(|error| error.to_string())?;
+        let session = driver
+            .relay_connect_mode(
+                "127.0.0.1:9".parse().expect("discard target is valid"),
+                "123456",
+                RelayMode::Emitter,
+                1,
+            )
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            driver.refresh().map_err(|error| error.to_string())?;
+            if driver.relay_devices_active() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !driver.relay_devices_active() {
+            return Err("browser application relay worker did not start".into());
+        }
+        driver
+            .request_meters(&BTreeSet::from([node]))
+            .map_err(|error| error.to_string())?;
+        let during = observe_native_peak(&mut driver)?;
+        println!("browser application relay selector={selector} local_peak_during={during:.4}");
+        driver
+            .relay_disconnect(session)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    result.expect("browser application relay local-output smoke test failed");
 }

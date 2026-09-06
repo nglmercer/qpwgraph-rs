@@ -737,6 +737,8 @@ fn validate_package_metadata() {
         "-AllowTestSigned",
         "--verify-roles",
         "--round-trip",
+        "--relay-round-trip",
+        "--verify-cables",
         "PublishedInf",
         "DisableTestMode",
     ] {

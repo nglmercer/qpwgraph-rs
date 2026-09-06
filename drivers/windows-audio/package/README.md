@@ -99,6 +99,8 @@ provides the live gates:
 & $smoke --verify-roles
 & $smoke --list
 & $smoke --round-trip --duration-ms 5000
+& $smoke --relay-round-trip --duration-ms 5000
+& $smoke --verify-cables --duration-ms 5000
 ```
 
 Do not use `-SkipEndpointVerification` for the acceptance pass. If the
@@ -186,7 +188,37 @@ Example release lifecycle commands:
 After a signed package is installed on a Windows test machine, run the smoke
 probe with `--render-name "QPWGraph Virtual Output"` or the exact
 `--render-id` printed by `--list`. `--round-trip` selects the provider-owned
-`app-render` and `app-monitor` roles, writes a deterministic tone to the render
-stream, and requires non-silent captured PCM. Without `--round-trip`, the
-probe only exercises shared-mode open/start/stop/reset. It exits with code 2
-when the requested endpoint is absent.
+`app-render` and `app-monitor` roles, while `--relay-round-trip` selects
+`relay-render` and `relay-capture`; both write a deterministic tone to the
+render stream and require non-silent captured PCM. Without either round-trip
+option, the probe only exercises shared-mode open/start/stop/reset. It exits
+with code 2 when the requested endpoint is absent.
+
+`--verify-cables` drives each render endpoint in turn while reading both
+capture endpoints. It requires audio on the matching cable, actual silent
+packets on the other cable, and silence after rendering stops (one second
+to drain queued audio followed by a half-second measurement). Run this on a
+quiet test machine with no other clients rendering to either virtual cable.
+The app cable uses a 1 kHz tone and the relay cable uses 2 kHz; the probe
+requires the expected tone and reports both amplitudes on both captures,
+so a failure can distinguish the active test signal from previous-cable audio.
+Non-finite PCM fails the probe. Tone analysis uses only the first channel;
+peak and silence checks cover all channels.
+This detects cross-talk and stale audio across stream restarts; it does not
+replace relay peer-disconnect or ordinary-client acceptance. Run live capture
+probes outside restricted process sandboxes: the restricted execution context
+can make WASAPI capture initialization fail with `0x80070057` even when the
+same binary succeeds in the normal user context.
+
+`powershell -File tests/install-binding.ps1` separately exercises the install
+verification gate without mutating devices. The gate requires the devnode's
+bound INF to equal the exact published package and its problem code to be
+zero before accepting endpoint roles. Existing endpoints from an older
+package cannot prove an upgrade succeeded.
+
+The native EOS boundary regression can be run from the nested workspace with
+`clang tests/render_eos.c -o target/render-eos-test.exe`, followed by
+`./target/render-eos-test.exe`; eWDK CI runs it before packaging. It exercises
+the same packet-prefix decision used by the bridge. The bridge honors the
+final byte length and suppresses later circular-buffer data as described by
+the [ACX render packet contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/acxstreams/nc-acxstreams-evt_acx_stream_set_render_packet).

@@ -241,11 +241,25 @@ function Invoke-SmokeCheck([string] $Argument) {
     }
 }
 
-function Wait-ForEndpointRoles {
+function Assert-ActivePackage([string] $ExpectedInf) {
+    $boundInf = [string](Get-PnpDeviceProperty -InstanceId $rootDeviceInstanceId `
+        -KeyName 'DEVPKEY_Device_DriverInfPath' -ErrorAction Stop).Data
+    if ([string]::IsNullOrWhiteSpace($boundInf) -or $boundInf -ine $ExpectedInf) {
+        throw "The QPWGraph device is bound to '$boundInf', not the requested '$ExpectedInf'; existing endpoint roles cannot verify this install."
+    }
+    $problemCode = (Get-PnpDeviceProperty -InstanceId $rootDeviceInstanceId `
+        -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction Stop).Data
+    if ($null -eq $problemCode -or [uint32]$problemCode -ne 0) {
+        throw "The QPWGraph device has problem code '$problemCode'; package activation is not ready."
+    }
+}
+
+function Wait-ForEndpointRoles([string] $ExpectedInf) {
     $deadline = (Get-Date).AddSeconds($VerificationTimeoutSeconds)
     $lastError = 'the smoke probe did not run'
     do {
         try {
+            Assert-ActivePackage $ExpectedInf
             Invoke-SmokeCheck '--verify-roles'
             return
         } catch {
@@ -292,6 +306,13 @@ $pnputilExitCode = $LASTEXITCODE
 if (-not [string]::IsNullOrWhiteSpace($pnputilOutput)) {
     Write-Verbose ($pnputilOutput.TrimEnd())
 }
+if ($pnputilExitCode -eq 3010) {
+    # PnPUtil has staged the package, but Windows cannot replace a loaded
+    # driver until the next boot.  Do not accept the old endpoint instance as
+    # proof for the new package; the caller must reboot and rerun Install so
+    # role verification observes the newly loaded image.
+    throw "PnPUtil staged $inf but requires a reboot (exit code 3010) before the driver can be verified. Reboot Windows, then rerun Install; no Windows default device was changed."
+}
 if ($pnputilExitCode -ne 0 -and $pnputilOutput -notmatch '(?im)Driver package is up-to-date on device') {
     Remove-QpwgraphRootDevice
     throw "PnPUtil failed with exit code $pnputilExitCode. No Windows default device was changed."
@@ -313,7 +334,7 @@ try {
     if ($SkipEndpointVerification) {
         Write-Warning 'Endpoint-role verification was explicitly skipped; the package is installed but not validated.'
     } else {
-        Wait-ForEndpointRoles
+        Wait-ForEndpointRoles $publishedInf
     }
 } catch {
     Remove-QpwgraphRootDevice
