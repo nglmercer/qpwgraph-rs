@@ -193,9 +193,7 @@ pub(super) fn worker_thread(
                 let _ = sender.send(Ok(()));
             }
             WorkerCommand::ReconcileProcessCaptures(requests, sender) => {
-                worker
-                    .process_captures
-                    .reconcile_routes(requests, crate::router::AudioFormat::new(48_000, 2));
+                worker.process_captures.reconcile_route_probes(requests);
                 let _ = sender.send(Ok(worker.process_captures.statuses()));
             }
             #[cfg(feature = "relay")]

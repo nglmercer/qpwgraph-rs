@@ -15,7 +15,9 @@
 use super::app_route_policy::verify_live_process_identity;
 #[cfg(test)]
 use super::app_route_policy::ProcessIdentity;
-use super::process_loopback::{ProcessLoopbackMode, ProcessLoopbackSource};
+use super::process_loopback::{
+    ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
+};
 use crate::api::{BackendError, BackendResult};
 use crate::router::{AudioFormat, AudioSource, RingSource, StreamHealth};
 use pw_graph_core::NodeId;
@@ -89,9 +91,9 @@ pub struct ProcessMeterTarget {
     pub mode: ProcessLoopbackMode,
 }
 
-/// A non-meter consumer that needs a capture to stay alive.  Route restore
-/// uses this shape so the capture manager can own the same activation/backoff
-/// policy as the meter path without inventing a graph edge.
+/// A non-meter consumer that needs a capture capability. Long-lived
+/// capture-only consumers use this shape; graph-owned isolated routes use it
+/// for the short readiness probe and keep their realtime source in routing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessCaptureRequest {
     pub selector: String,
@@ -125,6 +127,11 @@ struct FailedCapture {
 pub struct ProcessCaptureManager {
     active: BTreeMap<ProcessCaptureKey, ActiveCapture>,
     failed: BTreeMap<CaptureIdentity, FailedCapture>,
+    /// Route restore uses a short operational capability probe before the
+    /// graph-owned route opens its one realtime process source. Keeping the
+    /// probe state separate prevents the manager from opening a second
+    /// long-lived process-loopback client for the same PID.
+    route_probe_states: BTreeMap<CaptureIdentity, ProcessCaptureState>,
     meter_targets: BTreeMap<NodeId, ProcessMeterTarget>,
     route_targets: BTreeSet<CaptureIdentity>,
     external_relay: Option<ProcessCaptureKey>,
@@ -153,9 +160,10 @@ impl ProcessCaptureManager {
         self.reconcile(format);
     }
 
-    /// Reconcile captures required by saved application routes.  Meter and
-    /// route leases are combined before any activation is opened, so a route
-    /// cannot stop a capture that a visible meter still owns.
+    /// Reconcile a long-lived manager-owned capture request. Meter and
+    /// non-graph consumers can share these streams. The graph-owned isolated
+    /// application route uses [`Self::reconcile_route_probes`] instead, then
+    /// opens its one realtime source in the router.
     pub fn reconcile_routes(
         &mut self,
         requests: impl IntoIterator<Item = ProcessCaptureRequest>,
@@ -171,6 +179,75 @@ impl ProcessCaptureManager {
             })
             .collect();
         self.reconcile(format);
+    }
+
+    /// Probe route capture capability without owning a second realtime source.
+    ///
+    /// The graph-owned isolated route opens its own `ProcessLoopbackSource`
+    /// when the plan is applied. Windows 10 can reject two simultaneous
+    /// process-loopback activations for one PID, so a saved route must use the
+    /// bounded activation probe for readiness while leaving the live source to
+    /// the router. Meter and relay consumers continue to use `reconcile` and
+    /// retain their long-lived manager-owned streams.
+    pub fn reconcile_route_probes(
+        &mut self,
+        requests: impl IntoIterator<Item = ProcessCaptureRequest>,
+    ) {
+        self.route_targets = requests
+            .into_iter()
+            .filter_map(|request| {
+                if request.pid == 0
+                    || validate_capture_selector(&request.selector, request.pid).is_err()
+                {
+                    return None;
+                }
+                Some(CaptureIdentity::Selector {
+                    selector: request.selector,
+                    pid: request.pid,
+                    mode: request.mode,
+                })
+            })
+            .collect();
+        self.route_probe_states
+            .retain(|identity, _| self.route_targets.contains(identity));
+
+        for identity in self.route_targets.clone() {
+            let state = match &identity {
+                CaptureIdentity::Selector {
+                    selector,
+                    pid,
+                    mode,
+                } => match ProcessLoopbackSource::detect_capability(*pid, *mode) {
+                    ProcessLoopbackCapability::Available => ProcessCaptureState::Active,
+                    ProcessLoopbackCapability::Unavailable { reason, .. } => {
+                        ProcessCaptureState::Unavailable {
+                            reason: format!("{selector}: {reason}"),
+                        }
+                    }
+                    ProcessLoopbackCapability::Unknown => ProcessCaptureState::Unavailable {
+                        reason: "process-loopback capability is unknown".into(),
+                    },
+                },
+            };
+            self.route_probe_states.insert(identity, state);
+        }
+
+        // A meter may already own a real source for the same identity. Route
+        // readiness is still represented by the probe, but its consumer set
+        // should include the route for diagnostics and shared lifetime logic.
+        let consumers: BTreeMap<_, _> = self
+            .active
+            .keys()
+            .map(|key| {
+                let identity = capture_identity(key);
+                (key.clone(), self.consumers_for(&identity))
+            })
+            .collect();
+        for (key, consumers) in consumers {
+            if let Some(capture) = self.active.get_mut(&key) {
+                capture.consumers = consumers;
+            }
+        }
     }
 
     /// Register the realtime relay activation that is owned by the relay
@@ -434,14 +511,34 @@ impl ProcessCaptureManager {
                 last_error: capture.last_error.clone(),
             })
             .collect();
-        statuses.extend(self.failed.iter().map(|(identity, failure)| {
-            let (selector, pid, mode) = match identity {
-                CaptureIdentity::Selector {
-                    selector,
-                    pid,
-                    mode,
-                } => (selector.clone(), *pid, *mode),
-            };
+        let probed: BTreeSet<_> = self.route_probe_states.keys().cloned().collect();
+        statuses.extend(
+            self.failed
+                .iter()
+                .map(|(identity, failure)| {
+                    let (selector, pid, mode) = match identity {
+                        CaptureIdentity::Selector {
+                            selector,
+                            pid,
+                            mode,
+                        } => (selector.clone(), *pid, *mode),
+                    };
+                    ProcessCaptureStatus {
+                        key: ProcessCaptureKey {
+                            selector,
+                            pid,
+                            generation: 0,
+                            mode,
+                        },
+                        consumers: self.consumers_for(identity),
+                        state: failure.state.clone(),
+                        last_error: Some(failure.error.clone()),
+                    }
+                })
+                .filter(|status| !probed.contains(&capture_identity(&status.key))),
+        );
+        statuses.extend(self.route_probe_states.iter().map(|(identity, state)| {
+            let (selector, pid, mode) = identity_parts(identity);
             ProcessCaptureStatus {
                 key: ProcessCaptureKey {
                     selector,
@@ -449,9 +546,13 @@ impl ProcessCaptureManager {
                     generation: 0,
                     mode,
                 },
-                consumers: self.consumers_for(identity),
-                state: failure.state.clone(),
-                last_error: Some(failure.error.clone()),
+                consumers: BTreeSet::from([ProcessCaptureConsumer::OwnedRoute]),
+                state: state.clone(),
+                last_error: match state {
+                    ProcessCaptureState::Unavailable { reason }
+                    | ProcessCaptureState::Lost { reason } => Some(reason.clone()),
+                    ProcessCaptureState::Active => None,
+                },
             }
         }));
         if let Some(key) = &self.external_relay {
@@ -479,6 +580,7 @@ impl ProcessCaptureManager {
 
     pub fn clear_failures(&mut self) {
         self.failed.clear();
+        self.route_probe_states.clear();
     }
 }
 

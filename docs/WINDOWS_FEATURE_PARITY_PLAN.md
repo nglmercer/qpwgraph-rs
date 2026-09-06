@@ -6,8 +6,9 @@ the WDK `stampinf`/`Inf2Cat` package stage passes with WDK 10.0.26100 and
 released LLVM 21.1.2. A live Windows 10 version 2004 test-signed pass now
 verifies all four ACX endpoints, role ownership, shared-mode streaming, a
 non-silent app render/monitor round trip, install, and uninstall. Driver
-Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client gates remain
-explicitly open.
+Verifier, HLK, Microsoft signing, Secure Boot, and third-party ordinary-client
+gates remain explicitly open; a live ordinary WASAPI Relay Microphone proof is
+now recorded below.
 
 This document replaces the old “build everything from zero” roadmap with the next implementation steps after the Windows parity foundations landed.
 
@@ -76,7 +77,9 @@ warnings remain). A final 2026-09-06 `--build-package`, test-sign, and
 `--validate-package` pass reproduced the same SYS hash and staged the updated
 README/manifest package. The upgraded-build pass above verifies the new
 package's basic cable operation. Full disconnect/reconnect reliability and
-ordinary third-party capture-client acceptance remain separate open gates.
+ordinary third-party capture-client acceptance remain separate open gates; the
+opt-in ordinary shared-mode WASAPI capture-client probe now covers the
+provider-owned Relay Microphone endpoint itself.
 
 The repository-side evidence for this snapshot is complete:
 
@@ -97,6 +100,36 @@ The repository-side evidence for this snapshot is complete:
 - the opt-in live relay endpoint-switch test changed the selected playback
   endpoint while hosting and confirmed that the authenticated host stayed
   active; both relay directions also passed their WASAPI endpoint-start gate;
+- `PW_GRAPH_TEST_RELAY_MICROPHONE=1 cargo test -p windows-audio-test-tone
+  --features relay-tests --test relay_microphone -- --nocapture` passed against
+  the installed package using an ordinary shared-mode WASAPI capture client:
+  peer 1 kHz audio reached `relay-capture`, a separately rendered 2 kHz
+  app-cable tone stayed isolated, disconnect drained to silence, and a second
+  authenticated session delivered peer audio again without a driver restart;
+  the helper explicitly selected a non-QPWGraph render endpoint so the test is
+  independent of the user's default output.
+- `PW_GRAPH_TEST_WINDOWS_EFFECTS=1 cargo test -p windows-audio-test-tone
+  --features relay-tests --test relay_microphone
+  isolated_application_effect_applies_and_bypass_restores_audio -- --nocapture`
+  passed with the helper explicitly rendered to the provider-owned
+  `app-render` endpoint. A live isolated application source traversed a
+  built-in noise gate into physical `Speakers (USB Audio Device)` loopback:
+  the enabled gate carried 96000 frames with zero 1 kHz output, and bypass
+  restored a 0.2431 1 kHz amplitude at 0.2500 peak.
+- `PW_GRAPH_TEST_RELAY_LOCAL_OUTPUT=1 cargo test -p windows-audio-test-tone
+  --features relay-tests --test relay_microphone
+  ordinary_application_relay_preserves_local_output -- --nocapture` passed
+  with a deterministic helper on a physical endpoint: physical loopback
+  measured 0.2500 peak both before and during process-loopback relay.
+- `PW_GRAPH_TEST_WINDOWS_APP_ROUTE_RESTART=1 cargo test
+  -p windows-audio-test-tone --features relay-tests --test relay_microphone
+  isolated_application_route_rebinds_after_helper_restart -- --nocapture`
+  passed with the helper manually isolated on `app-render`: the persisted
+  application route delivered 0.2381 1 kHz amplitude, stopped cleanly when
+  the helper exited, then re-resolved the same stable selector to a new PID
+  and delivered 0.2314 after restart. Route readiness now uses a bounded
+  capability probe so Windows 10 does not receive duplicate process-loopback
+  activations.
 - the WDK-initialized nested workspace passed `cargo test --workspace
   --locked` (3 driver transport tests and 11 core timing/transport tests);
 - `--audit-toolchain` and `--build-package` passed with WDK 10.0.26100,
@@ -470,7 +503,8 @@ Keep process-loopback RMS for eligible active sessions, subject to a sane worker
 
 ```text
 [x] ordinary app session can report true RMS without virtual driver (opt-in helper smoke test passed locally)
-[ ] audible output is unchanged
+[x] audible output is unchanged (opt-in physical-loopback probe measured
+    0.2500 peak before and during ordinary app relay)
 [x] peak fallback survives process-loopback failure (opt-in live native-peak fallback smoke test passed locally with fault-injected process-loopback activation)
 [x] meter policy controls worker lifetime (opt-in helper smoke test passed locally)
 [x] process exit closes capture (opt-in live smoke test passed locally)
@@ -906,8 +940,9 @@ Do not claim four-endpoint readiness until this succeeds:
 The feature-gated implementation creates the app render/monitor pair and the
 independent relay sink/microphone pair, and connects each pair to its own
 bounded Rust cable. The test-signed Windows pass verified all four endpoint
-roles and the app render/monitor stream; relay ordinary-client acceptance and
-release stability gates remain open.
+roles and the app render/monitor stream; the opt-in ordinary shared-mode
+Relay Microphone capture-client pass is recorded in the verification snapshot,
+while third-party-client and release-stability gates remain open.
 
 The first live validation target is the app render/monitor pair; relay
 endpoint acceptance depends on the same stream, verifier, and package gates.
@@ -1178,9 +1213,9 @@ remote peer
 [ ] OBS records received peer audio
 [ ] browser microphone test receives peer audio
 [ ] Discord input receives peer audio
-[ ] stopping relay produces silence, not stale audio
-[ ] restarting relay does not require driver restart
-[ ] app-routing cable audio never leaks into relay mic
+[x] stopping relay produces silence, not stale audio (ordinary WASAPI capture-client probe passed)
+[x] restarting relay does not require driver restart (same probe reconnected and received peer audio)
+[x] app-routing cable audio never leaks into relay mic (distinct 2 kHz app-cable tone stayed absent)
 ```
 
 ---
@@ -1583,8 +1618,8 @@ That is why private AudioPolicyConfig work belongs near the end.
 [ ] peer -> OBS
 [ ] peer -> browser
 [ ] peer -> Discord
-[ ] silence after disconnect
-[ ] no cross-talk with app virtual cable
+[x] silence after disconnect (opt-in ordinary WASAPI capture-client relay probe)
+[x] no cross-talk with app virtual cable (distinct-tone probe)
 ```
 
 ## App reroute/effects
@@ -1593,11 +1628,11 @@ That is why private AudioPolicyConfig work belongs near the end.
 [x] manual isolation recognized (reconciler's virtual-output isolation gate is unit-tested)
 [x] process identity reverified (live activation and PID-reuse identity tests pass)
 [x] dry+processed duplication impossible (ordinary capture-only sessions remain read-only until isolation)
-[ ] effect chain applies
-[ ] effect bypass restores
+[x] effect chain applies (opt-in live isolated-application noise-gate probe)
+[x] effect bypass restores (same live probe restored 1 kHz physical loopback)
 [ ] destination disappears
 [ ] destination returns
-[ ] app restarts
+[x] app restarts (opt-in live persisted isolated-route restart probe)
 ```
 
 ---
@@ -1742,9 +1777,9 @@ Call **Windows parity milestone 2** complete when all of these work:
 [x] saved application route has an explicit reconciler state (reconciler unit tests passed locally)
 [x] one real Rust ACX render endpoint enumerates and streams (test-signed live app cable pass)
 [x] virtual render/capture cable carries deterministic PCM (distinct-tone isolation and silence pass)
-[ ] Relay Microphone works in an ordinary Windows capture client
-[ ] per-app effects work after manual isolation (repository restore path is in place;
-    live processor validation remains)
+[x] Relay Microphone works in an ordinary Windows capture client (opt-in shared-mode WASAPI capture-client relay probe passed)
+[x] per-app effects work after manual isolation (opt-in live isolated-application
+    noise-gate processor probe; repository restore path remains covered)
 [x] portable app still works with no driver installed (opt-in backend startup smoke test passed locally)
 ```
 

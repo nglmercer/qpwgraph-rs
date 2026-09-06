@@ -21,12 +21,13 @@ const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
 
 #[cfg(any(target_os = "windows", test))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Options {
     duration: Duration,
     frequency: f32,
     amplitude: f32,
     sessions: usize,
+    render_id: Option<String>,
     spawn_child_only: bool,
     child_leaf: bool,
 }
@@ -39,6 +40,7 @@ impl Default for Options {
             frequency: 440.0,
             amplitude: 0.25,
             sessions: 1,
+            render_id: None,
             spawn_child_only: false,
             child_leaf: false,
         }
@@ -121,6 +123,12 @@ where
                     .parse::<usize>()
                     .map_err(|_| "--sessions must be an integer".to_owned())?;
             }
+            "--render-id" => {
+                if value.is_empty() {
+                    return Err("--render-id must not be empty".into());
+                }
+                options.render_id = Some(value);
+            }
             _ => return Err(format!("unknown argument {argument}")),
         }
     }
@@ -141,7 +149,7 @@ fn main() {
     let options = match parse_options() {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("{error}\nusage: windows-audio-test-tone [--duration-ms N] [--frequency HZ] [--amplitude 0..1] [--sessions N] [--spawn-child-only]");
+            eprintln!("{error}\nusage: windows-audio-test-tone [--duration-ms N] [--frequency HZ] [--amplitude 0..1] [--sessions N] [--render-id MMDEVICE_ID] [--spawn-child-only]");
             std::process::exit(2);
         }
     };
@@ -188,7 +196,7 @@ fn main() {
     });
     if !options.spawn_child_only {
         for index in 0..options.sessions {
-            let worker_options = options;
+            let worker_options = options.clone();
             workers.push(
                 std::thread::Builder::new()
                     .name(format!("qpwgraph-test-tone-{index}"))
@@ -242,7 +250,12 @@ fn play_wasapi(options: Options, session_index: usize) -> windows::core::Result<
     let enumerator: Audio::IMMDeviceEnumerator = unsafe {
         windows::Win32::System::Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL)?
     };
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole)? };
+    let device = if let Some(render_id) = options.render_id.as_deref() {
+        let wide: Vec<u16> = render_id.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr()))? }
+    } else {
+        unsafe { enumerator.GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole)? }
+    };
     let client: Audio::IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
     // Give each helper worker its own Core Audio session. This keeps
     // `--sessions N` useful for validating applications with multiple active
@@ -328,5 +341,8 @@ mod tests {
         let options = parse_arguments(["--duration-ms", "25", "--frequency", "1000"]).unwrap();
         assert_eq!(options.duration, Duration::from_millis(25));
         assert_eq!(options.frequency, 1_000.0);
+        let options = parse_arguments(["--render-id", "endpoint-id"]).unwrap();
+        assert_eq!(options.render_id.as_deref(), Some("endpoint-id"));
+        assert!(parse_arguments(["--render-id", ""]).is_err());
     }
 }

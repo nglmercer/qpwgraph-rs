@@ -6229,6 +6229,8 @@ name = "windows-audio-test-tone"
 version = "0.1.0"
 dependencies = [
  "pw-graph-backend",
+ "pw-graph-config",
+ "pw-graph-core",
  "windows",
 ]
 
