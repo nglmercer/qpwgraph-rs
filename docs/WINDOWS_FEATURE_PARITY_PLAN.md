@@ -108,6 +108,26 @@ The repository-side evidence for this snapshot is complete:
   authenticated session delivered peer audio again without a driver restart;
   the helper explicitly selected a non-QPWGraph render endpoint so the test is
   independent of the user's default output.
+- OBS Studio 32.2.2 was validated as a real Relay Microphone client through
+  its `wasapi_input_capture` source: `Mic/Aux` was bound to the exact
+  `relay-capture` MMDevice, and a concurrent peer-stream run produced 224 OBS
+  input-meter events with a `0.2587` peak. OBS `StartRecord`/`StopRecord`
+  completed the same run with a non-empty 323,622-byte recording, after which
+  the original default microphone selection was restored.
+- Microsoft Edge 152.0.4191.62 was validated with a disposable local
+  microphone page and a fresh profile. The page selected the provider's two
+  virtual audio-input devices by label; the Relay Microphone endpoint carried
+  a 1 kHz peer tone at `0.0661` correlation amplitude with `0.00014` at 2 kHz,
+  while the other virtual input stayed at `0.00016`/`0.00003`. This proves a
+  real browser `getUserMedia` client receives peer audio without app-cable
+  cross-talk.
+- A signed MSIX build of the deterministic helper was installed and upgraded
+  from `1.0.0.0` to `1.0.0.1` with the same package identity. The packaged
+  process ran from `WindowsApps`, exposed package family
+  `QPWGraph.TestTone_0e9e006802a0a` and AUMID
+  `QPWGraph.TestTone_0e9e006802a0a!Tone`, and delivered non-silent
+  process-loopback audio. Two fresh packaged PIDs retained the same selector
+  after restart/update (`packaged_application_restart_preserves_aumid_selector_when_opted_in`).
 - `PW_GRAPH_TEST_WINDOWS_EFFECTS=1 cargo test -p windows-audio-test-tone
   --features relay-tests --test relay_microphone
   isolated_application_effect_applies_and_bypass_restores_audio -- --nocapture`
@@ -630,7 +650,8 @@ This matters for:
 
 ```text
 [x] unpackaged Win32 app survives restart (reconciler + opt-in helper restart coverage passed locally)
-[ ] packaged app survives restart/update when its stable app identity remains
+[x] packaged app survives restart/update when its stable app identity remains
+    (signed MSIX helper update and AUMID/PID restart probe passed)
 [x] PID reuse never activates an unrelated app (identity/reconciler tests passed locally)
 [x] display-name-only selector never activates automatically (selector test passed locally)
 ```
@@ -1210,8 +1231,10 @@ remote peer
 ### Acceptance
 
 ```text
-[ ] OBS records received peer audio
-[ ] browser microphone test receives peer audio
+[x] OBS records received peer audio (OBS Studio 32.2.2 was bound to the
+    `relay-capture` endpoint; its input meter and recording were non-silent)
+[x] browser microphone test receives peer audio (Edge 152 disposable
+    `getUserMedia` page measured the 1 kHz Relay Microphone tone)
 [ ] Discord input receives peer audio
 [x] stopping relay produces silence, not stale audio (ordinary WASAPI capture-client probe passed)
 [x] restarting relay does not require driver restart (same probe reconnected and received peer audio)
@@ -1567,7 +1590,8 @@ That is why private AudioPolicyConfig work belongs near the end.
 
 ```text
 [x] ordinary Win32 app (deterministic helper; opt-in live smoke test passed locally)
-[ ] packaged/MSIX app
+[x] packaged/MSIX app (signed helper package installed from WindowsApps and
+    process-loopback audio verified)
 [x] browser with child processes (Firefox Web Audio tone; opt-in browser application-relay smoke passed locally)
 [x] multiple audio sessions in same process (opt-in helper live smoke test passed locally)
 [x] silent process (opt-in helper live smoke test passed locally)
@@ -1615,8 +1639,8 @@ That is why private AudioPolicyConfig work belongs near the end.
 ## Relay microphone
 
 ```text
-[ ] peer -> OBS
-[ ] peer -> browser
+[x] peer -> OBS (OBS Studio 32.2.2 recording-backed Relay Microphone probe)
+[x] peer -> browser (Edge 152 disposable `getUserMedia` page)
 [ ] peer -> Discord
 [x] silence after disconnect (opt-in ordinary WASAPI capture-client relay probe)
 [x] no cross-talk with app virtual cable (distinct-tone probe)

@@ -116,6 +116,101 @@ fn helper_audio_is_visible_to_process_loopback_when_opted_in() {
 }
 
 #[test]
+fn packaged_application_identity_and_process_loopback_are_visible_when_opted_in() {
+    if std::env::var("PW_GRAPH_TEST_PACKAGED_APP").ok().as_deref() != Some("1") {
+        return;
+    }
+    let pid = std::env::var("PW_GRAPH_TEST_PACKAGED_PID")
+        .expect("PW_GRAPH_TEST_PACKAGED_PID is required for packaged-app smoke")
+        .parse::<u32>()
+        .expect("PW_GRAPH_TEST_PACKAGED_PID is numeric");
+    let identity = ProcessIdentity::from_pid(pid).expect("packaged process is queryable");
+    assert!(
+        identity.package_family_name.is_some(),
+        "packaged helper did not expose a package family: {identity:?}"
+    );
+    assert!(
+        identity.app_user_model_id.is_some(),
+        "packaged helper did not expose an AUMID: {identity:?}"
+    );
+    let (mut source, mut worker) = ProcessLoopbackSource::open(
+        pid,
+        ProcessLoopbackMode::IncludeProcessTree,
+        AudioFormat::new(48_000, 2),
+        4_096,
+    )
+    .expect("packaged helper process-loopback activation failed");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut block = vec![0.0f32; 480 * 2];
+    let mut observed = false;
+    while Instant::now() < deadline {
+        let read = source.read(&mut block);
+        if read.health == StreamHealth::Lost {
+            break;
+        }
+        if read.frames > 0
+            && block[..read.frames * 2]
+                .iter()
+                .any(|sample| sample.abs() > 0.01)
+        {
+            observed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    worker.stop();
+    println!(
+        "packaged process family={:?} aumid={:?} selector={:?} audio={observed}",
+        identity.package_family_name,
+        identity.app_user_model_id,
+        identity.selector_key()
+    );
+    assert!(
+        observed,
+        "packaged helper produced no process-loopback audio"
+    );
+}
+
+#[test]
+fn packaged_application_restart_preserves_aumid_selector_when_opted_in() {
+    if std::env::var("PW_GRAPH_TEST_PACKAGED_RESTART")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let pids = std::env::var("PW_GRAPH_TEST_PACKAGED_PIDS")
+        .expect("PW_GRAPH_TEST_PACKAGED_PIDS is required for packaged restart smoke")
+        .split(',')
+        .map(|value| value.parse::<u32>().expect("packaged PID is numeric"))
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 2, "packaged restart smoke needs two PIDs");
+    let first = ProcessIdentity::from_pid(pids[0]).expect("first packaged process is queryable");
+    let second =
+        ProcessIdentity::from_pid(pids[1]).expect("restarted packaged process is queryable");
+    assert_eq!(
+        first.package_family_name, second.package_family_name,
+        "package family changed across the restart: first={first:?} second={second:?}"
+    );
+    assert_eq!(
+        first.app_user_model_id, second.app_user_model_id,
+        "AUMID changed across the restart: first={first:?} second={second:?}"
+    );
+    assert_eq!(
+        first.selector_key(),
+        second.selector_key(),
+        "stable selector changed across the restart: first={first:?} second={second:?}"
+    );
+    println!(
+        "packaged restart selectors: first_pid={} second_pid={} selector={:?}",
+        pids[0],
+        pids[1],
+        second.selector_key()
+    );
+}
+
+#[test]
 fn process_loopback_includes_audio_from_child_processes() {
     if std::env::var("PW_GRAPH_TEST_PROCESS_CHILD_TREE")
         .ok()
