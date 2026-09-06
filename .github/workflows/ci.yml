@@ -203,6 +203,29 @@ jobs:
       - name: Validate Windows driver package metadata
         shell: pwsh
         run: cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --validate-package
+      - name: Validate read-only Windows release tooling
+        shell: pwsh
+        run: |
+          $scripts = @(
+            'drivers/windows-audio/package/release-audit.ps1',
+            'drivers/windows-audio/package/lifecycle-validation.ps1'
+          )
+          foreach ($scriptPath in $scripts) {
+            $tokens = $null
+            $errors = $null
+            $text = Get-Content -LiteralPath $scriptPath -Raw
+            [void][System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) {
+              $messages = ($errors | ForEach-Object { $_.Message }) -join '; '
+              throw "$scriptPath failed PowerShell parsing: $messages"
+            }
+          }
+          $auditJson = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scripts[0] -Json | Out-String
+          $audit = $auditJson | ConvertFrom-Json
+          if ($audit.checks.Count -eq 0) {
+            throw 'The release audit returned no checks.'
+          }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scripts[1] -Phase Plan
       - name: Windows driver ring-core tests
         run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
 
