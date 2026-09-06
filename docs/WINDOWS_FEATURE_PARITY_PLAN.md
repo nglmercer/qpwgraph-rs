@@ -832,7 +832,9 @@ Do not poll aggressively.
 # 6. Priority P0 — Finish support diagnostics UI
 
 The bounded backend report and a Windows diagnostics rail action are now wired;
-the live report still needs validation on a Windows audio system.
+opt-in process-loopback policy and fault tests exercise the report's live
+capture state and privacy boundary; an interactive clipboard-copy pass remains
+manual UI validation.
 
 ---
 
@@ -888,9 +890,9 @@ EvtDeviceAdd -> STATUS_NOT_SUPPORTED
 
 The opt-in `acx` build now contains the app and relay endpoint transactions in
 the C-side ACX bridge, while the Rust entry point keeps the opaque ACX ABI
-isolated. The release build and unsigned package stage are verified locally;
-the remaining blocker is the test-signed load, endpoint enumeration, and
-streaming validation pass.
+isolated. The release build, unsigned package stage, and test-signed
+endpoint/streaming validation pass are recorded above; the remaining blockers
+are release Verifier/HLK/signing/Secure-Boot and broader ordinary-client gates.
 
 ---
 
@@ -1085,8 +1087,10 @@ mixed render producer and one capture consumer, couples the bounded SPSC ring
 to monotonic render/capture clocks, records packet QPC/discontinuity state, and
 tests drop-newest overflow (including whole-frame admission for an unaligned
 sample capacity) plus silence-on-underflow. The opt-in ACX adapter now connects
-the PCM16 packet callbacks to the Rust SPSC cable; the live pin, clock, and
-underflow behavior still needs Windows validation.
+the PCM16 packet callbacks to the Rust SPSC cable; the installed-package live
+app/relay cable pass verifies endpoint streaming, distinct-tone isolation, and
+stopped-render silence. Power-cycle and device-lifecycle behavior remain live
+gates.
 
 After one render endpoint and the timing model work:
 
@@ -1403,11 +1407,12 @@ source gain.
 A failed effect restore must not leave half the route graph applied.
 
 The chosen policy is to fail the entire activation and report
-`EffectRestoreFailed`; saved effects are never silently bypassed. Live Windows
-acceptance still needs to verify processor audio, parameter behavior, restart
-reconciliation, and rollback on the supported effect host. Module-backed
-effects are rejected explicitly until the Windows realtime host supports their
-module path; they are never substituted with a built-in processor.
+`EffectRestoreFailed`; saved effects are never silently bypassed. The live
+isolated-application probe verifies processor audio, bypass, and restart
+reconciliation; physical destination disappearance/return and a dedicated
+rollback exercise remain open. Module-backed effects are rejected explicitly
+until the Windows realtime host supports their module path; they are never
+substituted with a built-in processor.
 
 ---
 
