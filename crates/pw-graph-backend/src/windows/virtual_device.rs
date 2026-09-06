@@ -29,6 +29,17 @@ impl QpwVirtualEndpointRole {
             Self::RelayCapture => "relay-capture",
         }
     }
+
+    /// Return the durable selector used for a provider-owned endpoint when
+    /// Windows does not expose `PKEY_AudioEndpoint_StableId`.
+    ///
+    /// This is deliberately namespaced and semantic rather than derived from
+    /// a display name or the current MMDevice id. Callers may use it only
+    /// after proving the endpoint's qpwgraph service, parent, and role
+    /// properties; the string itself is not an ownership proof.
+    pub fn stable_selector(self) -> String {
+        format!("qpwgraph:{}", self.config_key())
+    }
 }
 
 /// Driver-owned identity for one virtual endpoint.  A friendly name is not
@@ -269,6 +280,25 @@ mod tests {
             true,
         )
         .is_none());
+    }
+
+    #[test]
+    fn provider_roles_have_distinct_namespaced_stable_selectors() {
+        let selectors = [
+            QpwVirtualEndpointRole::AppRender.stable_selector(),
+            QpwVirtualEndpointRole::AppMonitor.stable_selector(),
+            QpwVirtualEndpointRole::RelayRender.stable_selector(),
+            QpwVirtualEndpointRole::RelayCapture.stable_selector(),
+        ];
+        assert_eq!(
+            selectors,
+            [
+                "qpwgraph:app-render",
+                "qpwgraph:app-monitor",
+                "qpwgraph:relay-render",
+                "qpwgraph:relay-capture",
+            ]
+        );
     }
 
     fn identity(role: QpwVirtualEndpointRole, version: Option<&str>) -> QpwVirtualEndpointIdentity {

@@ -177,6 +177,38 @@ fn portable_backend_starts_without_the_optional_virtual_driver() {
 }
 
 #[test]
+#[ignore = "requires the installed QPWGraph virtual audio driver"]
+fn installed_provider_endpoints_expose_durable_selectors_after_refresh() {
+    let driver = WindowsAudioDriver::new().expect("Core Audio should be available");
+    assert_eq!(driver.virtual_endpoint_identities.len(), 4);
+    for identity in &driver.virtual_endpoint_identities {
+        let selector = driver
+            .endpoint_selectors
+            .get(&identity.mmdevice_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "provider endpoint {:?} had no selector for {}",
+                    identity.role, identity.mmdevice_id
+                )
+            });
+        let expected_flow = match identity.role {
+            QpwVirtualEndpointRole::AppRender | QpwVirtualEndpointRole::RelayRender => {
+                AudioFlow::Render
+            }
+            QpwVirtualEndpointRole::AppMonitor | QpwVirtualEndpointRole::RelayCapture => {
+                AudioFlow::Capture
+            }
+        };
+        assert_eq!(selector.data_flow, expected_flow);
+        let expected = identity
+            .stable_endpoint_id
+            .clone()
+            .unwrap_or_else(|| identity.role.stable_selector());
+        assert_eq!(selector.stable_id.as_deref(), Some(expected.as_str()));
+    }
+}
+
+#[test]
 fn every_playback_endpoint_offers_a_monitor_alongside_its_input() {
     let Ok(driver) = WindowsAudioDriver::new() else {
         return;

@@ -402,7 +402,7 @@ impl CoreAudioWorker {
             } else {
                 AudioFlow::Capture
             };
-            let selector = WindowsEndpointSelector::from_device(&device, data_flow).unwrap_or(
+            let mut selector = WindowsEndpointSelector::from_device(&device, data_flow).unwrap_or(
                 WindowsEndpointSelector {
                     stable_id: None,
                     current_mmdevice_id: None,
@@ -412,6 +412,13 @@ impl CoreAudioWorker {
             );
             let virtual_identity = qpwgraph_virtual_endpoint_identity(&device, &endpoint_id)
                 .filter(|identity| qpwgraph_endpoint_role_matches_flow(flow, identity.role));
+            // Windows 10 images predating PKEY_AudioEndpoint_StableId still
+            // expose the provider-owned role property. Once the service,
+            // parent, and semantic role have all been verified, that role is
+            // a safer durable selector than the MMDevice id generated for
+            // this installation. Physical endpoints retain the documented
+            // PKEY -> MMDevice -> unique-name resolution order.
+            apply_provider_selector_fallback(&mut selector, virtual_identity.as_ref());
             let endpoint = EndpointRecord {
                 id: endpoint_id,
                 flow,

@@ -33,9 +33,10 @@ const PKEY_QPWGRAPH_ENDPOINT_ROLE: PROPERTYKEY = PROPERTYKEY {
 const QPWGRAPH_DRIVER_SERVICE: &str = "qpwgraph_audio";
 const QPWGRAPH_ROOT_DEVICE_INSTANCE_ID: &str = "ROOT\\DEVGEN\\QPWGRAPH_AUDIO";
 
-/// The durable selector used when Windows exposes a stable endpoint id.
+/// The durable selector used when Windows exposes a stable endpoint id or when
+/// a provider-owned endpoint has a verified semantic selector fallback.
 /// `current_mmdevice_id` and `friendly_name` are fallbacks and diagnostics,
-/// never a replacement for a matching stable id.
+/// never a replacement for a matching durable selector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsEndpointSelector {
     pub stable_id: Option<String>,
@@ -160,6 +161,24 @@ impl WindowsEndpointSelector {
             .collect();
         Ok(resolve_endpoint_candidate_index(self, &identities)?
             .map(|index| candidates[index].0.clone()))
+    }
+}
+
+/// Add the semantic selector that a verified provider-owned endpoint can use
+/// when this Windows image does not expose `PKEY_AudioEndpoint_StableId`.
+///
+/// This helper is intentionally separate from endpoint enumeration so the
+/// fallback can be tested without manufacturing COM objects. A caller must
+/// supply the result of the provider ownership/role proof; an arbitrary role
+/// string must never make a friendly-name endpoint look provider-owned.
+pub(super) fn apply_provider_selector_fallback(
+    selector: &mut WindowsEndpointSelector,
+    identity: Option<&QpwVirtualEndpointIdentity>,
+) {
+    if selector.stable_id.is_none() {
+        if let Some(identity) = identity {
+            selector.stable_id = Some(identity.role.stable_selector());
+        }
     }
 }
 
@@ -594,6 +613,102 @@ mod tests {
             resolve_endpoint_candidate_index(&selector, &candidates).unwrap(),
             Some(0)
         );
+    }
+
+    #[test]
+    fn provider_role_selector_survives_current_mmdevice_id_churn() {
+        let selector = selector(
+            Some("qpwgraph:relay-capture"),
+            Some("old-mmdevice"),
+            Some("QPWGraph Relay Microphone"),
+        );
+        let candidates = vec![
+            candidate(
+                Some("qpwgraph:relay-capture"),
+                "new-mmdevice",
+                Some("QPWGraph Relay Microphone"),
+            ),
+            candidate(
+                Some("qpwgraph:relay-render"),
+                "other-mmdevice",
+                Some("QPWGraph Relay Sink"),
+            ),
+        ];
+
+        assert_eq!(
+            resolve_endpoint_candidate_index(&selector, &candidates).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn provider_selector_fallback_requires_verified_identity_and_preserves_pkey() {
+        let mut selector_without_identity = selector(None, Some("mmdevice"), Some("Relay"));
+        apply_provider_selector_fallback(&mut selector_without_identity, None);
+        assert_eq!(selector_without_identity.stable_id, None);
+
+        let identity = QpwVirtualEndpointIdentity {
+            role: QpwVirtualEndpointRole::RelayCapture,
+            stable_endpoint_id: None,
+            mmdevice_id: "mmdevice".into(),
+            driver_version: Some("test".into()),
+        };
+        apply_provider_selector_fallback(&mut selector_without_identity, Some(&identity));
+        assert_eq!(
+            selector_without_identity.stable_id.as_deref(),
+            Some("qpwgraph:relay-capture")
+        );
+
+        let mut selector_with_pkey = selector(Some("windows-stable"), Some("mmdevice"), None);
+        apply_provider_selector_fallback(&mut selector_with_pkey, Some(&identity));
+        assert_eq!(
+            selector_with_pkey.stable_id.as_deref(),
+            Some("windows-stable")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the installed QPWGraph virtual audio driver"]
+    fn installed_virtual_endpoints_have_durable_role_selectors() {
+        unsafe { Com::CoInitializeEx(None, Com::COINIT_MULTITHREADED) }
+            .ok()
+            .unwrap();
+        let enumerator: Audio::IMMDeviceEnumerator =
+            unsafe { Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, Com::CLSCTX_ALL) }
+                .unwrap();
+        let mut found = 0;
+        for flow in [Audio::eRender, Audio::eCapture] {
+            let collection =
+                unsafe { enumerator.EnumAudioEndpoints(flow, Audio::DEVICE_STATE_ACTIVE) }.unwrap();
+            for index in 0..unsafe { collection.GetCount() }.unwrap() {
+                let device = unsafe { collection.Item(index) }.unwrap();
+                let id = unsafe { device.GetId() }.map(take_pwstr).unwrap();
+                let Some(identity) = qpwgraph_virtual_endpoint_identity(&device, &id) else {
+                    continue;
+                };
+                let data_flow = if flow == Audio::eRender {
+                    AudioFlow::Render
+                } else {
+                    AudioFlow::Capture
+                };
+                let mut selector = WindowsEndpointSelector::from_device(&device, data_flow)
+                    .expect("provider endpoint should expose a selector");
+                let had_windows_stable_id = selector.stable_id.is_some();
+                apply_provider_selector_fallback(&mut selector, Some(&identity));
+                let role_selector = identity.role.stable_selector();
+                assert!(selector.stable_id.is_some());
+                if !had_windows_stable_id {
+                    assert_eq!(selector.stable_id.as_deref(), Some(role_selector.as_str()));
+                }
+                println!(
+                    "provider role={:?} pkey_stable_id={} selector={:?} mmdevice_id={}",
+                    identity.role, had_windows_stable_id, selector.stable_id, id
+                );
+                found += 1;
+            }
+        }
+        assert_eq!(found, 4, "all four provider endpoint roles must be present");
+        unsafe { Com::CoUninitialize() };
     }
 
     #[test]

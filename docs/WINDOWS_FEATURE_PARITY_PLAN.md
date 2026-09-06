@@ -128,6 +128,15 @@ The repository-side evidence for this snapshot is complete:
   `QPWGraph.TestTone_0e9e006802a0a!Tone`, and delivered non-silent
   process-loopback audio. Two fresh packaged PIDs retained the same selector
   after restart/update (`packaged_application_restart_preserves_aumid_selector_when_opted_in`).
+- The live backend selector probe against the installed development driver
+  found all four provider roles with no Windows PKEY stable ID and assigned
+  the namespaced semantic selectors `qpwgraph:app-render`,
+  `qpwgraph:app-monitor`, `qpwgraph:relay-render`, and
+  `qpwgraph:relay-capture`; the probe passed after current MMDevice IDs were
+  enumerated. The worker-level refresh assertion
+  (`installed_provider_endpoints_expose_durable_selectors_after_refresh`)
+  passed as well. The fallback is ownership-gated and never applies to a
+  physical endpoint.
 - `PW_GRAPH_TEST_WINDOWS_EFFECTS=1 cargo test -p windows-audio-test-tone
   --features relay-tests --test relay_microphone
   isolated_application_effect_applies_and_bypass_restores_audio -- --nocapture`
@@ -193,6 +202,7 @@ The main architectural rule stays unchanged:
 - [x] route-capture readiness is keyed by stable selector plus live PID, and duplicate endpoint IDs/flow mismatches fail closed;
 - [x] packaged identities use AUMID/package-family data when Windows exposes it;
 - [x] endpoint selectors resolve stable ID -> current MMDevice ID -> unique friendly-name fallback;
+- [x] verified qpwgraph endpoints without a Windows stable ID use a namespaced semantic-role selector that survives MMDevice-ID churn;
 - [x] persisted application routes reconcile on startup/refresh and migrate legacy destination selectors;
 - [x] Windows audio report can be copied from the UI without exposing PCM, paths, or relay secrets;
 - [x] virtual endpoint ownership now requires the qpwgraph service plus a provider-published semantic role property;
@@ -1177,15 +1187,23 @@ contract on each endpoint interface. The current INF template uses endpoint
 store `HKR,EP\0` values for the four role values and retains typed
 `AddProperty` sections for device-property consumers. The live test-signed
 install exposed and verified both forms on all four endpoints. The Windows 10
-image does not expose `PKEY_AudioEndpoint_StableId`, so the selector continues
-to fall back to the opaque MMDevice ID and then a unique friendly name on that
+image does not expose `PKEY_AudioEndpoint_StableId`. For provider-owned
+qpwgraph endpoints, the backend now uses a namespaced semantic role selector
+(`qpwgraph:app-render`, `qpwgraph:app-monitor`, `qpwgraph:relay-render`, or
+`qpwgraph:relay-capture`) after the service, parent, and role proof succeeds;
+this survives the image's MMDevice-ID churn. Physical endpoints still use the
+documented PKEY -> opaque MMDevice ID -> unique friendly-name order on that
 OS.
 
 The backend now resolves the parent devnode service with the Configuration
 Manager API, matching the provider proof used by the smoke probe. The ignored
-live backend test `installed_virtual_endpoints_have_backend_ownership_identity`
 passes against the upgraded `oem20.inf` installation and recognizes all four
-roles after their MMDevice IDs changed. A friendly-name-only endpoint still
+roles after their MMDevice IDs changed. The ignored live selector probe
+`installed_virtual_endpoints_have_durable_role_selectors` also passes: on this
+Windows 10 image the PKEY is absent, so every verified role receives its
+`qpwgraph:*` semantic selector. The worker-level
+`installed_provider_endpoints_expose_durable_selectors_after_refresh` assertion
+passes against the same live snapshot. A friendly-name-only endpoint still
 cannot satisfy this proof.
 
 ### Required behavior
@@ -1659,6 +1677,11 @@ That is why private AudioPolicyConfig work belongs near the end.
 [x] app restarts (opt-in live persisted isolated-route restart probe)
 ```
 
+The two destination rows above still require a live effect-route probe that
+removes and restores an actual destination endpoint. The reconciler's
+missing/returning transition is covered by deterministic tests; those tests do
+not substitute for physically disappearing and returning endpoint evidence.
+
 ---
 
 # 22. New PR sequence
@@ -1798,6 +1821,8 @@ Call **Windows parity milestone 2** complete when all of these work:
 [x] true RMS for a normal application without driver (opt-in helper smoke test passed locally)
 [x] stable app selectors survive restart (opt-in helper smoke test passed locally)
 [ ] stable endpoint selectors survive normal endpoint churn
+    (provider-owned semantic-role fallback is implemented and unit-tested;
+    live physical-endpoint churn remains)
 [x] saved application route has an explicit reconciler state (reconciler unit tests passed locally)
 [x] one real Rust ACX render endpoint enumerates and streams (test-signed live app cable pass)
 [x] virtual render/capture cable carries deterministic PCM (distinct-tone isolation and silence pass)
