@@ -1542,6 +1542,14 @@ Release-driver gate:
 [x] upgrade and uninstall verified (exact package binding, endpoint removal, and reinstall pass)
 ```
 
+The staged package now includes a read-only `release-audit.ps1` report. It
+checks package/signature shape, WDK/compiler/HLK availability, verifier and
+Secure Boot state, test-signing state, provider-device presence, and client
+availability, then keeps the manual HLK, Microsoft-signing, lifecycle, and
+ordinary-client rows explicitly open. It never changes boot, device, signing,
+or installation state; `-Strict` is suitable for a release gate and `-Json`
+produces CI-consumable evidence.
+
 Portable user-mode ZIP remains independent.
 
 Release tiers:

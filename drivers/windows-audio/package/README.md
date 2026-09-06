@@ -152,6 +152,27 @@ WDKContentRoot, the versioned KM CRT headers, acx.h, the target-architecture
 attempted. A nonzero result means the bootstrap driver remains fail-closed;
 it is not evidence that an endpoint build succeeded.
 
+`release-audit.ps1` is a read-only release-gate report for a build or test
+machine. It checks the staged package shape and signatures, WDK/compiler/HLK
+availability, verifier and Secure Boot state, test-signing state, installed
+provider devices, and ordinary-client availability. It also lists the manual
+HLK, Microsoft-signing, lifecycle, and ordinary-client acceptance rows that
+cannot be proven by inspection. It never installs, signs, enables, disables,
+restarts, or removes anything. By default it reports all findings and exits
+zero so it can be collected on an incomplete machine; `-Strict` exits nonzero
+when any row is blocked or unknown, and `-Json` emits a machine-readable report:
+
+```powershell
+Push-Location drivers/windows-audio/package
+.\release-audit.ps1
+.\release-audit.ps1 -Json > release-audit.json
+.\release-audit.ps1 -Strict
+Pop-Location
+```
+
+When a staged package exists, the script audits it automatically; otherwise it
+audits the source package and reports the expected missing build artifacts.
+
 After a passing audit, the opt-in binding compilation is:
 
     Push-Location drivers/windows-audio

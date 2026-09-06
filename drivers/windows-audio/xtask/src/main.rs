@@ -130,6 +130,7 @@ fn stage_package(
         "test-validation.ps1",
         "run-validation-elevated.ps1",
         "run-validation.cmd",
+        "release-audit.ps1",
         "README.md",
     ] {
         let path = output.join(filename);
@@ -216,6 +217,7 @@ fn stage_package(
         "test-validation.ps1",
         "run-validation-elevated.ps1",
         "run-validation.cmd",
+        "release-audit.ps1",
         "README.md",
     ] {
         let source = package_source.join(filename);
@@ -763,6 +765,28 @@ fn validate_package_metadata() {
             elevated_validation_script.contains(required),
             "{} is missing elevated-launch marker {required}",
             package.join("run-validation-elevated.ps1").display()
+        );
+    }
+    let release_audit_script =
+        fs::read_to_string(package.join("release-audit.ps1")).unwrap_or_else(|error| {
+            panic!(
+                "could not read {}: {error}",
+                package.join("release-audit.ps1").display()
+            );
+        });
+    for required in [
+        "#requires -Version 5.1",
+        "Get-AuthenticodeSignature",
+        "Confirm-SecureBootUEFI",
+        "verifier.exe",
+        "[switch] $Strict",
+        "[switch] $Json",
+        "never changes boot",
+    ] {
+        assert!(
+            release_audit_script.contains(required),
+            "{} is missing read-only release-audit marker {required}",
+            package.join("release-audit.ps1").display()
         );
     }
     println!("driver package metadata validated");
