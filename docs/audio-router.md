@@ -25,16 +25,18 @@ graph engine.
 
 With WASAPI endpoints on both ends it carries device-to-device audio today —
 microphone into speakers, one playback device's monitor into another. What it
-cannot do is present a qpwgraph-owned endpoint that *other* applications can
-select: the virtual microphone the relay needs, and the destination an
-arbitrary application could be pointed at. The driver workspace currently
-contains a fail-closed KMDF bootstrap and bounded ring core; the ACX endpoint
-circuits still require a real WDK/eWDK build and VM validation.
+cannot do without the optional driver is present a qpwgraph-owned endpoint
+that *other* applications can select: the virtual microphone the relay needs,
+and the destination an arbitrary application could be pointed at. The driver
+workspace contains an opt-in ACX endpoint runtime and bounded Rust transport,
+but its Rust-driver port, WDK/eWDK build, Verifier, HLK, signing, Secure Boot,
+and third-party-client evidence remain release-gated.
 
 Capturing a single application is now represented by the Windows
-`ProcessLoopbackSource`. It is activated only for a session already assigned
-to QPWGraph Virtual Output, so effects and RMS operate on owned PCM without
-creating a dry duplicate path.
+`ProcessLoopbackSource`. It can capture an ordinary session read-only for
+relay and RMS. Local effects and rerendering are activated only after the
+session is assigned to QPWGraph Virtual Output, so a processed copy cannot be
+played alongside the original dry path.
 
 ## The block cycle
 

@@ -25,6 +25,9 @@ pub struct ProcessIdentity {
     pub package_family_name: Option<String>,
     pub app_user_model_id: Option<String>,
     pub display_name: Option<String>,
+    /// Runtime-only PID used immediately before a policy call. It is never
+    /// included in [`Self::application_selector`] or persisted configuration.
+    pub(crate) process_id: Option<u32>,
 }
 
 impl ProcessIdentity {
@@ -36,9 +39,10 @@ impl ProcessIdentity {
 
     /// Resolve the stable identity that is available for a live process.
     ///
-    /// The PID is used only during this query and is intentionally not stored
-    /// in the returned value. A path hash and executable name together prevent
-    /// a persisted route from silently attaching to an unrelated PID reuse.
+    /// The PID is used for this live query and retained only as runtime
+    /// metadata for the immediate policy call. It is never part of the
+    /// persisted selector. A path hash and executable name together prevent a
+    /// persisted route from silently attaching to an unrelated PID reuse.
     pub fn from_pid(pid: u32) -> BackendResult<Self> {
         if pid == 0 {
             return Err(BackendError::native(
@@ -83,7 +87,12 @@ impl ProcessIdentity {
             package_family_name,
             app_user_model_id,
             display_name: executable_name,
+            process_id: Some(pid),
         })
+    }
+
+    pub(crate) fn runtime_pid(&self) -> Option<u32> {
+        self.process_id.filter(|pid| *pid != 0)
     }
 
     /// A compact selector suitable for endpoint-choice IDs and diagnostics.
@@ -186,7 +195,7 @@ pub enum AudioFlow {
     Capture,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AudioRole {
     Console,
     Multimedia,
@@ -195,8 +204,13 @@ pub enum AudioRole {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppRoutePolicySupport {
-    ManualOnly { reason: String },
-    Experimental { interface_version: String },
+    ManualOnly {
+        reason: String,
+    },
+    Experimental {
+        interface_version: String,
+        os_build: u32,
+    },
 }
 
 pub trait AppRoutePolicy: Send + Sync {
@@ -265,6 +279,7 @@ mod tests {
             package_family_name: None,
             app_user_model_id: None,
             display_name: Some("Player".into()),
+            process_id: None,
         };
         assert!(identity.is_stable());
     }
@@ -282,6 +297,7 @@ mod tests {
                     package_family_name: None,
                     app_user_model_id: None,
                     display_name: None,
+                    process_id: None,
                 },
                 AudioFlow::Render,
                 AudioRole::Multimedia,
@@ -298,6 +314,7 @@ mod tests {
             package_family_name: None,
             app_user_model_id: None,
             display_name: None,
+            process_id: None,
         };
         let candidate = ProcessIdentity {
             executable_path_hash: Some("SHA256:ABC".into()),
@@ -305,6 +322,7 @@ mod tests {
             package_family_name: None,
             app_user_model_id: None,
             display_name: Some("A different display name".into()),
+            process_id: None,
         };
         assert!(selector.matches(&candidate));
         assert_eq!(selector.selector_key().as_deref(), Some("sha256:abc"));

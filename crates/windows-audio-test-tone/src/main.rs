@@ -28,6 +28,7 @@ struct Options {
     amplitude: f32,
     sessions: usize,
     render_id: Option<String>,
+    reopen_after_ms: Option<u64>,
     spawn_child_only: bool,
     child_leaf: bool,
 }
@@ -41,6 +42,7 @@ impl Default for Options {
             amplitude: 0.25,
             sessions: 1,
             render_id: None,
+            reopen_after_ms: None,
             spawn_child_only: false,
             child_leaf: false,
         }
@@ -129,6 +131,15 @@ where
                 }
                 options.render_id = Some(value);
             }
+            "--reopen-after-ms" => {
+                let millis = value
+                    .parse::<u64>()
+                    .map_err(|_| "--reopen-after-ms must be an integer".to_owned())?;
+                if millis > 60_000 {
+                    return Err("--reopen-after-ms must be between 0 and 60000".into());
+                }
+                options.reopen_after_ms = Some(millis);
+            }
             _ => return Err(format!("unknown argument {argument}")),
         }
     }
@@ -149,38 +160,43 @@ fn main() {
     let options = match parse_options() {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("{error}\nusage: windows-audio-test-tone [--duration-ms N] [--frequency HZ] [--amplitude 0..1] [--sessions N] [--render-id MMDEVICE_ID] [--spawn-child-only]");
+            eprintln!("{error}\nusage: windows-audio-test-tone [--duration-ms N] [--frequency HZ] [--amplitude 0..1] [--sessions N] [--render-id MMDEVICE_ID] [--reopen-after-ms N] [--spawn-child-only]");
             std::process::exit(2);
         }
     };
     println!(
-        "pid={} sample-rate={} channels={} frequency={} amplitude={} sessions={}",
+        "pid={} sample-rate={} channels={} frequency={} amplitude={} sessions={} reopen-after-ms={:?}",
         std::process::id(),
         SAMPLE_RATE,
         CHANNELS,
         options.frequency,
         options.amplitude,
-        options.sessions
+        options.sessions,
+        options.reopen_after_ms,
     );
 
     let mut child: Option<Child> = None;
     if options.spawn_child_only && !options.child_leaf {
         let child_frequency = (options.frequency * 3.0).min(20_000.0);
         let duration_ms = options.duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        let mut child_args = vec![
+            "--duration-ms".to_owned(),
+            duration_ms.to_string(),
+            "--frequency".to_owned(),
+            child_frequency.to_string(),
+            "--amplitude".to_owned(),
+            options.amplitude.to_string(),
+        ];
+        if let Some(reopen_after_ms) = options.reopen_after_ms {
+            child_args.extend(["--reopen-after-ms".to_owned(), reopen_after_ms.to_string()]);
+        }
+        child_args.push("--child-leaf".to_owned());
         child = Some(
             Command::new(std::env::current_exe().unwrap_or_else(|error| {
                 eprintln!("could not locate the helper executable: {error}");
                 std::process::exit(1);
             }))
-            .args([
-                "--duration-ms".to_owned(),
-                duration_ms.to_string(),
-                "--frequency".to_owned(),
-                child_frequency.to_string(),
-                "--amplitude".to_owned(),
-                options.amplitude.to_string(),
-                "--child-leaf".to_owned(),
-            ])
+            .args(child_args)
             .spawn()
             .unwrap_or_else(|error| {
                 eprintln!("could not start child tone process: {error}");
@@ -247,73 +263,95 @@ fn play_wasapi(options: Options, session_index: usize) -> windows::core::Result<
     use windows::Win32::System::Com::CLSCTX_ALL;
 
     const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
-    let enumerator: Audio::IMMDeviceEnumerator = unsafe {
-        windows::Win32::System::Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL)?
-    };
-    let device = if let Some(render_id) = options.render_id.as_deref() {
-        let wide: Vec<u16> = render_id.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe { enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr()))? }
-    } else {
-        unsafe { enumerator.GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole)? }
-    };
-    let client: Audio::IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
-    // Give each helper worker its own Core Audio session. This keeps
-    // `--sessions N` useful for validating applications with multiple active
-    // sessions instead of relying on Windows' process-default grouping.
     let session_guid = windows::core::GUID::from_u128(
         0x6f6f_7077_6772_6170_685f_746f_6e65_0000_u128 | session_index as u128,
     );
-    let bits = 32u16;
-    let block_align = CHANNELS * bits / 8;
-    let format = Audio::WAVEFORMATEX {
-        wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
-        nChannels: CHANNELS,
-        nSamplesPerSec: SAMPLE_RATE,
-        nAvgBytesPerSec: SAMPLE_RATE * u32::from(block_align),
-        nBlockAlign: block_align,
-        wBitsPerSample: bits,
-        cbSize: 0,
-    };
-    let flags =
-        Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | Audio::AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    unsafe {
-        client.Initialize(
-            Audio::AUDCLNT_SHAREMODE_SHARED,
-            flags,
-            400_000,
-            0,
-            &format,
-            Some(&session_guid as *const _),
-        )?
-    };
-    let buffer_frames = unsafe { client.GetBufferSize()? } as usize;
-    let render = unsafe { client.GetService::<Audio::IAudioRenderClient>()? };
-    unsafe { client.Start()? };
-
-    let deadline = Instant::now() + options.duration;
+    let overall_deadline = Instant::now() + options.duration;
+    let mut reopened = false;
     let mut tone = Tone::new(options.frequency, options.amplitude);
     let mut block = vec![0.0f32; 480 * CHANNELS as usize];
-    while Instant::now() < deadline {
-        let padding = unsafe { client.GetCurrentPadding()? } as usize;
-        let available = buffer_frames.saturating_sub(padding).min(480);
-        if available == 0 {
-            std::thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-        let samples = available * CHANNELS as usize;
-        tone.fill(&mut block[..samples]);
-        let data = unsafe { render.GetBuffer(available as u32)? };
-        if data.is_null() {
-            let _ = unsafe { render.ReleaseBuffer(available as u32, 0) };
-            continue;
-        }
+
+    loop {
+        let enumerator: Audio::IMMDeviceEnumerator = unsafe {
+            windows::Win32::System::Com::CoCreateInstance(
+                &Audio::MMDeviceEnumerator,
+                None,
+                CLSCTX_ALL,
+            )?
+        };
+        let device = if let Some(render_id) = options.render_id.as_deref() {
+            let wide: Vec<u16> = render_id.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe { enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr()))? }
+        } else {
+            unsafe { enumerator.GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole)? }
+        };
+        let client: Audio::IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        // Give each helper worker its own Core Audio session. This keeps
+        // `--sessions N` useful for validating applications with multiple active
+        // sessions instead of relying on Windows' process-default grouping.
+        let bits = 32u16;
+        let block_align = CHANNELS * bits / 8;
+        let format = Audio::WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nChannels: CHANNELS,
+            nSamplesPerSec: SAMPLE_RATE,
+            nAvgBytesPerSec: SAMPLE_RATE * u32::from(block_align),
+            nBlockAlign: block_align,
+            wBitsPerSample: bits,
+            cbSize: 0,
+        };
+        let flags = Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | Audio::AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
         unsafe {
-            std::slice::from_raw_parts_mut(data.cast::<f32>(), samples)
-                .copy_from_slice(&block[..samples]);
-            render.ReleaseBuffer(available as u32, 0)?;
+            client.Initialize(
+                Audio::AUDCLNT_SHAREMODE_SHARED,
+                flags,
+                400_000,
+                0,
+                &format,
+                Some(&session_guid as *const _),
+            )?
+        };
+        let buffer_frames = unsafe { client.GetBufferSize()? } as usize;
+        let render = unsafe { client.GetService::<Audio::IAudioRenderClient>()? };
+        unsafe { client.Start()? };
+
+        let segment_deadline = if !reopened {
+            options.reopen_after_ms.map_or(overall_deadline, |millis| {
+                let deadline = Instant::now() + Duration::from_millis(millis);
+                deadline.min(overall_deadline)
+            })
+        } else {
+            overall_deadline
+        };
+        while Instant::now() < segment_deadline {
+            let padding = unsafe { client.GetCurrentPadding()? } as usize;
+            let available = buffer_frames.saturating_sub(padding).min(480);
+            if available == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            let samples = available * CHANNELS as usize;
+            tone.fill(&mut block[..samples]);
+            let data = unsafe { render.GetBuffer(available as u32)? };
+            if data.is_null() {
+                let _ = unsafe { render.ReleaseBuffer(available as u32, 0) };
+                continue;
+            }
+            unsafe {
+                std::slice::from_raw_parts_mut(data.cast::<f32>(), samples)
+                    .copy_from_slice(&block[..samples]);
+                render.ReleaseBuffer(available as u32, 0)?;
+            }
         }
+
+        unsafe { client.Stop()? };
+        if reopened || options.reopen_after_ms.is_none() || Instant::now() >= overall_deadline {
+            break;
+        }
+        reopened = true;
+        std::thread::sleep(Duration::from_millis(25));
     }
-    unsafe { client.Stop()? };
     Ok(())
 }
 
@@ -343,6 +381,9 @@ mod tests {
         assert_eq!(options.frequency, 1_000.0);
         let options = parse_arguments(["--render-id", "endpoint-id"]).unwrap();
         assert_eq!(options.render_id.as_deref(), Some("endpoint-id"));
+        let options = parse_arguments(["--reopen-after-ms", "5000"]).unwrap();
+        assert_eq!(options.reopen_after_ms, Some(5_000));
         assert!(parse_arguments(["--render-id", ""]).is_err());
+        assert!(parse_arguments(["--reopen-after-ms", "60001"]).is_err());
     }
 }

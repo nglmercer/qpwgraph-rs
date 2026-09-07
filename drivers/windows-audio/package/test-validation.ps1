@@ -113,7 +113,8 @@ function Invoke-Prepare {
     if ($null -eq $repositoryRoot) {
         throw 'The staged package is not below the repository root; pass -SmokeProbe explicitly.'
     }
-    if (-not $PSCmdlet.ShouldProcess($packageRootPath, 'sign the package, trust its public test certificate, and build the smoke probe')) {
+    if ($WhatIfPreference) {
+        Write-Output 'WhatIf mode: package signing and smoke-probe preparation were not run.'
         return
     }
 
@@ -153,14 +154,15 @@ function Invoke-EnableTestMode {
     if (Test-TestSigningEnabled) {
         Write-Output 'Windows test-signing is already enabled.'
     } else {
-        if (-not $PSCmdlet.ShouldProcess('Windows boot configuration', 'enable test-signing')) {
+        if ($WhatIfPreference) {
+            Write-Output 'WhatIf mode: Windows test-signing was not enabled.'
             return
         }
         Invoke-Native 'bcdedit.exe' @('/set', 'testsigning', 'on') 'Enabling Windows test-signing'
         Write-Output 'Windows test-signing enabled for the next boot.'
     }
     if ($Reboot) {
-        if ($PSCmdlet.ShouldProcess('this computer', 'reboot into Windows test mode')) {
+        if (-not $WhatIfPreference) {
             Invoke-Native 'shutdown.exe' @('/r', '/t', '0') 'Rebooting into Windows test mode'
         }
     } else {
@@ -214,12 +216,13 @@ function Invoke-Uninstall {
 }
 
 function Invoke-DisableTestMode {
-    if (-not $PSCmdlet.ShouldProcess('Windows boot configuration', 'disable test-signing')) {
+    if ($WhatIfPreference) {
+        Write-Output 'WhatIf mode: Windows test-signing was not disabled.'
         return
     }
     Invoke-Native 'bcdedit.exe' @('/set', 'testsigning', 'off') 'Disabling Windows test-signing'
     if ($Reboot) {
-        if ($PSCmdlet.ShouldProcess('this computer', 'reboot out of Windows test mode')) {
+        if (-not $WhatIfPreference) {
             Invoke-Native 'shutdown.exe' @('/r', '/t', '0') 'Rebooting out of Windows test mode'
         }
     } else {

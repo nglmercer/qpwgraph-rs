@@ -1,0 +1,242 @@
+name: Windows driver release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_full:
+        description: 'Build the full bundle only when external release evidence is available'
+        required: true
+        default: false
+        type: boolean
+      evidence_artifact:
+        description: 'Artifact name containing externally retained HLK/Verifier/Secure Boot/lifecycle/client evidence'
+        required: false
+        type: string
+      evidence_run_id:
+        description: 'Workflow run ID containing evidence_artifact in this repository'
+        required: false
+        type: string
+      returned_package_artifact:
+        description: 'Artifact name containing the returned Microsoft-signed driver package'
+        required: false
+        type: string
+      returned_package_run_id:
+        description: 'Workflow run ID containing returned_package_artifact in this repository'
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: windows-driver-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-validation:
+    name: Source and package validation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+      - name: Format and workspace tests
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --all-features --locked
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Validate driver package metadata
+        shell: pwsh
+        run: cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --validate-package
+      - name: Parse release scripts without executing them
+        shell: pwsh
+        run: |
+          $scripts = @(
+            Get-ChildItem drivers/windows-audio/package -Filter '*.ps1' -File
+            Get-ChildItem packaging/windows -Filter '*.ps1' -File
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) {
+              $messages = ($errors | ForEach-Object { $_.Message }) -join '; '
+              throw "$($script.Name) failed PowerShell parsing: $messages"
+            }
+          }
+
+  driver-build:
+    name: eWDK ACX package build
+    if: ${{ vars.QPWGRAPH_EWDK_CI == 'true' }}
+    runs-on: [self-hosted, windows, ewdk]
+    needs: source-validation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Reject project-authored C/C++ runtime sources
+        shell: pwsh
+        run: |
+          $forbidden = @(Get-ChildItem drivers/windows-audio/driver/src -Recurse -File |
+            Where-Object { $_.Extension -in @('.c', '.cc', '.cpp') })
+          if ($forbidden.Count -ne 0) {
+            throw "Project-authored C/C++ runtime source remains: $($forbidden.FullName -join '; ')"
+          }
+      - name: Audit eWDK toolchain
+        shell: pwsh
+        working-directory: drivers/windows-audio
+        run: cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
+      - name: Build and stage unsigned release candidate
+        shell: pwsh
+        run: .\drivers\windows-audio\package\build-release-driver.ps1
+      - name: Run core and EOS tests
+        shell: pwsh
+        working-directory: drivers/windows-audio
+        run: |
+          cargo test --workspace --locked
+          cargo test -p qpwgraph-audio-core render_eos --locked
+      - name: Upload driver candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-driver-candidate
+          path: |
+            drivers/windows-audio/target/qpwgraph-audio-package
+            drivers/windows-audio/target/qpwgraph-audio-package/release-manifest.json
+          if-no-files-found: error
+
+  full-release:
+    name: Evidence-gated full Windows bundle
+    if: ${{ inputs.publish_full == true }}
+    runs-on: windows-latest
+    needs: [source-validation, driver-build]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Require the opt-in eWDK job
+        shell: pwsh
+        run: |
+          if ('${{ vars.QPWGRAPH_EWDK_CI }}' -ne 'true') {
+            throw 'Full release requested but QPWGRAPH_EWDK_CI is not true.'
+          }
+      - name: Download externally retained release evidence
+        if: ${{ inputs.evidence_artifact != '' && inputs.evidence_run_id != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.evidence_artifact }}
+          path: release-evidence
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.evidence_run_id }}
+      - name: Download returned Microsoft-signed package
+        if: ${{ inputs.returned_package_artifact != '' && inputs.returned_package_run_id != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.returned_package_artifact }}
+          path: returned-driver-package
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.returned_package_run_id }}
+      - name: Require external release evidence
+        shell: pwsh
+        run: |
+          if ('${{ inputs.evidence_artifact }}' -eq '') {
+            throw 'Full release requires an explicit externally retained HLK/signing/Secure Boot evidence artifact.'
+          }
+          if ('${{ inputs.evidence_run_id }}' -eq '') {
+            throw 'Full release requires the workflow run ID containing the external evidence artifact.'
+          }
+          if ('${{ inputs.returned_package_artifact }}' -eq '') {
+            throw 'Full release requires an explicit artifact containing the returned Microsoft-signed driver package.'
+          }
+          if ('${{ inputs.returned_package_run_id }}' -eq '') {
+            throw 'Full release requires the workflow run ID containing the returned driver package.'
+          }
+          if (-not (Test-Path -LiteralPath 'release-evidence')) {
+            throw 'The requested external evidence artifact was not available.'
+          }
+          if (-not (Test-Path -LiteralPath 'returned-driver-package')) {
+            throw 'The returned Microsoft-signed driver package was not available.'
+          }
+          $required = @('hlk-preparation.json', 'secure-boot-audit.json', 'verifier-evidence.json', 'driver-stress.json', 'acceptance-evidence.json')
+          foreach ($name in $required) {
+            if (-not (Get-ChildItem -Path 'release-evidence' -Filter $name -Recurse -File -ErrorAction SilentlyContinue)) {
+              throw "External evidence is missing $name."
+            }
+          }
+          foreach ($name in @('hlk-result-package.zip', 'hlk-result-package.zip.sha256', 'driver-release-manifest.json', 'test-machine-build.txt')) {
+            if (-not (Get-ChildItem -Path 'release-evidence' -Filter $name -Recurse -File -ErrorAction SilentlyContinue)) {
+              throw "External evidence is missing $name."
+            }
+          }
+      - name: Resolve returned driver package root
+        shell: pwsh
+        run: |
+          $manifests = @(Get-ChildItem -LiteralPath .\returned-driver-package -Filter 'manifest.json' -Recurse -File)
+          if ($manifests.Count -ne 1) {
+            throw "Expected exactly one manifest.json in the returned driver artifact; found $($manifests.Count)."
+          }
+          $driverRoot = $manifests[0].Directory.FullName
+          foreach ($name in @('qpwgraph_audio.sys', 'qpwgraph-audio.inf', 'qpwgraph-audio.cat', 'install.ps1', 'uninstall.ps1')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $driverRoot $name) -PathType Leaf)) {
+              throw "Returned driver package root is missing ${name}: $driverRoot"
+            }
+          }
+          "DRIVER_PACKAGE_ROOT=$driverRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "Returned driver package root: $driverRoot"
+      - name: Build portable application
+        run: cargo build --release --locked -p pw-graph-app
+      - name: Verify returned Microsoft package
+        shell: pwsh
+        run: |
+          $manifests = @(Get-ChildItem -LiteralPath .\release-evidence -Filter 'driver-release-manifest.json' -Recurse -File)
+          if ($manifests.Count -ne 1) {
+            throw "Expected exactly one driver-release-manifest.json in release-evidence; found $($manifests.Count)."
+          }
+          .\drivers\windows-audio\package\verify-returned-driver.ps1 -PackageRoot $env:DRIVER_PACKAGE_ROOT -SubmissionManifest $manifests[0].FullName -OutputPath .\release-evidence\returned-driver-verification.json
+      - name: Validate retained release evidence
+        shell: pwsh
+        run: .\drivers\windows-audio\package\validate-release-evidence.ps1 -EvidenceRoot .\release-evidence -PackageRoot $env:DRIVER_PACKAGE_ROOT -OutputPath .\release-evidence\evidence-validation.json
+      - name: Build full installer bundle
+        shell: pwsh
+        run: .\packaging\windows\build-full-installer.ps1 -DriverPackage $env:DRIVER_PACKAGE_ROOT
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | ForEach-Object {
+            $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+            Set-Content -LiteralPath ($_.FullName + '.sha256') -Value ("{0}  {1}" -f $hash.Hash, $_.Name) -Encoding ASCII
+          }
+      - name: Upload full release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-full-release
+          path: dist/
+          if-no-files-found: error
+
+  gate:
+    name: Driver release gate
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [source-validation, driver-build, full-release]
+    steps:
+      - name: Do not convert missing external evidence into a green release
+        env:
+          SOURCE_RESULT: ${{ needs.source-validation.result }}
+          DRIVER_RESULT: ${{ needs.driver-build.result }}
+          FULL_RESULT: ${{ needs.full-release.result }}
+          PUBLISH_FULL: ${{ inputs.publish_full }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_RESULT" = success
+          if [ "$PUBLISH_FULL" = true ]; then
+            test "$DRIVER_RESULT" = success
+            test "$FULL_RESULT" = success
+          fi
+          echo "portable/source gate passed; full release requested=$PUBLISH_FULL"

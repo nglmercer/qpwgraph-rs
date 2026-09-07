@@ -60,7 +60,7 @@ function Wait-ForEndpointRemoval {
     } while ($true)
 }
 
-if ($PSCmdlet.ShouldProcess($PublishedInf, 'remove the QPWGraph audio driver package')) {
+if (-not $WhatIfPreference) {
     $removeDeviceOutput = (& pnputil.exe /remove-device $rootDeviceInstanceId /subtree 2>&1 | Out-String)
     $removeDeviceExitCode = $LASTEXITCODE
     if (-not [string]::IsNullOrWhiteSpace($removeDeviceOutput)) {

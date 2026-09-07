@@ -1,7 +1,7 @@
 //! KMDF bootstrap for the ACX virtual audio adapter.
 //!
 //! The default build is fail-closed. The opt-in `acx` build owns the first
-//! app/relay endpoint transaction in the ACX bridge and remains an eWDK-only
+//! app/relay endpoint transaction in the Rust ACX runtime and remains an eWDK-only
 //! validation target until it passes the Windows smoke and verifier gates.
 
 use wdk::{nt_success, paged_code};
@@ -50,7 +50,7 @@ pub unsafe extern "system" fn driver_entry(
 
 /// ACX adapter creation is isolated behind the binding gate. The normal
 /// package still rejects device-add; the eWDK-only feature path creates the
-/// app and relay endpoint pairs through the documented ACX bridge.
+/// app and relay endpoint pairs through the documented ACX runtime bindings.
 #[link_section = "PAGE"]
 extern "C" fn evt_device_add(driver: WDFDRIVER, device_init: PWDFDEVICE_INIT) -> NTSTATUS {
     paged_code!();

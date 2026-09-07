@@ -12,16 +12,21 @@
 //! cycle for a short smoke test.
 //! Additional opt-in probes cover local-output preservation during ordinary
 //! app relay, isolated-application effects and bypass, and persisted route
-//! rebind after the helper restarts with a new PID.
+//! rebind after the helper restarts with a new PID. The automatic policy probe
+//! additionally starts the helper on its ordinary default endpoint, verifies
+//! the three-role persisted route transaction, and checks restoration. A
+//! separate opt-in probe leaves that lease active while the backend is dropped
+//! to verify qpwgraph-shutdown restoration.
 
 #![cfg(target_os = "windows")]
 
 #[cfg(feature = "relay-tests")]
 mod live {
     use pw_graph_backend::{
-        EffectDriver, EffectNodeRequest, GraphDriver, ProcessIdentity, RelayCodecKind,
-        RelayDirection, RelayDriver, RelayHostRequest, RelayMode, RelayReceiveSink,
-        RelaySendSource, RelayTransportPreference, WindowsAudioDriver,
+        AppRoutePolicy, AudioFlow, AudioRole, EffectDriver, EffectNodeRequest, GraphDriver,
+        ProcessIdentity, RelayCodecKind, RelayDirection, RelayDriver, RelayHostRequest, RelayMode,
+        RelayReceiveSink, RelaySendSource, RelayTransportPreference, VerifiedAudioPolicyConfig,
+        WindowsAudioDriver,
     };
     use pw_graph_config::WindowsApplicationRoute;
     use std::collections::BTreeMap;
@@ -229,6 +234,42 @@ mod live {
         result.expect("isolated application route did not survive helper restart");
     }
 
+    #[test]
+    fn experimental_application_route_rebinds_default_helper_and_restores() {
+        if std::env::var("PW_GRAPH_TEST_WINDOWS_AUTO_APP_ROUTE")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let initialized = unsafe { Com::CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if initialized.is_err() {
+            panic!("could not initialize COM: {initialized:?}");
+        }
+        let result = run_automatic_application_route_test();
+        unsafe { Com::CoUninitialize() };
+        result.expect("experimental automatic application route failed");
+    }
+
+    #[test]
+    fn experimental_application_route_restores_on_driver_shutdown() {
+        if std::env::var("PW_GRAPH_TEST_WINDOWS_AUTO_APP_ROUTE_DROP")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let initialized = unsafe { Com::CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if initialized.is_err() {
+            panic!("could not initialize COM: {initialized:?}");
+        }
+        let result = run_automatic_application_route_shutdown_test();
+        unsafe { Com::CoUninitialize() };
+        result.expect("experimental automatic application route was not restored on shutdown");
+    }
+
     fn run_application_route_restart_test() -> Result<(), String> {
         let helper = std::env::var_os("CARGO_BIN_EXE_windows-audio-test-tone")
             .map(std::path::PathBuf::from)
@@ -317,23 +358,396 @@ mod live {
         result
     }
 
+    fn run_automatic_application_route_test() -> Result<(), String> {
+        let helper = std::env::var_os("CARGO_BIN_EXE_windows-audio-test-tone")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "Cargo did not provide the tone helper executable".to_owned())?;
+        let enumerator: Audio::IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|error| format!("create MMDeviceEnumerator: {error}"))?;
+        let app_render = wait_for_role(
+            &enumerator,
+            Flow::Render,
+            APP_RENDER_ROLE,
+            Duration::from_secs(8),
+        )?;
+        let physical_render = choose_external_render(&enumerator)?;
+        let loopback = open_loopback_stream(&physical_render.device)?;
+        let loopback_client = unsafe { loopback.client.GetService::<Audio::IAudioCaptureClient>() }
+            .map_err(|error| format!("get physical render loopback service: {error}"))?;
+        unsafe {
+            loopback
+                .client
+                .Start()
+                .map_err(|error| format!("start physical render loopback: {error}"))?;
+        }
+
+        let mut tone = spawn_default_helper(&helper)?;
+        let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
+        driver.set_experimental_app_routing(true);
+        let policy = VerifiedAudioPolicyConfig::new(true);
+        let original_process = ProcessIdentity::from_pid(tone.id())
+            .map_err(|error| format!("read helper identity: {error}"))?;
+        let roles = [
+            AudioRole::Console,
+            AudioRole::Multimedia,
+            AudioRole::Communications,
+        ];
+        let original = read_policy_endpoints(&policy, &original_process, roles)?;
+        let route = WindowsApplicationRoute {
+            application: original_process.application_selector(),
+            destination_mmdevice_id: Some(physical_render.id.clone()),
+            virtualization_required: true,
+            gain: 1.0,
+            enabled: true,
+            ..WindowsApplicationRoute::default()
+        };
+
+        let result = (|| -> Result<(), String> {
+            let plans = driver
+                .reconcile_application_routes(vec![route])
+                .map_err(|error| format!("install automatic application route: {error}"))?;
+            println!(
+                "automatic application route initial plan: {plans:?}; original_endpoints={original:?}"
+            );
+            let expected_virtual: BTreeMap<_, _> = roles
+                .iter()
+                .map(|role| (*role, Some(app_render.id.clone())))
+                .collect();
+            wait_for_policy_endpoints(
+                &mut driver,
+                &policy,
+                &original_process,
+                &roles,
+                &expected_virtual,
+                Duration::from_secs(12),
+            )?;
+
+            // A running WASAPI client can keep its original endpoint. Start a
+            // fresh process only after the policy transaction has succeeded;
+            // its ordinary default open must now land on AppRender.
+            let replacement = spawn_default_helper_with_reopen(&helper, 5_000)?;
+            stop_child(&mut tone);
+            tone = replacement;
+            wait_for_application_route(&mut driver, true, Duration::from_secs(15))?;
+            let after_restart =
+                observe_loopback_tone(&loopback, &loopback_client, Duration::from_secs(2))?;
+            if after_restart < 0.01 {
+                return Err(format!(
+                    "automatic route restart remained silent: amplitude={after_restart:.4}"
+                ));
+            }
+            let replacement_process = ProcessIdentity::from_pid(tone.id())
+                .map_err(|error| format!("read replacement helper identity: {error}"))?;
+            let current = read_policy_endpoints(&policy, &replacement_process, roles)?;
+            if !policy_endpoints_match(&expected_virtual, &current) {
+                return Err(format!(
+                    "replacement helper policy did not remain on AppRender: expected={expected_virtual:?}, actual={current:?}"
+                ));
+            }
+            println!(
+                "automatic application route after restart: 1 kHz amplitude {after_restart:.4}; current_endpoints={current:?}"
+            );
+            Ok(())
+        })();
+
+        // Removing the rule is part of the test, not just teardown: it must
+        // restore the exact role-specific values captured before activation.
+        let cleanup = (|| -> Result<(), String> {
+            driver
+                .reconcile_application_routes(Vec::new())
+                .map_err(|error| format!("remove automatic application route: {error}"))?;
+            let current_process = ProcessIdentity::from_pid(tone.id())
+                .map_err(|error| format!("read cleanup helper identity: {error}"))?;
+            wait_for_policy_endpoints(
+                &mut driver,
+                &policy,
+                &current_process,
+                &roles,
+                &original,
+                Duration::from_secs(12),
+            )
+        })();
+        stop_child(&mut tone);
+
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(test), Ok(())) => Err(test),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(test), Err(cleanup)) => Err(format!("{test}; cleanup also failed: {cleanup}")),
+        }
+    }
+
+    fn run_automatic_application_route_shutdown_test() -> Result<(), String> {
+        let helper = std::env::var_os("CARGO_BIN_EXE_windows-audio-test-tone")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "Cargo did not provide the tone helper executable".to_owned())?;
+        let enumerator: Audio::IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|error| format!("create MMDeviceEnumerator: {error}"))?;
+        let app_render = wait_for_role(
+            &enumerator,
+            Flow::Render,
+            APP_RENDER_ROLE,
+            Duration::from_secs(8),
+        )?;
+        let physical_render = choose_external_render(&enumerator)?;
+        let loopback = open_loopback_stream(&physical_render.device)?;
+        let loopback_client = unsafe { loopback.client.GetService::<Audio::IAudioCaptureClient>() }
+            .map_err(|error| format!("get physical render loopback service: {error}"))?;
+        unsafe {
+            loopback
+                .client
+                .Start()
+                .map_err(|error| format!("start physical render loopback: {error}"))?;
+        }
+
+        let mut tone = spawn_default_helper(&helper)?;
+        let mut driver = match WindowsAudioDriver::new() {
+            Ok(driver) => driver,
+            Err(error) => {
+                stop_child(&mut tone);
+                return Err(error.to_string());
+            }
+        };
+        driver.set_experimental_app_routing(true);
+        let policy = VerifiedAudioPolicyConfig::new(true);
+        let roles = [
+            AudioRole::Console,
+            AudioRole::Multimedia,
+            AudioRole::Communications,
+        ];
+        let original_process = match ProcessIdentity::from_pid(tone.id()) {
+            Ok(process) => process,
+            Err(error) => {
+                drop(driver);
+                stop_child(&mut tone);
+                return Err(format!("read helper identity: {error}"));
+            }
+        };
+        let original = match read_policy_endpoints(&policy, &original_process, roles) {
+            Ok(original) => original,
+            Err(error) => {
+                drop(driver);
+                stop_child(&mut tone);
+                return Err(error);
+            }
+        };
+        let route = WindowsApplicationRoute {
+            application: original_process.application_selector(),
+            destination_mmdevice_id: Some(physical_render.id.clone()),
+            virtualization_required: true,
+            gain: 1.0,
+            enabled: true,
+            ..WindowsApplicationRoute::default()
+        };
+        let expected_virtual: BTreeMap<_, _> = roles
+            .iter()
+            .map(|role| (*role, Some(app_render.id.clone())))
+            .collect();
+
+        let result = (|| -> Result<(), String> {
+            let plans = driver
+                .reconcile_application_routes(vec![route])
+                .map_err(|error| format!("install automatic application route: {error}"))?;
+            println!(
+                "automatic shutdown-restore route initial plan: {plans:?}; original_endpoints={original:?}"
+            );
+            wait_for_policy_endpoints(
+                &mut driver,
+                &policy,
+                &original_process,
+                &roles,
+                &expected_virtual,
+                Duration::from_secs(12),
+            )?;
+
+            // Rebind the lease to a fresh PID before shutdown. This makes the
+            // probe cover both restart recovery and Drop-time restoration.
+            let replacement = spawn_default_helper_with_reopen(&helper, 5_000)?;
+            stop_child(&mut tone);
+            tone = replacement;
+            wait_for_application_route(&mut driver, true, Duration::from_secs(15))?;
+            let after_restart =
+                observe_loopback_tone(&loopback, &loopback_client, Duration::from_secs(2))?;
+            if after_restart < 0.01 {
+                return Err(format!(
+                    "automatic route shutdown probe remained silent after restart: amplitude={after_restart:.4}"
+                ));
+            }
+            let replacement_process = ProcessIdentity::from_pid(tone.id())
+                .map_err(|error| format!("read replacement helper identity: {error}"))?;
+            let current = read_policy_endpoints(&policy, &replacement_process, roles)?;
+            if !policy_endpoints_match(&expected_virtual, &current) {
+                return Err(format!(
+                    "replacement helper policy did not remain on AppRender before shutdown: expected={expected_virtual:?}, actual={current:?}"
+                ));
+            }
+            println!(
+                "automatic shutdown-restore route before driver drop: 1 kHz amplitude {after_restart:.4}; current_endpoints={current:?}"
+            );
+            Ok(())
+        })();
+
+        let current_process = ProcessIdentity::from_pid(tone.id()).ok();
+        // Do not remove the rule: the driver destructor must restore its live
+        // lease while the helper is still running.
+        drop(driver);
+        let restore = current_process.map_or_else(
+            || Err("could not read the live helper identity after driver shutdown".to_owned()),
+            |process| {
+                wait_for_policy_snapshot(
+                    &policy,
+                    &process,
+                    &roles,
+                    &original,
+                    Duration::from_secs(12),
+                )
+            },
+        );
+        stop_child(&mut tone);
+
+        match (result, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(test), Ok(())) => Err(test),
+            (Ok(()), Err(restore)) => {
+                Err(format!("driver shutdown policy restore failed: {restore}"))
+            }
+            (Err(test), Err(restore)) => Err(format!(
+                "{test}; driver shutdown policy restore also failed: {restore}"
+            )),
+        }
+    }
+
+    fn read_policy_endpoints(
+        policy: &VerifiedAudioPolicyConfig,
+        process: &ProcessIdentity,
+        roles: [AudioRole; 3],
+    ) -> Result<BTreeMap<AudioRole, Option<String>>, String> {
+        roles
+            .into_iter()
+            .map(|role| {
+                policy
+                    .get_persisted_endpoint(process, AudioFlow::Render, role)
+                    .map(|endpoint| (role, endpoint))
+                    .map_err(|error| format!("read persisted {role:?} endpoint: {error}"))
+            })
+            .collect()
+    }
+
+    fn wait_for_policy_endpoints(
+        driver: &mut WindowsAudioDriver,
+        policy: &VerifiedAudioPolicyConfig,
+        process: &ProcessIdentity,
+        roles: &[AudioRole; 3],
+        expected: &BTreeMap<AudioRole, Option<String>>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut last = String::from("no policy observation");
+        while Instant::now() < deadline {
+            if let Err(error) = driver.refresh() {
+                last = format!("refresh failed: {error}");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            match read_policy_endpoints(policy, process, *roles) {
+                Ok(actual) if policy_endpoints_match(expected, &actual) => return Ok(()),
+                Ok(actual) => last = format!("actual={actual:?}"),
+                Err(error) => last = error,
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!(
+            "persisted application endpoint transaction did not reach expected values: expected={expected:?}, {last}"
+        ))
+    }
+
+    fn wait_for_policy_snapshot(
+        policy: &VerifiedAudioPolicyConfig,
+        process: &ProcessIdentity,
+        roles: &[AudioRole; 3],
+        expected: &BTreeMap<AudioRole, Option<String>>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut last = String::from("no policy observation");
+        while Instant::now() < deadline {
+            match read_policy_endpoints(policy, process, *roles) {
+                Ok(actual) if policy_endpoints_match(expected, &actual) => return Ok(()),
+                Ok(actual) => last = format!("actual={actual:?}"),
+                Err(error) => last = error,
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!(
+            "persisted application endpoint restore did not reach expected values: expected={expected:?}, {last}"
+        ))
+    }
+
+    fn policy_endpoints_match(
+        expected: &BTreeMap<AudioRole, Option<String>>,
+        actual: &BTreeMap<AudioRole, Option<String>>,
+    ) -> bool {
+        expected.iter().all(|(role, expected_endpoint)| {
+            actual.get(role).is_some_and(|actual_endpoint| {
+                match (expected_endpoint, actual_endpoint) {
+                    (None, None) => true,
+                    (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
+                    _ => false,
+                }
+            })
+        })
+    }
+
     fn spawn_isolated_helper(
         helper: &std::path::Path,
         app_render_id: &str,
     ) -> Result<Child, String> {
-        Command::new(helper)
-            .args([
-                "--duration-ms",
-                "60000",
-                "--frequency",
-                "1000",
-                "--amplitude",
-                "0.25",
-                "--render-id",
-                app_render_id,
-            ])
+        spawn_tone_helper(helper, Some(app_render_id))
+    }
+
+    fn spawn_default_helper(helper: &std::path::Path) -> Result<Child, String> {
+        spawn_tone_helper(helper, None)
+    }
+
+    fn spawn_default_helper_with_reopen(
+        helper: &std::path::Path,
+        reopen_after_ms: u64,
+    ) -> Result<Child, String> {
+        spawn_tone_helper_with_reopen(helper, None, Some(reopen_after_ms))
+    }
+
+    fn spawn_tone_helper(
+        helper: &std::path::Path,
+        render_id: Option<&str>,
+    ) -> Result<Child, String> {
+        spawn_tone_helper_with_reopen(helper, render_id, None)
+    }
+
+    fn spawn_tone_helper_with_reopen(
+        helper: &std::path::Path,
+        render_id: Option<&str>,
+        reopen_after_ms: Option<u64>,
+    ) -> Result<Child, String> {
+        let mut command = Command::new(helper);
+        command.args([
+            "--duration-ms",
+            "60000",
+            "--frequency",
+            "1000",
+            "--amplitude",
+            "0.25",
+        ]);
+        if let Some(render_id) = render_id {
+            command.args(["--render-id", render_id]);
+        }
+        if let Some(reopen_after_ms) = reopen_after_ms {
+            command.args(["--reopen-after-ms", &reopen_after_ms.to_string()]);
+        }
+        command
             .spawn()
-            .map_err(|error| format!("start isolated helper: {error}"))
+            .map_err(|error| format!("start tone helper: {error}"))
     }
 
     fn wait_for_application_route(

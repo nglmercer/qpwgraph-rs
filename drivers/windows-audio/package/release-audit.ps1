@@ -86,6 +86,21 @@ function Find-Executable([string] $Name) {
     return $null
 }
 
+function Invoke-Captured([string] $FileName, [string[]] $Arguments) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $FileName @Arguments 2>&1) | ForEach-Object { $_.ToString() }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    return [pscustomobject]@{
+        output = @($output)
+        exit_code = $exitCode
+    }
+}
+
 function Find-FirstFile([string[]] $Candidates) {
     foreach ($candidate in $Candidates) {
         if (-not [string]::IsNullOrWhiteSpace($candidate) -and
@@ -194,7 +209,17 @@ $requiredPackageFiles = @(
     'install.ps1',
     'uninstall.ps1',
     'sign-test.ps1',
-    'lifecycle-validation.ps1'
+    'lifecycle-validation.ps1',
+    'enable-verifier.ps1',
+    'disable-verifier.ps1',
+    'run-driver-stress.ps1',
+    'collect-verifier-evidence.ps1',
+    'prepare-hlk.ps1',
+    'secure-boot-audit.ps1',
+    'build-release-driver.ps1',
+    'prepare-dashboard-submission.ps1',
+    'verify-returned-driver.ps1',
+    'validate-release-evidence.ps1'
 )
 $missingFiles = @(
     $requiredPackageFiles |
@@ -237,6 +262,22 @@ if (-not (Test-Path -LiteralPath $infPath -PathType Leaf)) {
 Add-SignatureCheck 'Driver Authenticode signature' (Join-Path $packageRootPath 'qpwgraph_audio.sys')
 Add-SignatureCheck 'Catalog Authenticode signature' (Join-Path $packageRootPath 'qpwgraph-audio.cat')
 
+# The release gate must say explicitly whether the driver implementation has
+# completed the Rust port. This is intentionally a source audit, not an
+# inference from a successful package build.
+$driverSourceRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'driver\src'
+if (Test-Path -LiteralPath $driverSourceRoot -PathType Container) {
+    $runtimeSources = @(Get-ChildItem -LiteralPath $driverSourceRoot -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.c', '.cc', '.cpp') })
+    if ($runtimeSources.Count -eq 0) {
+        Add-Check '100% Rust driver source' 'pass' $driverSourceRoot
+    } else {
+        Add-Check '100% Rust driver source' 'blocked' ("project-authored C/C++ remains: " + (($runtimeSources | ForEach-Object { $_.FullName }) -join '; '))
+    }
+} else {
+    Add-Check '100% Rust driver source' 'unknown' "driver source root was not found: $driverSourceRoot"
+}
+
 # Build prerequisites. These checks are intentionally read-only and overlap the
 # xtask audit so the same report can be collected from a staged package.
 $wdkRootText = [Environment]::GetEnvironmentVariable('WDKContentRoot', 'Process')
@@ -256,37 +297,52 @@ if ($null -eq $wdkRoot) {
     Add-Check 'ACX stub library' 'blocked' 'not checked because WDKContentRoot is unavailable'
 } else {
     $includeRoot = Join-Path $wdkRoot 'Include'
-    $crt = $null
-    if (Test-Path -LiteralPath $includeRoot -PathType Container) {
-        foreach ($versionDirectory in (Get-ChildItem -LiteralPath $includeRoot -Directory -ErrorAction SilentlyContinue)) {
-            $candidate = Join-Path $versionDirectory.FullName 'km\crt'
-            if (Test-Path -LiteralPath $candidate -PathType Container) {
-                $crt = $candidate
-                break
-            }
-        }
-    }
-    if ($null -ne $crt) {
-        Add-Check 'WDK KM CRT headers' 'pass' $crt
+    $versionDirectory = Get-ChildItem -LiteralPath $includeRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'km\crt') -PathType Container } |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
+    if ($null -ne $versionDirectory) {
+        Add-Check 'WDK KM CRT headers' 'pass' (Join-Path $versionDirectory.FullName 'km\crt')
     } else {
         Add-Check 'WDK KM CRT headers' 'blocked' "no Include\\<version>\\km\\crt under $includeRoot"
     }
 
-    $acxHeader = Get-ChildItem -LiteralPath $includeRoot -Filter 'acx.h' -File -Recurse -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    $acxHeader = $null
+    if ($null -ne $versionDirectory) {
+        $acxRoot = Join-Path $versionDirectory.FullName 'km\acx'
+        $preferredAcxHeader = Join-Path $acxRoot 'km\1.1\acx.h'
+        if (Test-Path -LiteralPath $preferredAcxHeader -PathType Leaf) {
+            $acxHeader = Get-Item -LiteralPath $preferredAcxHeader
+        } else {
+            $acxHeader = Get-ChildItem -LiteralPath $acxRoot -Filter 'acx.h' -File -Recurse -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+        }
+    }
     if ($null -ne $acxHeader) {
         Add-Check 'ACX header' 'pass' $acxHeader.FullName
     } else {
-        Add-Check 'ACX header' 'blocked' "acx.h was not found below $includeRoot"
+        Add-Check 'ACX header' 'blocked' "acx.h was not found below the newest WDK km\\acx tree under $includeRoot"
     }
 
-    $libRoot = Join-Path $wdkRoot 'Lib'
-    $acxStub = Get-ChildItem -LiteralPath $libRoot -Filter 'acxstub.lib' -File -Recurse -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    $acxStub = $null
+    if ($null -ne $versionDirectory) {
+        $libVersionDirectory = Join-Path $wdkRoot "Lib\$($versionDirectory.Name)\km\x64\acx"
+        if (Test-Path -LiteralPath $libVersionDirectory -PathType Container) {
+            $preferredAcxStub = Join-Path $libVersionDirectory 'km\1.1\acxstub.lib'
+            if (Test-Path -LiteralPath $preferredAcxStub -PathType Leaf) {
+                $acxStub = Get-Item -LiteralPath $preferredAcxStub
+            } else {
+                $acxStub = Get-ChildItem -LiteralPath $libVersionDirectory -Filter 'acxstub.lib' -File -Recurse -ErrorAction SilentlyContinue |
+                    Sort-Object FullName -Descending |
+                    Select-Object -First 1
+            }
+        }
+    }
     if ($null -ne $acxStub) {
         Add-Check 'ACX stub library' 'pass' $acxStub.FullName
     } else {
-        Add-Check 'ACX stub library' 'blocked' "acxstub.lib was not found below $libRoot"
+        Add-Check 'ACX stub library' 'blocked' 'target x64 acxstub.lib was not found for the newest WDK version'
     }
 }
 
@@ -312,7 +368,7 @@ $clangPath = Find-Executable 'clang.exe'
 if ($null -eq $clangPath) {
     Add-Check 'LLVM/clang toolchain' 'blocked' 'clang.exe was not found on PATH; use released LLVM 17-21'
 } else {
-    $versionOutput = @(& $clangPath '--version' 2>&1) | ForEach-Object { $_.ToString() }
+    $versionOutput = @(Invoke-Captured $clangPath @('--version')).output
     $versionText = $versionOutput -join ' '
     if ($versionText -match '(?i)(?:LLVM|clang) version\s+(\d+)(?:\.\d+)?') {
         $major = [int] $Matches[1]
@@ -333,7 +389,7 @@ $verifierPath = Find-Executable 'verifier.exe'
 if ($null -eq $verifierPath) {
     Add-Check 'Driver Verifier clean' 'unknown' 'verifier.exe was not found; run the release verifier matrix on a test machine'
 } else {
-    $verifierOutput = @(& $verifierPath '/querysettings' 2>&1) | ForEach-Object { $_.ToString() }
+    $verifierOutput = @(Invoke-Captured $verifierPath @('/querysettings')).output
     $verifierText = $verifierOutput -join [Environment]::NewLine
     if ($verifierText -match '(?im)Verifier Flags:\s*0x0+\b') {
         Add-Check 'Driver Verifier clean' 'unknown' 'no verifier rules are configured; a clean exercised run is still required'
@@ -365,10 +421,12 @@ $bcdeditPath = Find-Executable 'bcdedit.exe'
 if ($null -eq $bcdeditPath) {
     Add-Check 'Windows test-signing disabled' 'unknown' 'bcdedit.exe was not found'
 } else {
-    $bootOutput = @(& $bcdeditPath '/enum' '{current}' 2>&1) | ForEach-Object { $_.ToString() }
+    # Query the complete store first. Passing {current} can be rejected on
+    # some UEFI/non-elevated sessions before bcdedit exposes the real state.
+    $bootOutput = @(Invoke-Captured $bcdeditPath @('/enum')).output
     $bootText = $bootOutput -join [Environment]::NewLine
     if ($bootText -notmatch '(?im)^\s*testsigning\s+(Yes|No)\s*$') {
-        $bootOutput = @(& $bcdeditPath '/enum' 'all' 2>&1) | ForEach-Object { $_.ToString() }
+        $bootOutput = @(Invoke-Captured $bcdeditPath @('/enum', 'all')).output
         $bootText = $bootOutput -join [Environment]::NewLine
     }
     if ($bootText -match '(?im)^\s*testsigning\s+Yes\s*$') {
@@ -466,12 +524,18 @@ foreach ($client in $clientDefinitions) {
 # acceptance procedure. Keeping them in the same report prevents a green local
 # build from being mistaken for complete Windows feature parity.
 Add-ManualGate 'HLK audio tests complete' 'run the relevant HLK audio tests and attach the result'
+Add-ManualGate 'Rust ACX runtime parity' 'complete the Rust ACX callback port and attach test-signed live parity evidence'
+Add-ManualGate 'Driver Verifier stress matrix' 'run the explicit Verifier stress matrix and attach clean evidence'
 Add-ManualGate 'Microsoft signing pipeline established' 'obtain and record the Microsoft-signed release package'
 Add-ManualGate 'Secure Boot installation verified' 'install the Microsoft-signed package with Secure Boot enabled and record the result'
 Add-ManualGate 'Chrome/VLC ordinary relay acceptance' 'run the normal-speaker relay matrix with Chrome and VLC'
 Add-ManualGate 'Discord Relay Microphone acceptance' 'run peer-to-Discord capture acceptance on the disposable test machine'
 Add-ManualGate 'Sleep/resume lifecycle' 'exercise suspend/resume with active and idle streams and record endpoint/cable results'
+Add-ManualGate 'AudioSrv restart lifecycle' 'restart Audiosrv with active and idle streams and record endpoint/cable results'
 Add-ManualGate 'Disable/enable lifecycle' 'exercise device disable/enable and record endpoint/cable results'
+Add-ManualGate 'Reboot lifecycle' 'reboot after install/upgrade and verify all four endpoints and both cables return'
+Add-ManualGate 'Crash recovery lifecycle' 'exercise qpwgraph, render-client, and capture-client crashes with active streams'
+Add-ManualGate 'Install/uninstall/upgrade lifecycle' 'repeat install, uninstall, and upgrade cycles and retain exact package evidence'
 Add-ManualGate 'Destination disappearance and return' 'remove and restore the physical destination during an isolated effect route'
 Add-ManualGate 'Physical endpoint churn selector stability' 'change the physical endpoint and verify stable selectors recover the route'
 

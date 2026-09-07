@@ -129,6 +129,15 @@ impl ApplicationDriver {
         }
     }
 
+    /// Configure the single Windows automatic-routing boundary. Demo mode
+    /// deliberately ignores the setting because it has no native backend.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn configure_windows_app_routing(&mut self, enabled: bool) {
+        if let BackendKind::Live(driver) = &mut self.backend {
+            driver.configure_windows_app_routing(enabled);
+        }
+    }
+
     pub(crate) fn has_alsa(&self) -> bool {
         match &self.backend {
             BackendKind::Demo(_) => false,

@@ -3,6 +3,8 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod render_eos;
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 

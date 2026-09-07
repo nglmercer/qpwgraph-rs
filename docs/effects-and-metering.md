@@ -13,6 +13,12 @@ activates the patchbay when configured, and then restores routed effects.
 That order matters: a routed effect needs the link it sits on to exist before
 it can be reinserted, so patchbay activation has to run in between.
 
+Windows currently supports the built-in effect registry in the user-mode
+realtime router. A persisted `module_path` is rejected explicitly because no
+stable, crash-contained Windows module ABI has been released; it is not
+silently ignored or loaded in the kernel driver. External module hosting is a
+separate future feature with its own ABI, realtime-safety, and lifecycle gate.
+
 ## Metering
 
 Audio meters can be **Disabled**, **OnDemand**, or **Always**. On-demand helper

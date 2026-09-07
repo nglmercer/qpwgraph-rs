@@ -66,7 +66,7 @@ about what they cover:
 | --- | --- | --- |
 | a recording endpoint | a playback endpoint | a real route |
 | a playback endpoint's monitor | another playback endpoint | a real route |
-| an ordinary application session | anything | refused, with an explanation |
+| an ordinary application session | read-only process capture/relay | mutable reroute refused, with an explanation |
 | a session already on QPWGraph Virtual Output | physical endpoint/effect | process-loopback PCM route |
 
 The ordinary-session row is why `node_supports_routing` exists. A backend-wide capability
@@ -204,11 +204,13 @@ Capturing a process's actual PCM stream is *not* reachable by extending
 `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, which records what one process
 tree renders, on build 20348 and newer. The Windows worker reads
 `IAudioSessionControl2::GetProcessId` for every session and exposes a process
-port only after the session is attached to QPWGraph Virtual Output. The
-`ProcessLoopbackSource` activation owns the blob, PROPVARIANT, completion
-handler, and async operation until the callback finishes, then feeds the same
-bounded router source used by physical endpoints. Capability probes are
-cached by PID/mode and can be cleared after an audio-service or device change.
+port for an ordinary session as a read-only source, without requiring the
+session to be moved first. The `ProcessLoopbackSource` activation owns the
+blob, PROPVARIANT, completion handler, and async operation until the callback
+finishes, then feeds the same bounded router source used by physical endpoints.
+Capability probes are cached by PID/mode and can be cleared after an
+audio-service or device change. Mutable rerendering and effects still require
+the separate Virtual Output isolation proof.
 
 Metering is intentionally conservative on PipeWire. Measuring a node means
 attaching a real capture stream, which the session manager links like any other
@@ -225,7 +227,7 @@ are flagged passive, monitor-only, and non-reconnecting.
 | Relay: emit local audio | Yes, selected source to Relay Speaker | Yes, physical input or selected render monitor | Partial |
 | Relay: receive peer audio | Yes, Relay Microphone to selected sink | Selected render endpoint or optional Relay Microphone | Partial |
 | Relay: peer audio as a system capture endpoint | Yes, virtual Relay Microphone | Optional qpwgraph driver | Partial without driver |
-| Relay: send one application only | Yes | Process-loopback source is selectable for live sessions already isolated on QPWGraph Virtual Output | Partial: manual isolation/driver gate |
+| Relay: send one application only | Yes | Read-only process-loopback source for a live stable application selector | Partial: capability/OS gate |
 | Relay: choose which endpoint | n/a | Yes, by stable endpoint ID | Partial |
 | MIDI | ALSA | WinMM, with routing, fan-out, and fan-in | Equivalent for MIDI 1.0 |
 
@@ -281,7 +283,7 @@ when that default changes.
 
 On Windows, Emitter mode opens either a physical input with WASAPI `eCapture`,
 a playback monitor with `eRender` loopback, or the process-loopback ring for a
-live app already assigned to QPWGraph Virtual Output. Receiver mode opens an
+live app selected by stable identity. Receiver mode opens an
 `eRender` stream for peer audio. The relay panel exposes independent source
 and sink lists and persists stable Core Audio IDs or app selectors; default
 selectors follow the current endpoint and a removed explicit device falls back
@@ -292,12 +294,12 @@ Windows cannot present received audio as a **microphone** to other applications
 without an optional kernel-mode virtual-audio driver. Direct Receiver mode is
 still fully usable because it plays peer audio on the selected render endpoint.
 The relay selector also exposes live `application:<selector>` sources for
-render sessions the user has already moved to QPWGraph Virtual Output. Those
-entries use process-loopback PCM and disappear when the session is no longer
-isolated; they never fall back to another process. The same source is
-available to qpwgraph-owned graph routes, where it can provide true RMS and
-effects. Automatic reassignment through the undocumented Windows audio-policy
-interface remains unsupported.
+ordinary render sessions. Those entries use process-loopback PCM and disappear
+when the target session exits; they never fall back to another process. The
+same source is available to qpwgraph-owned capture/relay routes, where it can
+provide true RMS. Local effects and rerendering remain restricted to an
+isolated Virtual Output session. Automatic reassignment through the
+undocumented Windows audio-policy interface remains disabled and manual-only.
 
 ### Refresh and notification behavior
 
@@ -325,12 +327,13 @@ later refresh instead of silently dropping the link.
 Ordered by how much each one improves what a user actually sees. Everything
 above the line has landed; what is left is blocked on something specific.
 
-1. **Windows per-app output routing.** *Blocked on an ABI that cannot be
-   derived by probing.* The edge the graph draws between an application session
+1. **Windows per-app output routing.** The private policy boundary is now
+   implemented for the explicitly verified Windows 10 build range 19041--19045
+   and remains opt-in. The edge the graph draws between an application session
    and an endpoint is the one relationship Windows lets a user change --
    Settings calls it "App volume and device preferences". The undocumented
-   object behind it was probed on 10.0.19045, and these results are worth
-   keeping because they narrow the next attempt considerably:
+   object behind it was probed on 10.0.19045, and these results remain part of
+   the support record:
 
    | Probe | Result |
    | --- | --- |
@@ -339,9 +342,12 @@ above the line has landed; what is left is blocked on something specific.
    | IID `{ab3d4648-e242-459f-b02f-541c70306324}` (Windows 11) | E_NOINTERFACE |
    | IID `{2a59116d-6c4f-45e0-a74f-707e3fef9258}` (Windows 10) | **S_OK** |
 
-   So the interface **is present here**, under the Windows 10 IID. What could
-   not be established is its method layout. Probing vtable slots past
-   `IInspectable`:
+   So the interface **is present here**, under the Windows 10 IID. The backend
+   now uses the exact source-matched declaration for the 19 intervening
+   methods followed by `SetPersistedDefaultAudioEndpoint`,
+   `GetPersistedDefaultAudioEndpoint`, and
+   `ClearAllPersistedApplicationDefaultEndpoints`; it never repeats the
+   black-box slot probe. The historical probe results were:
 
    | Slot | Behaviour |
    | --- | --- |
@@ -360,21 +366,17 @@ above the line has landed; what is left is blocked on something specific.
    terminate usefully, so the method count could not be recovered that way
    either.
 
-   That is as far as black-box probing goes. A wrong slot is undefined
-   behaviour rather than a failed call -- seven of twelve faulted -- and a
-   wrong *write* would land in the user's persisted audio settings rather than
-   in a crash. The next attempt needs a reference declaration for the
-   `{2a59116d-…}` IID, not another guess, and every call should be gated on
-   that exact IID so a build exposing a different one reports unsupported
-   instead of calling into the wrong slots.
-2. **Automatic per-application relay policy.** The process-loopback capture
-   primitive and relay source adapter are landed for sessions already isolated
-   on QPWGraph Virtual Output. Process loopback requires build 20348 or newer;
-   the source list is operationally discovered, uses a stable executable-path
-   selector, resolves a live PID only while starting the worker, and fails
-   closed when the app is no longer isolated. Automatic reassignment through
-   the private Windows audio-policy interface remains intentionally
-   unsupported.
+   The Windows 11 IID remains recorded but disabled until the same declaration
+   has live evidence on a Windows 11 build. Automatic reassignment is still
+   experimental: the default is off, identity and endpoint ambiguity fail
+   closed, and the route is not activated until the worker confirms isolation.
+2. **Automatic per-application policy.** The process-loopback capture
+   primitive and relay source adapter remain read-only for ordinary sessions.
+   With the opt-in policy enabled on a supported Windows 10 build, a stable
+   Win32 or packaged identity can be moved to the provider-verified virtual
+   output, confirmed by a refreshed Core Audio session snapshot, and then
+   routed through qpwgraph. Runtime leases restore only qpwgraph-owned changes;
+   unsupported builds and policy failures retain the manual Volume Mixer path.
 3. **Linux param subscriptions.** PipeWire controls are read at each rebuild;
    Windows follows them by callback. Holding a `Props` subscription per node
    would close that gap.
@@ -405,8 +407,10 @@ compiles, and locked release builds. Native Linux development packages are
 installed in the Linux job. These checks do not require a live PipeWire daemon,
 physical MIDI hardware, or a Windows endpoint. The manual acceptance checklists
 remain separate live smoke tests and are not represented as passed by unit or
-CI results. A Windows relay application source additionally requires a live
-render session on QPWGraph Virtual Output and a process-loopback-capable OS.
+CI results. A Windows relay application source requires a live render session
+and a process-loopback-capable OS; Virtual Output isolation is additionally
+required only for mutable local rerendering and effects, not for read-only
+relay capture.
 
 When adding a rule both backends rely on, put the rule in `api` and test it
 there. A shared rule tested only inside one driver is untested on the other

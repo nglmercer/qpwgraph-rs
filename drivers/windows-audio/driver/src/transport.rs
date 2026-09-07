@@ -1,14 +1,21 @@
 //! Rust-owned PCM transport used by the opt-in ACX adapter.
 //!
-//! The ACX callback and WDF timer stay in the small C ABI bridge because the
-//! WDK headers contain versioned macros and opaque object layouts.  The audio
-//! data itself crosses into this module through fixed, allocation-free FFI
-//! helpers, so the bounded SPSC policy in `qpwgraph-audio-core` is the actual
-//! cable implementation rather than a C-side placeholder.
+//! The ACX callback and WDF timer use a small generated-binding boundary
+//! because the WDK headers contain versioned macros and opaque object layouts.
+//! The audio data itself crosses into this module through fixed,
+//! allocation-free FFI helpers, so the bounded SPSC policy in
+//! `qpwgraph-audio-core` is the actual cable implementation rather than a
+//! project-authored native runtime placeholder.
 
 use crate::ring::{PushResult, SpscSampleRing};
 
 const CABLE_SAMPLES: usize = 48_000 * 2;
+
+/// The fixed 16-bit transport boundary is never allowed to process more than
+/// one complete cable's worth of samples in a single callback.  This keeps the
+/// FFI length and its loop bounded even if a malformed caller supplies an
+/// unexpectedly large byte count.
+pub(crate) const MAX_PCM16_BYTES: u32 = (CABLE_SAMPLES * 2) as u32;
 
 static APP_CABLE: SpscSampleRing<CABLE_SAMPLES> = SpscSampleRing::new();
 static RELAY_CABLE: SpscSampleRing<CABLE_SAMPLES> = SpscSampleRing::new();
@@ -59,12 +66,15 @@ unsafe fn push_pcm16_into(
     if data.is_null() || bytes < 2 {
         return 0;
     }
+    if bytes > MAX_PCM16_BYTES {
+        return bytes;
+    }
 
     let sample_bytes = bytes & !1;
     let mut dropped = 0u32;
     for offset in (0..sample_bytes).step_by(2) {
         // SAFETY: the ACX packet allocator supplies a valid buffer for the
-        // exact packet length passed by the bridge.
+        // exact packet length passed by the ACX packet callback.
         let sample =
             unsafe { pcm16_to_f32(*data.add(offset as usize), *data.add(offset as usize + 1)) };
         if let PushResult::DroppedNewest { .. } = cable.push(&[sample]) {
@@ -96,6 +106,9 @@ unsafe fn pop_pcm16_from(cable: &SpscSampleRing<CABLE_SAMPLES>, data: *mut u8, b
     if data.is_null() || bytes < 2 {
         return 0;
     }
+    if bytes > MAX_PCM16_BYTES {
+        return 0;
+    }
 
     let sample_bytes = bytes & !1;
     for offset in (0..sample_bytes).step_by(2) {
@@ -103,7 +116,7 @@ unsafe fn pop_pcm16_from(cable: &SpscSampleRing<CABLE_SAMPLES>, data: *mut u8, b
         cable.pop_or_silence(&mut sample);
         let encoded = f32_to_pcm16(sample[0]).to_le_bytes();
         // SAFETY: the ACX packet allocator supplies a writable buffer for the
-        // exact packet length passed by the bridge.
+        // exact packet length passed by the ACX packet callback.
         unsafe {
             *data.add(offset as usize) = encoded[0];
             *data.add(offset as usize + 1) = encoded[1];
@@ -113,7 +126,7 @@ unsafe fn pop_pcm16_from(cable: &SpscSampleRing<CABLE_SAMPLES>, data: *mut u8, b
 }
 
 /// Clear queued audio after both ACX streams have stopped or the device is
-/// being released.  The bridge only calls this when no producer or consumer
+/// being released.  The ACX runtime only calls this when no producer or consumer
 /// callback can still be using the ring.
 #[unsafe(no_mangle)]
 pub extern "C" fn qpwgraph_audio_transport_clear() {
@@ -126,6 +139,27 @@ pub extern "C" fn qpwgraph_audio_transport_clear() {
 #[unsafe(no_mangle)]
 pub extern "C" fn qpwgraph_audio_transport_clear_relay() {
     RELAY_CABLE.clear();
+}
+
+/// Apply the allocation-free EOS boundary policy from the Rust driver core.
+///
+/// The Rust ACX runtime consumes this ABI-shaped result at its transport
+/// boundary; packet-length policy remains in the driver core.
+#[unsafe(no_mangle)]
+pub extern "C" fn qpwgraph_audio_render_payload(
+    packet: u32,
+    packet_bytes: u32,
+    eos_state: i32,
+    eos_packet: u32,
+    eos_bytes: u32,
+) -> qpwgraph_audio_core::render_eos::RenderPayload {
+    qpwgraph_audio_core::render_eos::render_payload(
+        packet,
+        packet_bytes,
+        eos_state,
+        eos_packet,
+        eos_bytes,
+    )
 }
 
 #[cfg(test)]

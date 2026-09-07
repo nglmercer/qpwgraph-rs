@@ -39,12 +39,15 @@ pub use windows::{
     classify_driver_owned_endpoint, classify_virtual_endpoint, AppRoutePolicy,
     AppRoutePolicySupport, ApplicationRouteActivation, ApplicationRouteCandidate,
     ApplicationRouteEnvironment, ApplicationRoutePlan, ApplicationRouteReconciler,
-    ApplicationRouteState, AudioFlow, AudioRole, ProcessAudioCapabilities, ProcessCaptureConsumer,
-    ProcessCaptureKey, ProcessCaptureManager, ProcessCaptureReadiness, ProcessCaptureRequest,
-    ProcessCaptureState, ProcessCaptureStatus, ProcessIdentity, ProcessLoopbackCapability,
-    ProcessLoopbackMode, ProcessLoopbackSource, ProcessMeterReading, ProcessMeterTarget,
-    QpwVirtualEndpointIdentity, QpwVirtualEndpointRole, UnsupportedAppRoutePolicy,
+    ApplicationRouteState, AudioFlow, AudioPolicyDiagnostics, AudioRole, AutomaticAppRouteLease,
+    ProcessAudioCapabilities, ProcessCaptureConsumer, ProcessCaptureKey, ProcessCaptureManager,
+    ProcessCaptureReadiness, ProcessCaptureRequest, ProcessCaptureState, ProcessCaptureStatus,
+    ProcessIdentity, ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
+    ProcessMeterReading, ProcessMeterTarget, QpwVirtualEndpointIdentity, QpwVirtualEndpointRole,
+    UnsupportedAppRoutePolicy, VerifiedAudioPolicyAbi, VerifiedAudioPolicyConfig,
     VirtualAudioDriverHealth, WindowsAudioDriver, WindowsEndpointSelector,
+    AUDIO_POLICY_CONFIG_FACTORY_IID_WIN10, AUDIO_POLICY_CONFIG_FACTORY_IID_WIN11,
+    VERIFIED_AUDIO_POLICY_ABIS,
 };
 #[cfg(target_os = "windows")]
 pub use windows_midi::WindowsMidiDriver;

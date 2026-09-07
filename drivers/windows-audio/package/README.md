@@ -23,6 +23,11 @@ generates `qpwgraph-audio.cat`, and stages the installable file set under
 this directory remains `bootstrap-fail-closed`; the generated manifest is
 marked `ready` only after the real `.sys` and catalog have been produced.
 
+`build-release-driver.ps1` is stricter than the development staging command:
+it refuses to create a production candidate while any project-authored C/C++
+runtime source remains under `driver/src`. The Rust ACX runtime still requires
+the WDK and live validation gates before it can become a release candidate.
+
 ## Development test signing
 
 The staged package is unsigned. On a disposable test VM, run the bundled
@@ -43,6 +48,12 @@ printed `.cer` into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`
 on the test machine from an elevated PowerShell prompt. An existing code
 signing certificate can be selected with
 `-CertificateThumbprint <thumbprint>` instead.
+
+When `-CreateCertificate` is used without `-ImportCertificate`, the helper
+temporarily trusts only the generated public certificate in the current
+user's `Root` store so SignTool can verify the exact package. It removes that
+temporary trust before returning; it does not make the certificate trusted for
+installation or change any machine-wide store.
 
 For a guided elevated flow, use the staged `run-validation.cmd` launcher. It
 uses `ExecutionPolicy Bypass`, requests a Windows UAC elevation when needed,
@@ -122,9 +133,11 @@ The default driver build intentionally returns `STATUS_NOT_SUPPORTED` from
 device-add. The opt-in `acx` build now contains the ACX app and relay endpoint
 transactions (device, circuits, pins, format, RT packet timing, and two
 independent Rust bounded PCM cables), but it is not installable until an eWDK
-build and a test-signed Windows validation pass prove that path. This default fail-closed
-state prevents an unvalidated development binary from being confused with a
-successful release driver.
+build and a test-signed Windows validation pass prove that path. A newly
+staged candidate still needs its own disposable-machine install evidence before
+it can be treated as live validated. This default fail-closed state prevents an
+unvalidated development binary from being confused with a successful release
+driver.
 The installer checks `manifest.json` and refuses packages whose
 `implementation_status` is not `ready`.
 
@@ -141,10 +154,12 @@ properties in the INF `HKR,EP\0` sections, so
 Output, `app-monitor` for Virtual Monitor, `relay-render` for Relay Sink, and
 `relay-capture` for Relay Microphone. The matching typed `AddProperty`
 sections remain on each interface for device-property consumers. The ACX
-bridge gives the app pair and relay pair independent bounded PCM cables. The
-Windows 10 test-signed pass verified all four roles and the app cable's
-non-silent round trip; Driver Verifier, HLK, release-signing, Secure Boot, and
-ordinary-client relay tests remain separate release gates.
+runtime gives the app pair and relay pair independent bounded PCM cables. The
+recorded Windows 10 test-signed baseline verified all four roles and the app
+cable's non-silent round trip against the then-installed development package;
+it does not validate the newly staged candidate. Driver Verifier, HLK,
+release-signing, Secure Boot, and ordinary-client relay tests remain separate
+release gates.
 
 The `--audit-toolchain` command is the explicit ACX gate. It checks
 WDKContentRoot, the versioned KM CRT headers, acx.h, the target-architecture
@@ -222,6 +237,69 @@ re-enable the exact devnode in a `finally` block. The script never changes boot
 configuration, installs or removes a package, or disables an unrelated device;
 preserve its output as the lifecycle acceptance record.
 
+Audio service recovery is a separate explicit phase and restarts only
+`Audiosrv`:
+
+```powershell
+.\lifecycle-validation.ps1 -Phase AudioService -Execute -AllowAudioServiceRestart -Verbose
+```
+
+The script verifies both cables before and after the restart. Reboot, client
+crash, uninstall/upgrade, and physical endpoint churn remain separate live
+rows because they require a disposable image and their own evidence.
+
+The release-gate helpers are explicit about machine state:
+
+```powershell
+# Read-only package and machine evidence:
+.\prepare-hlk.ps1 -OutputPath .\hlk-preparation.json
+.\secure-boot-audit.ps1 -OutputPath .\secure-boot-audit.json
+.\collect-verifier-evidence.ps1 -OutputPath .\verifier-evidence.json
+
+# State-mutating Verifier controls; both require an explicit confirmation:
+.\enable-verifier.ps1 -ConfirmEnable
+.\run-driver-stress.ps1 -Execute -Cycles 100 -PackageRoot . -EvidencePath .\driver-stress.json
+.\disable-verifier.ps1 -ConfirmReset
+```
+
+The Verifier scripts never run from a normal build. Enabling/resetting
+Verifier is machine-wide and normally requires a reboot; pass the separate
+`-Reboot -AllowReboot` switches only on a disposable test image. The stress
+runner opens/stops the exact four endpoint roles through the smoke probe and
+does not claim that client-crash, HLK, Microsoft-signing, or Secure Boot rows
+passed. Its structured evidence requires 100 or more completed app-cable,
+relay-cable, and two-cable-isolation cycles before the full-release validator
+will accept it. Preserve its output with the read-only evidence JSON.
+
+Retain the human-reviewed lifecycle/client record as
+`acceptance-evidence.json` in the same evidence directory. It uses the
+`release-audit.ps1 -EvidencePath` schema, and the full-release validator
+requires every listed external gate to have `status: "pass"` with a non-empty
+evidence reference.
+
+For a production-signing boundary, build a candidate and prepare an external
+dashboard submission without credentials:
+
+```powershell
+.\build-release-driver.ps1
+.\prepare-dashboard-submission.ps1 -OutputDirectory C:\evidence\qpwgraph-submission
+.\verify-returned-driver.ps1 `
+  -PackageRoot C:\evidence\returned-driver `
+  -SubmissionManifest C:\evidence\qpwgraph-submission\submission-manifest.json
+.\validate-release-evidence.ps1 `
+  -EvidenceRoot C:\evidence\release-evidence `
+  -PackageRoot C:\evidence\returned-driver `
+  -OutputPath C:\evidence\release-evidence\evidence-validation.json
+```
+
+`verify-returned-driver.ps1` requires valid SYS/CAT signatures, Microsoft
+publisher identity by default, catalog membership, and all four semantic role
+declarations. Supplying the submission manifest additionally requires exact
+INF/manifest identity and records the allowed SYS/CAT signing or dashboard
+transformation relationship. Test-signed packages must be verified separately
+with `-AllowNonMicrosoft` for development only and must not be used as
+production evidence.
+
 After a passing audit, the opt-in binding compilation is:
 
     Push-Location drivers/windows-audio
@@ -229,11 +307,12 @@ After a passing audit, the opt-in binding compilation is:
     Pop-Location
 
 That command proves that the selected eWDK ACX headers and the feature-gated
-device/circuit/stream bridge can be compiled. The test-signed Windows pass
-also proves that the generated driver loads, enumerates all four roles, and
-passes the basic shared-mode round trip. The package remains development-only
-until Verifier, HLK, release-signing, Secure Boot, and ordinary-client gates
-pass.
+device/circuit/stream runtime can be compiled. The test-signed Windows pass
+also proves that the recorded installed development package loaded, enumerated
+all four roles, and passed the basic shared-mode round trip. A newly staged
+candidate still needs its own install/run record. The package remains
+development-only until Verifier, HLK, release-signing, Secure Boot, and
+ordinary-client gates pass.
 
 `install.ps1` creates the development-only `ROOT\DEVGEN\QPWGRAPH_AUDIO` devnode with
 WDK `devgen.exe`, then uses PnPUtil for package installation and removal while
@@ -286,9 +365,9 @@ bound INF to equal the exact published package and its problem code to be
 zero before accepting endpoint roles. Existing endpoints from an older
 package cannot prove an upgrade succeeded.
 
-The native EOS boundary regression can be run from the nested workspace with
-`clang tests/render_eos.c -o target/render-eos-test.exe`, followed by
-`./target/render-eos-test.exe`; eWDK CI runs it before packaging. It exercises
-the same packet-prefix decision used by the bridge. The bridge honors the
-final byte length and suppresses later circular-buffer data as described by
-the [ACX render packet contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/acxstreams/nc-acxstreams-evt_acx_stream_set_render_packet).
+The EOS boundary regression now lives in the no-std Rust driver core. Run
+`cargo test -p qpwgraph-audio-core render_eos --locked` from the nested
+workspace; the Rust ACX runtime consumes the result through a small
+FFI-shaped transport boundary and honors the final byte length while
+suppressing later circular-buffer data as required by the ACX render packet
+contract.

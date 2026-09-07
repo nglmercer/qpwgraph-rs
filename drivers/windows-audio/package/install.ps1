@@ -84,7 +84,9 @@ function Assert-Administrator {
 }
 
 function Assert-TestSigningEnabled {
-    $settings = (& bcdedit.exe /enum '{current}' 2>$null | Out-String)
+    # Query the complete store. Passing {current} can be rejected on some
+    # UEFI/non-elevated sessions before bcdedit reports the actual state.
+    $settings = (& bcdedit.exe /enum 2>$null | Out-String)
     if ($LASTEXITCODE -ne 0 -or $settings -notmatch '(?im)^\s*testsigning\s+Yes\s*$') {
         throw '-AllowTestSigned requires Windows test-signing mode to be enabled for the current boot entry.'
     }
@@ -293,7 +295,8 @@ if ($AllowTestSigned) {
     Write-Verbose 'Installing through PnPUtil with normal Windows signature policy.'
 }
 
-if (-not $PSCmdlet.ShouldProcess($inf, 'install the QPWGraph audio driver package')) {
+if ($WhatIfPreference) {
+    Write-Output 'WhatIf mode: the QPWGraph audio driver package was not installed.'
     return
 }
 

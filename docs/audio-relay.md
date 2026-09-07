@@ -9,7 +9,8 @@ format is documented separately in
 
 The relay panel exposes two generic modes. **Emitter** selects a local source
 (the default input, a physical input, a playback monitor, or—on Windows—a
-live app already isolated on QPWGraph Virtual Output) and connects to a peer.
+live application process-loopback source, whether ordinary or already
+isolated on QPWGraph Virtual Output) and connects to a peer.
 **Receiver** starts a local host, accepts a peer, and selects the output that
 should play the received audio. Advanced settings cover codec, frame duration,
 transport, pairing, trusted peers, and QR endpoint information. Linux also

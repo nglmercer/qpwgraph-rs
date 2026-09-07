@@ -129,6 +129,15 @@ pub struct WindowsAudioDriver {
     pub(super) virtual_endpoint_identities: Vec<QpwVirtualEndpointIdentity>,
     /// Health of the optional four-endpoint qpwgraph driver package.
     pub(super) virtual_driver_health: VirtualAudioDriverHealth,
+    /// The sole boundary for the optional, undocumented per-application
+    /// endpoint policy. It is disabled until a build-matched ABI is verified.
+    pub(super) app_route_policy: VerifiedAudioPolicyConfig,
+    /// Runtime-only ownership records for private per-application endpoint
+    /// changes. The role is part of the key because AudioPolicyConfig stores
+    /// one persisted endpoint per flow/role; neither the key nor the PID is
+    /// written to configuration.
+    pub(super) application_route_leases: BTreeMap<(usize, AudioRole), AutomaticAppRouteLease>,
+    pub(super) application_route_policy_generation: u64,
     /// The routes qpwgraph owns, and the audio behind them.
     ///
     /// Started on the first connect rather than at construction: a session
@@ -237,6 +246,9 @@ impl WindowsAudioDriver {
             process_captures: snapshot.process_captures,
             virtual_endpoint_identities: snapshot.virtual_endpoint_identities,
             virtual_driver_health: snapshot.virtual_driver_health,
+            app_route_policy: VerifiedAudioPolicyConfig::disabled(),
+            application_route_leases: BTreeMap::new(),
+            application_route_policy_generation: 0,
             routing: None,
             effects: WindowsEffects::new(),
             effect_positions: BTreeMap::new(),
@@ -629,7 +641,27 @@ impl WindowsAudioDriver {
     /// undocumented Windows ABI calls.  The manual fallback remains
     /// actionable and can be shown even when the optional driver is absent.
     pub fn app_route_policy_support(&self) -> AppRoutePolicySupport {
-        UnsupportedAppRoutePolicy.support()
+        self.app_route_policy.support()
+    }
+
+    /// Return the privacy-safe diagnostics for automatic application routing.
+    /// This never exposes COM pointers, process paths, or endpoint property
+    /// blobs.
+    pub fn app_route_policy_diagnostics(&self) -> AudioPolicyDiagnostics {
+        self.app_route_policy.diagnostics()
+    }
+
+    /// Apply the persisted opt-in switch to the isolated policy boundary.
+    /// Disabling the switch first stops qpwgraph-owned rerender links, then
+    /// gives any live, still-owned lease a chance to restore through the old
+    /// policy object. A failed restore is retained for the next live
+    /// reconciliation rather than being silently forgotten.
+    pub fn set_experimental_app_routing(&mut self, enabled: bool) {
+        if !enabled {
+            let _ = self.clear_application_route_links();
+            self.restore_automatic_application_route_policies(true);
+        }
+        self.app_route_policy = VerifiedAudioPolicyConfig::new(enabled);
     }
 
     /// Return the capability split for a live Windows application session.
@@ -1013,6 +1045,422 @@ impl WindowsAudioDriver {
         Ok((link_ids, effect_ids))
     }
 
+    const AUTOMATIC_APP_ROUTE_ROLES: [AudioRole; 3] = [
+        AudioRole::Console,
+        AudioRole::Multimedia,
+        AudioRole::Communications,
+    ];
+
+    fn app_render_endpoint_selector(&self) -> Option<WindowsEndpointSelector> {
+        let identities: Vec<_> = self
+            .virtual_endpoint_identities
+            .iter()
+            .filter(|identity| identity.role == QpwVirtualEndpointRole::AppRender)
+            .collect();
+        let [identity] = identities.as_slice() else {
+            return None;
+        };
+        self.endpoint_selectors
+            .get(&identity.mmdevice_id)
+            .filter(|selector| selector.data_flow == AudioFlow::Render)
+            .cloned()
+    }
+
+    fn unique_application_candidate(
+        &self,
+        selector: &pw_graph_config::WindowsApplicationSelector,
+    ) -> Option<ApplicationRouteCandidate> {
+        let mut matches = self
+            .application_route_candidates
+            .iter()
+            .filter(|candidate| selector.matches(&candidate.selector));
+        let candidate = matches.next()?.clone();
+        matches.next().is_none().then_some(candidate)
+    }
+
+    fn route_rule_is_winner(
+        &self,
+        rule_index: usize,
+        selector: &pw_graph_config::WindowsApplicationSelector,
+    ) -> bool {
+        self.application_routes
+            .rules()
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.matches_application(selector))
+            .min_by(|(left_index, left), (right_index, right)| {
+                right
+                    .selector_specificity()
+                    .cmp(&left.selector_specificity())
+                    .then_with(|| left_index.cmp(right_index))
+            })
+            .is_some_and(|(winner, _)| winner == rule_index)
+    }
+
+    fn selector_for_policy_endpoint(
+        &self,
+        endpoint: Option<&str>,
+    ) -> Option<WindowsEndpointSelector> {
+        let endpoint = endpoint.filter(|endpoint| !endpoint.trim().is_empty())?;
+        if let Some(selector) = self.endpoint_selectors.get(endpoint) {
+            return (selector.data_flow == AudioFlow::Render).then_some(selector.clone());
+        }
+        // The saved endpoint may be temporarily absent. Preserve its exact
+        // MMDevice id for a later restore; never downgrade it to a friendly
+        // name or choose a replacement endpoint.
+        Some(WindowsEndpointSelector {
+            stable_id: None,
+            current_mmdevice_id: Some(endpoint.to_owned()),
+            friendly_name: None,
+            data_flow: AudioFlow::Render,
+        })
+    }
+
+    fn endpoint_id_matches(selector: &WindowsEndpointSelector, endpoint: Option<&str>) -> bool {
+        selector
+            .current_mmdevice_id
+            .as_deref()
+            .zip(endpoint)
+            .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+    }
+
+    fn restore_automatic_application_route_policies(&mut self, force: bool) {
+        let lease_keys: Vec<_> = self.application_route_leases.keys().copied().collect();
+        let virtual_output = self.app_render_endpoint_selector();
+        for (rule_index, role) in lease_keys {
+            let Some(lease) = self
+                .application_route_leases
+                .get(&(rule_index, role))
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(candidate) = self.unique_application_candidate(&lease.selector) else {
+                // A stopped process has no safe PID to call. Keep the lease
+                // until the same stable selector returns with a new PID.
+                continue;
+            };
+            let Ok(identity) = ProcessIdentity::from_pid(candidate.pid) else {
+                continue;
+            };
+            if !lease.selector.matches(&identity.application_selector()) {
+                continue;
+            }
+            let still_requested = !force
+                && self
+                    .application_routes
+                    .rules()
+                    .get(rule_index)
+                    .is_some_and(|rule| {
+                        rule.enabled
+                            && self.route_rule_is_winner(rule_index, &lease.selector)
+                            && virtual_output.is_some()
+                    });
+            if lease.process_id != candidate.pid {
+                // The private policy is keyed by PID on the verified ABI. A
+                // selector-matched replacement process therefore needs the
+                // old lease's original endpoint, but it must not be treated
+                // as a user override merely because its new PID has no
+                // persisted value yet. The automatic sync below reapplies
+                // the target to this PID. If the rule was removed, the old
+                // PID is already gone and there is no owned value on the new
+                // PID to restore.
+                if !still_requested {
+                    self.application_route_leases.remove(&(rule_index, role));
+                }
+                continue;
+            }
+            if !lease.owned {
+                if !still_requested {
+                    self.application_route_leases.remove(&(rule_index, role));
+                }
+                continue;
+            }
+            let Ok(current) =
+                self.app_route_policy
+                    .get_persisted_endpoint(&identity, AudioFlow::Render, role)
+            else {
+                continue;
+            };
+            if !Self::endpoint_id_matches(&lease.applied_endpoint, current.as_deref()) {
+                // A current endpoint other than the one qpwgraph applied is a
+                // user or third-party override. Drop ownership and preserve
+                // that choice; do not restore over it later.
+                if still_requested {
+                    if let Some(lease) = self.application_route_leases.get_mut(&(rule_index, role))
+                    {
+                        lease.mark_user_override();
+                    }
+                } else {
+                    self.application_route_leases.remove(&(rule_index, role));
+                }
+                continue;
+            }
+            if still_requested {
+                continue;
+            }
+            let original = lease
+                .original_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.current_mmdevice_id.as_deref());
+            let restored = self
+                .app_route_policy
+                .set_persisted_endpoint(&identity, AudioFlow::Render, role, original)
+                .is_ok()
+                && self
+                    .app_route_policy
+                    .get_persisted_endpoint(&identity, AudioFlow::Render, role)
+                    .is_ok_and(|current| match lease.original_endpoint.as_ref() {
+                        Some(original) => Self::endpoint_id_matches(original, current.as_deref()),
+                        None => current.is_none(),
+                    });
+            if restored {
+                self.application_route_leases.remove(&(rule_index, role));
+            }
+        }
+    }
+
+    /// Apply or reconcile the private per-application endpoint policy. This
+    /// method never changes graph state itself: a Core Audio refresh must first
+    /// prove that the application session actually moved to AppRender before
+    /// the ordinary reconciler can request capture/effects.
+    fn sync_automatic_application_route_policies(&mut self) -> bool {
+        self.restore_automatic_application_route_policies(false);
+        if !matches!(
+            self.app_route_policy.support(),
+            AppRoutePolicySupport::Experimental { .. }
+        ) {
+            return false;
+        }
+        let Some(virtual_output) = self.app_render_endpoint_selector() else {
+            return false;
+        };
+        let rules = self.application_routes.rules().to_vec();
+        let mut changed = false;
+        for (rule_index, rule) in rules.iter().enumerate() {
+            if !rule.enabled || !self.route_rule_is_winner(rule_index, &rule.application) {
+                continue;
+            }
+            let Some(candidate) = self.unique_application_candidate(&rule.application) else {
+                continue;
+            };
+            if candidate.isolated || candidate.pid == 0 {
+                continue;
+            }
+            let Ok(identity) = ProcessIdentity::from_pid(candidate.pid) else {
+                continue;
+            };
+            let live_selector = identity.application_selector();
+            if !rule.application.matches(&live_selector)
+                || !candidate.selector.matches(&live_selector)
+            {
+                continue;
+            }
+
+            let existing_leases: Vec<_> = Self::AUTOMATIC_APP_ROUTE_ROLES
+                .iter()
+                .map(|role| {
+                    self.application_route_leases
+                        .get(&(rule_index, *role))
+                        .cloned()
+                })
+                .collect();
+            let existing_lease = existing_leases.iter().all(|lease| {
+                lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.process_id == candidate.pid)
+            });
+            if existing_lease {
+                // A lease already owns this transaction. The next refresh is
+                // responsible for observing the endpoint move; never rewrite
+                // it repeatedly while Core Audio is catching up.
+                continue;
+            }
+
+            // A user override is an explicit revocation of qpwgraph's
+            // ownership. Preserve it across a selector-matched process
+            // restart instead of reapplying the private policy.
+            if existing_leases.iter().flatten().any(|lease| !lease.owned) {
+                continue;
+            }
+
+            let mut originals = BTreeMap::new();
+            let mut read_failed = false;
+            for (index, role) in Self::AUTOMATIC_APP_ROUTE_ROLES.iter().enumerate() {
+                if let Some(lease) = existing_leases[index].as_ref() {
+                    // Preserve the original endpoint captured for the first
+                    // PID. Reading the replacement PID here would usually
+                    // return `None` and would make a restart lose the safe
+                    // restore target.
+                    originals.insert(
+                        *role,
+                        lease
+                            .original_endpoint
+                            .as_ref()
+                            .and_then(|endpoint| endpoint.current_mmdevice_id.clone()),
+                    );
+                    continue;
+                }
+                let Ok(original_id) = self.app_route_policy.get_persisted_endpoint(
+                    &identity,
+                    AudioFlow::Render,
+                    *role,
+                ) else {
+                    read_failed = true;
+                    break;
+                };
+                originals.insert(*role, original_id);
+            }
+            if read_failed {
+                continue;
+            }
+
+            let mut attempted_roles = Vec::new();
+            let mut set_failed = false;
+            let target = virtual_output
+                .current_mmdevice_id
+                .as_deref()
+                .unwrap_or_default();
+            if target.is_empty() {
+                continue;
+            }
+            for role in Self::AUTOMATIC_APP_ROUTE_ROLES {
+                attempted_roles.push(role);
+                if self
+                    .app_route_policy
+                    .set_persisted_endpoint(&identity, AudioFlow::Render, role, Some(target))
+                    .is_err()
+                {
+                    set_failed = true;
+                    break;
+                }
+            }
+            if set_failed {
+                // Best-effort rollback is still ownership-safe: if the PID or
+                // identity changed, the policy boundary rejects the call and
+                // the route remains manual/degraded rather than touching a
+                // reused process.
+                let mut rollback_failed_roles = Vec::new();
+                for role in attempted_roles {
+                    let original = originals
+                        .get(&role)
+                        .and_then(|endpoint| endpoint.as_deref());
+                    if self
+                        .app_route_policy
+                        .rollback_persisted_endpoint(&identity, AudioFlow::Render, role, original)
+                        .is_err()
+                    {
+                        rollback_failed_roles.push(role);
+                    }
+                }
+                if !rollback_failed_roles.is_empty() {
+                    // Keep ownership for any role that could not be restored.
+                    // A later refresh after the policy is recreated can retry
+                    // the restore, while a route that was already restored is
+                    // not represented as an active lease.
+                    self.application_route_policy_generation =
+                        self.application_route_policy_generation.wrapping_add(1);
+                    let generation = self.application_route_policy_generation;
+                    for role in rollback_failed_roles {
+                        let original_endpoint = self.selector_for_policy_endpoint(
+                            originals
+                                .get(&role)
+                                .and_then(|endpoint| endpoint.as_deref()),
+                        );
+                        self.application_route_leases.insert(
+                            (rule_index, role),
+                            AutomaticAppRouteLease::new(
+                                candidate.selector.clone(),
+                                candidate.pid,
+                                original_endpoint,
+                                virtual_output.clone(),
+                                generation,
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // A successful private setter is not by itself proof that the
+            // per-role policy was committed. Read each role back before
+            // publishing leases or allowing the ordinary route reconciler to
+            // treat isolation as complete. A mismatch uses the same
+            // ownership-safe rollback as a setter failure.
+            if Self::AUTOMATIC_APP_ROUTE_ROLES.iter().any(|role| {
+                !self
+                    .app_route_policy
+                    .get_persisted_endpoint(&identity, AudioFlow::Render, *role)
+                    .is_ok_and(|current| {
+                        Self::endpoint_id_matches(&virtual_output, current.as_deref())
+                    })
+            }) {
+                set_failed = true;
+            }
+            if set_failed {
+                let mut rollback_failed_roles = Vec::new();
+                for role in Self::AUTOMATIC_APP_ROUTE_ROLES {
+                    let original = originals
+                        .get(&role)
+                        .and_then(|endpoint| endpoint.as_deref());
+                    if self
+                        .app_route_policy
+                        .rollback_persisted_endpoint(&identity, AudioFlow::Render, role, original)
+                        .is_err()
+                    {
+                        rollback_failed_roles.push(role);
+                    }
+                }
+                if !rollback_failed_roles.is_empty() {
+                    self.application_route_policy_generation =
+                        self.application_route_policy_generation.wrapping_add(1);
+                    let generation = self.application_route_policy_generation;
+                    for role in rollback_failed_roles {
+                        let original_endpoint = self.selector_for_policy_endpoint(
+                            originals
+                                .get(&role)
+                                .and_then(|endpoint| endpoint.as_deref()),
+                        );
+                        self.application_route_leases.insert(
+                            (rule_index, role),
+                            AutomaticAppRouteLease::new(
+                                candidate.selector.clone(),
+                                candidate.pid,
+                                original_endpoint,
+                                virtual_output.clone(),
+                                generation,
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+
+            self.application_route_policy_generation =
+                self.application_route_policy_generation.wrapping_add(1);
+            let generation = self.application_route_policy_generation;
+            for role in Self::AUTOMATIC_APP_ROUTE_ROLES {
+                let original_endpoint = self.selector_for_policy_endpoint(
+                    originals
+                        .get(&role)
+                        .and_then(|endpoint| endpoint.as_deref()),
+                );
+                self.application_route_leases.insert(
+                    (rule_index, role),
+                    AutomaticAppRouteLease::new(
+                        candidate.selector.clone(),
+                        candidate.pid,
+                        original_endpoint,
+                        virtual_output.clone(),
+                        generation,
+                    ),
+                );
+            }
+            changed = true;
+        }
+        changed
+    }
+
     fn reconcile_application_route_snapshot(&mut self) {
         let mut captures = BTreeMap::new();
         for capture in &self.process_captures {
@@ -1117,6 +1565,17 @@ impl WindowsAudioDriver {
         let _ = writeln!(
             report,
             "process_loopback_support=operational_activation_probe_per_session"
+        );
+        let policy = self.app_route_policy.diagnostics();
+        let _ = writeln!(
+            report,
+            "automatic_app_route_policy enabled={} os_build={} interface_version={:?} last_operation={:?} last_hresult={:?} fallback_reason={:?}",
+            policy.enabled,
+            policy.os_build,
+            policy.interface_version,
+            policy.last_operation,
+            policy.last_hresult,
+            policy.fallback_reason,
         );
         for capture in &self.process_captures {
             let _ = writeln!(
@@ -1318,6 +1777,11 @@ impl WindowsAudioDriver {
         }
         self.graph = graph;
         self.apply_application_route_plans()?;
+        // Private policy changes happen after qpwgraph has removed any route
+        // that is no longer requested. The current snapshot may still show
+        // the old physical endpoint; Core Audio will notify the worker and a
+        // later refresh must confirm AppRender isolation before activation.
+        let _automatic_policy_changed = self.sync_automatic_application_route_policies();
         self.meterable = snapshot.meterable;
         // A refresh re-reads volumes from Core Audio, which knows only about
         // the part of the level it is holding. Multiply the route's software
@@ -1375,6 +1839,14 @@ impl WindowsAudioDriver {
 
 impl Drop for WindowsAudioDriver {
     fn drop(&mut self) {
+        // A qpwgraph restart must not abandon a live private policy lease.
+        // Restore only while the currently observed endpoint still matches
+        // qpwgraph's applied value; user overrides remain untouched. This is
+        // best effort because Drop cannot report a native-policy failure.
+        if !self.application_route_leases.is_empty() {
+            let _ = self.clear_application_route_links();
+            self.restore_automatic_application_route_policies(true);
+        }
         let _ = self.command_tx.send(WorkerCommand::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

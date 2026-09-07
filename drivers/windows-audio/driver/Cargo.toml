@@ -14,6 +14,11 @@ acx = []
 [lib]
 crate-type = ["cdylib"]
 path = "src/lib.rs"
+# This target links against ntoskrnl.exe/HAL.dll and is loaded by the kernel;
+# Cargo's user-mode test harness cannot execute it. Host-runnable transport and
+# EOS coverage lives in qpwgraph-audio-core and the smoke crate instead.
+test = false
+doctest = false
 
 [dependencies]
 qpwgraph-audio-core.workspace = true

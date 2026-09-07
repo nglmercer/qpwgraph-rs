@@ -39,10 +39,10 @@ impl CompositeDriver {
             .unwrap_or_else(|| "qpwgraph Windows audio backend unavailable\n".into())
     }
 
-    /// Safe per-application routing capability.  The current backend only
-    /// exposes the documented manual Volume Mixer fallback; keeping the
-    /// capability on the composite lets the UI explain that state without
-    /// probing an undocumented ABI.
+    /// Safe per-application routing capability. The backend reports the
+    /// build-gated experimental policy only after its isolated private ABI
+    /// boundary activates; otherwise the composite exposes the manual Volume
+    /// Mixer fallback.
     #[cfg(target_os = "windows")]
     pub fn windows_app_route_policy_support(&self) -> pw_graph_backend::AppRoutePolicySupport {
         self.windows_audio
@@ -51,6 +51,17 @@ impl CompositeDriver {
             .unwrap_or_else(|| pw_graph_backend::AppRoutePolicySupport::ManualOnly {
                 reason: "Windows audio backend is unavailable".into(),
             })
+    }
+
+    /// Pass the persisted opt-in switch to the single automatic-routing
+    /// boundary. The backend performs only its explicit build-matched
+    /// activation check here; route calls remain behind the reconciler's
+    /// identity and isolation gates.
+    #[cfg(target_os = "windows")]
+    pub fn configure_windows_app_routing(&mut self, enabled: bool) {
+        if let Some(driver) = self.windows_audio.as_mut() {
+            driver.set_experimental_app_routing(enabled);
+        }
     }
 
     #[cfg(target_os = "windows")]

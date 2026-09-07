@@ -14,9 +14,11 @@ between Linux and Windows, the difference is stated here and detailed in
 - Windows WinMM MIDI devices with stable interface-based identities and real
   input-to-output routing.
 - Windows Core Audio graph relationships are informational: arbitrary
-  system-wide audio routing is not exposed as a mutable patchbay. A session
-  already assigned to QPWGraph Virtual Output can opt into process-loopback
-  routing through the user-mode router.
+  system-wide audio routing is not exposed as a mutable patchbay. Any live
+  application session can be captured read-only for relay and RMS when
+  process-loopback is available; a session already assigned to QPWGraph
+  Virtual Output can additionally opt into mutable process-loopback routing
+  and effects through the user-mode router.
 
 ## Editing
 
@@ -40,8 +42,10 @@ See [Configuration and patchbay files](configuration.md).
 - Built-in effect gallery with routed insertion, standalone nodes, every
   parameter, bypass, restoration, and cleanup.
 - Disabled, on-demand, and always-on audio metering.
-- Windows process-loopback PCM sources provide per-application true RMS and
-  effects once the application is isolated on QPWGraph Virtual Output.
+- Windows process-loopback PCM sources provide read-only per-application relay
+  and true RMS where activation is supported. Effects and local rerendering
+  remain restricted to applications isolated on QPWGraph Virtual Output, so a
+  normal application's dry output is never mixed with a processed copy.
 
 See [Effects and metering](effects-and-metering.md).
 

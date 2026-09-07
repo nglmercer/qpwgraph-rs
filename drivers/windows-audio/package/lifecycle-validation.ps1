@@ -3,7 +3,7 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory = $false)]
-    [ValidateSet('Plan', 'SleepResume', 'DisableEnable', 'All')]
+    [ValidateSet('Plan', 'SleepResume', 'DisableEnable', 'AudioService', 'All')]
     [string] $Phase = 'Plan',
     [Parameter(Mandatory = $false)]
     [string] $PackageRoot,
@@ -15,7 +15,9 @@ param(
     [Parameter(Mandatory = $false)]
     [switch] $Execute,
     [Parameter(Mandatory = $false)]
-    [switch] $AllowSuspend
+    [switch] $AllowSuspend,
+    [Parameter(Mandatory = $false)]
+    [switch] $AllowAudioServiceRestart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -174,6 +176,16 @@ function Invoke-DisableEnable {
     }
 }
 
+function Invoke-AudioServiceRestart {
+    Wait-Smoke @('--verify-roles') 'Pre-AudioSrv endpoint-role verification'
+    Wait-Smoke @('--verify-cables', '--duration-ms', '2000') 'Pre-AudioSrv cable verification'
+    Write-Output 'Restarting the exact Windows Audio service Audiosrv.'
+    Restart-Service -Name 'Audiosrv' -Force
+    Start-Sleep -Seconds 2
+    Wait-Smoke @('--verify-roles') 'Post-AudioSrv endpoint-role verification'
+    Wait-Smoke @('--verify-cables', '--duration-ms', '2000') 'Post-AudioSrv cable verification'
+}
+
 function Invoke-SleepResume {
     if (-not ('QpwgraphPowerTransition' -as [type])) {
         Add-Type @'
@@ -188,6 +200,7 @@ public static class QpwgraphPowerTransition
         bool forceCritical,
         bool disableWakeEvent);
 }
+
 '@
     }
 
@@ -221,6 +234,7 @@ if ($Phase -eq 'Plan' -or -not $Execute) {
     Write-Output 'Plan-only mode: no device, endpoint, boot, or power state will be changed.'
     Write-Output 'Execute disable/enable: -Phase DisableEnable -Execute'
     Write-Output 'Execute suspend/resume: -Phase SleepResume -Execute -AllowSuspend'
+    Write-Output 'Execute AudioSrv recovery: -Phase AudioService -Execute -AllowAudioServiceRestart'
     Write-Output 'Execute both: -Phase All -Execute -AllowSuspend'
     exit 0
 }
@@ -238,16 +252,20 @@ if ($Phase -eq 'SleepResume' -or $Phase -eq 'All') {
         throw 'Sleep/resume requires the explicit -AllowSuspend switch in addition to -Execute.'
     }
 }
-
-if ($Phase -eq 'DisableEnable' -or $Phase -eq 'All') {
-    if ($PSCmdlet.ShouldProcess($rootDeviceInstanceId, 'disable, verify absence, enable, and verify the exact QPWGraph device')) {
-        Invoke-DisableEnable
+if ($Phase -eq 'AudioService' -or $Phase -eq 'All') {
+    if (-not $AllowAudioServiceRestart) {
+        throw 'AudioSrv recovery requires the explicit -AllowAudioServiceRestart switch in addition to -Execute.'
     }
 }
+
+if ($Phase -eq 'DisableEnable' -or $Phase -eq 'All') {
+    Invoke-DisableEnable
+}
 if ($Phase -eq 'SleepResume' -or $Phase -eq 'All') {
-    if ($PSCmdlet.ShouldProcess('this computer', 'suspend and resume for QPWGraph lifecycle validation')) {
-        Invoke-SleepResume
-    }
+    Invoke-SleepResume
+}
+if ($Phase -eq 'AudioService' -or $Phase -eq 'All') {
+    Invoke-AudioServiceRestart
 }
 
 Write-Output 'Lifecycle validation completed. Preserve the command output as acceptance evidence.'

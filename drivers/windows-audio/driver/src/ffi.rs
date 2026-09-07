@@ -1,8 +1,8 @@
-//! Minimal raw ACX declarations.
+//! Generated ACX declarations and fail-closed non-ACX placeholders.
 //!
-//! `wdk-sys` exposes KMDF but not the Audio Class Extensions headers.  Keep
-//! the ABI boundary opaque until it is generated and verified inside the eWDK
-//! environment; no guessed structure layout is allowed to cross this module.
+//! The feature build includes the exact types generated from the selected WDK
+//! headers. The only handwritten C is the macro/function-table glue in
+//! `acx_wrapper.h`; no ACX layout is recreated here.
 
 #[cfg(not(feature = "acx"))]
 use core::ffi::c_void;
@@ -10,17 +10,36 @@ use core::ffi::c_void;
 use wdk_sys::{NTSTATUS, PWDFDEVICE_INIT, WDFDEVICE};
 
 #[cfg(feature = "acx")]
-include!(env!("QPWGRAPH_ACX_BINDINGS"));
+#[allow(
+    clippy::all,
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unnecessary_transmutes,
+    unused_imports,
+    unused_unsafe
+)]
+mod generated {
+    include!(env!("QPWGRAPH_ACX_BINDINGS"));
+}
+
+#[cfg(feature = "acx")]
+pub use generated::*;
 
 /// Opaque ACX handles. Their concrete definitions belong to `acx.h` and are
 /// intentionally not recreated in Rust.
 #[cfg(not(feature = "acx"))]
+#[allow(clippy::upper_case_acronyms, dead_code)]
 pub type ACXDEVICE = *mut c_void;
 #[cfg(not(feature = "acx"))]
+#[allow(clippy::upper_case_acronyms, dead_code)]
 pub type ACXCIRCUIT = *mut c_void;
 #[cfg(not(feature = "acx"))]
+#[allow(clippy::upper_case_acronyms, dead_code)]
 pub type ACXPIN = *mut c_void;
 #[cfg(not(feature = "acx"))]
+#[allow(clippy::upper_case_acronyms, dead_code)]
 pub type ACXSTREAM = *mut c_void;
 
 /// The ACX configuration structures are opaque here for the same reason. The

@@ -118,30 +118,14 @@ fn stage_package(
     output: &Path,
     driver_binary: &Path,
 ) -> Result<(), String> {
-    fs::create_dir_all(output).map_err(|error| format!("create {}: {error}", output.display()))?;
-    for filename in [
-        "qpwgraph_audio.sys",
-        "qpwgraph-audio.inf",
-        "qpwgraph-audio.cat",
-        "manifest.json",
-        "install.ps1",
-        "uninstall.ps1",
-        "sign-test.ps1",
-        "test-validation.ps1",
-        "run-validation-elevated.ps1",
-        "run-validation.cmd",
-        "release-audit.ps1",
-        "lifecycle-validation.ps1",
-        "README.md",
-    ] {
-        let path = output.join(filename);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("remove {}: {error}", path.display())),
-        }
+    // The package directory is generated output. Recreate it so an older
+    // release manifest, validation log, or evidence file can never be
+    // mistaken for evidence belonging to the newly built driver.
+    if output.is_dir() {
+        fs::remove_dir_all(output)
+            .map_err(|error| format!("remove stale {}: {error}", output.display()))?;
     }
-
+    fs::create_dir_all(output).map_err(|error| format!("create {}: {error}", output.display()))?;
     fs::copy(driver_binary, output.join("qpwgraph_audio.sys"))
         .map_err(|error| format!("copy {}: {error}", driver_binary.display()))?;
     let source_inx = package_source.join("qpwgraph-audio.inx");
@@ -220,6 +204,16 @@ fn stage_package(
         "run-validation.cmd",
         "release-audit.ps1",
         "lifecycle-validation.ps1",
+        "enable-verifier.ps1",
+        "disable-verifier.ps1",
+        "run-driver-stress.ps1",
+        "collect-verifier-evidence.ps1",
+        "prepare-hlk.ps1",
+        "secure-boot-audit.ps1",
+        "build-release-driver.ps1",
+        "prepare-dashboard-submission.ps1",
+        "verify-returned-driver.ps1",
+        "validate-release-evidence.ps1",
         "README.md",
     ] {
         let source = package_source.join(filename);
@@ -441,6 +435,7 @@ fn clang_version(path: &str) -> Option<(u32, String)> {
 
 fn find_directory_with_suffix(root: &Path, suffix: &[&str]) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
+    let mut matches = Vec::new();
     while let Some(path) = stack.pop() {
         let entries = fs::read_dir(&path).ok()?;
         for entry in entries.flatten() {
@@ -457,17 +452,20 @@ fn find_directory_with_suffix(root: &Path, suffix: &[&str]) -> Option<PathBuf> {
                             .is_some_and(|name| name.eq_ignore_ascii_case(part))
                     })
                 {
-                    return Some(candidate);
+                    matches.push(candidate);
+                } else {
+                    stack.push(candidate);
                 }
-                stack.push(candidate);
             }
         }
     }
-    None
+    matches.sort_by(|left, right| right.to_string_lossy().cmp(&left.to_string_lossy()));
+    matches.into_iter().next()
 }
 
 fn find_file(root: &Path, wanted: &str) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
+    let mut matches = Vec::new();
     while let Some(path) = stack.pop() {
         let entries = fs::read_dir(&path).ok()?;
         for entry in entries.flatten() {
@@ -479,11 +477,12 @@ fn find_file(root: &Path, wanted: &str) -> Option<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
             {
-                return Some(candidate);
+                matches.push(candidate);
             }
         }
     }
-    None
+    matches.sort_by(|left, right| right.to_string_lossy().cmp(&left.to_string_lossy()));
+    matches.into_iter().next()
 }
 
 fn find_arch_file(root: &Path, wanted: &str) -> Option<PathBuf> {
@@ -494,7 +493,18 @@ fn find_arch_file(root: &Path, wanted: &str) -> Option<PathBuf> {
     } else {
         return None;
     };
+    let preferred = root
+        .join("km")
+        .join(target_directory)
+        .join("acx")
+        .join("km")
+        .join("1.1")
+        .join(wanted);
+    if preferred.is_file() {
+        return Some(preferred);
+    }
     let mut stack = vec![root.to_path_buf()];
+    let mut matches = Vec::new();
     while let Some(path) = stack.pop() {
         let entries = fs::read_dir(&path).ok()?;
         for entry in entries.flatten() {
@@ -512,11 +522,12 @@ fn find_arch_file(root: &Path, wanted: &str) -> Option<PathBuf> {
                         .is_some_and(|name| name.eq_ignore_ascii_case(target_directory))
                 })
             {
-                return Some(candidate);
+                matches.push(candidate);
             }
         }
     }
-    None
+    matches.sort_by(|left, right| right.to_string_lossy().cmp(&left.to_string_lossy()));
+    matches.into_iter().next()
 }
 
 fn validate_package_metadata() {
@@ -769,8 +780,8 @@ fn validate_package_metadata() {
             package.join("run-validation-elevated.ps1").display()
         );
     }
-    let release_audit_script =
-        fs::read_to_string(package.join("release-audit.ps1")).unwrap_or_else(|error| {
+    let release_audit_script = fs::read_to_string(package.join("release-audit.ps1"))
+        .unwrap_or_else(|error| {
             panic!(
                 "could not read {}: {error}",
                 package.join("release-audit.ps1").display()
@@ -807,6 +818,8 @@ fn validate_package_metadata() {
         "--verify-roles",
         "--verify-absent",
         "--verify-cables",
+        "AudioService",
+        "AllowAudioServiceRestart",
         "Disable-PnpDevice",
         "Enable-PnpDevice",
         "SetSuspendState",
@@ -819,6 +832,102 @@ fn validate_package_metadata() {
             "{} is missing lifecycle-validation marker {required}",
             package.join("lifecycle-validation.ps1").display()
         );
+    }
+
+    let release_gate_scripts: &[(&str, &[&str])] = &[
+        (
+            "enable-verifier.ps1",
+            &[
+                "ConfirmEnable",
+                "STATE-MUTATING",
+                "REBOOT-REQUIRING",
+                "verifier.exe",
+            ],
+        ),
+        (
+            "disable-verifier.ps1",
+            &["ConfirmReset", "machine-wide Driver Verifier configuration"],
+        ),
+        (
+            "run-driver-stress.ps1",
+            &[
+                "--round-trip",
+                "--relay-round-trip",
+                "--verify-cables",
+                "AllowAudioServiceRestart",
+            ],
+        ),
+        (
+            "collect-verifier-evidence.ps1",
+            &["/querysettings", "Win32_SystemDriver", "READ-ONLY"],
+        ),
+        (
+            "prepare-hlk.ps1",
+            &[
+                "expected_endpoint_roles",
+                "qpwgraph-audio.cat",
+                "OutputPath",
+            ],
+        ),
+        (
+            "secure-boot-audit.ps1",
+            &[
+                "Confirm-SecureBootUEFI",
+                "test_signing",
+                "endpoint_role_probe",
+            ],
+        ),
+        (
+            "build-release-driver.ps1",
+            &[
+                "git_commit",
+                "sys_sha256",
+                "llvm_version",
+                "--build-package",
+            ],
+        ),
+        (
+            "prepare-dashboard-submission.ps1",
+            &[
+                "Hardware Dev Center",
+                "credentials",
+                "submission-manifest.json",
+            ],
+        ),
+        (
+            "verify-returned-driver.ps1",
+            &[
+                "ExpectedPublisher",
+                "signtool.exe",
+                "Catalog membership",
+                "artifact_relationships",
+                "qpwgraph-audio.inf",
+                "relay-capture",
+                "OutputPath",
+            ],
+        ),
+        (
+            "validate-release-evidence.ps1",
+            &[
+                "qpwgraph-windows-release-evidence-validation",
+                "hlk-result-package.zip.sha256",
+                "Microsoft Windows Hardware Compatibility Publisher",
+                "Secure Boot was enabled",
+            ],
+        ),
+    ];
+    for &(script_name, required_markers) in release_gate_scripts {
+        let script_path = package.join(script_name);
+        let script = fs::read_to_string(&script_path).unwrap_or_else(|error| {
+            panic!("could not read {}: {error}", script_path.display());
+        });
+        for required in required_markers {
+            assert!(
+                script.contains(required),
+                "{} is missing release-gate marker {required}",
+                script_path.display()
+            );
+        }
     }
     println!("driver package metadata validated");
 }

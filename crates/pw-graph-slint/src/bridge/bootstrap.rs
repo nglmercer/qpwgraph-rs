@@ -19,6 +19,8 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
     let i18n = I18n::from_language(&language);
     let meter_policy = MeterPolicy::parse(&config.audio_meters);
     let (mut source, mut status) = ApplicationDriver::new(args, meter_policy, &i18n);
+    #[cfg(target_os = "windows")]
+    source.configure_windows_app_routing(config.windows.experimental_app_routing);
     restore_node_positions(&mut source, &config);
     let patchbay_file = selected_patchbay_path(&config);
     let patchbay = Patchbay::load_from(&patchbay_file)

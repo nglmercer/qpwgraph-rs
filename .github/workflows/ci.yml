@@ -208,7 +208,20 @@ jobs:
         run: |
           $scripts = @(
             'drivers/windows-audio/package/release-audit.ps1',
-            'drivers/windows-audio/package/lifecycle-validation.ps1'
+            'drivers/windows-audio/package/lifecycle-validation.ps1',
+            'drivers/windows-audio/package/enable-verifier.ps1',
+            'drivers/windows-audio/package/disable-verifier.ps1',
+            'drivers/windows-audio/package/run-driver-stress.ps1',
+            'drivers/windows-audio/package/collect-verifier-evidence.ps1',
+            'drivers/windows-audio/package/prepare-hlk.ps1',
+            'drivers/windows-audio/package/secure-boot-audit.ps1',
+            'drivers/windows-audio/package/build-release-driver.ps1',
+            'drivers/windows-audio/package/prepare-dashboard-submission.ps1',
+            'drivers/windows-audio/package/verify-returned-driver.ps1',
+            'drivers/windows-audio/package/validate-release-evidence.ps1',
+            'packaging/windows/build-full-installer.ps1',
+            'packaging/windows/install-full.ps1',
+            'packaging/windows/uninstall-full.ps1'
           )
           foreach ($scriptPath in $scripts) {
             $tokens = $null
@@ -226,6 +239,10 @@ jobs:
             throw 'The release audit returned no checks.'
           }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scripts[1] -Phase Plan
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scripts[2] -ConfirmEnable -WhatIf
+          if ($LASTEXITCODE -ne 0) { throw 'Driver Verifier enable WhatIf probe failed.' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scripts[3] -ConfirmReset -WhatIf
+          if ($LASTEXITCODE -ne 0) { throw 'Driver Verifier reset WhatIf probe failed.' }
       - name: Test release audit evidence overlay
         shell: pwsh
         run: ./drivers/windows-audio/tests/release-audit.ps1
@@ -245,6 +262,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Reject project-authored C/C++ runtime sources
+        shell: pwsh
+        run: |
+          $forbidden = @(Get-ChildItem drivers/windows-audio/driver/src -Recurse -File |
+            Where-Object { $_.Extension -in @('.c', '.cc', '.cpp') })
+          if ($forbidden.Count -ne 0) {
+            throw "Project-authored C/C++ runtime source remains: $($forbidden.FullName -join '; ')"
+          }
       - name: Validate Windows driver package metadata
         shell: pwsh
         working-directory: drivers/windows-audio
@@ -257,14 +282,10 @@ jobs:
         shell: pwsh
         working-directory: drivers/windows-audio
         run: cargo check -p qpwgraph-audio --features acx --locked
-      - name: Test ACX end-of-stream packet boundaries
+      - name: Test Rust ACX end-of-stream packet boundaries
         shell: pwsh
         working-directory: drivers/windows-audio
-        run: |
-          clang tests/render_eos.c -o target/render-eos-test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ./target/render-eos-test.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: cargo test -p qpwgraph-audio-core render_eos --locked
       - name: Test installer package binding gate
         shell: pwsh
         run: ./drivers/windows-audio/tests/install-binding.ps1

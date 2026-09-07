@@ -32,11 +32,13 @@ overflow, and discontinuity tests. The default driver package remains a
 fail-closed Stage-0 bootstrap: device-add returns `STATUS_NOT_SUPPORTED`.
 An opt-in eWDK build now contains the ACX app and relay endpoint pairs,
 circuit/stream callbacks, and two independent Rust-owned bounded PCM-cable
-paths. A Windows 10 test-signed validation pass now proves endpoint
+paths. The recorded Windows 10 test-signed smoke baseline proves endpoint
 enumeration, role ownership, shared-mode streaming, and the app cable's
-non-silent round trip. The source/default package remains fail-closed, and a
-public release still requires Verifier, HLK, Microsoft signing, Secure Boot,
-and ordinary-client validation.
+non-silent round trip against the then-installed development package; it does
+not prove that a newly built Rust candidate has been installed. The
+source/default package remains fail-closed, and a public release still
+requires Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client
+validation.
 
 Build/package commands require a real eWDK/WDK developer prompt, KMDF 1.31 or
 newer, a released LLVM 17--21 toolchain, and the WDK tools. LLVM 22 currently breaks

@@ -12,8 +12,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=WDKContentRoot");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
     println!("cargo:rerun-if-changed=src/acx_wrapper.h");
-    println!("cargo:rerun-if-changed=src/acx_bridge.c");
-    println!("cargo:rerun-if-changed=src/render_eos.h");
 
     if env::var_os("CARGO_FEATURE_ACX").is_some() {
         generate_acx_bindings()?;
@@ -36,7 +34,7 @@ fn generate_acx_bindings() -> Result<(), Box<dyn std::error::Error>> {
             root.display()
         )
     })?;
-    let acx_header = find_file(&include_root, "acx.h")
+    let acx_header = find_acx_header(&include_root)
         .ok_or_else(|| format!("acx.h disappeared below {}", include_root.display()))?;
     let acx_include = acx_header
         .parent()
@@ -55,7 +53,7 @@ fn generate_acx_bindings() -> Result<(), Box<dyn std::error::Error>> {
     let wdk_config = wdk_build::Config::from_env_auto()?;
 
     // Compile against the ACX 1.1 surface supported by Windows 10 version
-    // 2004. Keep the minimum framework version separate: the bridge only
+    // 2004. Keep the minimum framework version separate: the Rust runtime only
     // uses DDIs common to the older ACX surface, and ACX can probe the
     // framework's available function/structure tables at runtime.
     let builder = bindgen::Builder::wdk_default(&wdk_config)?
@@ -65,6 +63,24 @@ fn generate_acx_bindings() -> Result<(), Box<dyn std::error::Error>> {
         .clang_arg("--define-macro=ACX_VERSION_MINOR=1")
         .clang_arg("--define-macro=ACX_MINIMUM_VERSION_REQUIRED=0")
         .allowlist_function("^qpwgraph_acx_.*")
+        .allowlist_function("^qpwgraph_wdf_.*")
+        // Keep the exact ACX layouts and enums available to the Rust port.
+        // These names are sourced from the eWDK acx.h; no structure layout is
+        // recreated in Rust.
+        .allowlist_type("^ACX.*")
+        .allowlist_type("^Acx.*")
+        .allowlist_type("^PFN_ACX_.*")
+        .allowlist_type("^KSDATAFORMAT$")
+        .allowlist_type("^KSDATAFORMAT_WAVEFORMATEXTENSIBLE$")
+        .allowlist_type("^WAVEFORMATEX$")
+        .allowlist_type("^WAVEFORMATEXTENSIBLE$")
+        .allowlist_var("^Acx.*")
+        .allowlist_function("^Acx.*")
+        // The WDK headers contain several compiler-only layout sentinels that
+        // are not portable across the installed SDK/Clang pair. The fields
+        // and alignments still come from the selected headers; the eWDK/CI
+        // build remains the authoritative layout check.
+        .layout_tests(false)
         .wrap_static_fns(true)
         .wrap_static_fns_path(&wrapper_source)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
@@ -83,16 +99,12 @@ fn generate_acx_bindings() -> Result<(), Box<dyn std::error::Error>> {
 
     // The wrapper functions are static inline C because they expand WDK/ACX
     // initialization macros. Bindgen emits Rust declarations for them and a
-    // companion C translation unit; compile that unit with the same WDK
+    // build-generated C translation unit; compile that unit with the same WDK
     // include paths and kernel-mode definitions so the Rust calls have a real
     // linkable implementation.
     let wrapper_source = wrapper_source.with_extension("c");
-    let production_bridge = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/acx_bridge.c");
     let mut compiler = cc::Build::new();
-    compiler
-        .file(&wrapper_source)
-        .file(&production_bridge)
-        .warnings(false);
+    compiler.file(&wrapper_source).warnings(false);
     for include in wdk_config.include_paths()? {
         compiler.include(include);
     }
@@ -132,6 +144,7 @@ fn find_include_root(root: &Path) -> Option<PathBuf> {
 
 fn find_file(root: &Path, wanted: &str) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
+    let mut matches = Vec::new();
     while let Some(path) = stack.pop() {
         let entries = fs::read_dir(&path).ok()?;
         for entry in entries.flatten() {
@@ -143,11 +156,25 @@ fn find_file(root: &Path, wanted: &str) -> Option<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
             {
-                return Some(candidate);
+                matches.push(candidate);
             }
         }
     }
-    None
+    matches.sort_by(|left, right| right.to_string_lossy().cmp(&left.to_string_lossy()));
+    matches.into_iter().next()
+}
+
+fn find_acx_header(include_root: &Path) -> Option<PathBuf> {
+    let preferred = include_root
+        .join("km")
+        .join("acx")
+        .join("km")
+        .join("1.1")
+        .join("acx.h");
+    if preferred.is_file() {
+        return Some(preferred);
+    }
+    find_file(&include_root.join("km"), "acx.h")
 }
 
 fn find_arch_file(root: &Path, wanted: &str) -> Option<PathBuf> {
@@ -157,7 +184,18 @@ fn find_arch_file(root: &Path, wanted: &str) -> Option<PathBuf> {
         "aarch64" => "arm64",
         _ => return None,
     };
+    let preferred = root
+        .join("km")
+        .join(target_directory)
+        .join("acx")
+        .join("km")
+        .join("1.1")
+        .join(wanted);
+    if preferred.is_file() {
+        return Some(preferred);
+    }
     let mut stack = vec![root.to_path_buf()];
+    let mut matches = Vec::new();
     while let Some(path) = stack.pop() {
         let entries = fs::read_dir(&path).ok()?;
         for entry in entries.flatten() {
@@ -175,9 +213,10 @@ fn find_arch_file(root: &Path, wanted: &str) -> Option<PathBuf> {
                         .is_some_and(|name| name.eq_ignore_ascii_case(target_directory))
                 })
             {
-                return Some(candidate);
+                matches.push(candidate);
             }
         }
     }
-    None
+    matches.sort_by(|left, right| right.to_string_lossy().cmp(&left.to_string_lossy()));
+    matches.into_iter().next()
 }

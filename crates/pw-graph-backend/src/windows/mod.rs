@@ -57,6 +57,7 @@ use windows_core::BOOL;
 
 pub mod app_route_policy;
 mod app_route_reconciler;
+pub mod audio_policy_config;
 mod callbacks;
 mod driver;
 mod effects;
@@ -82,6 +83,11 @@ pub use self::app_route_reconciler::{
     ApplicationRouteActivation, ApplicationRouteCandidate, ApplicationRouteEnvironment,
     ApplicationRoutePlan, ApplicationRouteReconciler, ApplicationRouteState,
     ProcessCaptureReadiness,
+};
+pub use self::audio_policy_config::{
+    AudioPolicyDiagnostics, AutomaticAppRouteLease, VerifiedAudioPolicyAbi,
+    VerifiedAudioPolicyConfig, AUDIO_POLICY_CONFIG_FACTORY_IID_WIN10,
+    AUDIO_POLICY_CONFIG_FACTORY_IID_WIN11, VERIFIED_AUDIO_POLICY_ABIS,
 };
 use self::callbacks::*;
 pub use self::driver::WindowsAudioDriver;

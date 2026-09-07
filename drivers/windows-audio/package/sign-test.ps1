@@ -49,12 +49,15 @@ if ($manifest.implementation_status -ne 'ready') {
     throw 'The package manifest is not ready. Run --build-package before signing.'
 }
 
-if (-not $PSCmdlet.ShouldProcess($packageRootPath, 'test-sign the QPWGraph ACX package')) {
+if ($WhatIfPreference) {
+    Write-Output 'WhatIf mode: the package was not test-signed.'
     return
 }
 
 $certificate = $null
 $machineStore = $false
+$temporaryRootStore = $null
+$temporaryRootCertificate = $null
 if ($CreateCertificate) {
     $certificate = New-SelfSignedCertificate `
         -Type CodeSigningCert `
@@ -91,6 +94,34 @@ if ($CreateCertificate) {
         throw "A code-signing certificate with private key was not found for thumbprint $normalizedThumbprint."
     }
     $CertificateThumbprint = $certificate.Thumbprint
+}
+
+# A newly generated certificate is intentionally not imported into a machine
+# trust store unless -ImportCertificate is requested. SignTool's normal policy
+# verification nevertheless requires a trusted root, so temporarily trust the
+# public .cer in the current user's root store for this process only. The
+# certificate is removed in the finally block after the exact package checks.
+if ($CreateCertificate -and -not $ImportCertificate) {
+    try {
+        $temporaryRootCertificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($CertificateOutputPath)
+        $temporaryRootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser')
+        $temporaryRootStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $temporaryRootStore.Add($temporaryRootCertificate)
+        # Do not hold the certificate-store handle while SignTool asks the
+        # Windows trust provider to validate the package. Some Windows 10
+        # trust-provider combinations deadlock when the same store remains
+        # open in this PowerShell process.
+        $temporaryRootStore.Close()
+        Write-Verbose 'Temporarily trusted the generated test root in CurrentUser\Root for package verification.'
+    } catch {
+        if ($null -ne $temporaryRootStore) {
+            $temporaryRootStore.Close()
+        }
+        if ($null -ne $temporaryRootCertificate) {
+            $temporaryRootCertificate.Dispose()
+        }
+        throw "Could not prepare temporary CurrentUser\Root trust for test-signing verification: $($_.Exception.Message)"
+    }
 }
 
 function Find-WdkTool([string] $Name) {
@@ -153,27 +184,43 @@ function Invoke-SignatureVerification(
     }
 }
 
-$signTool = Find-WdkTool 'signtool.exe'
-$inf2Cat = Find-WdkTool 'Inf2Cat.exe'
-$storeArguments = @()
-if ($machineStore) {
-    $storeArguments += '/sm'
+try {
+    $signTool = Find-WdkTool 'signtool.exe'
+    $inf2Cat = Find-WdkTool 'Inf2Cat.exe'
+    $storeArguments = @()
+    if ($machineStore) {
+        $storeArguments += '/sm'
+    }
+
+    Write-Output "Signing $sys with certificate $CertificateThumbprint"
+    Invoke-Tool $signTool (@('sign', '/fd', 'SHA256', '/sha1', $CertificateThumbprint) + $storeArguments + @($sys)) 'SignTool driver signing'
+
+    # The catalog hashes the package contents. Regenerate it after signing the
+    # SYS, then sign the regenerated catalog with the same certificate.
+    Write-Output 'Regenerating the package catalog after driver signing'
+    Invoke-Tool $inf2Cat @("/driver:$packageRootPath", '/os:10_X64') 'Inf2Cat'
+    Invoke-Tool $signTool (@('sign', '/fd', 'SHA256', '/sha1', $CertificateThumbprint) + $storeArguments + @($cat)) 'SignTool catalog signing'
+
+    # Verify the exact files that the installer will hand to PnPUtil. This catches
+    # an unsigned or stale catalog before it is copied into the driver store.
+    Invoke-SignatureVerification $signTool '' $cat 'Catalog signature verification'
+    Invoke-SignatureVerification $signTool $cat $sys 'Driver catalog verification'
+    Invoke-SignatureVerification $signTool $cat $inf 'INF catalog verification'
+
+    Write-Output "Test-signed package ready at $packageRootPath"
+    Write-Output "Certificate thumbprint: $CertificateThumbprint"
+} finally {
+    if ($null -ne $temporaryRootStore) {
+        if ($null -ne $temporaryRootCertificate) {
+            $temporaryRootStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            try {
+                $temporaryRootStore.Remove($temporaryRootCertificate)
+            } finally {
+                $temporaryRootStore.Close()
+            }
+        }
+    }
+    if ($null -ne $temporaryRootCertificate) {
+        $temporaryRootCertificate.Dispose()
+    }
 }
-
-Write-Output "Signing $sys with certificate $CertificateThumbprint"
-Invoke-Tool $signTool (@('sign', '/fd', 'SHA256', '/sha1', $CertificateThumbprint) + $storeArguments + @($sys)) 'SignTool driver signing'
-
-# The catalog hashes the package contents. Regenerate it after signing the
-# SYS, then sign the regenerated catalog with the same certificate.
-Write-Output 'Regenerating the package catalog after driver signing'
-Invoke-Tool $inf2Cat @("/driver:$packageRootPath", '/os:10_X64') 'Inf2Cat'
-Invoke-Tool $signTool (@('sign', '/fd', 'SHA256', '/sha1', $CertificateThumbprint) + $storeArguments + @($cat)) 'SignTool catalog signing'
-
-# Verify the exact files that the installer will hand to PnPUtil. This catches
-# an unsigned or stale catalog before it is copied into the driver store.
-Invoke-SignatureVerification $signTool '' $cat 'Catalog signature verification'
-Invoke-SignatureVerification $signTool $cat $sys 'Driver catalog verification'
-Invoke-SignatureVerification $signTool $cat $inf 'INF catalog verification'
-
-Write-Output "Test-signed package ready at $packageRootPath"
-Write-Output "Certificate thumbprint: $CertificateThumbprint"
