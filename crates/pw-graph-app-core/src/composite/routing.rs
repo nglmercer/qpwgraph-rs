@@ -164,6 +164,10 @@ impl CompositeDriver {
     }
 
     fn node_supports_routing(&self, backend: BackendKind, node: NodeId) -> bool {
+        // Minimal builds compile out every native backend below, leaving
+        // `node` (and `self`) unused. Bind them explicitly so
+        // `RUSTFLAGS="-D warnings"` stays green on Linux minimal checks.
+        let _ = (&self, node);
         match backend {
             BackendKind::PipeWire => {
                 #[cfg(all(target_os = "linux", feature = "pipewire"))]

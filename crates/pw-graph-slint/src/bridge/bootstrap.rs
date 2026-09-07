@@ -11,6 +11,9 @@ use std::collections::BTreeSet;
 /// The opened application state, plus the meter policy the window shows.
 pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, MeterPolicy) {
     let config_file = config_path("qpwgraph-rs");
+    // `config` is only mutated on Windows (application routes); keep the
+    // binding mutable everywhere to avoid cfg-divergent code.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut config = AppConfig::load_from(&config_file).unwrap_or_default();
     let language = args
         .language

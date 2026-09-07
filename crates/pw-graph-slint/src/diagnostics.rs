@@ -49,7 +49,9 @@ pub(crate) fn copy_text(text: &str) -> Result<(), String> {
     result.and(close.map_err(|error| format!("could not close the Windows clipboard: {error}")))
 }
 
+/// Non-Windows stub, retained for API symmetry; only the Windows build calls it.
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub(crate) fn copy_text(_text: &str) -> Result<(), String> {
     Err("Windows audio diagnostics are available only on Windows".into())
 }

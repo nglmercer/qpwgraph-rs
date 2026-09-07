@@ -108,6 +108,8 @@ pub(super) fn install_registry_listener(
 /// listener callback is invoked on the same thread loop as the registry, so an
 /// Rc-backed collection is sufficient and avoids putting raw PipeWire
 /// proxies behind a cross-thread mutex.
+/// Held for its `Drop` order (listener before proxy); never read directly.
+#[allow(dead_code)]
 pub(super) struct MetadataBinding {
     /// Drop the listener before its metadata proxy.
     pub(super) listener: pw::metadata::MetadataListener,
@@ -146,7 +148,7 @@ pub(super) fn install_default_metadata_listener(
             let is_default = global
                 .props
                 .and_then(|props| props.get("metadata.name"))
-                .map_or(true, |name| name == "default");
+                .is_none_or(|name| name == "default");
             if !is_default {
                 return;
             }

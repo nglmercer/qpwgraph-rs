@@ -129,6 +129,9 @@ pub enum RelayPlaybackState {
     Disabled,
     WaitingForSink,
     Connected,
+    /// Legacy failure state, still matched for display/compat but only
+    /// constructed by the retained legacy playback route.
+    #[allow(dead_code)]
     Error(String),
 }
 
@@ -355,6 +358,10 @@ impl Default for RelayPlaybackRouter {
     }
 }
 
+/// Legacy deterministic routing layer, superseded by `RelayLocalRouter`.
+/// Retained for one-release compatibility: the live local route still drains
+/// its link ids, and unit tests exercise `desired_links`.
+#[allow(dead_code)]
 impl RelayPlaybackRouter {
     pub fn new() -> Self {
         Self::default()
@@ -553,6 +560,10 @@ impl RelayPlaybackRouter {
 /// The older `RelayPlaybackRouter` remains below the public compatibility
 /// surface, but new callers use this controller so an Emitter route and a
 /// Receiver route cannot coexist.
+///
+/// Desired route: link pairs plus source/sink ids and a human description.
+pub type RelayLocalDesiredRoute = Option<(Vec<(PortId, PortId)>, String, String, String)>;
+
 #[derive(Clone, Debug)]
 pub struct RelayLocalRouter {
     pub mode: Option<RelayMode>,
@@ -745,7 +756,7 @@ impl RelayLocalRouter {
         registry: &std::collections::BTreeMap<u32, crate::pipewire::registry::NodeRecord>,
         default_source: Option<&crate::pipewire::registry::DefaultDevice>,
         default_sink: Option<&crate::pipewire::registry::DefaultDevice>,
-    ) -> Option<(Vec<(PortId, PortId)>, String, String, String)> {
+    ) -> RelayLocalDesiredRoute {
         if !self.enabled {
             return None;
         }

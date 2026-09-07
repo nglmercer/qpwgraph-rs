@@ -1046,6 +1046,9 @@ impl GraphDriver for PipewireDriver {
         if record.node_type == NodeType::Effect {
             return Ok(NodeAudioState::UNSUPPORTED);
         }
+        // The `relay` field only exists with the `relay` feature; without it
+        // `is_relay_device_node` always returns false.
+        #[cfg(all(target_os = "linux", feature = "relay"))]
         if is_relay_device_node(&record.name) {
             // Relay nodes expose application-local gain (0.0..2.0) instead of
             // PipeWire Props. This mirrors the node-audio slider/mute that
@@ -1063,6 +1066,10 @@ impl GraphDriver for PipewireDriver {
                     mute_writable: true,
                 });
             }
+            return Ok(NodeAudioState::UNSUPPORTED);
+        }
+        #[cfg(not(all(target_os = "linux", feature = "relay")))]
+        if is_relay_device_node(&record.name) {
             return Ok(NodeAudioState::UNSUPPORTED);
         }
         let known = self.audio_controls.get(&node).copied().unwrap_or_default();
@@ -1285,6 +1292,9 @@ impl RelayDriver for PipewireDriver {
         self.relay.is_some()
     }
 
+    // `EngineConfig::direction` is deprecated but kept synchronized with
+    // `mode` as a wire/trusted-peer compatibility shim.
+    #[allow(deprecated)]
     fn relay_start_host(&mut self, request: RelayHostRequest) -> BackendResult<u16> {
         if request.mode != RelayMode::Receiver {
             return Err(BackendError::unsupported(
@@ -1326,6 +1336,9 @@ impl RelayDriver for PipewireDriver {
         Ok(())
     }
 
+    // `EngineConfig::direction` is deprecated but kept synchronized with
+    // `mode` as a wire/trusted-peer compatibility shim.
+    #[allow(deprecated)]
     fn relay_connect(
         &mut self,
         target: std::net::SocketAddr,
@@ -1359,6 +1372,9 @@ impl RelayDriver for PipewireDriver {
         })
     }
 
+    // `EngineConfig::direction` is deprecated but kept synchronized with
+    // `mode` as a wire/trusted-peer compatibility shim.
+    #[allow(deprecated)]
     fn relay_connect_mode(
         &mut self,
         target: std::net::SocketAddr,
@@ -1388,6 +1404,9 @@ impl RelayDriver for PipewireDriver {
         })
     }
 
+    // `EngineConfig::direction` is deprecated but kept synchronized with
+    // `mode` as a wire/trusted-peer compatibility shim.
+    #[allow(deprecated)]
     fn relay_connect_trusted(
         &mut self,
         target: std::net::SocketAddr,
@@ -2149,6 +2168,10 @@ impl PipewireDriver {
 
     /// Ensure relay playback routing: Relay Microphone -> selected/default sink.
     /// Idempotent and realtime-safe (graph mutation outside callback).
+    ///
+    /// Legacy path superseded by `ensure_relay_local_route_locked`, retained
+    /// for one-release compatibility and exercised by unit tests.
+    #[allow(dead_code)]
     fn ensure_relay_playback_route_locked(&mut self) -> BackendResult<()> {
         if self.relay.is_none() {
             return Ok(());

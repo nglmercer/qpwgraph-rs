@@ -38,6 +38,9 @@ impl PipewireDriver {
 
     pub(super) fn set_node_mute_locked(&mut self, node: NodeId, muted: bool) -> BackendResult<()> {
         // Relay nodes use application-local gain/mute, not PipeWire Props.
+        // The `relay` field only exists with the `relay` feature; without it
+        // `is_relay_device_node` always returns false.
+        #[cfg(all(target_os = "linux", feature = "relay"))]
         if let Some(node_name) = self.graph.node(node).map(|n| n.name.clone()) {
             if is_relay_device_node(&node_name) {
                 if let Some(relay) = self.relay.as_ref() {
@@ -66,6 +69,9 @@ impl PipewireDriver {
         volume: f32,
     ) -> BackendResult<()> {
         // Relay nodes: linear 0.0..2.0 gain, clamped and stored in shared playback state.
+        // The `relay` field only exists with the `relay` feature; without it
+        // `is_relay_device_node` always returns false.
+        #[cfg(all(target_os = "linux", feature = "relay"))]
         if let Some(node_name) = self.graph.node(node).map(|n| n.name.clone()) {
             if is_relay_device_node(&node_name) {
                 let g = volume.clamp(0.0, 2.0);
