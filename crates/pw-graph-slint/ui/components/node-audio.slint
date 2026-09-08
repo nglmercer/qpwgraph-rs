@@ -30,6 +30,12 @@ export component NodeAudioControl inherits Rectangle {
     property <bool> displayed-muted: mute-touch.pending
         ? mute-touch.requested-muted
         : root.muted;
+    // The volume lane is hidden when the backend reported no level and the
+    // meter already fills the card: otherwise a blank track sits above the
+    // live meter and reads as a duplicated volume indicator. Nodes with no
+    // meter at all keep the (dimmed) lane so the fader affordance remains.
+    property <bool> show-volume: root.volume-known
+        || (!root.meter-peak-supported && !(root.meter-available && root.meter-rms-supported));
 
     changed volume-position => {
         if (slider-touch.pending && abs(root.volume-position - slider-touch.drag-position) < 0.002) {
@@ -46,24 +52,40 @@ export component NodeAudioControl inherits Rectangle {
         x: 0px; y: 0px; width: root.slider-width; height: 27px;
         background: #1d232a; border-color: #3f4b58; border-width: 1px; border-radius: 5px;
 
-        Rectangle { x: 8px; y: 8px; width: parent.width - 16px; height: 3px; background: #4d5864; border-radius: 2px; }
-        Rectangle { x: 8px; y: 8px; width: (parent.width - 16px) * root.displayed-volume-position; height: 3px; background: #9aa7b2; border-radius: 2px; opacity: root.volume-known && root.volume-enabled ? 1.0 : 0.35; }
-        Rectangle { x: 8px; y: 13px; width: (parent.width - 16px) * root.meter-rms-position; height: 2px; background: #d6e7f2; border-radius: 1px; visible: root.meter-available && root.meter-rms-supported; opacity: 0.9; }
+        // Shared lane geometry: the volume track, the RMS bar and the peak
+        // segments all start at 8px and span parent.width - 16px, so their
+        // left/right edges line up. Previously the peak ticks ran 6px..-6px
+        // while the bars ran 8px..-8px, and the three bars used three
+        // different heights (3px / 2px / 4px).
+        Rectangle { x: 8px; y: 6px; width: parent.width - 16px; height: 4px; background: #4d5864; border-radius: 2px; visible: root.show-volume; }
+        Rectangle { x: 8px; y: 6px; width: (parent.width - 16px) * root.displayed-volume-position; height: 4px; background: #9aa7b2; border-radius: 2px; visible: root.show-volume; opacity: root.volume-known && root.volume-enabled ? 1.0 : 0.35; }
+        Rectangle { x: 8px; y: root.show-volume ? 13px : 8px; width: (parent.width - 16px) * root.meter-rms-position; height: 2px; background: #d6e7f2; border-radius: 1px; visible: root.meter-available && root.meter-rms-supported; opacity: 0.9; }
 
-        for _[index] in 31: Rectangle {
-            property <float> fraction: index / 30;
-            x: 6px + index * (slider.width - 12px) / 30;
-            y: 18px; width: 1px; height: 4px;
+        // Peak meter: 31 identical 2x6 segments, spread evenly by the layout
+        // engine. The previous manual `x: 6px + index * (width - 12px) / 30`
+        // math landed segments on fractional pixels, so neighbouring ticks
+        // rendered with visibly uneven widths and gaps (image 2).
+        meter-row := Rectangle {
+            x: 8px; y: root.show-volume ? 17px : 12px; width: parent.width - 16px; height: 6px;
             visible: root.meter-peak-supported;
-            background: root.meter-available && root.meter-peak-supported && self.fraction <= root.meter-peak-position
-                ? self.fraction < 0.72 ? #39a6e0 : self.fraction < 0.90 ? #dca44c : #dd4b48
-                : self.fraction < 0.72 ? #22465b : self.fraction < 0.90 ? #5b482d : #5c292a;
+            HorizontalLayout {
+                alignment: space-between;
+                cross-axis-alignment: center;
+                for _[index] in 31: Rectangle {
+                    property <float> fraction: index / 30;
+                    width: 2px; height: 6px;
+                    background: root.meter-available && root.meter-peak-supported && self.fraction <= root.meter-peak-position
+                        ? self.fraction < 0.72 ? #39a6e0 : self.fraction < 0.90 ? #dca44c : #dd4b48
+                        : self.fraction < 0.72 ? #22465b : self.fraction < 0.90 ? #5b482d : #5c292a;
+                }
+            }
         }
 
         Rectangle {
-            x: (parent.width - 16px) * root.displayed-volume-position;
-            y: 2px; width: 16px; height: 16px;
-            background: #2a3037; border-color: #aab5be; border-width: 1px; border-radius: 8px;
+            x: 8px + (parent.width - 16px) * root.displayed-volume-position - 7px;
+            y: 1px; width: 14px; height: 14px;
+            background: #2a3037; border-color: #aab5be; border-width: 1px; border-radius: 7px;
+            visible: root.show-volume;
             opacity: root.volume-known && root.volume-enabled ? 1.0 : 0.35;
         }
 
