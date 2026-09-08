@@ -61,6 +61,11 @@ impl MeterCell {
         let mut peak = 0.0f32;
         let mut sum = 0.0f64;
         for &sample in block {
+            // A malformed source or processor must not turn an observational
+            // meter into a NaN that survives until the UI reads it. The audio
+            // path owns its own fallback; this only keeps the observation
+            // deterministic.
+            let sample = if sample.is_finite() { sample } else { 0.0 };
             let magnitude = sample.abs();
             if magnitude > peak {
                 peak = magnitude;
@@ -158,6 +163,16 @@ mod tests {
         meter.observe(&[1.0, -1.0, 1.0, -1.0], 0);
         let reading = meter.read(0, 48_000);
         assert!((reading.rms - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn non_finite_samples_are_observed_as_silence() {
+        let meter = MeterCell::new();
+        meter.observe(&[f32::NAN, f32::INFINITY, -f32::INFINITY, 0.25], 0);
+        let reading = meter.read(0, 48_000);
+
+        assert_eq!(reading.peak, 0.25);
+        assert!((reading.rms - 0.125).abs() < 1e-6);
     }
 
     #[test]

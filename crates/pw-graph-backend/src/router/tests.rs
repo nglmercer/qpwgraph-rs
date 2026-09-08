@@ -57,6 +57,8 @@ struct Doubler {
     factor: f32,
     prepared: bool,
     fail: bool,
+    panic: bool,
+    non_finite: bool,
 }
 
 impl Doubler {
@@ -72,12 +74,28 @@ impl Doubler {
             factor: 2.0,
             prepared: false,
             fail: false,
+            panic: false,
+            non_finite: false,
         }
     }
 
     fn failing() -> Self {
         Self {
             fail: true,
+            ..Self::new()
+        }
+    }
+
+    fn panicking() -> Self {
+        Self {
+            panic: true,
+            ..Self::new()
+        }
+    }
+
+    fn non_finite() -> Self {
+        Self {
+            non_finite: true,
             ..Self::new()
         }
     }
@@ -95,15 +113,21 @@ impl EffectProcessor for Doubler {
     }
 
     fn process(&mut self, buffer: &mut [f32], _frames: u32) -> Result<(), EffectError> {
-        if self.fail {
-            return Err(EffectError::NotPrepared);
-        }
         assert!(
             self.prepared,
             "the router must prepare an effect before use"
         );
         for sample in buffer.iter_mut() {
             *sample *= self.factor;
+        }
+        if self.fail {
+            return Err(EffectError::NotPrepared);
+        }
+        if self.panic {
+            panic!("test processor panic");
+        }
+        if self.non_finite {
+            buffer[0] = f32::NAN;
         }
         Ok(())
     }
@@ -577,6 +601,52 @@ fn a_failing_effect_is_bypassed_for_the_block_and_reported() {
     let metrics = core.metrics(RouteId(1)).expect("the route exists");
     assert_eq!(metrics.fault, RouteFault::ProcessorFailed);
     assert!(metrics.fault_message().is_some());
+}
+
+#[test]
+fn a_panicking_effect_is_bypassed_without_publishing_partial_audio() {
+    let mut core = core();
+    add_source(&mut core, 1, MONO, vec![0.25; 4]);
+    let captured = add_sink(&mut core, 1, MONO);
+    core.add_processor(
+        ProcessorId(1),
+        Box::new(Doubler::panicking()),
+        spec(MONO, 4),
+    )
+    .expect("a fresh effect id");
+    core.set_routes(&[through(RouteId(1), SourceId(1), ProcessorId(1), SinkId(1))])
+        .expect("a valid route");
+
+    core.process();
+
+    assert_eq!(recorded(&captured), vec![0.25; 4]);
+    assert_eq!(
+        core.metrics(RouteId(1)).expect("the route exists").fault,
+        RouteFault::ProcessorFailed
+    );
+}
+
+#[test]
+fn a_non_finite_effect_result_is_bypassed_without_publishing_invalid_audio() {
+    let mut core = core();
+    add_source(&mut core, 1, MONO, vec![0.25; 4]);
+    let captured = add_sink(&mut core, 1, MONO);
+    core.add_processor(
+        ProcessorId(1),
+        Box::new(Doubler::non_finite()),
+        spec(MONO, 4),
+    )
+    .expect("a fresh effect id");
+    core.set_routes(&[through(RouteId(1), SourceId(1), ProcessorId(1), SinkId(1))])
+        .expect("a valid route");
+
+    core.process();
+
+    assert_eq!(recorded(&captured), vec![0.25; 4]);
+    assert_eq!(
+        core.metrics(RouteId(1)).expect("the route exists").fault,
+        RouteFault::ProcessorFailed
+    );
 }
 
 #[test]

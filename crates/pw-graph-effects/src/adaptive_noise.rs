@@ -499,6 +499,15 @@ impl EffectProcessor for AdaptiveNoiseSuppressor {
                 expected,
             });
         }
+
+        // Sanitize before either the model or a resampler sees the block. In
+        // particular, allowing NaN/Inf into a resampler would poison its
+        // history and make later finite blocks depend on the malformed one.
+        for sample in buffer.iter_mut() {
+            if !sample.is_finite() {
+                *sample = 0.0;
+            }
+        }
         if self.bypass {
             return Ok(());
         }
@@ -524,7 +533,11 @@ impl EffectProcessor for AdaptiveNoiseSuppressor {
             NOISE_SUPPRESSOR_ADAPTATION => self.adaptation = value,
             NOISE_SUPPRESSOR_VOICE_PRESERVE => self.voice_preserve = value,
             NOISE_SUPPRESSOR_BYPASS => {
-                self.bypass = value >= 0.5;
+                let bypass = value >= 0.5;
+                if self.bypass != bypass {
+                    self.bypass = bypass;
+                    self.reset();
+                }
                 return Ok(());
             }
             _ => unreachable!("descriptor and parameter match are kept together"),
@@ -605,5 +618,57 @@ mod tests {
             suppressor.process(&mut audio, 128).unwrap();
             assert!(audio.iter().all(|sample| sample.is_finite()));
         }
+    }
+
+    #[test]
+    fn exact_silence_stays_finite_and_zero_at_48_khz() {
+        let mut suppressor = prepared_suppressor(MODEL_SAMPLE_RATE, 2);
+        for _ in 0..128 {
+            let mut audio = vec![0.0; 128 * 2];
+            suppressor.process(&mut audio, 128).unwrap();
+            assert!(audio.iter().all(|sample| sample.is_finite()));
+            assert!(audio.iter().all(|sample| *sample == 0.0));
+        }
+    }
+
+    #[test]
+    fn exact_silence_stays_finite_and_zero_through_resampling() {
+        let mut suppressor = prepared_suppressor(44_100, 2);
+        for _ in 0..128 {
+            let mut audio = vec![0.0; 128 * 2];
+            suppressor.process(&mut audio, 128).unwrap();
+            assert!(audio.iter().all(|sample| sample.is_finite()));
+            assert!(audio.iter().all(|sample| *sample == 0.0));
+        }
+    }
+
+    #[test]
+    fn reset_discards_queued_audio_before_silence_is_processed() {
+        let mut suppressor = prepared_suppressor(MODEL_SAMPLE_RATE, 1);
+        for _ in 0..12 {
+            let mut signal = vec![0.5; 256];
+            suppressor.process(&mut signal, 256).unwrap();
+        }
+        suppressor.reset();
+
+        for _ in 0..16 {
+            let mut silence = vec![0.0; 256];
+            suppressor.process(&mut silence, 256).unwrap();
+            assert!(silence.iter().all(|sample| sample.is_finite()));
+            assert!(silence.iter().all(|sample| *sample == 0.0));
+        }
+    }
+
+    #[test]
+    fn bypass_is_transparent_for_valid_audio_and_silent_for_invalid_audio() {
+        let mut suppressor = prepared_suppressor(MODEL_SAMPLE_RATE, 1);
+        suppressor
+            .set_parameter(NOISE_SUPPRESSOR_BYPASS, 1.0)
+            .unwrap();
+        let mut audio = vec![0.25, f32::NAN, f32::INFINITY, -0.5];
+
+        suppressor.process(&mut audio, 4).unwrap();
+
+        assert_eq!(audio, vec![0.25, 0.0, 0.0, -0.5]);
     }
 }

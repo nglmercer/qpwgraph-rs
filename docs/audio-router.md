@@ -88,9 +88,9 @@ bug, not a degraded mode.
 
 **Failures are counted, not hidden.** A starved source contributes silence
 rather than replaying its last block. A destination that cannot keep up has the
-dropped frames counted. A failing effect is bypassed for that block so a bad
-parameter does not become unexplained silence. Each of those sets a
-`RouteFault` the UI can render.
+dropped frames counted. A failing, panicking, or non-finite effect is bypassed
+for that block, preserving sanitized input for connected channels and silence
+for unavailable samples. Each of those sets a `RouteFault` the UI can render.
 
 **Nothing grows without bound.** The device-to-router hand-off is a fixed-size
 ring; a consumer that falls behind loses the tail and increments a counter,

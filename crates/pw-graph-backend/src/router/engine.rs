@@ -412,6 +412,10 @@ struct Branch {
     /// This branch's own copy of the block, so its effects cannot reach a
     /// sibling branch's audio.
     block: Vec<f32>,
+    /// The input to the processor currently being called. It is preallocated
+    /// so a processor that mutates its buffer before returning an error or
+    /// panicking can still be bypassed transparently for this block.
+    fallback: Vec<f32>,
     meter: Arc<MeterCell>,
 }
 
@@ -792,6 +796,7 @@ impl RouterCore {
                     gain: branch.gain,
                     destinations,
                     block: vec![0.0; source_format.samples(self.config.block_frames)],
+                    fallback: vec![0.0; source_format.samples(self.config.block_frames)],
                     meter,
                 });
             }
@@ -966,6 +971,11 @@ impl RouterCore {
                 }
             }
             let samples = route.format.samples(frames);
+            for sample in &mut route.input[..samples] {
+                if !sample.is_finite() {
+                    *sample = 0.0;
+                }
+            }
             let input = &route.input[..samples];
             // The device's own level, before this route touched it. This is
             // the reading an endpoint node shows, and the one Core Audio can
@@ -998,10 +1008,18 @@ impl RouterCore {
                     if slot.bypassed {
                         continue;
                     }
-                    if slot.processor.process(block, frames as u32).is_err() {
-                        // A failing effect is bypassed for this block.
-                        // Dropping the audio instead would turn a bad
-                        // parameter into silence the user cannot explain.
+                    branch.fallback[..samples].copy_from_slice(block);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        slot.processor.process(block, frames as u32)
+                    }));
+                    if !matches!(result, Ok(Ok(())))
+                        || !block.iter().all(|sample| sample.is_finite())
+                    {
+                        // A failing effect is bypassed for this block. Restore
+                        // the input it received even if it partially mutated
+                        // the buffer or panicked; never publish a stale,
+                        // non-finite, or half-processed block.
+                        block.copy_from_slice(&branch.fallback[..samples]);
                         processor_failed = true;
                     }
                 }

@@ -96,7 +96,18 @@ impl PipewireDriver {
         let Ok(registry) = self.registry() else {
             return;
         };
-        let nodes: Vec<NodeId> = self.graph.nodes.keys().copied().collect();
+        // Effect nodes deliberately do not expose writable PipeWire audio
+        // Props; their state is owned by the callback runtime. Avoid binding
+        // a temporary Node proxy for them. In addition to unnecessary work,
+        // an outstanding Props request can race a filter being destroyed and
+        // make PipeWire report `unknown resource` during effect removal.
+        let nodes: Vec<NodeId> = self
+            .graph
+            .nodes
+            .values()
+            .filter(|node| node.node_type != NodeType::Effect)
+            .map(|node| node.id)
+            .collect();
         if nodes.is_empty() {
             return;
         }

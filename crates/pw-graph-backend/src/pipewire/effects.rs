@@ -21,7 +21,7 @@ use pw_graph_effects::{
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 
 /// PipeWire's standard quantum is normally far smaller than this.  Keeping a
 /// finite ceiling lets the callback build an exactly-sized Rust slice without
@@ -30,6 +30,9 @@ const MAX_DSP_FRAMES: u32 = 16_384;
 const PREPARED_SAMPLE_RATE: u32 = 48_000;
 const DSP_CHANNELS: usize = 2;
 const UNRESOLVED_ID: u64 = u64::MAX;
+const DANGLING_FL: u32 = 1 << 0;
+const DANGLING_FR: u32 = 1 << 1;
+const DANGLING_BOTH: u32 = DANGLING_FL | DANGLING_FR;
 
 /// Processing state that is never reallocated from the realtime callback.
 struct ProcessorState {
@@ -46,11 +49,10 @@ struct CallbackState {
     output_ports: [AtomicPtr<c_void>; DSP_CHANNELS],
     enabled: AtomicBool,
     processor_failed: AtomicBool,
-    /// Seed for the low-level diagnostic signal used when an input channel is
-    /// not connected. A filter can still have a live output connection while
-    /// one or both inputs are dangling; leaving the output buffer untouched in
-    /// that case is both silent and unsafe.
-    fallback_noise: AtomicU32,
+    /// Bit 0/1 reports a missing FL/FR input while the matching output buffer
+    /// is active. This is deliberately metadata only: it never participates in
+    /// sample generation.
+    dangling_inputs: AtomicU32,
     /// A control update may run while PipeWire is processing.  The realtime
     /// callback uses `try_lock` and transparently bypasses a single quantum if
     /// the UI owns this mutex, rather than ever blocking the audio thread.
@@ -68,7 +70,7 @@ impl CallbackState {
             output_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             enabled: AtomicBool::new(enabled),
             processor_failed: AtomicBool::new(false),
-            fallback_noise: AtomicU32::new(0x6d2b_79f5),
+            dangling_inputs: AtomicU32::new(0),
             processor: Mutex::new(ProcessorState {
                 processor,
                 interleaved: vec![0.0; MAX_DSP_FRAMES as usize * DSP_CHANNELS],
@@ -89,6 +91,7 @@ impl CallbackState {
         let frames = (*position).clock.duration;
         if frames == 0 || frames > u64::from(MAX_DSP_FRAMES) {
             self.processor_failed.store(true, Ordering::Relaxed);
+            self.dangling_inputs.store(0, Ordering::Release);
             return;
         }
         let frames = frames as u32;
@@ -101,13 +104,14 @@ impl CallbackState {
             .each_ref()
             .map(|port| port.load(Ordering::Acquire));
         if output_ports.iter().all(|port| port.is_null()) {
+            self.dangling_inputs.store(0, Ordering::Release);
             return;
         }
 
         // PipeWire may not provide a DSP buffer for an unconnected port. Keep
         // each channel independent: a connected FL input must still reach its
-        // output when FR is not patched, and an output-only effect should emit
-        // a small diagnostic signal instead of leaving the output undefined.
+        // output when FR is not patched, and an output-only effect must emit
+        // digital silence.
         let inputs: [*mut c_void; DSP_CHANNELS] = std::array::from_fn(|channel| {
             let port = input_ports[channel];
             if port.is_null() {
@@ -125,72 +129,77 @@ impl CallbackState {
             }
         });
         if outputs.iter().all(|buffer| buffer.is_null()) {
+            self.dangling_inputs.store(0, Ordering::Release);
             return;
         }
+
+        self.process_buffers(inputs, outputs, frames);
+    }
+
+    /// Process one already-resolved set of planar buffers. Keeping this
+    /// separate from the PipeWire buffer lookup makes the safety policy easy
+    /// to exercise without a running daemon and keeps every callback branch
+    /// on the same fallback path.
+    ///
+    /// # Safety
+    ///
+    /// Each non-null input/output pointer refers to at least `frames` valid
+    /// F32 samples, as returned by PipeWire or by a caller obeying the same
+    /// contract. The pointers are not changed while this function runs.
+    unsafe fn process_buffers(
+        &self,
+        inputs: [*mut c_void; DSP_CHANNELS],
+        outputs: [*mut c_void; DSP_CHANNELS],
+        frames: u32,
+    ) {
+        let frame_count = frames as usize;
+        let mut dangling_inputs = 0_u32;
+        for channel in 0..DSP_CHANNELS {
+            if !outputs[channel].is_null() && inputs[channel].is_null() {
+                dangling_inputs |= 1 << channel;
+            }
+        }
+        self.dangling_inputs
+            .store(dangling_inputs, Ordering::Release);
+
+        // Publish a deterministic fallback before invoking user-extensible
+        // DSP. If the processor returns an error or panics after mutating its
+        // scratch buffer, these samples remain untouched and are still safe.
+        copy_inputs_to_outputs(inputs, outputs, frame_count);
 
         let enabled = self.enabled.load(Ordering::Acquire);
         if !enabled {
             // Disabled effects remain transparent for connected channels and
-            // produce silence for dangling inputs. The diagnostic signal is a
-            // useful enabled-effect indication, not a bypass-side effect.
-            for frame in 0..frames as usize {
-                for channel in 0..DSP_CHANNELS {
-                    if !outputs[channel].is_null() {
-                        *outputs[channel].cast::<f32>().add(frame) = if inputs[channel].is_null() {
-                            0.0
-                        } else {
-                            *inputs[channel].cast::<f32>().add(frame)
-                        };
-                    }
-                }
-            }
+            // produce exact silence for dangling or non-finite inputs.
             return;
         }
 
-        let Ok(mut state) = self.processor.try_lock() else {
-            // Parameter edits are intentionally allowed to cost one bypassed
-            // quantum. Waiting for a non-realtime UI thread here would risk an
-            // xrun for the entire PipeWire graph.
-            for frame in 0..frames as usize {
-                for channel in 0..DSP_CHANNELS {
-                    if !outputs[channel].is_null() {
-                        let sample = if inputs[channel].is_null() {
-                            next_diagnostic_noise(&self.fallback_noise)
-                        } else {
-                            *inputs[channel].cast::<f32>().add(frame)
-                        };
-                        *outputs[channel].cast::<f32>().add(frame) = sample;
-                    }
-                }
+        let mut state = match self.processor.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => {
+                // Parameter edits are intentionally allowed to cost one
+                // bypassed quantum. Waiting for a non-realtime UI thread here
+                // would risk an xrun for the entire PipeWire graph.
+                // `copy_inputs_to_outputs` above is the safe transparent
+                // fallback.
+                return;
             }
-            return;
+            Err(TryLockError::Poisoned(_)) => {
+                // A control-thread panic poisoned the processor state. The
+                // audio fallback is already published; retain an error bit so
+                // the control snapshot can report the failure separately.
+                self.processor_failed.store(true, Ordering::Relaxed);
+                return;
+            }
         };
         let ProcessorState {
             processor,
             interleaved,
         } = &mut *state;
-        let samples = &mut interleaved[..frames as usize * DSP_CHANNELS];
-        for frame in 0..frames as usize {
+        let samples = &mut interleaved[..frame_count * DSP_CHANNELS];
+        for frame in 0..frame_count {
             for channel in 0..DSP_CHANNELS {
-                samples[frame * DSP_CHANNELS + channel] = if inputs[channel].is_null() {
-                    // Keep this deliberately quiet (about -34 dBFS) so an
-                    // accidentally dangling effect is noticeable without
-                    // being an abrupt full-scale burst.
-                    next_diagnostic_noise(&self.fallback_noise)
-                } else {
-                    *inputs[channel].cast::<f32>().add(frame)
-                };
-            }
-        }
-        // Initialize the outputs before invoking the processor. If a future
-        // processor rejects a buffer or panics, the callback still publishes a
-        // valid pass-through/diagnostic signal for this quantum.
-        for frame in 0..frames as usize {
-            for channel in 0..DSP_CHANNELS {
-                if !outputs[channel].is_null() {
-                    *outputs[channel].cast::<f32>().add(frame) =
-                        samples[frame * DSP_CHANNELS + channel];
-                }
+                samples[frame * DSP_CHANNELS + channel] = input_sample(inputs[channel], frame);
             }
         }
         // No Rust panic may cross the C callback boundary. Builtin processors
@@ -199,37 +208,75 @@ impl CallbackState {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             processor.process(samples, frames)
         }));
-        match result {
-            Ok(Ok(())) => {
-                for frame in 0..frames as usize {
-                    for channel in 0..DSP_CHANNELS {
-                        if !outputs[channel].is_null() {
-                            *outputs[channel].cast::<f32>().add(frame) =
-                                samples[frame * DSP_CHANNELS + channel];
-                        }
-                    }
-                }
-                self.processor_failed.store(false, Ordering::Relaxed);
-            }
-            _ => self.processor_failed.store(true, Ordering::Relaxed),
+        if matches!(result, Ok(Ok(()))) && samples.iter().all(|sample| sample.is_finite()) {
+            copy_processed_to_outputs(samples, outputs, dangling_inputs, frame_count);
+            self.processor_failed.store(false, Ordering::Relaxed);
+        } else {
+            // The fallback was published before processing, so an error,
+            // panic, or non-finite result cannot expose partial or undefined
+            // processor output. Keep the diagnostic state separate from audio.
+            self.processor_failed.store(true, Ordering::Relaxed);
         }
     }
 }
 
-/// Generate a bounded, allocation-free diagnostic sample for a dangling
-/// effect input. An xorshift stream is sufficient here; this is a routing
-/// indicator, not an audio-quality noise source.
-fn next_diagnostic_noise(state: &AtomicU32) -> f32 {
-    let value = state
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            let mut next = value;
-            next ^= next << 13;
-            next ^= next >> 17;
-            next ^= next << 5;
-            Some(next)
-        })
-        .unwrap_or(0x6d2b_79f5);
-    ((value as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.02
+/// Read one planar input sample without allowing a missing or non-finite
+/// value to enter DSP.
+#[inline]
+unsafe fn input_sample(input: *mut c_void, frame: usize) -> f32 {
+    if input.is_null() {
+        return 0.0;
+    }
+    let sample = *input.cast::<f32>().add(frame);
+    if sample.is_finite() {
+        sample
+    } else {
+        0.0
+    }
+}
+
+/// Fill active output ports with sanitized input, or exact silence when the
+/// corresponding input port has no DSP buffer.
+#[inline]
+unsafe fn copy_inputs_to_outputs(
+    inputs: [*mut c_void; DSP_CHANNELS],
+    outputs: [*mut c_void; DSP_CHANNELS],
+    frames: usize,
+) {
+    for frame in 0..frames {
+        for channel in 0..DSP_CHANNELS {
+            if !outputs[channel].is_null() {
+                *outputs[channel].cast::<f32>().add(frame) = input_sample(inputs[channel], frame);
+            }
+        }
+    }
+}
+
+/// Copy a successful, finite processor result to active output ports. The
+/// caller has already written the transparent fallback, so this function does
+/// not need an error path in the realtime callback.
+#[inline]
+unsafe fn copy_processed_to_outputs(
+    samples: &[f32],
+    outputs: [*mut c_void; DSP_CHANNELS],
+    dangling_inputs: u32,
+    frames: usize,
+) {
+    for frame in 0..frames {
+        for channel in 0..DSP_CHANNELS {
+            if !outputs[channel].is_null() {
+                let sample = if dangling_inputs & (1 << channel) != 0 {
+                    // A stateful processor may still have a queued tail after
+                    // its input is disconnected. Do not let that tail turn a
+                    // passive meter into an audio source.
+                    0.0
+                } else {
+                    samples[frame * DSP_CHANNELS + channel]
+                };
+                *outputs[channel].cast::<f32>().add(frame) = sample;
+            }
+        }
+    }
 }
 
 unsafe extern "C" fn filter_process(
@@ -392,14 +439,16 @@ impl NativeEffect {
 
     pub(super) fn snapshot(&self) -> EffectInstance {
         let mut instance = self.instance.clone();
-        if self
-            .runtime
-            .callback()
-            .processor_failed
-            .load(Ordering::Relaxed)
-        {
+        let callback = self.runtime.callback();
+        if callback.processor_failed.load(Ordering::Relaxed) {
             instance.error =
                 Some("effect processor rejected the most recent realtime buffer".into());
+        } else if let Some(message) =
+            dangling_input_message(callback.dangling_inputs.load(Ordering::Acquire))
+        {
+            // This is rendered from a control-thread snapshot. The realtime
+            // callback only publishes the bit mask and never formats text.
+            instance.error = Some(message.into());
         }
         instance
     }
@@ -431,6 +480,15 @@ impl NativeEffect {
     }
 }
 
+fn dangling_input_message(mask: u32) -> Option<&'static str> {
+    match mask & (DANGLING_FL | DANGLING_FR) {
+        DANGLING_FL => Some("effect output is active while the FL input is disconnected"),
+        DANGLING_FR => Some("effect output is active while the FR input is disconnected"),
+        DANGLING_BOTH => Some("effect output is active while both inputs are disconnected"),
+        _ => None,
+    }
+}
+
 fn validate_request(request: &EffectNodeRequest) -> BackendResult<()> {
     if request.instance_id.trim().is_empty() {
         return Err(BackendError::native("effect instance id cannot be empty"));
@@ -451,15 +509,374 @@ fn validate_pipewire_text(label: &str, value: &str) -> BackendResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::next_diagnostic_noise;
-    use std::sync::atomic::AtomicU32;
+    use super::*;
+    use pw_graph_effects::{AudioSpec, EffectDescriptor, EffectError, EffectProcessor};
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Clone, Copy)]
+    enum ProcessBehavior {
+        Gain,
+        EmitsConstant,
+        ErrorAfterMutation,
+        PanicAfterMutation,
+        NonFinite,
+    }
+
+    struct TestProcessor {
+        descriptor: EffectDescriptor,
+        factor: f32,
+        behavior: ProcessBehavior,
+    }
+
+    impl TestProcessor {
+        fn new(behavior: ProcessBehavior) -> Self {
+            Self {
+                descriptor: EffectDescriptor {
+                    id: "test.pipewire-effect".into(),
+                    name: "PipeWire callback test effect".into(),
+                    vendor: "qpwgraph-rs".into(),
+                    version: "1".into(),
+                    parameters: Vec::new(),
+                },
+                factor: 2.0,
+                behavior,
+            }
+        }
+    }
+
+    impl EffectProcessor for TestProcessor {
+        fn descriptor(&self) -> &EffectDescriptor {
+            &self.descriptor
+        }
+
+        fn prepare(&mut self, spec: AudioSpec) -> Result<(), EffectError> {
+            spec.validate()
+        }
+
+        fn process(&mut self, buffer: &mut [f32], _frames: u32) -> Result<(), EffectError> {
+            for sample in buffer.iter_mut() {
+                *sample *= self.factor;
+            }
+            match self.behavior {
+                ProcessBehavior::Gain => Ok(()),
+                ProcessBehavior::EmitsConstant => {
+                    buffer.fill(0.25);
+                    Ok(())
+                }
+                ProcessBehavior::ErrorAfterMutation => Err(EffectError::NotPrepared),
+                ProcessBehavior::PanicAfterMutation => panic!("test processor panic"),
+                ProcessBehavior::NonFinite => {
+                    buffer[0] = f32::NAN;
+                    Ok(())
+                }
+            }
+        }
+
+        fn set_parameter(&mut self, id: &str, value: f32) -> Result<(), EffectError> {
+            if id != "factor" {
+                return Err(EffectError::UnsupportedParameter(id.into()));
+            }
+            self.factor = value;
+            Ok(())
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    fn run_buffers(
+        state: &CallbackState,
+        inputs: [Option<&mut [f32]>; DSP_CHANNELS],
+        outputs: [Option<&mut [f32]>; DSP_CHANNELS],
+        frames: usize,
+    ) {
+        let input_ptrs = inputs.map(|input| {
+            input.map_or(ptr::null_mut(), |buffer| {
+                buffer.as_mut_ptr().cast::<c_void>()
+            })
+        });
+        let output_ptrs = outputs.map(|output| {
+            output.map_or(ptr::null_mut(), |buffer| {
+                buffer.as_mut_ptr().cast::<c_void>()
+            })
+        });
+        unsafe { state.process_buffers(input_ptrs, output_ptrs, frames as u32) };
+    }
 
     #[test]
-    fn dangling_input_signal_is_bounded_and_changes() {
-        let state = AtomicU32::new(0x6d2b_79f5);
-        let samples: Vec<_> = (0..32).map(|_| next_diagnostic_noise(&state)).collect();
-        assert!(samples.iter().all(|sample| sample.is_finite()));
-        assert!(samples.iter().all(|sample| sample.abs() <= 0.02));
-        assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
+    fn dangling_enabled_effect_publishes_exact_silence() {
+        let state = CallbackState::new(
+            Box::new(TestProcessor::new(ProcessBehavior::EmitsConstant)),
+            true,
+        );
+        let mut left = [9.0; 32];
+        let mut right = [9.0; 32];
+
+        run_buffers(
+            &state,
+            [None, None],
+            [Some(&mut left), Some(&mut right)],
+            32,
+        );
+
+        assert_eq!(left, [0.0; 32]);
+        assert_eq!(right, [0.0; 32]);
+        assert_eq!(
+            state.dangling_inputs.load(Ordering::Acquire),
+            DANGLING_FL | DANGLING_FR
+        );
+    }
+
+    #[test]
+    fn a_meter_only_output_cannot_make_a_dangling_effect_generate_audio() {
+        // A live output buffer models the hidden capture stream that activates
+        // an otherwise unconnected effect output in PipeWire.
+        let state = CallbackState::new(
+            Box::new(TestProcessor::new(ProcessBehavior::EmitsConstant)),
+            true,
+        );
+        let mut observed = [1.0; 64];
+
+        run_buffers(&state, [None, None], [Some(&mut observed), None], 64);
+
+        assert_eq!(observed, [0.0; 64]);
+    }
+
+    #[test]
+    fn disconnected_channels_cannot_leak_a_processor_tail() {
+        let state = CallbackState::new(
+            Box::new(TestProcessor::new(ProcessBehavior::EmitsConstant)),
+            true,
+        );
+        let mut connected_input = [0.5; 16];
+        let mut left_output = [9.0; 16];
+        let mut right_output = [9.0; 16];
+
+        // Establish a non-zero processor result first, then disconnect both
+        // inputs while keeping the output buffers active as a meter would.
+        run_buffers(
+            &state,
+            [Some(&mut connected_input), None],
+            [Some(&mut left_output), Some(&mut right_output)],
+            16,
+        );
+        assert_eq!(left_output, [0.25; 16]);
+        assert_eq!(right_output, [0.0; 16]);
+
+        let mut left_output = [9.0; 16];
+        let mut right_output = [9.0; 16];
+        run_buffers(
+            &state,
+            [None, None],
+            [Some(&mut left_output), Some(&mut right_output)],
+            16,
+        );
+        assert_eq!(left_output, [0.0; 16]);
+        assert_eq!(right_output, [0.0; 16]);
+    }
+
+    #[test]
+    fn disabled_dangling_effect_is_silent() {
+        let state = CallbackState::new(Box::new(TestProcessor::new(ProcessBehavior::Gain)), false);
+        let mut left = [7.0; 16];
+        let mut right = [7.0; 16];
+
+        run_buffers(
+            &state,
+            [None, None],
+            [Some(&mut left), Some(&mut right)],
+            16,
+        );
+
+        assert_eq!(left, [0.0; 16]);
+        assert_eq!(right, [0.0; 16]);
+    }
+
+    #[test]
+    fn partial_stereo_inputs_are_processed_independently() {
+        let state = CallbackState::new(Box::new(TestProcessor::new(ProcessBehavior::Gain)), true);
+        let mut left_input = [0.25, -0.5, 0.75, -1.0];
+        let mut left_output = [9.0; 4];
+        let mut right_output = [9.0; 4];
+
+        run_buffers(
+            &state,
+            [Some(&mut left_input), None],
+            [Some(&mut left_output), Some(&mut right_output)],
+            4,
+        );
+
+        assert_eq!(left_output, [0.5, -1.0, 1.5, -2.0]);
+        assert_eq!(right_output, [0.0; 4]);
+        assert_eq!(state.dangling_inputs.load(Ordering::Acquire), DANGLING_FR);
+
+        let mut right_input = [0.125, -0.25, 0.375, -0.5];
+        let mut left_output = [9.0; 4];
+        let mut right_output = [9.0; 4];
+        run_buffers(
+            &state,
+            [None, Some(&mut right_input)],
+            [Some(&mut left_output), Some(&mut right_output)],
+            4,
+        );
+        assert_eq!(left_output, [0.0; 4]);
+        assert_eq!(right_output, [0.25, -0.5, 0.75, -1.0]);
+        assert_eq!(state.dangling_inputs.load(Ordering::Acquire), DANGLING_FL);
+    }
+
+    #[test]
+    fn lock_contention_is_transparent_on_connected_channels_and_silent_on_missing_channels() {
+        let state = CallbackState::new(Box::new(TestProcessor::new(ProcessBehavior::Gain)), true);
+        let _processor_guard = state.processor.lock().expect("test processor lock");
+        let mut input = [0.25, -0.5, 0.75, -1.0];
+        let mut left = [9.0; 4];
+        let mut right = [9.0; 4];
+
+        run_buffers(
+            &state,
+            [Some(&mut input), None],
+            [Some(&mut left), Some(&mut right)],
+            4,
+        );
+
+        assert_eq!(left, input);
+        assert_eq!(right, [0.0; 4]);
+    }
+
+    #[test]
+    fn processor_error_restores_the_sanitized_pass_through_fallback() {
+        let state = CallbackState::new(
+            Box::new(TestProcessor::new(ProcessBehavior::ErrorAfterMutation)),
+            true,
+        );
+        let mut input = [0.25, -0.5, 0.75, -1.0];
+        let mut left = [9.0; 4];
+        let mut right = [9.0; 4];
+
+        run_buffers(
+            &state,
+            [Some(&mut input), None],
+            [Some(&mut left), Some(&mut right)],
+            4,
+        );
+
+        assert_eq!(left, input);
+        assert_eq!(right, [0.0; 4]);
+        assert!(state.processor_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn processor_panic_is_caught_and_restores_the_pass_through_fallback() {
+        let state = CallbackState::new(
+            Box::new(TestProcessor::new(ProcessBehavior::PanicAfterMutation)),
+            true,
+        );
+        let mut input = [0.25, -0.5, 0.75, -1.0];
+        let mut left = [9.0; 4];
+        let mut right = [9.0; 4];
+
+        run_buffers(
+            &state,
+            [Some(&mut input), None],
+            [Some(&mut left), Some(&mut right)],
+            4,
+        );
+
+        assert_eq!(left, input);
+        assert_eq!(right, [0.0; 4]);
+        assert!(state.processor_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn non_finite_processor_output_is_rejected_without_replacing_the_fallback() {
+        let state = CallbackState::new(
+            Box::new(TestProcessor::new(ProcessBehavior::NonFinite)),
+            true,
+        );
+        let mut input = [0.25, -0.5, 0.75, -1.0];
+        let mut left = [9.0; 4];
+
+        run_buffers(&state, [Some(&mut input), None], [Some(&mut left), None], 4);
+
+        assert_eq!(left, input);
+        assert!(state.processor_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn parameter_changes_cannot_inject_audio_into_missing_channels() {
+        let state = CallbackState::new(Box::new(TestProcessor::new(ProcessBehavior::Gain)), true);
+        for value in [0.0, 0.5, 1.0, 4.0, -2.0] {
+            state
+                .processor
+                .lock()
+                .expect("test processor lock")
+                .processor
+                .set_parameter("factor", value)
+                .expect("test parameter");
+            let mut left = [3.0; 24];
+            let mut right = [3.0; 24];
+            run_buffers(
+                &state,
+                [None, None],
+                [Some(&mut left), Some(&mut right)],
+                24,
+            );
+            assert_eq!(left, [0.0; 24]);
+            assert_eq!(right, [0.0; 24]);
+        }
+    }
+
+    #[test]
+    fn repeated_dangling_blocks_remain_silent() {
+        let state = CallbackState::new(
+            Box::new(TestProcessor::new(ProcessBehavior::EmitsConstant)),
+            true,
+        );
+        for _ in 0..64 {
+            let mut left = [5.0; 128];
+            let mut right = [5.0; 128];
+            run_buffers(
+                &state,
+                [None, None],
+                [Some(&mut left), Some(&mut right)],
+                128,
+            );
+            assert_eq!(left, [0.0; 128]);
+            assert_eq!(right, [0.0; 128]);
+        }
+    }
+
+    #[test]
+    fn missing_and_non_finite_inputs_are_read_as_zero() {
+        let state = CallbackState::new(Box::new(TestProcessor::new(ProcessBehavior::Gain)), true);
+        let mut input = [f32::NAN, f32::INFINITY, -f32::INFINITY, 0.25];
+        let mut output = [9.0; 4];
+
+        run_buffers(
+            &state,
+            [Some(&mut input), None],
+            [Some(&mut output), None],
+            4,
+        );
+
+        assert_eq!(output, [0.0, 0.0, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn dangling_input_diagnostics_are_metadata_only() {
+        assert_eq!(dangling_input_message(0), None);
+        assert_eq!(
+            dangling_input_message(DANGLING_FL),
+            Some("effect output is active while the FL input is disconnected")
+        );
+        assert_eq!(
+            dangling_input_message(DANGLING_FR),
+            Some("effect output is active while the FR input is disconnected")
+        );
+        assert_eq!(
+            dangling_input_message(DANGLING_FL | DANGLING_FR),
+            Some("effect output is active while both inputs are disconnected")
+        );
     }
 }

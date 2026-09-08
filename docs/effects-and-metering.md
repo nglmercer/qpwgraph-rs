@@ -19,6 +19,15 @@ stable, crash-contained Windows module ABI has been released; it is not
 silently ignored or loaded in the kernel driver. External module hosting is a
 separate future feature with its own ABI, realtime-safety, and lifecycle gate.
 
+Every effect host uses the same missing-input rule: an unavailable FL or FR
+buffer is replaced with exact digital silence. Connected channels remain
+independent, so a partial stereo route cannot contaminate its other channel.
+Disabled effects, a processor lock held by a parameter update, and a processor
+error or panic use a deterministic fallback of sanitized pass-through for
+connected channels and silence for missing channels. The callback publishes
+failure or dangling-input state separately; it never emits an audible error
+indicator or leaves an output buffer undefined.
+
 ## Metering
 
 Audio meters can be **Disabled**, **OnDemand**, or **Always**. On-demand helper
@@ -28,6 +37,13 @@ each node's reported capability, so meter-only and peak-only nodes are valid.
 Windows uses Core Audio peak readings where available; its legacy RMS field
 remains zero because Core Audio does not provide an equivalent RMS value.
 **Reset audio config** releases all meter streams.
+
+PipeWire meters are passive, hidden capture helpers (`stream.monitor=true`,
+`node.passive=true`, and an explicit target). They only observe the target and
+do not participate in routing or DSP decisions. In particular, attaching a
+meter can activate an effect output callback, but an effect with no real input
+still writes silence. Removing a meter, or waiting through the linger period,
+therefore cannot change the target's audio or leave generated sound behind.
 
 ## Related
 

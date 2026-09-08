@@ -307,7 +307,15 @@ impl EffectProcessor for NoiseGate {
                 expected,
             });
         }
+        // Bypass is transparent for valid samples, but a malformed sample is
+        // still replaced with digital silence. This keeps the standalone SDK
+        // contract consistent with the PipeWire host's realtime sanitizer.
         if self.bypass {
+            for sample in buffer {
+                if !sample.is_finite() {
+                    *sample = 0.0;
+                }
+            }
             return Ok(());
         }
 
@@ -358,7 +366,13 @@ impl EffectProcessor for NoiseGate {
             NOISE_GATE_ATTACK => self.attack_ms = value,
             NOISE_GATE_HOLD => self.hold_ms = value,
             NOISE_GATE_RELEASE => self.release_ms = value,
-            NOISE_GATE_BYPASS => self.bypass = value >= 0.5,
+            NOISE_GATE_BYPASS => {
+                let bypass = value >= 0.5;
+                if self.bypass != bypass {
+                    self.bypass = bypass;
+                    self.reset();
+                }
+            }
             _ => unreachable!("descriptor and parameter match are kept together"),
         }
         Ok(())
@@ -410,6 +424,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_silence_stays_exactly_silent() {
+        let mut gate = prepared_gate();
+        let mut audio = vec![0.0; 64];
+        gate.process(&mut audio, 32).unwrap();
+        assert_eq!(audio, vec![0.0; 64]);
+    }
+
+    #[test]
+    fn a_disconnected_stereo_channel_cannot_open_the_gate() {
+        let mut gate = prepared_gate();
+        gate.set_parameter(NOISE_GATE_ATTACK, 0.0).unwrap();
+        gate.set_parameter(NOISE_GATE_HOLD, 0.0).unwrap();
+        let mut audio = Vec::with_capacity(64);
+        for _ in 0..32 {
+            // FL is below the default threshold; FR represents a missing
+            // channel supplied to the processor as exact zero.
+            audio.extend_from_slice(&[0.001, 0.0]);
+        }
+
+        gate.process(&mut audio, 32).unwrap();
+
+        assert_eq!(audio, vec![0.0; 64]);
+    }
+
+    #[test]
     fn loud_signal_opens_gate() {
         let mut gate = prepared_gate();
         gate.set_parameter(NOISE_GATE_ATTACK, 0.0).unwrap();
@@ -446,6 +485,32 @@ mod tests {
         let mut audio = vec![0.5; 2];
         gate.process(&mut audio, 1).unwrap();
         assert_eq!(audio, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn resetting_the_gate_clears_its_open_state() {
+        let mut gate = prepared_gate();
+        gate.set_parameter(NOISE_GATE_ATTACK, 0.0).unwrap();
+        gate.set_parameter(NOISE_GATE_HOLD, 100.0).unwrap();
+        let mut loud = vec![0.8; 2];
+        gate.process(&mut loud, 1).unwrap();
+        gate.reset();
+
+        let mut quiet = vec![0.001; 2];
+        gate.process(&mut quiet, 1).unwrap();
+
+        assert_eq!(quiet, vec![0.0; 2]);
+    }
+
+    #[test]
+    fn bypass_sanitizes_non_finite_samples_but_preserves_valid_audio() {
+        let mut gate = prepared_gate();
+        gate.set_parameter(NOISE_GATE_BYPASS, 1.0).unwrap();
+        let mut audio = vec![0.25, f32::NAN, f32::INFINITY, -0.5];
+
+        gate.process(&mut audio, 2).unwrap();
+
+        assert_eq!(audio, vec![0.25, 0.0, 0.0, -0.5]);
     }
 
     #[test]
