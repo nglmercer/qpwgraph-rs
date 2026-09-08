@@ -13,8 +13,16 @@ export component EffectsDialog inherits DialogShell {
     in property <[EffectParameterRow]> effect-setup-parameters: [];
     in-out property <bool> effect-configuring: false;
     in-out property <bool> effect-setup-enabled: true;
-    in-out property <int> effect-selection-index: 0;
-    callback action(string);
+    in property <int> effect-selection-index: 0;
+    callback effect-selected(int);
+    callback effect-create-requested();
+    callback effect-config-back();
+    callback effect-toggle(string);
+    callback effect-remove(string);
+    callback effect-inspect(string);
+    callback effect-parameter-changed(string, string, float);
+    callback effect-draft-parameter-changed(string, float);
+    callback effect-draft-enabled-changed(bool);
 
     Text { x: 20px; y: 45px; width: parent.width - 90px; text: UiI18n.localized("effects.gallery_hint"); color: #aebdca; font-size: 11px * UiTheme.panel-scale; overflow: elide; }
 
@@ -36,19 +44,19 @@ export component EffectsDialog inherits DialogShell {
                         Text { x: 11px; width: 102px; height: parent.height; text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : ""); color: #aebdca; font-size: 9px * UiTheme.panel-scale; vertical-alignment: center; overflow: elide; }
                         if parameter.boolean: CheckBox {
                             x: 118px; y: 2px; text: UiI18n.localized("effects.enabled"); checked: parameter.value >= 0.5;
-                            toggled => { root.action("effect-parameter:" + effect.instance-id + ":" + parameter.id + ":" + (self.checked ? 1 : 0)); }
+                            toggled => { root.effect-parameter-changed(effect.instance-id, parameter.id, self.checked ? 1 : 0); }
                         }
                         if !parameter.boolean: Slider {
                             x: 118px; y: 2px; width: parent.width - 310px; height: 24px;
                             minimum: parameter.minimum;
                             maximum: parameter.maximum;
                             value: parameter.value;
-                            changed(value) => { root.action("effect-parameter:" + effect.instance-id + ":" + parameter.id + ":" + value); }
+                            changed(value) => { root.effect-parameter-changed(effect.instance-id, parameter.id, value); }
                         }
                     }
-                    ActionButton { x: parent.width - 168px; y: 10px; width: 76px; text: effect.enabled ? UiI18n.localized("effects.disable") : UiI18n.localized("effects.enable"); clicked => { root.action("effect-toggle:" + effect.instance-id); } }
-                    ActionButton { x: parent.width - 86px; y: 10px; width: 76px; text: UiI18n.localized("effects.setup"); clicked => { root.action("effect-inspect:" + effect.instance-id); } }
-                    ActionButton { x: parent.width - 86px; y: 43px; width: 76px; text: UiI18n.localized("effects.remove"); clicked => { root.action("effect-remove:" + effect.instance-id); } }
+                    ActionButton { x: parent.width - 168px; y: 10px; width: 76px; text: effect.enabled ? UiI18n.localized("effects.disable") : UiI18n.localized("effects.enable"); clicked => { root.effect-toggle(effect.instance-id); } }
+                    ActionButton { x: parent.width - 86px; y: 10px; width: 76px; text: UiI18n.localized("effects.setup"); clicked => { root.effect-inspect(effect.instance-id); } }
+                    ActionButton { x: parent.width - 86px; y: 43px; width: 76px; text: UiI18n.localized("effects.remove"); clicked => { root.effect-remove(effect.instance-id); } }
                 }
             }
             if root.effect-configuring: Rectangle {
@@ -59,30 +67,30 @@ export component EffectsDialog inherits DialogShell {
                 border-radius: 5px;
                 Text { x: 12px; y: 10px; width: parent.width - 24px; height: 20px; text: UiI18n.localized("effects.initial_settings"); color: #edf3f7; font-size: 13px * UiTheme.panel-scale; }
                 Text { x: 12px; y: 32px; width: parent.width - 24px; height: 18px; text: UiI18n.localized("effects.setup_hint"); color: #aebdca; font-size: 9px * UiTheme.panel-scale; overflow: elide; }
-                CheckBox { x: 12px; y: 54px; text: UiI18n.localized("effects.enabled"); checked: root.effect-setup-enabled; toggled => { root.action("effect-draft-enabled:" + (self.checked ? "1" : "0")); } }
+                CheckBox { x: 12px; y: 54px; text: UiI18n.localized("effects.enabled"); checked: root.effect-setup-enabled; toggled => { root.effect-draft-enabled-changed(self.checked); } }
                 for parameter[index] in root.effect-setup-parameters: Rectangle {
                     y: 86px + index * 38px;
                     height: 34px;
                     Text { x: 12px; y: 5px; width: 145px; height: 24px; text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : ""); color: #aebdca; font-size: 10px * UiTheme.panel-scale; vertical-alignment: center; overflow: elide; }
                     if parameter.boolean: CheckBox {
                         x: 166px; y: 5px; text: UiI18n.localized("effects.enabled"); checked: parameter.value >= 0.5;
-                        toggled => { root.action("effect-draft-parameter:" + parameter.id + ":" + (self.checked ? 1 : 0)); }
+                        toggled => { root.effect-draft-parameter-changed(parameter.id, self.checked ? 1 : 0); }
                     }
                     if !parameter.boolean: Slider {
                         x: 166px; y: 5px; width: parent.width - 260px; height: 24px;
                         minimum: parameter.minimum;
                         maximum: parameter.maximum;
                         value: parameter.value;
-                        changed(value) => { root.action("effect-draft-parameter:" + parameter.id + ":" + value); }
+                        changed(value) => { root.effect-draft-parameter-changed(parameter.id, value); }
                     }
                     Text { x: parent.width - 86px; y: 5px; width: 74px; height: 24px; text: parameter.value; color: #e7edf2; font-size: 9px * UiTheme.panel-scale; horizontal-alignment: right; vertical-alignment: center; }
                 }
             }
         }
     }
-    ComboBox { x: 20px; y: parent.height - 48px; width: 230px; model: root.effect-options; current-index <=> root.effect-selection-index; changed current-index => { root.action("effect-selection:" + root.effect-selection-index); } }
-    if !root.effect-configuring: ActionButton { x: 260px; y: parent.height - 48px; width: 112px; text: UiI18n.localized("effects.add"); enabled: root.effects-available && root.effect-options.length > 0; clicked => { root.action("effect-create"); } }
-    if root.effect-configuring: ActionButton { x: 260px; y: parent.height - 48px; width: 112px; text: UiI18n.localized("effects.create_node"); enabled: root.effects-available && root.effect-options.length > 0; clicked => { root.action("effect-create"); } }
-    if root.effect-configuring: ActionButton { x: 380px; y: parent.height - 48px; width: 90px; text: UiI18n.localized("effects.back"); clicked => { root.action("effect-config-back"); } }
+    ComboBox { x: 20px; y: parent.height - 48px; width: 230px; model: root.effect-options; current-index: root.effect-selection-index; selected(value) => { root.effect-selected(self.current-index); } }
+    if !root.effect-configuring: ActionButton { x: 260px; y: parent.height - 48px; width: 112px; text: UiI18n.localized("effects.add"); enabled: root.effects-available && root.effect-options.length > 0; clicked => { root.effect-create-requested(); } }
+    if root.effect-configuring: ActionButton { x: 260px; y: parent.height - 48px; width: 112px; text: UiI18n.localized("effects.create_node"); enabled: root.effects-available && root.effect-options.length > 0; clicked => { root.effect-create-requested(); } }
+    if root.effect-configuring: ActionButton { x: 380px; y: parent.height - 48px; width: 90px; text: UiI18n.localized("effects.back"); clicked => { root.effect-config-back(); } }
     if !root.effect-configuring: Text { x: 385px; y: parent.height - 39px; text: UiI18n.localized("help.configuration"); color: #aebdca; font-size: 10px * UiTheme.panel-scale; }
 }

@@ -16,6 +16,28 @@ use pw_graph_backend::RelayPeerInfo;
 
 pub(crate) enum UiEvent {
     Action(String),
+    EffectSelected(i32),
+    EffectCreateRequested,
+    EffectConfigBack,
+    EffectToggle {
+        instance_id: String,
+    },
+    EffectRemove {
+        instance_id: String,
+    },
+    EffectInspect {
+        instance_id: String,
+    },
+    EffectParameterChanged {
+        instance_id: String,
+        parameter_id: String,
+        value: f32,
+    },
+    EffectDraftParameterChanged {
+        parameter_id: String,
+        value: f32,
+    },
+    EffectDraftEnabledChanged(bool),
     SelectNode(i32, bool),
     SelectLink(i32, bool),
     ClearSelection,
@@ -87,6 +109,9 @@ pub(crate) struct Application {
     /// Transient effect-gallery configuration. It is deliberately kept out
     /// of `AppConfig` until the user confirms creation.
     pub(crate) effect_draft_id: Option<String>,
+    /// Stable descriptor identity projected into the ComboBox as an index.
+    /// The index is never persisted or used as the effect identity.
+    pub(crate) effect_selection_id: Option<String>,
     pub(crate) effect_draft_enabled: bool,
     pub(crate) effect_draft_parameters: BTreeMap<String, f32>,
     pub(crate) debug: bool,

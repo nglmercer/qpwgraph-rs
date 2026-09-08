@@ -91,6 +91,7 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         toast_error: false,
         pending_connection_pin: None,
         effect_draft_id: None,
+        effect_selection_id: None,
         effect_draft_enabled: true,
         effect_draft_parameters: BTreeMap::new(),
         debug: args.debug,

@@ -162,6 +162,14 @@ impl CallbackState {
         self.dangling_inputs
             .store(dangling_inputs, Ordering::Release);
 
+        // A stateful effect must learn about route changes before it queues
+        // this block. The default implementation is a no-op; Hush uses the
+        // atomic/generation-only hook to reset disconnected denoiser state.
+        let channel_mask = (!dangling_inputs) as u16 & ((1u16 << DSP_CHANNELS) - 1);
+        if let Ok(mut state) = self.processor.try_lock() {
+            state.processor.set_channel_mask(channel_mask);
+        }
+
         // Publish a deterministic fallback before invoking user-extensible
         // DSP. If the processor returns an error or panics after mutating its
         // scratch buffer, these samples remain untouched and are still safe.
@@ -210,7 +218,12 @@ impl CallbackState {
         }));
         if matches!(result, Ok(Ok(()))) && samples.iter().all(|sample| sample.is_finite()) {
             copy_processed_to_outputs(samples, outputs, dangling_inputs, frame_count);
-            self.processor_failed.store(false, Ordering::Relaxed);
+            // A Hush worker can fail while still returning its aligned dry
+            // fallback. Preserve that audio and publish the diagnostic
+            // separately instead of replacing it with an instantaneous pass-
+            // through block.
+            self.processor_failed
+                .store(processor.has_failed(), Ordering::Relaxed);
         } else {
             // The fallback was published before processing, so an error,
             // panic, or non-finite result cannot expose partial or undefined
@@ -441,8 +454,7 @@ impl NativeEffect {
         let mut instance = self.instance.clone();
         let callback = self.runtime.callback();
         if callback.processor_failed.load(Ordering::Relaxed) {
-            instance.error =
-                Some("effect processor rejected the most recent realtime buffer".into());
+            instance.error = Some("effect processor reported a realtime or worker failure".into());
         } else if let Some(message) =
             dangling_input_message(callback.dangling_inputs.load(Ordering::Acquire))
         {
@@ -454,10 +466,18 @@ impl NativeEffect {
     }
 
     pub(super) fn set_enabled(&mut self, enabled: bool) {
-        self.runtime
-            .callback()
-            .enabled
-            .store(enabled, Ordering::Release);
+        let callback = self.runtime.callback();
+        let previous = callback.enabled.swap(enabled, Ordering::AcqRel);
+        if previous != enabled {
+            // An enabled/disabled transition is a bypass transition too. A
+            // stateful processor must discard queued wet audio and recurrent
+            // state before it is allowed back into the graph. This lock is
+            // taken only by the control path; the realtime callback uses
+            // `try_lock` and never waits for it.
+            if let Ok(mut state) = callback.processor.lock() {
+                state.processor.reset();
+            }
+        }
         self.instance.config.enabled = enabled;
     }
 

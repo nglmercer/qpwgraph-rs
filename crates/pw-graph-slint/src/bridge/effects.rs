@@ -3,7 +3,7 @@ use pw_graph_backend::{EffectInsertRequest, EffectInstance, EffectNodeRequest, G
 use pw_graph_config::{AppConfig, PersistedEffect};
 use pw_graph_effects::{EffectDescriptor, EffectParameter};
 use pw_graph_i18n::I18n;
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{Model, ModelRc, SharedString, VecModel};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,8 +117,15 @@ pub(crate) fn create_effect(window: &MainWindow, application: &mut Application) 
         return;
     }
     let descriptors = available_descriptors(&application.source);
-    let Some(descriptor) = descriptors
-        .get(window.get_effect_selection_index().max(0) as usize)
+    let Some(descriptor) = application
+        .effect_selection_id
+        .as_deref()
+        .and_then(|id| descriptors.iter().find(|descriptor| descriptor.id == id))
+        .or_else(|| {
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.id == pw_graph_effects::DEFAULT_EFFECT_ID)
+        })
         .or_else(|| descriptors.first())
         .cloned()
     else {
@@ -243,19 +250,12 @@ pub(crate) fn toggle_effect(application: &mut Application, instance_id: &str) {
     }
 }
 
-pub(crate) fn set_effect_parameter(application: &mut Application, details: &str) {
-    let Some((details, value)) = details.rsplit_once(':') else {
-        application.status = application.t("status.effect_parameter_invalid");
-        return;
-    };
-    let Some((instance_id, parameter)) = details.rsplit_once(':') else {
-        application.status = application.t("status.effect_parameter_invalid");
-        return;
-    };
-    let Ok(value) = value.parse::<f32>() else {
-        application.status = application.t("status.effect_parameter_value_invalid");
-        return;
-    };
+pub(crate) fn set_effect_parameter_typed(
+    application: &mut Application,
+    instance_id: &str,
+    parameter: &str,
+    value: f32,
+) {
     match application
         .source
         .set_effect_parameter(instance_id, parameter, value)
@@ -492,6 +492,121 @@ pub(crate) fn effect_rows(source: &ApplicationDriver, i18n: &I18n) -> Vec<Effect
         .collect()
 }
 
+/// Synchronize effect rows without replacing the outer or nested models when
+/// the descriptor/instance shape is unchanged. Slint repeated components keep
+/// pointer capture only while their model row survives; parameter values are
+/// therefore patched into the existing `VecModel` during slider drags.
+pub(crate) fn sync_effect_rows(
+    current: ModelRc<EffectRow>,
+    source: &ApplicationDriver,
+    i18n: &I18n,
+) -> Option<ModelRc<EffectRow>> {
+    let descriptors = available_descriptors(source);
+    let mut instances = source.effect_instances();
+    instances.sort_by(|a, b| a.config.instance_id.cmp(&b.config.instance_id));
+    let Some(model) = current.as_any().downcast_ref::<VecModel<EffectRow>>() else {
+        return Some(ModelRc::from(Rc::new(VecModel::from(effect_rows(
+            source, i18n,
+        )))));
+    };
+    if model.row_count() != instances.len()
+        || instances.iter().enumerate().any(|(index, instance)| {
+            model
+                .row_data(index)
+                .is_none_or(|row| row.instance_id.as_str() != instance.config.instance_id)
+        })
+    {
+        return Some(ModelRc::from(Rc::new(VecModel::from(effect_rows(
+            source, i18n,
+        )))));
+    }
+
+    for (index, instance) in instances.into_iter().enumerate() {
+        let Some(current_row) = model.row_data(index) else {
+            continue;
+        };
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == instance.config.effect_id);
+        let name = descriptor
+            .map(|descriptor| descriptor.name.clone())
+            .unwrap_or_else(|| instance.config.effect_id.clone());
+        let vendor = descriptor
+            .map(|descriptor| descriptor.vendor.clone())
+            .unwrap_or_else(|| i18n.text("effects.unknown_provider"));
+        let vendor = match instance.error {
+            Some(error) => i18n.format("effects.error", &[("vendor", vendor), ("error", error)]),
+            None => vendor,
+        };
+        let parameter_rows = descriptor
+            .map(|descriptor| {
+                descriptor
+                    .parameters
+                    .iter()
+                    .map(|parameter| EffectParameterRow {
+                        id: SharedString::from(parameter.id.clone()),
+                        name: SharedString::from(parameter.name.clone()),
+                        minimum: parameter.minimum,
+                        maximum: parameter.maximum,
+                        default_value: parameter.default,
+                        value: instance
+                            .config
+                            .parameters
+                            .get(&parameter.id)
+                            .copied()
+                            .unwrap_or(parameter.default),
+                        unit: SharedString::from(parameter.unit.clone()),
+                        boolean: parameter.unit == "boolean",
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let parameters = if let Some(parameter_model) = current_row
+            .parameters
+            .as_any()
+            .downcast_ref::<VecModel<EffectParameterRow>>()
+        {
+            let stable_shape = parameter_model.row_count() == parameter_rows.len()
+                && parameter_rows
+                    .iter()
+                    .enumerate()
+                    .all(|(parameter_index, row)| {
+                        parameter_model
+                            .row_data(parameter_index)
+                            .is_some_and(|current| current.id == row.id)
+                    });
+            if stable_shape {
+                for (parameter_index, row) in parameter_rows.into_iter().enumerate() {
+                    if parameter_model
+                        .row_data(parameter_index)
+                        .is_some_and(|current| current == row)
+                    {
+                        continue;
+                    }
+                    parameter_model.set_row_data(parameter_index, row);
+                }
+                current_row.parameters.clone()
+            } else {
+                ModelRc::from(Rc::new(VecModel::from(parameter_rows)))
+            }
+        } else {
+            ModelRc::from(Rc::new(VecModel::from(parameter_rows)))
+        };
+        let next = EffectRow {
+            instance_id: SharedString::from(instance.config.instance_id),
+            name: SharedString::from(name),
+            vendor: SharedString::from(vendor),
+            description: current_row.description.clone(),
+            enabled: instance.config.enabled,
+            parameters,
+        };
+        if current_row != next {
+            model.set_row_data(index, next);
+        }
+    }
+    None
+}
+
 pub(crate) fn effect_options(source: &ApplicationDriver) -> Vec<SharedString> {
     available_descriptors(source)
         .into_iter()
@@ -541,14 +656,53 @@ pub(crate) fn effect_setup_rows(
         .unwrap_or_default()
 }
 
+/// Update the draft setup model without replacing it during a slider drag.
+/// Slint's repeated controls keep pointer capture only while their model row
+/// survives, so value changes are patched into the existing `VecModel` when
+/// the parameter structure is unchanged.
+pub(crate) fn sync_effect_setup_rows(
+    current: ModelRc<EffectParameterRow>,
+    rows: Vec<EffectParameterRow>,
+) -> Option<ModelRc<EffectParameterRow>> {
+    let Some(model) = current
+        .as_any()
+        .downcast_ref::<VecModel<EffectParameterRow>>()
+    else {
+        return Some(ModelRc::from(Rc::new(VecModel::from(rows))));
+    };
+    let stable_shape = model.row_count() == rows.len()
+        && rows.iter().enumerate().all(|(index, row)| {
+            model
+                .row_data(index)
+                .is_some_and(|current| current.id == row.id)
+        });
+    if !stable_shape {
+        return Some(ModelRc::from(Rc::new(VecModel::from(rows))));
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if model.row_data(index).is_some_and(|current| current == row) {
+            continue;
+        }
+        model.set_row_data(index, row);
+    }
+    None
+}
+
 pub(crate) fn prepare_effect_draft(window: &MainWindow, application: &mut Application) {
     let descriptors = available_descriptors(&application.source);
-    let requested = window.get_effect_selection_index().max(0) as usize;
-    let Some(descriptor) = descriptors
-        .get(requested)
-        .or_else(|| descriptors.first())
+    let descriptor = application
+        .effect_selection_id
+        .as_deref()
+        .and_then(|id| descriptors.iter().find(|descriptor| descriptor.id == id))
         .cloned()
-    else {
+        .or_else(|| {
+            descriptors
+                .iter()
+                .find(|descriptor| descriptor.id == pw_graph_effects::DEFAULT_EFFECT_ID)
+                .cloned()
+        })
+        .or_else(|| descriptors.first().cloned());
+    let Some(descriptor) = descriptor else {
         application.effect_draft_id = None;
         application.effect_draft_parameters.clear();
         window.set_effect_configuring(false);
@@ -560,6 +714,7 @@ pub(crate) fn prepare_effect_draft(window: &MainWindow, application: &mut Applic
         .position(|candidate| candidate.id == descriptor.id)
         .unwrap_or(0);
     application.effect_draft_id = Some(descriptor.id.clone());
+    application.effect_selection_id = Some(descriptor.id.clone());
     application.effect_draft_enabled = true;
     application.effect_draft_parameters = default_parameters(&descriptor);
     window.set_effect_selection_index(index as i32);
@@ -578,6 +733,10 @@ pub(crate) fn select_effect_draft(
     application: &mut Application,
     index: usize,
 ) {
+    let descriptors = available_descriptors(&application.source);
+    if let Some(descriptor) = descriptors.get(index) {
+        application.effect_selection_id = Some(descriptor.id.clone());
+    }
     window.set_effect_selection_index(index as i32);
     prepare_effect_draft(window, application);
 }
@@ -588,15 +747,11 @@ pub(crate) fn set_effect_draft_enabled(application: &mut Application, enabled: b
     }
 }
 
-pub(crate) fn set_effect_draft_parameter(application: &mut Application, details: &str) {
-    let Some((parameter_id, value)) = details.rsplit_once(':') else {
-        application.status = application.t("status.effect_parameter_invalid");
-        return;
-    };
-    let Ok(value) = value.parse::<f32>() else {
-        application.status = application.t("status.effect_parameter_value_invalid");
-        return;
-    };
+pub(crate) fn set_effect_draft_parameter_typed(
+    application: &mut Application,
+    parameter_id: &str,
+    value: f32,
+) {
     let Some(effect_id) = application.effect_draft_id.as_deref() else {
         return;
     };

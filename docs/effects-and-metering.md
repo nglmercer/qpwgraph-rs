@@ -13,6 +13,26 @@ activates the patchbay when configured, and then restores routed effects.
 That order matters: a routed effect needs the link it sits on to exist before
 it can be reinserted, so patchbay activation has to run in between.
 
+New noise-suppression effects use the separate `builtin.hush-noise-suppressor`
+descriptor. Hush runs the pinned DeepFilterNet-SE model at 16 kHz in 160-sample
+mono frames, so it adds an algorithmic latency of 320 samples (20 ms at its
+native rate) and a 160-sample overlap-add synthesis delay. The immutable model
+is embedded in the release artifact and loaded once on a setup thread.
+Development and CI may override it with `QPWGRAPH_HUSH_MODEL` or `HUSH_MODEL`;
+the pinned SHA-256 is recorded in `vendor/nnnoiseless/UPSTREAM.md`. Each effect
+owns independent channel denoisers and a bounded worker queue. Tract inference
+and resampling never run in a PipeWire or Windows realtime callback. A
+delayed, sanitized dry path is used while the worker is warming up, late,
+bypassed, or failed. The worker keeps atomic readiness, failure, reset, and
+queue-depth and overrun diagnostics; those counters never participate in
+sample generation.
+
+The original `builtin.adaptive-noise-suppressor` remains the compatibility
+implementation for saved configurations. Its persisted reduction, adaptation,
+voice-preserve, and bypass parameters are not migrated to Hush. If an override
+bundle is unavailable or fails checksum validation, creating a Hush effect
+reports a setup error and leaves the audio path on its deterministic fallback.
+
 Windows currently supports the built-in effect registry in the user-mode
 realtime router. A persisted `module_path` is rejected explicitly because no
 stable, crash-contained Windows module ABI has been released; it is not

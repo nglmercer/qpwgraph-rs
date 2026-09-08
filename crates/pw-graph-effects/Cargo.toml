@@ -9,7 +9,8 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-nnnoiseless = { path = "../../vendor/nnnoiseless", default-features = false }
+nnnoiseless = { path = "../../vendor/nnnoiseless", default-features = false, features = ["hush"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true

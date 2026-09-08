@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::app::{toast_visible, Application};
-use super::effects::{effect_options, effect_rows, effect_setup_rows};
+use super::effects::{effect_options, effect_setup_rows, sync_effect_rows, sync_effect_setup_rows};
 use super::meters::meter_fallback;
 #[cfg(feature = "relay")]
 use super::relay::relay_qr_payload;
@@ -276,10 +276,9 @@ pub(crate) fn sync_models(
         window.set_relay_send_source_index(0);
         window.set_relay_receive_sink_index(0);
     }
-    if let Some(model) = set_window_model_if_changed(
-        window.get_effects(),
-        effect_rows(&application.source, &application.i18n),
-    ) {
+    if let Some(model) =
+        sync_effect_rows(window.get_effects(), &application.source, &application.i18n)
+    {
         window.set_effects(model);
     }
     if let Some(model) = set_window_model_if_changed(
@@ -288,9 +287,31 @@ pub(crate) fn sync_models(
     ) {
         window.set_effect_options(model);
     }
+    let descriptors = application.source.effect_descriptors();
+    let selected_index = application
+        .effect_selection_id
+        .as_deref()
+        .and_then(|id| {
+            descriptors
+                .iter()
+                .position(|descriptor| descriptor.id == id)
+        })
+        .or_else(|| {
+            descriptors
+                .iter()
+                .position(|descriptor| descriptor.id == pw_graph_effects::DEFAULT_EFFECT_ID)
+        })
+        .or_else(|| (!descriptors.is_empty()).then_some(0))
+        .unwrap_or(0) as i32;
+    if application.effect_selection_id.is_none() {
+        application.effect_selection_id = descriptors
+            .get(selected_index as usize)
+            .map(|descriptor| descriptor.id.clone());
+    }
+    window.set_effect_selection_index(selected_index);
     window.set_effect_configuring(application.effect_draft_id.is_some());
     window.set_effect_setup_enabled(application.effect_draft_enabled);
-    if let Some(model) = set_window_model_if_changed(
+    if let Some(model) = sync_effect_setup_rows(
         window.get_effect_setup_parameters(),
         effect_setup_rows(
             &application.source,

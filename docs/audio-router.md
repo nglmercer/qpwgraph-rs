@@ -110,6 +110,18 @@ changing an effect parameter — run as closures on the router thread between
 blocks, and anything the core gives up on removal is handed back so it is
 dropped on the caller's thread rather than between two blocks of audio.
 
+Hush uses the same platform-neutral `EffectProcessor` contract here as it does
+for PipeWire. The router callback only performs bounded queue operations; its
+DeepFilterNet/Tract worker owns frame assembly, 16 kHz conversion, denoiser
+state, and the reverse resampling. Missing channels are marked in block
+metadata and forced to exact zero even if an old worker block is still in
+flight. Generation tags discard output queued before reset, disconnect,
+reprepare, or bypass.
+
+The pinned Hush bundle is embedded in `pw-graph-effects`; development builds
+may point `QPWGRAPH_HUSH_MODEL` at a checksum-verified replacement. Neither
+the PipeWire callback nor the Windows router downloads or parses model files.
+
 On Windows, `router::wasapi` opens render, capture, and render-loopback
 endpoints. Each gets its own thread owning the COM apartment it initialized and
 every interface created in it, the same invariant the Core Audio observation

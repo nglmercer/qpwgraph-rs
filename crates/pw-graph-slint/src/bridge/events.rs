@@ -12,6 +12,11 @@ use super::config::{autosave_config, read_window_state};
 use super::connections::{
     easy_connect_from_pin, easy_connect_nodes, handle_link_requested, handle_link_rerouted,
 };
+use super::effects::{
+    cancel_effect_setup, create_effect, inspect_effect, remove_effect, select_effect_draft,
+    set_effect_draft_enabled, set_effect_draft_parameter_typed, set_effect_parameter_typed,
+    toggle_effect,
+};
 use super::meters::refresh_meters;
 use super::models::{shortcut_rows, sync_meter_rows, sync_models, vec_model_rows_equal};
 use super::relay::{poll_relay_events, poll_relay_usb_hotplug};
@@ -122,6 +127,8 @@ fn refresh_interval(application: &Application) -> Duration {
 pub(crate) fn coalesce_audio_volume_events(pending: Vec<UiEvent>) -> Vec<UiEvent> {
     let mut compacted = Vec::with_capacity(pending.len());
     let mut volume_indices = BTreeMap::<i32, usize>::new();
+    let mut effect_indices = BTreeMap::<(String, String), usize>::new();
+    let mut draft_indices = BTreeMap::<String, usize>::new();
     for event in pending {
         match event {
             UiEvent::SetAudioVolume(id, position) => {
@@ -130,6 +137,40 @@ pub(crate) fn coalesce_audio_volume_events(pending: Vec<UiEvent>) -> Vec<UiEvent
                 } else {
                     volume_indices.insert(id, compacted.len());
                     compacted.push(UiEvent::SetAudioVolume(id, position));
+                }
+            }
+            UiEvent::EffectParameterChanged {
+                instance_id,
+                parameter_id,
+                value,
+            } => {
+                let key = (instance_id.clone(), parameter_id.clone());
+                let replacement = UiEvent::EffectParameterChanged {
+                    instance_id,
+                    parameter_id,
+                    value,
+                };
+                if let Some(index) = effect_indices.get(&key).copied() {
+                    compacted[index] = replacement;
+                } else {
+                    effect_indices.insert(key, compacted.len());
+                    compacted.push(replacement);
+                }
+            }
+            UiEvent::EffectDraftParameterChanged {
+                parameter_id,
+                value,
+            } => {
+                let key = parameter_id.clone();
+                let replacement = UiEvent::EffectDraftParameterChanged {
+                    parameter_id,
+                    value,
+                };
+                if let Some(index) = draft_indices.get(&key).copied() {
+                    compacted[index] = replacement;
+                } else {
+                    draft_indices.insert(key, compacted.len());
+                    compacted.push(replacement);
                 }
             }
             event => compacted.push(event),
@@ -141,6 +182,26 @@ pub(crate) fn coalesce_audio_volume_events(pending: Vec<UiEvent>) -> Vec<UiEvent
 pub(crate) fn process_event(window: &MainWindow, application: &mut Application, event: UiEvent) {
     match event {
         UiEvent::Action(action) => handle_action(window, application, &action),
+        UiEvent::EffectSelected(index) => {
+            select_effect_draft(window, application, index.max(0) as usize)
+        }
+        UiEvent::EffectCreateRequested => create_effect(window, application),
+        UiEvent::EffectConfigBack => cancel_effect_setup(window, application),
+        UiEvent::EffectToggle { instance_id } => toggle_effect(application, &instance_id),
+        UiEvent::EffectRemove { instance_id } => remove_effect(application, &instance_id),
+        UiEvent::EffectInspect { instance_id } => inspect_effect(application, Some(&instance_id)),
+        UiEvent::EffectParameterChanged {
+            instance_id,
+            parameter_id,
+            value,
+        } => set_effect_parameter_typed(application, &instance_id, &parameter_id, value),
+        UiEvent::EffectDraftParameterChanged {
+            parameter_id,
+            value,
+        } => set_effect_draft_parameter_typed(application, &parameter_id, value),
+        UiEvent::EffectDraftEnabledChanged(enabled) => {
+            set_effect_draft_enabled(application, enabled)
+        }
         UiEvent::SelectNode(id, shift) => application.view.select_node(id, shift),
         UiEvent::SelectLink(id, shift) => application.view.select_link(id, shift),
         UiEvent::ClearSelection => application.view.clear_selection(),

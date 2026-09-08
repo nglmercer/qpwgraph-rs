@@ -14,6 +14,10 @@ reference = []
 # Keep the neural-network weights quantized as `i8` in memory and widen them
 # during inference. Saves ~3x model memory at a cost in speed.
 low-memory = []
+
+# Hush/DeepFilterNet-SE support. The feature is deliberately opt-in because
+# it brings the Tract runtime and loads a model bundle separately.
+hush = ["dep:df", "dep:ndarray"]
 # JavaScript/WebAssembly bindings. Build with
 # `wasm-pack build --target web --no-default-features --features wasm`.
 wasm = ["dep:wasm-bindgen"]
@@ -25,4 +29,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 realfft = "3.5.0"
+df = { git = "https://github.com/Rikorose/DeepFilterNet.git", rev = "10d947c2b183934f34a8852a082e8a0f3c53fbb1", package = "deep_filter", default-features = false, features = ["tract", "transforms"], optional = true }
+ndarray = { version = "0.15", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }

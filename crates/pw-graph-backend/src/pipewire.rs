@@ -2534,4 +2534,40 @@ mod tests {
         assert!(driver.effect_instances().is_empty());
         assert!(driver.graph().node(instance.node_id).is_none());
     }
+
+    /// Opt-in Hush-specific lifecycle coverage. This keeps the model-backed
+    /// worker on the same raw PipeWire node path used by the legacy effect.
+    #[test]
+    fn native_backend_creates_and_removes_a_standalone_hush_effect_when_enabled() {
+        if std::env::var_os("PW_GRAPH_TEST_EFFECTS").is_none() {
+            return;
+        }
+        let mut driver = PipewireDriver::new().expect("PipeWire daemon should be available");
+        driver
+            .refresh()
+            .expect("PipeWire registry snapshot should succeed");
+        let instance_id = "qpwgraph-rs-test-hush-effect";
+        let instance = driver
+            .create_effect_node(EffectNodeRequest {
+                instance_id: instance_id.into(),
+                effect_id: pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID.into(),
+                module_path: None,
+                enabled: true,
+                parameters: BTreeMap::new(),
+                position: [56.0, 78.0],
+            })
+            .expect("the Hush PipeWire filter should publish a node and ports");
+        assert_eq!(
+            driver
+                .graph()
+                .node(instance.node_id)
+                .and_then(|node| node.effect_instance_id.as_deref()),
+            Some(instance_id)
+        );
+        driver
+            .remove_effect(instance_id)
+            .expect("destroying the Hush filter should remove its worker and node");
+        assert!(driver.effect_instances().is_empty());
+        assert!(driver.graph().node(instance.node_id).is_none());
+    }
 }

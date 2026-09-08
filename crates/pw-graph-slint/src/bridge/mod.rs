@@ -119,6 +119,60 @@ impl UiBridge {
                 .borrow_mut()
                 .push(UiEvent::Action(action.to_string()));
         });
+        let events = self.events.clone();
+        self.window.on_effect_selected(move |index| {
+            events.borrow_mut().push(UiEvent::EffectSelected(index))
+        });
+        let events = self.events.clone();
+        self.window.on_effect_create_requested(move || {
+            events.borrow_mut().push(UiEvent::EffectCreateRequested)
+        });
+        let events = self.events.clone();
+        self.window
+            .on_effect_config_back(move || events.borrow_mut().push(UiEvent::EffectConfigBack));
+        let events = self.events.clone();
+        self.window.on_effect_toggle(move |instance_id| {
+            events.borrow_mut().push(UiEvent::EffectToggle {
+                instance_id: instance_id.to_string(),
+            })
+        });
+        let events = self.events.clone();
+        self.window.on_effect_remove(move |instance_id| {
+            events.borrow_mut().push(UiEvent::EffectRemove {
+                instance_id: instance_id.to_string(),
+            })
+        });
+        let events = self.events.clone();
+        self.window.on_effect_inspect(move |instance_id| {
+            events.borrow_mut().push(UiEvent::EffectInspect {
+                instance_id: instance_id.to_string(),
+            })
+        });
+        let events = self.events.clone();
+        self.window
+            .on_effect_parameter_changed(move |instance_id, parameter_id, value| {
+                events.borrow_mut().push(UiEvent::EffectParameterChanged {
+                    instance_id: instance_id.to_string(),
+                    parameter_id: parameter_id.to_string(),
+                    value,
+                })
+            });
+        let events = self.events.clone();
+        self.window
+            .on_effect_draft_parameter_changed(move |parameter_id, value| {
+                events
+                    .borrow_mut()
+                    .push(UiEvent::EffectDraftParameterChanged {
+                        parameter_id: parameter_id.to_string(),
+                        value,
+                    })
+            });
+        let events = self.events.clone();
+        self.window.on_effect_draft_enabled_changed(move |enabled| {
+            events
+                .borrow_mut()
+                .push(UiEvent::EffectDraftEnabledChanged(enabled))
+        });
         install_canvas_callbacks(
             &self.window,
             &self.nodes,

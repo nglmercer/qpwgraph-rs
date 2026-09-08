@@ -125,7 +125,16 @@ export component MainWindow inherits Window {
     in property <[string]> relay-receive-sink-options: [];
     in-out property <int> relay-send-source-index: 0;
     in-out property <int> relay-receive-sink-index: 0;
-    in-out property <int> effect-selection-index: 0;
+    in property <int> effect-selection-index: 0;
+    callback effect-selected(int);
+    callback effect-create-requested();
+    callback effect-config-back();
+    callback effect-toggle(string);
+    callback effect-remove(string);
+    callback effect-inspect(string);
+    callback effect-parameter-changed(string, string, float);
+    callback effect-draft-parameter-changed(string, float);
+    callback effect-draft-enabled-changed(bool);
     in property <bool> relay-available: false;
     in property <bool> relay-host-active: false;
     in property <string> relay-host-endpoint: "";
@@ -581,8 +590,16 @@ export component MainWindow inherits Window {
                 effect-setup-parameters: root.effect-setup-parameters;
                 effect-configuring <=> root.effect-configuring;
                 effect-setup-enabled <=> root.effect-setup-enabled;
-                effect-selection-index <=> root.effect-selection-index;
-                action(action) => { root.action(action); }
+                effect-selection-index: root.effect-selection-index;
+                effect-selected(index) => { root.effect-selected(index); }
+                effect-create-requested => { root.effect-create-requested(); }
+                effect-config-back => { root.effect-config-back(); }
+                effect-toggle(instance-id) => { root.effect-toggle(instance-id); }
+                effect-remove(instance-id) => { root.effect-remove(instance-id); }
+                effect-inspect(instance-id) => { root.effect-inspect(instance-id); }
+                effect-parameter-changed(instance-id, parameter-id, value) => { root.effect-parameter-changed(instance-id, parameter-id, value); }
+                effect-draft-parameter-changed(parameter-id, value) => { root.effect-draft-parameter-changed(parameter-id, value); }
+                effect-draft-enabled-changed(enabled) => { root.effect-draft-enabled-changed(enabled); }
                 close => { root.action("effects"); }
             }
 

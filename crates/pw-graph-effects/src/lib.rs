@@ -11,11 +11,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 mod adaptive_noise;
+mod hush_noise;
+mod hush_worker;
 pub mod wasm;
 pub use adaptive_noise::AdaptiveNoiseSuppressor;
+pub use hush_noise::HushNoiseSuppressor;
 
 pub const NOISE_GATE_ID: &str = "builtin.noise-gate";
 pub const NOISE_SUPPRESSOR_ID: &str = "builtin.adaptive-noise-suppressor";
+pub use hush_noise::{DEFAULT_EFFECT_ID, HUSH_NOISE_SUPPRESSOR_ID};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AudioSpec {
@@ -88,6 +92,10 @@ pub enum EffectError {
     MissingWasmExport(String),
     #[error("invalid effect module manifest: {0}")]
     InvalidWasmManifest(String),
+    #[error("Hush model unavailable: {0}")]
+    ModelUnavailable(String),
+    #[error("Hush worker unavailable: {0}")]
+    WorkerUnavailable(String),
 }
 
 /// A processor is created and prepared off the realtime thread.
@@ -99,6 +107,17 @@ pub trait EffectProcessor: Send {
     /// Implementations must not allocate, block, panic, or perform I/O here.
     fn process(&mut self, buffer: &mut [f32], frames: u32) -> Result<(), EffectError>;
     fn set_parameter(&mut self, id: &str, value: f32) -> Result<(), EffectError>;
+    /// Update the realtime connection mask without allocating. Hosts use this
+    /// to force disconnected stateful channels to silence and to invalidate
+    /// stale worker generations.
+    fn set_channel_mask(&mut self, _mask: u16) {}
+    /// Report a persistent control/worker failure while still allowing the
+    /// processor to publish its deterministic audio fallback. Hosts can
+    /// surface the condition without replacing that aligned fallback with an
+    /// instantaneous dry copy.
+    fn has_failed(&self) -> bool {
+        false
+    }
     fn reset(&mut self);
 }
 
@@ -117,6 +136,7 @@ impl EffectHost {
         let mut host = Self::default();
         host.register(Box::new(NoiseGateFactory));
         host.register(Box::new(AdaptiveNoiseSuppressorFactory));
+        host.register(hush_noise::HushNoiseSuppressor::factory());
         host
     }
 
@@ -519,5 +539,33 @@ mod tests {
         assert!(descriptors
             .iter()
             .any(|descriptor| descriptor.id == NOISE_SUPPRESSOR_ID));
+    }
+
+    #[test]
+    fn host_exposes_hush_as_a_distinct_effect_and_default_identity() {
+        let descriptors = EffectHost::new().descriptors();
+        assert!(descriptors
+            .iter()
+            .any(|descriptor| descriptor.id == HUSH_NOISE_SUPPRESSOR_ID));
+        assert_eq!(DEFAULT_EFFECT_ID, HUSH_NOISE_SUPPRESSOR_ID);
+        assert_ne!(DEFAULT_EFFECT_ID, NOISE_SUPPRESSOR_ID);
+    }
+
+    #[test]
+    fn hush_descriptor_has_only_real_controls() {
+        let descriptor = EffectHost::new()
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HUSH_NOISE_SUPPRESSOR_ID)
+            .expect("Hush descriptor");
+        assert_eq!(descriptor.parameters.len(), 2);
+        assert!(descriptor
+            .parameters
+            .iter()
+            .any(|parameter| { parameter.id == "reduction-db" && parameter.default == 25.0 }));
+        assert!(descriptor
+            .parameters
+            .iter()
+            .any(|parameter| parameter.id == "bypass" && parameter.unit == "boolean"));
     }
 }

@@ -8,9 +8,10 @@ use crate::canvas::{self, HIT_NODE, HIT_NODE_BODY};
 use crate::model::{resolve_drag_delta, ConnectMode};
 use pw_graph_core::Direction;
 use slint::platform::{PointerEventButton, WindowEvent};
-use slint::{LogicalPosition, ModelRc};
-use std::collections::BTreeSet;
+use slint::{LogicalPosition, Model, ModelRc};
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 pub(super) fn demo_application() -> Application {
     let args = Args {
@@ -40,6 +41,7 @@ pub(super) fn demo_application() -> Application {
         toast_error: false,
         pending_connection_pin: None,
         effect_draft_id: None,
+        effect_selection_id: None,
         effect_draft_enabled: true,
         effect_draft_parameters: BTreeMap::new(),
         debug: false,
@@ -65,7 +67,7 @@ pub(super) fn demo_application() -> Application {
         #[cfg(feature = "relay")]
         relay_trusted_candidate_failures: BTreeMap::new(),
         #[cfg(feature = "relay")]
-        relay_trusted_refused: BTreeSet::new(),
+        relay_trusted_refused: std::collections::BTreeSet::new(),
         #[cfg(feature = "relay")]
         relay_pending_enrollment: None,
         #[cfg(feature = "relay")]
@@ -324,6 +326,133 @@ fn audio_slider_updates_are_coalesced_per_node() {
     assert!(
         matches!(compacted[1], UiEvent::SetAudioVolume(8, value) if (value - 0.4).abs() < f32::EPSILON)
     );
+}
+
+#[test]
+fn effect_slider_updates_are_coalesced_by_stable_identity() {
+    let compacted = coalesce_audio_volume_events(vec![
+        UiEvent::EffectParameterChanged {
+            instance_id: "hush-a".into(),
+            parameter_id: "reduction-db".into(),
+            value: 10.0,
+        },
+        UiEvent::EffectParameterChanged {
+            instance_id: "hush-a".into(),
+            parameter_id: "reduction-db".into(),
+            value: 30.0,
+        },
+        UiEvent::EffectDraftParameterChanged {
+            parameter_id: "reduction-db".into(),
+            value: 12.0,
+        },
+        UiEvent::EffectDraftParameterChanged {
+            parameter_id: "reduction-db".into(),
+            value: 25.0,
+        },
+    ]);
+    assert_eq!(compacted.len(), 2);
+    assert!(matches!(
+        &compacted[0],
+        UiEvent::EffectParameterChanged { value, .. } if (*value - 30.0).abs() < f32::EPSILON
+    ));
+    assert!(matches!(
+        &compacted[1],
+        UiEvent::EffectDraftParameterChanged { value, .. } if (*value - 25.0).abs() < f32::EPSILON
+    ));
+}
+
+#[test]
+fn empty_effect_model_is_kept_in_place_during_sync() {
+    let application = demo_application();
+    let i18n = application.i18n.clone();
+    let source = application.source;
+    let rows = std::rc::Rc::new(slint::VecModel::from(Vec::<EffectRow>::new()));
+    let current = ModelRc::from(rows.clone());
+    assert!(super::effects::sync_effect_rows(current, &source, &i18n).is_none());
+    assert_eq!(rows.row_count(), 0);
+}
+
+#[test]
+fn draft_parameter_model_is_kept_in_place_during_slider_updates() {
+    let application = demo_application();
+    let rows = super::effects::effect_setup_rows(
+        &application.source,
+        Some(pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID),
+        &std::collections::BTreeMap::from([("reduction-db".to_owned(), 10.0)]),
+    );
+    let model = std::rc::Rc::new(slint::VecModel::from(rows));
+    let current = ModelRc::from(model.clone());
+    let updated = super::effects::sync_effect_setup_rows(
+        current,
+        super::effects::effect_setup_rows(
+            &application.source,
+            Some(pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID),
+            &std::collections::BTreeMap::from([("reduction-db".to_owned(), 35.0)]),
+        ),
+    );
+    assert!(updated.is_none());
+    assert_eq!(model.row_data(0).expect("reduction row").value, 35.0);
+}
+
+#[test]
+fn effect_parameter_model_is_kept_in_place_during_slider_updates() {
+    let mut application = demo_application();
+    application
+        .source
+        .create_effect_node(pw_graph_backend::EffectNodeRequest {
+            instance_id: "stable-effect".into(),
+            effect_id: pw_graph_effects::NOISE_GATE_ID.into(),
+            module_path: None,
+            enabled: true,
+            parameters: std::collections::BTreeMap::new(),
+            position: [0.0, 0.0],
+        })
+        .expect("demo effect should be created");
+    let i18n = application.i18n.clone();
+    let initial = super::effects::effect_rows(&application.source, &i18n);
+    let model = std::rc::Rc::new(slint::VecModel::from(initial));
+    let current = ModelRc::from(model.clone());
+    let old_parameters = model.row_data(0).expect("effect row").parameters;
+    let old_parameters_ptr = old_parameters
+        .as_any()
+        .downcast_ref::<slint::VecModel<EffectParameterRow>>()
+        .expect("nested parameter model") as *const _;
+    application
+        .source
+        .set_effect_parameter(
+            "stable-effect",
+            pw_graph_effects::NOISE_GATE_THRESHOLD,
+            -20.0,
+        )
+        .expect("demo parameter should be updated");
+    assert!(super::effects::sync_effect_rows(current, &application.source, &i18n).is_none());
+    let new_parameters = model.row_data(0).expect("effect row").parameters;
+    let new_parameters_ptr = new_parameters
+        .as_any()
+        .downcast_ref::<slint::VecModel<EffectParameterRow>>()
+        .expect("nested parameter model") as *const _;
+    assert_eq!(old_parameters_ptr, new_parameters_ptr);
+    assert_eq!(
+        new_parameters.row_data(0).expect("threshold row").value,
+        -20.0
+    );
+}
+
+#[test]
+fn programmatic_effect_selection_does_not_emit_user_event() {
+    let window = MainWindow::new().expect("test window");
+    let events = Rc::new(Cell::new(0));
+    let observed = events.clone();
+    window.on_effect_selected(move |_| observed.set(observed.get() + 1));
+    let checkbox_events = Rc::new(Cell::new(0));
+    let observed_checkbox = checkbox_events.clone();
+    window.on_effect_draft_enabled_changed(move |_| {
+        observed_checkbox.set(observed_checkbox.get() + 1)
+    });
+    window.set_effect_selection_index(1);
+    window.set_effect_setup_enabled(false);
+    assert_eq!(events.get(), 0);
+    assert_eq!(checkbox_events.get(), 0);
 }
 
 #[test]

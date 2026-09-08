@@ -20,3 +20,11 @@ and the shared typography theme.
 The bridge updates `UiTheme` from the shared configuration for UI, panel, and
 node text scales. `UiI18n` resolves all user-visible application messages
 through `pw-graph-i18n`.
+
+Effects use typed callbacks for selection, creation, toggles, and parameter
+changes. Rust owns the selected descriptor ID and projects its index only into
+the ComboBox; the ComboBox's explicit `selected` callback is the only user
+selection event. Effect rows and their parameter `VecModel`s are retained and
+updated in place while values change, so a periodic graph sync cannot replace
+an active slider component or lose pointer capture. Rapid parameter events are
+coalesced by `(instance_id, parameter_id)` before they reach the backend.

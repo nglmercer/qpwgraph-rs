@@ -1021,6 +1021,11 @@ impl RouterCore {
                         // non-finite, or half-processed block.
                         block.copy_from_slice(&branch.fallback[..samples]);
                         processor_failed = true;
+                    } else if slot.processor.has_failed() {
+                        // Stateful workers can retain an aligned dry fallback
+                        // after reporting a persistent failure. Keep that
+                        // audio and surface the route fault separately.
+                        processor_failed = true;
                     }
                 }
                 effect_us += effects_started.elapsed().as_micros() as u64;

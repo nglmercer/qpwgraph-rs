@@ -1,0 +1,42 @@
+name: Hush model tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "vendor/nnnoiseless/**"
+      - "crates/pw-graph-effects/**"
+      - "crates/pw-graph-effects/resources/hush/**"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+env:
+  HUSH_MODEL_URL: https://huggingface.co/weya-ai/hush/resolve/e4ce7721d519438e8c2fa0b1f7cc27e1868fff99/onnx/advanced_dfnet16k_model_best_onnx.tar.gz?download=true
+  HUSH_MODEL_SHA256: 45632ccaa82b71bb743d6caa7c78e983fe2f2790a3af7f6ec48e6ed7ba085df6
+
+jobs:
+  model-backed-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang cmake libclang-dev
+      - name: Download and verify pinned model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            "$HUSH_MODEL_URL" --output models/hush.tar.gz
+          echo "$HUSH_MODEL_SHA256  models/hush.tar.gz" | sha256sum --check --strict
+      - name: Run model-backed Hush tests
+        env:
+          HUSH_MODEL: ${{ github.workspace }}/models/hush.tar.gz
+        run: cargo test -p nnnoiseless --features hush --test hush --test hush_buffer --locked
+      - name: Check qpwgraph Hush integration
+        run: cargo test -p pw-graph-effects --all-features --locked

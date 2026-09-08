@@ -7,10 +7,7 @@ use std::time::Instant;
 use super::app::Application;
 use super::config::save_config;
 use super::connections::{delete_selected_connections, disconnect_selected_node};
-use super::effects::{
-    cancel_effect_setup, create_effect, inspect_effect, remove_effect, select_effect_draft,
-    set_effect_draft_enabled, set_effect_draft_parameter, set_effect_parameter, toggle_effect,
-};
+use super::effects::{cancel_effect_setup, remove_effect};
 use super::patchbay::{
     activate_patchbay, add_rule_from_selection, begin_rule_edit, cancel_rule_edit,
     choose_patchbay_directory, load_patchbay, load_recent_patchbay, remove_rule, save_patchbay,
@@ -202,31 +199,6 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
         }
         "relay-host-start" => start_relay_host(application),
         "relay-host-stop" => stop_relay_host(application),
-        _ if action == "effect-create" || action == "create-effect" => {
-            create_effect(window, application);
-        }
-        _ if action.strip_prefix("effect-selection:").is_some() => {
-            if let Some(index) = action
-                .strip_prefix("effect-selection:")
-                .and_then(|value| value.parse::<usize>().ok())
-            {
-                select_effect_draft(window, application, index);
-            }
-        }
-        "effect-config-back" => cancel_effect_setup(window, application),
-        _ if action.strip_prefix("effect-draft-enabled:").is_some() => {
-            let enabled = action.strip_prefix("effect-draft-enabled:") == Some("1");
-            set_effect_draft_enabled(application, enabled);
-        }
-        _ if action.strip_prefix("effect-draft-parameter:").is_some() => {
-            let details = action
-                .strip_prefix("effect-draft-parameter:")
-                .unwrap_or_default();
-            set_effect_draft_parameter(application, details);
-        }
-        _ if action == "effect-inspect" || action == "inspect-effect" => {
-            inspect_effect(application, None);
-        }
         "toggle-statusbar" => window.set_show_statusbar(!window.get_show_statusbar()),
         "reset-audio" => {
             application.source.reset_meters();
@@ -393,22 +365,6 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
             {
                 toggle_rule_pin(application, index);
             }
-        }
-        _ if action.strip_prefix("effect-toggle:").is_some() => {
-            let instance_id = action.strip_prefix("effect-toggle:").unwrap_or_default();
-            toggle_effect(application, instance_id);
-        }
-        _ if action.strip_prefix("effect-parameter:").is_some() => {
-            let details = action.strip_prefix("effect-parameter:").unwrap_or_default();
-            set_effect_parameter(application, details);
-        }
-        _ if action.strip_prefix("effect-remove:").is_some() => {
-            let instance_id = action.strip_prefix("effect-remove:").unwrap_or_default();
-            remove_effect(application, instance_id);
-        }
-        _ if action.strip_prefix("effect-inspect:").is_some() => {
-            let instance_id = action.strip_prefix("effect-inspect:").unwrap_or_default();
-            inspect_effect(application, Some(instance_id));
         }
         _ if action.strip_prefix("relay-connect:").is_some() => {
             let target = action.strip_prefix("relay-connect:").unwrap_or_default();
