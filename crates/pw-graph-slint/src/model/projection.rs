@@ -20,7 +20,7 @@ pub(crate) fn node_type_color(node_type: NodeType) -> [u8; 4] {
 /// each media family. Keeping the role calculation here means Slint and the
 /// hit-tested graph model use the same colors for dots, accents, and links.
 pub(crate) fn port_color(port_type: PortType, direction: Direction, name: &str) -> [u8; 4] {
-    let monitor = name.to_ascii_lowercase().contains("monitor");
+    let monitor = name_contains_monitor(name);
     match (port_type, monitor, direction) {
         (PortType::Audio, true, _) => [139, 231, 177, 255],
         (PortType::Audio, false, Direction::Sink) => [44, 151, 96, 255],
@@ -41,7 +41,7 @@ pub(crate) fn port_color(port_type: PortType, direction: Direction, name: &str) 
 }
 
 pub(crate) fn link_color(port_type: PortType, direction: Direction, name: &str) -> [u8; 4] {
-    let monitor = name.to_ascii_lowercase().contains("monitor");
+    let monitor = name_contains_monitor(name);
     match (port_type, monitor, direction) {
         (PortType::Audio, true, _) => [105, 194, 145, 255],
         (PortType::Audio, false, Direction::Sink) => [38, 126, 80, 255],
@@ -159,4 +159,17 @@ pub(super) fn configured_appearances(
 
 pub(crate) fn is_relay_node(node: &Node) -> bool {
     matches!(node.name.as_str(), RELAY_SOURCE_NAME | RELAY_SINK_NAME)
+}
+
+/// Case-insensitive substring search for "monitor" without allocating a
+/// lowercased copy of the port name on every projection.
+fn name_contains_monitor(name: &str) -> bool {
+    const NEEDLE: &[u8] = b"monitor";
+    let bytes = name.as_bytes();
+    if bytes.len() < NEEDLE.len() {
+        return false;
+    }
+    bytes
+        .windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }

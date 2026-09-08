@@ -91,6 +91,13 @@ pub(crate) struct Application {
     pub(crate) effect_draft_parameters: BTreeMap<String, f32>,
     pub(crate) debug: bool,
     pub(crate) last_refresh: Instant,
+    /// Last time the full model sync ran. The 50 ms pump only refreshes
+    /// meters on most ticks; topology, selection, config and relay models
+    /// rebuild here at a slower cadence or when something actually changed.
+    pub(crate) last_full_sync: Instant,
+    /// Fingerprint of the layout inputs the last `sync_config` consumed, so
+    /// an idle pump can skip rebuilding every layout map.
+    pub(crate) config_layout_fingerprint: u64,
     pub(crate) meters: BTreeMap<pw_graph_core::NodeId, MeterReading>,
     pub(crate) meter_error: Option<String>,
     /// Audio controls are live UI state only. They are intentionally not

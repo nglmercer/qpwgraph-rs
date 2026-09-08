@@ -532,6 +532,34 @@ impl PipewireDriver {
     /// their monitor, which `create_meter_locked` already arranges with
     /// `stream.capture.sink`. The rule itself lives in [`crate::api`] so it can
     /// be unit-tested without a PipeWire daemon.
+    /// Whether one node can be measured, without enumerating every node.
+    /// `node_capabilities` runs once per node per UI sync, so building the
+    /// whole set there made each sync quadratic.
+    fn is_node_measurable(&self, node_id: NodeId) -> bool {
+        let Some(node) = self.graph.nodes.get(&node_id) else {
+            return false;
+        };
+        let mut has_source = false;
+        let mut has_sink = false;
+        for port_id in &node.ports {
+            let Some(port) = self.graph.port(*port_id) else {
+                continue;
+            };
+            if port.port_type != PortType::Audio {
+                continue;
+            }
+            has_source |= port.direction.is_source();
+            has_sink |= port.direction.is_sink();
+        }
+        let state = self.state.lock().unwrap();
+        let media_class = state
+            .nodes
+            .get(&native_node_id(node_id))
+            .map(|record| record.media_class.as_str())
+            .unwrap_or_default();
+        is_measurable_audio_node(media_class, has_source, has_sink)
+    }
+
     fn measurable_nodes(&self) -> BTreeSet<NodeId> {
         let state = self.state.lock().unwrap().clone();
         self.graph
@@ -1016,20 +1044,19 @@ impl GraphDriver for PipewireDriver {
         if !self.graph.nodes.contains_key(&node) {
             return Err(GraphError::MissingNode(node).into());
         }
-        self.with_loop(|driver| {
-            driver.roundtrip_locked()?;
-            driver.set_node_mute_locked(node, muted)
-        })
+        // One round-trip per control write, inside `set_node_props_locked`.
+        // A second one here made every fader/mute tick wait for PipeWire
+        // twice, which is what made dragged sliders feel sticky.
+        self.with_loop(|driver| driver.set_node_mute_locked(node, muted))
     }
 
     fn set_node_volume(&mut self, node: NodeId, volume: f32) -> BackendResult<()> {
         if !self.graph.nodes.contains_key(&node) {
             return Err(GraphError::MissingNode(node).into());
         }
-        self.with_loop(|driver| {
-            driver.roundtrip_locked()?;
-            driver.set_node_volume_locked(node, volume)
-        })
+        // See `set_node_mute`: the write itself round-trips, so a second
+        // pre-write round-trip only doubled slider latency.
+        self.with_loop(|driver| driver.set_node_volume_locked(node, volume))
     }
 
     /// Audio state for one node.
@@ -1101,7 +1128,7 @@ impl GraphDriver for PipewireDriver {
             capabilities.meter_rms = true;
             return capabilities;
         }
-        if self.measurable_nodes().contains(&node) {
+        if self.is_node_measurable(node) {
             capabilities.volume_max = PIPEWIRE_MAX_VOLUME;
             capabilities.meter_peak = true;
             capabilities.meter_rms = true;

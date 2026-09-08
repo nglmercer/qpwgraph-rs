@@ -276,8 +276,14 @@ fn project_box_selection(
     let (node_hits, link_hits) = {
         let geometry = geometry.borrow();
         (
-            geometry.nodes_in_box(x, y, width, height),
-            geometry.links_in_box(x, y, width, height),
+            geometry
+                .nodes_in_box(x, y, width, height)
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            geometry
+                .links_in_box(x, y, width, height)
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
         )
     };
 

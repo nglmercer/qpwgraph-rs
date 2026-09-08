@@ -57,8 +57,12 @@ pub(crate) fn sync_models(
         .map(|node| node_row(node, &application.i18n))
         .collect::<Vec<_>>();
     let rows_applied = sync_node_rows(window, nodes, node_rows);
-    links.set_vec(snapshot.links.iter().map(link_row).collect::<Vec<_>>());
-    minimap_nodes.set_vec(
+    set_vec_if_changed(
+        links,
+        snapshot.links.iter().map(link_row).collect::<Vec<_>>(),
+    );
+    set_vec_if_changed(
+        minimap_nodes,
         snapshot
             .nodes
             .iter()
@@ -161,9 +165,19 @@ pub(crate) fn sync_models(
     window.set_profile_name(SharedString::from(
         application.config.active_patchbay_profile.clone(),
     ));
-    window.set_profile_options(string_model(profile_options(&application.config)));
+    if let Some(model) = string_model_if_changed(
+        window.get_profile_options(),
+        profile_options(&application.config),
+    ) {
+        window.set_profile_options(model);
+    }
     window.set_profile_index(profile_index(&application.config));
-    window.set_recent_patchbay_paths(string_model(recent_patchbay_paths(&application.config)));
+    if let Some(model) = string_model_if_changed(
+        window.get_recent_patchbay_paths(),
+        recent_patchbay_paths(&application.config),
+    ) {
+        window.set_recent_patchbay_paths(model);
+    }
     window.set_zoom(application.view.zoom);
     window.set_pan_x(application.view.pan[0]);
     window.set_pan_y(application.view.pan[1]);
@@ -189,11 +203,19 @@ pub(crate) fn sync_models(
     window.set_relay_codec_index(relay_codec_index(&application.config.relay_codec));
     window.set_relay_frame_index(relay_frame_index(application.config.relay_frame_ms));
     window.set_relay_transport_index(relay_transport_index(&application.config.relay_transport));
-    window.set_relay_codec_options(string_model([
-        application.i18n.text("relay.codec_opus"),
-        application.i18n.text("relay.codec_pcm"),
-    ]));
-    window.set_relay_frame_options(string_model(
+    if let Some(model) = string_model_if_changed(
+        window.get_relay_codec_options(),
+        [
+            application.i18n.text("relay.codec_opus"),
+            application.i18n.text("relay.codec_pcm"),
+        ]
+        .into_iter()
+        .collect::<Vec<_>>(),
+    ) {
+        window.set_relay_codec_options(model);
+    }
+    if let Some(model) = string_model_if_changed(
+        window.get_relay_frame_options(),
         [5, 10, 20, 40, 60]
             .into_iter()
             .map(|frame| {
@@ -202,24 +224,42 @@ pub(crate) fn sync_models(
                     .format("relay.frame_option", &[("frame", frame.to_string())])
             })
             .collect::<Vec<_>>(),
-    ));
-    window.set_relay_transport_options(string_model([
-        application.i18n.text("relay.transport_auto"),
-        application.i18n.text("relay.transport_wifi"),
-        application.i18n.text("relay.transport_bluetooth_pan"),
-        application.i18n.text("relay.transport_lan"),
-        application.i18n.text("relay.transport_adb"),
-    ]));
+    ) {
+        window.set_relay_frame_options(model);
+    }
+    if let Some(model) = string_model_if_changed(
+        window.get_relay_transport_options(),
+        [
+            application.i18n.text("relay.transport_auto"),
+            application.i18n.text("relay.transport_wifi"),
+            application.i18n.text("relay.transport_bluetooth_pan"),
+            application.i18n.text("relay.transport_lan"),
+            application.i18n.text("relay.transport_adb"),
+        ]
+        .into_iter()
+        .collect::<Vec<_>>(),
+    ) {
+        window.set_relay_transport_options(model);
+    }
     #[cfg(feature = "relay")]
     {
         let send_options = relay_send_source_options(application);
         let receive_options = relay_receive_sink_options(application);
-        window.set_relay_send_source_options(string_model(
-            send_options.iter().map(|(_, name)| name.clone()),
-        ));
-        window.set_relay_receive_sink_options(string_model(
-            receive_options.iter().map(|(_, name)| name.clone()),
-        ));
+        if let Some(model) = string_model_if_changed(
+            window.get_relay_send_source_options(),
+            send_options.iter().map(|(_, name)| name.clone()).collect(),
+        ) {
+            window.set_relay_send_source_options(model);
+        }
+        if let Some(model) = string_model_if_changed(
+            window.get_relay_receive_sink_options(),
+            receive_options
+                .iter()
+                .map(|(_, name)| name.clone())
+                .collect(),
+        ) {
+            window.set_relay_receive_sink_options(model);
+        }
         window.set_relay_send_source_index(relay_selector_index(
             &application.config.relay_send_source,
             &send_options,
@@ -236,35 +276,53 @@ pub(crate) fn sync_models(
         window.set_relay_send_source_index(0);
         window.set_relay_receive_sink_index(0);
     }
-    window.set_effects(ModelRc::from(Rc::new(VecModel::from(effect_rows(
-        &application.source,
-        &application.i18n,
-    )))));
-    window.set_effect_options(ModelRc::from(Rc::new(VecModel::from(effect_options(
-        &application.source,
-    )))));
+    if let Some(model) = set_window_model_if_changed(
+        window.get_effects(),
+        effect_rows(&application.source, &application.i18n),
+    ) {
+        window.set_effects(model);
+    }
+    if let Some(model) = set_window_model_if_changed(
+        window.get_effect_options(),
+        effect_options(&application.source),
+    ) {
+        window.set_effect_options(model);
+    }
     window.set_effect_configuring(application.effect_draft_id.is_some());
     window.set_effect_setup_enabled(application.effect_draft_enabled);
-    window.set_effect_setup_parameters(ModelRc::from(Rc::new(VecModel::from(effect_setup_rows(
-        &application.source,
-        application.effect_draft_id.as_deref(),
-        &application.effect_draft_parameters,
-    )))));
-    window.set_rules(ModelRc::from(Rc::new(VecModel::from(rule_rows(
-        &application.patchbay,
-    )))));
+    if let Some(model) = set_window_model_if_changed(
+        window.get_effect_setup_parameters(),
+        effect_setup_rows(
+            &application.source,
+            application.effect_draft_id.as_deref(),
+            &application.effect_draft_parameters,
+        ),
+    ) {
+        window.set_effect_setup_parameters(model);
+    }
+    if let Some(model) =
+        set_window_model_if_changed(window.get_rules(), rule_rows(&application.patchbay))
+    {
+        window.set_rules(model);
+    }
     let (undo_history, redo_history) = application.history();
-    window.set_undo_history(ModelRc::from(Rc::new(VecModel::from(history_rows(
-        undo_history,
-    )))));
-    window.set_redo_history(ModelRc::from(Rc::new(VecModel::from(history_rows(
-        redo_history,
-    )))));
+    if let Some(model) =
+        set_window_model_if_changed(window.get_undo_history(), history_rows(undo_history))
+    {
+        window.set_undo_history(model);
+    }
+    if let Some(model) =
+        set_window_model_if_changed(window.get_redo_history(), history_rows(redo_history))
+    {
+        window.set_redo_history(model);
+    }
     window.set_effects_available(application.source.supports_effect_nodes());
-    window.set_relay_rows(ModelRc::from(Rc::new(VecModel::from(relay_rows(
-        application,
-        &application.i18n,
-    )))));
+    if let Some(model) = set_window_model_if_changed(
+        window.get_relay_rows(),
+        relay_rows(application, &application.i18n),
+    ) {
+        window.set_relay_rows(model);
+    }
     #[cfg(feature = "relay")]
     {
         let relay_status = application.source.relay_status();
@@ -274,9 +332,14 @@ pub(crate) fn sync_models(
             application,
             relay_status.host_port,
         )));
+        // The QR bitmap is re-rendered only when its payload changes. It is
+        // static for the life of a hosting session, so rebuilding it 20
+        // times a second only burned CPU and re-uploaded the same image.
         let payload = relay_qr_payload(application).unwrap_or_default();
-        window.set_relay_qr_payload(SharedString::from(payload.clone()));
-        window.set_relay_qr_image(qr_image(&payload));
+        if window.get_relay_qr_payload().as_str() != payload {
+            window.set_relay_qr_payload(SharedString::from(payload.clone()));
+            window.set_relay_qr_image(qr_image(&payload));
+        }
         if let Some(pending) = &application.relay_pending_enrollment {
             window.set_relay_pending_active(true);
             window.set_relay_pending_peer_name(SharedString::from(pending.peer_name.clone()));
@@ -316,15 +379,118 @@ fn sync_node_rows(window: &MainWindow, nodes: &VecModel<NodeRow>, rows: Vec<Node
                 .is_some_and(|current| current.id == row.id)
         });
     if stable_shape {
+        // Only touch rows whose content actually changed: meters update every
+        // tick, but pushing identical rows 20 times a second invalidates and
+        // redraws cards that did not move.
         for (index, row) in rows.into_iter().enumerate() {
+            if nodes.row_data(index).is_some_and(|current| current == row) {
+                continue;
+            }
             nodes.set_row_data(index, row);
         }
         true
     } else if !window.get_graph_node_dragging() {
+        if vec_model_rows_equal(nodes, &rows) {
+            return true;
+        }
         nodes.set_vec(rows);
         true
     } else {
         false
+    }
+}
+
+/// Replace a model's contents only when they differ, so an idle 50 ms pump
+/// does not invalidate every repeated component instance in the window.
+pub(crate) fn set_vec_if_changed<T>(model: &Rc<VecModel<T>>, rows: Vec<T>)
+where
+    T: Clone + PartialEq + 'static,
+{
+    if vec_model_rows_equal(model, &rows) {
+        return;
+    }
+    model.set_vec(rows);
+}
+
+pub(crate) fn vec_model_rows_equal<T>(model: &VecModel<T>, rows: &[T]) -> bool
+where
+    T: Clone + PartialEq + 'static,
+{
+    model.row_count() == rows.len()
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(index, row)| model.row_data(index).is_some_and(|current| current == *row))
+}
+
+/// Update only the meter fields of the rendered node rows from the freshly
+/// polled readings. This is the 50 ms fast path: topology, selection and
+/// every other model are untouched, so an idle window costs one pass over
+/// the visible cards instead of a full graph reprojection.
+pub(crate) fn sync_meter_rows(nodes: &Rc<VecModel<NodeRow>>, application: &Application) {
+    if nodes.row_count() != application.snapshot.nodes.len() {
+        return;
+    }
+    for (index, view) in application.snapshot.nodes.iter().enumerate() {
+        let Some(mut row) = nodes.row_data(index) else {
+            continue;
+        };
+        if row.id != view.id {
+            // Shape drifted (topology/selection changed); the next full
+            // sync rebuilds the rows.
+            return;
+        }
+        let Some(meter) = application.meters.get(&view.node_id).copied() else {
+            continue;
+        };
+        if row.meter_rms == meter.rms && row.meter_peak == meter.peak {
+            continue;
+        }
+        row.meter_rms = meter.rms;
+        row.meter_peak = meter.peak;
+        row.meter_rms_position = meter_fraction(meter.rms);
+        row.meter_peak_position = meter_fraction(meter.peak);
+        row.meter_available = matches!(meter.state, MeterState::Live | MeterState::Demo);
+        row.meter_label = SharedString::from(localized_meter_label(&application.i18n, meter.state));
+        nodes.set_row_data(index, row);
+    }
+}
+
+/// Replace a window-owned model only when its rows differ. Rebuilding e.g.
+/// the effects, rules, history or relay lists 20 times a second reallocates
+/// and re-expands every list even when nothing changed.
+fn set_window_model_if_changed<T>(current: ModelRc<T>, rows: Vec<T>) -> Option<ModelRc<T>>
+where
+    T: Clone + PartialEq + 'static,
+{
+    let same = current.row_count() == rows.len()
+        && rows.iter().enumerate().all(|(index, row)| {
+            current
+                .row_data(index)
+                .is_some_and(|current| current == *row)
+        });
+    if same {
+        None
+    } else {
+        Some(ModelRc::from(Rc::new(VecModel::from(rows))))
+    }
+}
+
+fn string_model_if_changed(
+    current: ModelRc<SharedString>,
+    values: Vec<String>,
+) -> Option<ModelRc<SharedString>> {
+    let rows: Vec<SharedString> = values.into_iter().map(SharedString::from).collect();
+    let same = current.row_count() == rows.len()
+        && rows.iter().enumerate().all(|(index, row)| {
+            current
+                .row_data(index)
+                .is_some_and(|current| current == *row)
+        });
+    if same {
+        None
+    } else {
+        Some(ModelRc::from(Rc::new(VecModel::from(rows))))
     }
 }
 

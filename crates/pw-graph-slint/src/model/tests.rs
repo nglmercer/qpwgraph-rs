@@ -845,3 +845,63 @@ fn channel_matching_wins_over_port_order() {
 
     assert_eq!(pairs, vec![(PortId(1), PortId(4)), (PortId(2), PortId(3))]);
 }
+
+#[test]
+fn topology_fingerprint_ignores_moves_but_not_links() {
+    let mut graph = graph();
+    let before = topology_fingerprint(&graph);
+    graph.nodes.get_mut(&NodeId(1)).unwrap().position = [999.0, 999.0];
+    assert_eq!(
+        topology_fingerprint(&graph),
+        before,
+        "moving a card must not invalidate the cached auto-layout"
+    );
+    graph
+        .add_node(Node::new(NodeId(3), "Extra", NodeType::PipeWire))
+        .unwrap();
+    assert_ne!(
+        topology_fingerprint(&graph),
+        before,
+        "a topology change must invalidate the cached auto-layout"
+    );
+}
+
+#[test]
+fn repulsion_ignores_distant_cards() {
+    // One colliding obstacle plus 200 far-away cards: the old Cartesian
+    // solver built ~400x400 candidates here; the bounded solver only pushes
+    // out of the one overlap and must agree with the two-card solution.
+    let config = AppConfig::default();
+    let mut state = UiGraphState::from_config(&config);
+    let base = graph();
+    let mut snapshot = state.snapshot(&base, &config);
+    snapshot.nodes[0].position = [0.0, 0.0];
+    snapshot.nodes[0].width = 100.0;
+    snapshot.nodes[0].height = 100.0;
+    snapshot.nodes[1].position = [100.0, 100.0];
+    snapshot.nodes[1].width = 100.0;
+    snapshot.nodes[1].height = 100.0;
+    for extra in 0..200 {
+        let mut far = snapshot.nodes[1].clone();
+        far.node_id = NodeId(1000 + extra);
+        far.id = 1000 + extra as i32;
+        far.position = [10_000.0 + extra as f32 * 500.0, 10_000.0];
+        snapshot.nodes.push(far);
+    }
+    let selected = BTreeSet::from([snapshot.nodes[0].node_id]);
+
+    let resolved = resolve_drag_delta(&snapshot, &selected, [100.0, 100.0], true);
+
+    assert_eq!(resolved, [100.0, -18.0]);
+    let dragged = snapshot
+        .nodes
+        .iter()
+        .filter(|node| selected.contains(&node.node_id))
+        .collect::<Vec<_>>();
+    let stationary = snapshot
+        .nodes
+        .iter()
+        .filter(|node| !selected.contains(&node.node_id))
+        .collect::<Vec<_>>();
+    assert!(drag_is_clear(&dragged, &stationary, resolved));
+}

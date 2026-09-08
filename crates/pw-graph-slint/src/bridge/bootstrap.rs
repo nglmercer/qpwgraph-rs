@@ -95,6 +95,8 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         effect_draft_parameters: BTreeMap::new(),
         debug: args.debug,
         last_refresh: Instant::now(),
+        last_full_sync: Instant::now(),
+        config_layout_fingerprint: 0,
         meters: BTreeMap::new(),
         meter_error: None,
         #[cfg(feature = "relay")]

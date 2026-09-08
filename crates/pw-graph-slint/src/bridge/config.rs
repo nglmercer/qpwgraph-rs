@@ -246,9 +246,17 @@ fn sync_config(application: &mut Application) {
         "ascending"
     }
     .into();
-    application
-        .view
-        .write_to_config(application.source.graph(), &mut application.config);
+    // Rebuilding every layout map only to discover nothing changed was a
+    // persistent background cost on every pump. The fingerprint covers every
+    // input `write_to_config` reads, so an idle tick skips it entirely.
+    let fingerprint =
+        crate::model::layout_inputs_fingerprint(&application.view, application.source.graph());
+    if fingerprint != application.config_layout_fingerprint {
+        application
+            .view
+            .write_to_config(application.source.graph(), &mut application.config);
+        application.config_layout_fingerprint = fingerprint;
+    }
 }
 
 pub(crate) fn autosave_config(application: &mut Application) {

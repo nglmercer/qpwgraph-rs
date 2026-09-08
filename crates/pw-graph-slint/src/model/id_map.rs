@@ -15,6 +15,9 @@ pub(crate) struct SlintIdMap {
     pub(super) nodes: BTreeMap<NodeId, i32>,
     pub(super) ports: BTreeMap<PortId, i32>,
     pub(super) links: BTreeMap<LinkId, i32>,
+    reverse_nodes: HashMap<i32, NodeId>,
+    reverse_ports: HashMap<i32, PortId>,
+    reverse_links: HashMap<i32, LinkId>,
 }
 
 impl SlintIdMap {
@@ -31,6 +34,25 @@ impl SlintIdMap {
         for id in graph.links.keys() {
             self.allocate_link(*id);
         }
+        self.rebuild_reverse();
+    }
+
+    fn rebuild_reverse(&mut self) {
+        self.reverse_nodes = self
+            .nodes
+            .iter()
+            .map(|(id, mapped)| (*mapped, *id))
+            .collect();
+        self.reverse_ports = self
+            .ports
+            .iter()
+            .map(|(id, mapped)| (*mapped, *id))
+            .collect();
+        self.reverse_links = self
+            .links
+            .iter()
+            .map(|(id, mapped)| (*mapped, *id))
+            .collect();
     }
 
     pub(crate) fn node(&self, id: NodeId) -> Option<i32> {
@@ -42,9 +64,7 @@ impl SlintIdMap {
     }
 
     pub(crate) fn port_id(&self, id: i32) -> Option<PortId> {
-        self.ports
-            .iter()
-            .find_map(|(port_id, mapped)| (*mapped == id).then_some(*port_id))
+        self.reverse_ports.get(&id).copied()
     }
 
     pub(crate) fn link(&self, id: LinkId) -> Option<i32> {
@@ -52,21 +72,18 @@ impl SlintIdMap {
     }
 
     pub(crate) fn node_id(&self, id: i32) -> Option<NodeId> {
-        self.nodes
-            .iter()
-            .find_map(|(node_id, mapped)| (*mapped == id).then_some(*node_id))
+        self.reverse_nodes.get(&id).copied()
     }
 
     pub(crate) fn link_id(&self, id: i32) -> Option<LinkId> {
-        self.links
-            .iter()
-            .find_map(|(link_id, mapped)| (*mapped == id).then_some(*link_id))
+        self.reverse_links.get(&id).copied()
     }
 
     pub(super) fn allocate_node(&mut self, id: NodeId) {
         if !self.nodes.contains_key(&id) {
             let next = self.next_id();
             self.nodes.insert(id, next);
+            self.reverse_nodes.insert(next, id);
         }
     }
 
@@ -74,6 +91,7 @@ impl SlintIdMap {
         if !self.ports.contains_key(&id) {
             let next = self.next_id();
             self.ports.insert(id, next);
+            self.reverse_ports.insert(next, id);
         }
     }
 
@@ -81,6 +99,7 @@ impl SlintIdMap {
         if !self.links.contains_key(&id) {
             let next = self.next_id();
             self.links.insert(id, next);
+            self.reverse_links.insert(next, id);
         }
     }
 

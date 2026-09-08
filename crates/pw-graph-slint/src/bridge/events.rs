@@ -7,16 +7,21 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::actions::handle_action;
-use super::app::{set_connection_feedback, Application, UiEvent};
+use super::app::{set_connection_feedback, toast_visible, Application, UiEvent};
 use super::config::{autosave_config, read_window_state};
 use super::connections::{
     easy_connect_from_pin, easy_connect_nodes, handle_link_requested, handle_link_rerouted,
 };
 use super::meters::refresh_meters;
-use super::models::{shortcut_rows, sync_models};
+use super::models::{shortcut_rows, sync_meter_rows, sync_models, vec_model_rows_equal};
 use super::relay::{poll_relay_events, poll_relay_usb_hotplug};
 use super::utils::volume_from_track_position;
 use super::{CanvasGeometry, LinkRow, MainWindow, MinimapNode, NodeRow, ShortcutRow};
+
+/// Slower cadence for the full model sync. Meters still refresh every 50 ms
+/// tick through the light path, but topology, selection, config, relay and
+/// list models only rebuild when something changed or this interval elapses.
+const FULL_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pump(
@@ -30,38 +35,71 @@ pub(crate) fn pump(
     geometry: &Rc<RefCell<CanvasGeometry>>,
     geometry_version: &Rc<Cell<i32>>,
 ) {
+    let had_events = !events.borrow().is_empty();
     let pending = coalesce_audio_volume_events(std::mem::take(&mut *events.borrow_mut()));
     let mut application = app.borrow_mut();
+    // Cheap view inputs that must react immediately (typing in the search
+    // box, zooming) are captured before the window state is read back.
+    let search_before = application.view.search_query.clone();
+    let zoom_before = application.view.zoom;
+    let pan_before = application.view.pan;
+    let thumbnail_before = application.view.thumbnail_mode;
+    let toast_before = toast_visible(&application);
     read_window_state(window, &mut application);
+    let view_changed = application.view.search_query != search_before
+        || application.view.zoom != zoom_before
+        || application.view.pan != pan_before
+        || application.view.thumbnail_mode != thumbnail_before;
     for event in pending {
         process_event(window, &mut application, event);
     }
     poll_relay_usb_hotplug(&mut application);
     poll_relay_events(&mut application);
-    if application.source.graph_dirty()
-        || application.last_refresh.elapsed() >= refresh_interval(&application)
-    {
+    let mut graph_changed = application.source.graph_dirty();
+    if graph_changed || application.last_refresh.elapsed() >= refresh_interval(&application) {
         if let Err(error) = application.source.refresh_if_needed() {
             application.status = application.tf("status.refresh_failed", &[("error", error)]);
         } else {
             application.last_refresh = Instant::now();
+            graph_changed = true;
         }
     }
     refresh_meters(window, &mut application);
-    autosave_config(&mut application);
-    shortcuts.set_vec(shortcut_rows(
-        &application.i18n,
-        window.get_shortcut_search().as_str(),
-    ));
-    sync_models(
-        window,
-        &mut application,
-        nodes,
-        links,
-        minimap_nodes,
-        geometry,
-        geometry_version,
-    );
+    // A toast expiring only flips a boolean; without this the message would
+    // linger until the next slow sync.
+    let toast_changed = toast_visible(&application) != toast_before
+        || window.get_toast_visible() != toast_visible(&application);
+    let full_sync_due = application.last_full_sync.elapsed() >= FULL_SYNC_INTERVAL
+        || application.snapshot.nodes.is_empty();
+    if had_events || view_changed || graph_changed || toast_changed || full_sync_due {
+        autosave_config(&mut application);
+        sync_shortcuts(window, &application, shortcuts);
+        sync_models(
+            window,
+            &mut application,
+            nodes,
+            links,
+            minimap_nodes,
+            geometry,
+            geometry_version,
+        );
+        application.last_full_sync = Instant::now();
+    } else {
+        sync_meter_rows(nodes, &application);
+    }
+}
+
+/// Rebuild the shortcut list only when its query or language changed, not on
+/// every 50 ms tick.
+fn sync_shortcuts(
+    window: &MainWindow,
+    application: &Application,
+    shortcuts: &Rc<VecModel<ShortcutRow>>,
+) {
+    let rows = shortcut_rows(&application.i18n, window.get_shortcut_search().as_str());
+    if !vec_model_rows_equal(shortcuts, &rows) {
+        shortcuts.set_vec(rows);
+    }
 }
 
 /// How often to re-read the graph when nothing has reported a change.

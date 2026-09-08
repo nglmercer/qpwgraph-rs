@@ -8,9 +8,11 @@ pub(super) const COLLISION_GAP: f32 = 18.0;
 /// Resolve a user-requested drag against the exact visible card rectangles.
 ///
 /// Every selected node receives the same returned delta, preserving the group
-/// as a rigid object. Candidate positions come from all four edges of every
-/// visible stationary card and are ranked by distance from the requested drop,
-/// with a stable coordinate tie-breaker.
+/// as a rigid object. Only obstacles the requested drop actually overlaps
+/// seed candidates -- one push per colliding edge -- so the search stays
+/// proportional to nearby collisions instead of the Cartesian product of
+/// every card edge. Candidates are ranked by distance from the requested
+/// drop, with a stable coordinate tie-breaker.
 pub(crate) fn resolve_drag_delta(
     snapshot: &GraphSnapshot,
     selected: &BTreeSet<NodeId>,
@@ -36,31 +38,100 @@ pub(crate) fn resolve_drag_delta(
         return desired;
     }
 
-    let mut xs = vec![desired[0]];
-    let mut ys = vec![desired[1]];
-    for moving in &dragged {
-        for obstacle in &stationary {
-            xs.push(obstacle.position[0] - COLLISION_GAP - moving.width - moving.position[0]);
-            xs.push(obstacle.position[0] + obstacle.width + COLLISION_GAP - moving.position[0]);
-            ys.push(obstacle.position[1] - COLLISION_GAP - moving.height - moving.position[1]);
-            ys.push(obstacle.position[1] + obstacle.height + COLLISION_GAP - moving.position[1]);
+    // Bounded local search: each round pushes out of the obstacles the probe
+    // still overlaps. One round suffices for the common single-collision
+    // drop; the bound keeps wedged groups from iterating forever.
+    let mut probe = desired;
+    for _ in 0..8 {
+        let colliding = colliding_obstacles(&dragged, &stationary, probe);
+        if colliding.is_empty() {
+            return probe;
         }
-    }
-    xs.sort_by(f32::total_cmp);
-    xs.dedup_by(|left, right| left.total_cmp(right).is_eq());
-    ys.sort_by(f32::total_cmp);
-    ys.dedup_by(|left, right| left.total_cmp(right).is_eq());
-
-    xs.into_iter()
-        .flat_map(|x| ys.iter().copied().map(move |y| [x, y]))
-        .filter(|candidate| drag_is_clear(&dragged, &stationary, *candidate))
-        .min_by(|left, right| {
-            drag_distance_squared(*left, desired)
-                .total_cmp(&drag_distance_squared(*right, desired))
+        let mut candidates = Vec::with_capacity(colliding.len() * 4 + 1);
+        for (moving, obstacle) in &colliding {
+            let left = obstacle.position[0] - COLLISION_GAP - moving.width - moving.position[0];
+            let right = obstacle.position[0] + obstacle.width + COLLISION_GAP - moving.position[0];
+            let above = obstacle.position[1] - COLLISION_GAP - moving.height - moving.position[1];
+            let below = obstacle.position[1] + obstacle.height + COLLISION_GAP - moving.position[1];
+            candidates.push([left, probe[1]]);
+            candidates.push([right, probe[1]]);
+            candidates.push([probe[0], above]);
+            candidates.push([probe[0], below]);
+        }
+        candidates.sort_by(|left, right| {
+            left[0]
+                .total_cmp(&right[0])
+                .then_with(|| left[1].total_cmp(&right[1]))
+        });
+        candidates.dedup_by(|left, right| {
+            left[0].total_cmp(&right[0]).is_eq() && left[1].total_cmp(&right[1]).is_eq()
+        });
+        if let Some(best) = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| drag_is_clear(&dragged, &stationary, *candidate))
+            .min_by(|left, right| {
+                drag_distance_squared(*left, desired)
+                    .total_cmp(&drag_distance_squared(*right, desired))
+                    .then_with(|| left[1].total_cmp(&right[1]))
+                    .then_with(|| left[0].total_cmp(&right[0]))
+            })
+        {
+            return best;
+        }
+        // No single-edge push clears the group; step toward the candidate
+        // with the fewest remaining overlaps so the next round can finish.
+        let Some(next) = candidates.iter().copied().min_by(|left, right| {
+            collision_count(&dragged, &stationary, *left)
+                .cmp(&collision_count(&dragged, &stationary, *right))
+                .then_with(|| {
+                    drag_distance_squared(*left, desired)
+                        .total_cmp(&drag_distance_squared(*right, desired))
+                })
                 .then_with(|| left[1].total_cmp(&right[1]))
                 .then_with(|| left[0].total_cmp(&right[0]))
-        })
-        .unwrap_or(desired)
+        }) else {
+            return desired;
+        };
+        if next == probe {
+            return desired;
+        }
+        probe = next;
+    }
+    if drag_is_clear(&dragged, &stationary, probe) {
+        probe
+    } else {
+        desired
+    }
+}
+
+/// The (moving, obstacle) pairs that overlap at `delta`.
+fn colliding_obstacles<'a>(
+    dragged: &[&'a NodeView],
+    stationary: &[&'a NodeView],
+    delta: [f32; 2],
+) -> Vec<(&'a NodeView, &'a NodeView)> {
+    let mut pairs = Vec::new();
+    for moving in dragged {
+        let position = [moving.position[0] + delta[0], moving.position[1] + delta[1]];
+        for obstacle in stationary {
+            if intersects(
+                position,
+                [moving.width, moving.height],
+                obstacle.position[0] - COLLISION_GAP,
+                obstacle.position[1] - COLLISION_GAP,
+                obstacle.width + COLLISION_GAP * 2.0,
+                obstacle.height + COLLISION_GAP * 2.0,
+            ) {
+                pairs.push((*moving, *obstacle));
+            }
+        }
+    }
+    pairs
+}
+
+fn collision_count(dragged: &[&NodeView], stationary: &[&NodeView], delta: [f32; 2]) -> usize {
+    colliding_obstacles(dragged, stationary, delta).len()
 }
 
 pub(super) fn drag_is_clear(

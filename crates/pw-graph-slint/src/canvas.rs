@@ -6,7 +6,7 @@
 //! back to Rust, which is what used to make dragging and edge creation
 //! disagree about where a pin actually is.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Visual height of the node header (the drag handle).
 pub(crate) const HEADER_HEIGHT: f32 = 40.0;
@@ -132,8 +132,10 @@ impl Hit {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CanvasGeometry {
     nodes: Vec<NodeGeometry>,
+    node_index: HashMap<i32, usize>,
     pins: BTreeMap<i32, PinGeometry>,
     links: Vec<LinkGeometry>,
+    link_index: HashMap<i32, usize>,
     easy_mode: bool,
 }
 
@@ -149,6 +151,29 @@ impl CanvasGeometry {
         self.pins = pins.into_iter().map(|pin| (pin.pin_id, pin)).collect();
         self.links = links;
         self.easy_mode = easy_mode;
+        self.rebuild_indices();
+    }
+
+    fn rebuild_indices(&mut self) {
+        self.node_index = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id, index))
+            .collect();
+        self.link_index = self
+            .links
+            .iter()
+            .enumerate()
+            .map(|(index, link)| (link.id, index))
+            .collect();
+    }
+
+    fn link(&self, id: i32) -> Option<LinkGeometry> {
+        self.link_index
+            .get(&id)
+            .copied()
+            .and_then(|index| self.links.get(index).copied())
     }
 
     /// Mirror the selection flags of the rendered rows, so a drag started in
@@ -165,7 +190,7 @@ impl CanvasGeometry {
     /// Move the committed drag into the cache so the edges stay attached until
     /// the next model sync rebuilds it.
     pub(crate) fn translate_selected(&mut self, dragged: i32, dx: f32, dy: f32) {
-        let moved: Vec<i32> = self
+        let moved: HashSet<i32> = self
             .nodes
             .iter()
             .filter(|node| node.selected || node.id == dragged)
@@ -190,7 +215,10 @@ impl CanvasGeometry {
     }
 
     pub(crate) fn node(&self, id: i32) -> Option<NodeGeometry> {
-        self.nodes.iter().copied().find(|node| node.id == id)
+        self.node_index
+            .get(&id)
+            .copied()
+            .and_then(|index| self.nodes.get(index).copied())
     }
 
     pub(crate) fn pin(&self, id: i32) -> Option<PinGeometry> {
@@ -266,6 +294,37 @@ impl CanvasGeometry {
             let start = self.anchor(&start, (0.0, 0.0));
             let end = self.anchor(&end, (0.0, 0.0));
             let curve = bezier(start, end);
+            // Cheap bounding-box reject before flattening: the curve is fully
+            // contained in the hull of its four control points, so a pointer
+            // outside that hull (expanded by the hit radius) cannot hit it.
+            // On dense graphs this skips the 32-segment test for almost every
+            // link on every mouse move.
+            let min_x = curve
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::INFINITY, f32::min)
+                - radius;
+            let max_x = curve
+                .iter()
+                .map(|point| point.0)
+                .fold(f32::NEG_INFINITY, f32::max)
+                + radius;
+            if x < min_x || x > max_x {
+                continue;
+            }
+            let min_y = curve
+                .iter()
+                .map(|point| point.1)
+                .fold(f32::INFINITY, f32::min)
+                - radius;
+            let max_y = curve
+                .iter()
+                .map(|point| point.1)
+                .fold(f32::NEG_INFINITY, f32::max)
+                + radius;
+            if y < min_y || y > max_y {
+                continue;
+            }
             let mut previous = cubic_at(&curve, 0.0);
             for step in 1..=SEGMENTS {
                 let current = cubic_at(&curve, step as f32 / SEGMENTS as f32);
@@ -363,7 +422,7 @@ impl CanvasGeometry {
     /// SVG commands for one link in world coordinates. `drag` is the live
     /// offset applied to every selected node while a move gesture is running.
     pub(crate) fn link_path(&self, link_id: i32, drag: (f32, f32)) -> String {
-        let Some(link) = self.links.iter().find(|link| link.id == link_id) else {
+        let Some(link) = self.link(link_id) else {
             return String::new();
         };
         let (Some(start), Some(end)) = (self.pin(link.start_pin), self.pin(link.end_pin)) else {
@@ -378,7 +437,7 @@ impl CanvasGeometry {
     /// the other, which is how every patchbay behaves. Returns the pin that
     /// stays anchored, or `0` when the link or its pins are not cached.
     pub(crate) fn link_drag_anchor(&self, link_id: i32, x: f32, y: f32) -> i32 {
-        let Some(link) = self.links.iter().find(|link| link.id == link_id) else {
+        let Some(link) = self.link(link_id) else {
             return 0;
         };
         let (Some(start), Some(end)) = (self.pin(link.start_pin), self.pin(link.end_pin)) else {

@@ -44,6 +44,8 @@ pub(super) fn demo_application() -> Application {
         effect_draft_parameters: BTreeMap::new(),
         debug: false,
         last_refresh: Instant::now(),
+        last_full_sync: Instant::now(),
+        config_layout_fingerprint: 0,
         meters: BTreeMap::new(),
         meter_error: None,
         #[cfg(feature = "relay")]

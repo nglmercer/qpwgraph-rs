@@ -21,6 +21,8 @@ pub(crate) struct UiGraphState {
     pub(crate) ids: SlintIdMap,
     pub(super) local_positions: BTreeMap<NodeId, [f32; 2]>,
     pub(super) local_appearances: BTreeMap<NodeId, NodeAppearance>,
+    layout_cache_fingerprint: u64,
+    layout_cache: BTreeMap<NodeId, [f32; 2]>,
 }
 
 impl UiGraphState {
@@ -42,6 +44,8 @@ impl UiGraphState {
             ids: SlintIdMap::default(),
             local_positions: BTreeMap::new(),
             local_appearances: BTreeMap::new(),
+            layout_cache_fingerprint: 0,
+            layout_cache: BTreeMap::new(),
         }
     }
 
@@ -70,12 +74,13 @@ impl UiGraphState {
         self.local_appearances
             .retain(|id, _| graph.nodes.contains_key(id));
 
+        let query = normalized_search_query(&self.search_query);
         let visible: BTreeSet<_> = graph
             .nodes
             .values()
             .filter(|node| self.relay_nodes_visible || !is_relay_node(node))
             .filter(|node| self.media_filter.matches_node(graph, node))
-            .filter(|node| self.search_matches(graph, node))
+            .filter(|node| search_matches_query(graph, node, query.as_str()))
             .map(|node| node.id)
             .collect();
         self.selected_nodes.retain(|id| visible.contains(id));
@@ -230,38 +235,37 @@ impl UiGraphState {
                 self.selected_nodes.insert(node.node_id);
             }
         }
+        // Index pin positions once so link-endpoint tests are O(1) per link
+        // instead of scanning every node and port for every link.
+        let mut pin_positions = HashMap::<i32, (f32, f32)>::new();
+        for node in &snapshot.nodes {
+            for (index, port) in node.ports.iter().enumerate() {
+                let point = if node.collapsed {
+                    (
+                        if port.direction == Direction::Source {
+                            node.position[0] + node.width
+                        } else {
+                            node.position[0]
+                        },
+                        node.position[1] + NODE_HEADER_HEIGHT / 2.0,
+                    )
+                } else {
+                    let (offset_x, offset_y) = crate::canvas::pin_offset(
+                        node.width,
+                        index,
+                        node.has_audio_panel,
+                        port.direction != Direction::Sink,
+                    );
+                    (node.position[0] + offset_x, node.position[1] + offset_y)
+                };
+                pin_positions.insert(port.pin_id, point);
+            }
+        }
         for link in &snapshot.links {
             let endpoint_in_box = |pin_id: i32| {
-                snapshot
-                    .nodes
-                    .iter()
-                    .find_map(|node| {
-                        node.ports
-                            .iter()
-                            .enumerate()
-                            .find(|(_, port)| port.pin_id == pin_id)
-                            .map(|(index, port)| {
-                                if node.collapsed {
-                                    (
-                                        if port.direction == Direction::Source {
-                                            node.position[0] + node.width
-                                        } else {
-                                            node.position[0]
-                                        },
-                                        node.position[1] + NODE_HEADER_HEIGHT / 2.0,
-                                    )
-                                } else {
-                                    let (offset_x, offset_y) = crate::canvas::pin_offset(
-                                        node.width,
-                                        index,
-                                        node.has_audio_panel,
-                                        port.direction != Direction::Sink,
-                                    );
-                                    (node.position[0] + offset_x, node.position[1] + offset_y)
-                                }
-                            })
-                    })
-                    .is_some_and(|point| point_in_box(point, x, y, w, h))
+                pin_positions
+                    .get(&pin_id)
+                    .is_some_and(|point| point_in_box(*point, x, y, w, h))
             };
             if endpoint_in_box(link.start_pin_id) || endpoint_in_box(link.end_pin_id) {
                 self.selected_links.insert(link.link_id);
@@ -349,7 +353,7 @@ impl UiGraphState {
 
     /// Write the effective Slint layout and node appearance into the shared
     /// application configuration using the same stable keys as the desktop UI.
-    pub(crate) fn write_to_config(&self, graph: &Graph, config: &mut AppConfig) {
+    pub(crate) fn write_to_config(&mut self, graph: &Graph, config: &mut AppConfig) {
         let configured_appearances = configured_appearances(graph, config);
         let effective_positions = self.effective_positions(graph, config);
         let mut key_counts = BTreeMap::<String, usize>::new();
@@ -402,17 +406,56 @@ impl UiGraphState {
     }
 
     pub(super) fn effective_positions(
-        &self,
+        &mut self,
         graph: &Graph,
         config: &AppConfig,
     ) -> BTreeMap<NodeId, [f32; 2]> {
-        let mut positions = configured_positions(graph, config);
+        let mut positions = self.configured_positions_cached(graph, config);
         positions.extend(
             self.local_positions
                 .iter()
                 .map(|(id, position)| (*id, *position)),
         );
         positions
+    }
+
+    /// Cached form of [`configured_positions`]: the default auto-layout is
+    /// the expensive part and only depends on graph topology, so it is
+    /// recomputed only when the topology fingerprint changes instead of on
+    /// every 50 ms UI pump.
+    fn configured_positions_cached(
+        &mut self,
+        graph: &Graph,
+        config: &AppConfig,
+    ) -> BTreeMap<NodeId, [f32; 2]> {
+        let fingerprint = topology_fingerprint(graph);
+        if self.layout_cache_fingerprint != fingerprint || self.layout_cache.is_empty() {
+            self.layout_cache = graph.default_node_positions();
+            self.layout_cache_fingerprint = fingerprint;
+        }
+        let defaults = &self.layout_cache;
+        let mut key_counts = BTreeMap::<String, usize>::new();
+        for node in graph.nodes.values() {
+            *key_counts.entry(node_layout_key(node)).or_default() += 1;
+        }
+        graph
+            .nodes
+            .values()
+            .map(|node| {
+                let key = node_layout_key(node);
+                let by_id = config.node_positions.get(&node.id.0.to_string()).copied();
+                let by_name = (key_counts.get(&key) == Some(&1))
+                    .then(|| config.node_positions_by_name.get(&key).copied())
+                    .flatten();
+                (
+                    node.id,
+                    by_id
+                        .or(by_name)
+                        .or_else(|| defaults.get(&node.id).copied())
+                        .unwrap_or(node.position),
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn visible_counts(&self, snapshot: &GraphSnapshot) -> (usize, usize, usize) {
@@ -610,12 +653,17 @@ impl UiGraphState {
     }
 
     pub(super) fn ordered_ports<'a>(&self, graph: &'a Graph, node: &Node) -> Vec<&'a Port> {
+        // The normalized query is computed once per node instead of once per
+        // port, and the empty-query fast path avoids every lowercase
+        // allocation on an unfiltered graph.
+        let query = normalized_search_query(&self.search_query);
+        let query = query.as_str();
         let mut ports: Vec<_> = node
             .ports
             .iter()
             .filter_map(|id| graph.port(*id))
             .filter(|port| self.media_filter.matches_port_type(port.port_type))
-            .filter(|port| self.search_matches_port(node, port))
+            .filter(|port| search_matches_port_query(node, port, query))
             .collect();
         if self.sort_ports_by_name {
             ports.sort_by_key(|port| port.name.to_ascii_lowercase());
@@ -627,22 +675,99 @@ impl UiGraphState {
         }
         ports
     }
+}
 
-    pub(super) fn search_matches(&self, graph: &Graph, node: &Node) -> bool {
-        let query = self.search_query.trim().to_ascii_lowercase();
-        query.is_empty()
-            || node.name.to_ascii_lowercase().contains(&query)
-            || node.ports.iter().any(|port_id| {
-                graph
-                    .port(*port_id)
-                    .is_some_and(|port| port.name.to_ascii_lowercase().contains(&query))
-            })
+/// Lowercase the search query once per projection. Returns an empty string
+/// for an unfiltered view so callers can skip every haystack allocation.
+fn normalized_search_query(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_ascii_lowercase()
     }
+}
 
-    pub(super) fn search_matches_port(&self, node: &Node, port: &Port) -> bool {
-        let query = self.search_query.trim().to_ascii_lowercase();
-        query.is_empty()
-            || node.name.to_ascii_lowercase().contains(&query)
-            || port.name.to_ascii_lowercase().contains(&query)
+fn search_matches_query(graph: &Graph, node: &Node, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
     }
+    if node.name.to_ascii_lowercase().contains(query) {
+        return true;
+    }
+    node.ports.iter().any(|port_id| {
+        graph
+            .port(*port_id)
+            .is_some_and(|port| port.name.to_ascii_lowercase().contains(query))
+    })
+}
+
+fn search_matches_port_query(node: &Node, port: &Port, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    node.name.to_ascii_lowercase().contains(query) || port.name.to_ascii_lowercase().contains(query)
+}
+
+/// Fingerprint of every input `write_to_config` reads: the topology, the
+/// node names its stable keys derive from, and the local position and
+/// appearance overrides. The config autosave consults this before rebuilding
+/// all layout maps just to discover nothing changed.
+pub(crate) fn layout_inputs_fingerprint(view: &UiGraphState, graph: &Graph) -> u64 {
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = topology_fingerprint(graph);
+    let mut mix_bytes = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    for node in graph.nodes.values() {
+        mix_bytes(node.name.as_bytes());
+    }
+    for (id, position) in &view.local_positions {
+        mix_bytes(&id.0.to_le_bytes());
+        mix_bytes(&position[0].to_le_bytes());
+        mix_bytes(&position[1].to_le_bytes());
+    }
+    for (id, appearance) in &view.local_appearances {
+        mix_bytes(&id.0.to_le_bytes());
+        mix_bytes(&[u8::from(appearance.collapsed)]);
+        if let Some(name) = appearance.custom_name.as_deref() {
+            mix_bytes(name.as_bytes());
+        }
+        if let Some(color) = appearance.color {
+            mix_bytes(&color);
+        }
+    }
+    hash
+}
+
+/// FNV-1a hash of the graph topology that the default auto-layout depends
+/// on: node identities, their port lists, and link endpoints. Positions and
+/// names do not affect layering, so moving a card or renaming it must not
+/// invalidate the cached layout.
+pub(crate) fn topology_fingerprint(graph: &Graph) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    let mut mix = |word: u64| {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    for (id, node) in &graph.nodes {
+        mix(id.0);
+        mix(node.ports.len() as u64);
+        for port in &node.ports {
+            mix(port.0);
+        }
+    }
+    for (id, link) in &graph.links {
+        mix(id.0);
+        mix(link.output_port.0);
+        mix(link.input_port.0);
+    }
+    hash
 }

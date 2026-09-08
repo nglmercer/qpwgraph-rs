@@ -9,9 +9,13 @@ https://github.com/user-attachments/assets/d7a9b1d4-d6d3-4ef2-b0d1-4cfc2de64650
 ## Quick start
 
 ```bash
-cargo run -p pw-graph-app            # native backend
-cargo run -p pw-graph-app -- --demo  # deterministic demo backend
+cargo run --release -p pw-graph-app            # native backend
+cargo run --release -p pw-graph-app -- --demo  # deterministic demo backend
 ```
+
+An unoptimized debug build (`cargo run` without `--release`) is dramatically
+slower at graph projection and hit-testing; always compare performance in
+release mode.
 
 Press F1 for the shortcut list. The canonical executable is always
 `qpwgraph-rs`.
