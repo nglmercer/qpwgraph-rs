@@ -23,8 +23,8 @@ export component RailButton inherits Rectangle {
     forward-focus: key-focus;
 
     Image {
-        x: 11px;
-        y: 9px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
         width: 22px;
         height: 22px;
         source: root.icon;

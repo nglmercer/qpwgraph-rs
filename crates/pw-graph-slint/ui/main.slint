@@ -313,7 +313,7 @@ export component MainWindow inherits Window {
             height: root.height - root.status-height;
             background: #20262d;
             Rectangle { x: parent.width - 1px; width: 1px; height: parent.height; background: #36414c; }
-            Image { x: 22px; y: 14px; width: 32px; height: 32px; source: @image-url("../../../assets/icons/brand.svg"); }
+            Image { x: (parent.width - self.width) / 2; y: 14px; width: 32px; height: 32px; source: @image-url("../../../assets/icons/brand.svg"); }
 
             rail-scroll := ScrollView {
                 x: 0px;
@@ -321,9 +321,10 @@ export component MainWindow inherits Window {
                 width: parent.width;
                 height: max(1px, parent.height - 54px);
                 VerticalBox {
-                    x: 17px;
-                    width: 42px;
+                    width: parent.width;
+                    padding: 0;
                     spacing: 6px;
+                    cross-axis-alignment: center;
 
                     Rectangle { width: 42px; height: 2px; background: transparent; }
                     preferences_button := RailActionButton {
@@ -357,7 +358,7 @@ export component MainWindow inherits Window {
                         hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); }
                     }
 
-                    Rectangle { width: 52px; x: -5px; height: 1px; background: #35414d; }
+                    Rectangle { width: 52px; height: 1px; background: #35414d; }
                     Rectangle { width: 42px; height: 7px; background: transparent; }
                     minimap_button := RailActionButton { icon: @image-url("../../../assets/icons/minimap.svg"); label: UiI18n.localized("toolbar.minimap"); active: root.show-minimap; clicked => { root.action("toggle-minimap"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-common-actions : RailActionButton { icon: @image-url("../../../assets/icons/refresh.svg"); label: UiI18n.localized("toolbar.refresh"); clicked => { root.action("refresh"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
