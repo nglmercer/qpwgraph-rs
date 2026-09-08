@@ -52,21 +52,18 @@ export component NodeAudioControl inherits Rectangle {
         x: 0px; y: 0px; width: root.slider-width; height: 27px;
         background: #1d232a; border-color: #3f4b58; border-width: 1px; border-radius: 5px;
 
-        // Shared lane geometry: the volume track, the RMS bar and the peak
-        // segments all start at 8px and span parent.width - 16px, so their
-        // left/right edges line up. Previously the peak ticks ran 6px..-6px
-        // while the bars ran 8px..-8px, and the three bars used three
-        // different heights (3px / 2px / 4px).
+        // Shared lane geometry: the volume track and the peak segments
+        // both start at 8px and span parent.width - 16px, so their
+        // left/right edges line up.
         Rectangle { x: 8px; y: 6px; width: parent.width - 16px; height: 4px; background: #4d5864; border-radius: 2px; visible: root.show-volume; }
         Rectangle { x: 8px; y: 6px; width: (parent.width - 16px) * root.displayed-volume-position; height: 4px; background: #9aa7b2; border-radius: 2px; visible: root.show-volume; opacity: root.volume-known && root.volume-enabled ? 1.0 : 0.35; }
-        Rectangle { x: 8px; y: root.show-volume ? 13px : 8px; width: (parent.width - 16px) * root.meter-rms-position; height: 2px; background: #d6e7f2; border-radius: 1px; visible: root.meter-available && root.meter-rms-supported; opacity: 0.9; }
 
         // Peak meter: 31 identical 2x6 segments, spread evenly by the layout
         // engine. The previous manual `x: 6px + index * (width - 12px) / 30`
         // math landed segments on fractional pixels, so neighbouring ticks
         // rendered with visibly uneven widths and gaps (image 2).
         meter-row := Rectangle {
-            x: 8px; y: root.show-volume ? 17px : 12px; width: parent.width - 16px; height: 6px;
+            x: 8px; y: root.show-volume ? 13px : 12px; width: parent.width - 16px; height: 6px;
             visible: root.meter-peak-supported;
             HorizontalLayout {
                 alignment: space-between;
