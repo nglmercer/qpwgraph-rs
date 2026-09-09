@@ -94,6 +94,7 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         effect_selection_id: None,
         effect_draft_enabled: true,
         effect_draft_parameters: BTreeMap::new(),
+        pending_effect_tickets: BTreeSet::new(),
         debug: args.debug,
         last_refresh: Instant::now(),
         last_full_sync: Instant::now(),

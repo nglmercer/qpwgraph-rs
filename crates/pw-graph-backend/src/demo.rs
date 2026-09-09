@@ -3,15 +3,18 @@
 #[cfg(feature = "relay")]
 use super::api::RelayDriver;
 use super::api::{
-    BackendCapabilities, BackendError, BackendResult, EffectDriver, EffectInsertRequest,
-    EffectInstance, EffectNodeRequest, GraphDriver, NodeAudioControl, NodeAudioState,
-    NodeCapabilities,
+    BackendCapabilities, BackendError, BackendResult, EffectCreateRequest, EffectDriver,
+    EffectEvent, EffectInsertRequest, EffectInstance, EffectNodeRequest, EffectTarget, GraphDriver,
+    NodeAudioControl, NodeAudioState, NodeCapabilities,
 };
 use pw_graph_core::{
     Direction, Graph, GraphError, Link, LinkId, Node, NodeId, NodeType, Port, PortId, PortKey,
     PortType,
 };
-use pw_graph_effects::{AudioSpec, EffectHost, EffectInstanceConfig, EffectProcessor};
+use pw_graph_effects::{
+    AudioSpec, EffectComponentManager, EffectHost, EffectInstanceConfig, EffectPreparationEvent,
+    EffectPrepareRequest, EffectProcessor, EffectTicket, PreparedEffect,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Boost headroom, matching PipeWire so demo mode behaves like the real thing.
@@ -29,6 +32,8 @@ pub struct DemoDriver {
     effects: BTreeMap<String, EffectInstance>,
     effect_host: EffectHost,
     effect_processors: BTreeMap<String, Box<dyn EffectProcessor>>,
+    effect_loader: EffectComponentManager,
+    pending_effects: BTreeMap<EffectTicket, EffectCreateRequest>,
     next_effect_id: u64,
     /// Suppression state used by backends that remember an explicit manual
     /// disconnect. Keeping it in the demo driver makes command rollback tests
@@ -69,6 +74,8 @@ impl DemoDriver {
             effects: BTreeMap::new(),
             effect_host: EffectHost::new(),
             effect_processors: BTreeMap::new(),
+            effect_loader: EffectComponentManager::new(2, 16),
+            pending_effects: BTreeMap::new(),
             next_effect_id: 1000,
             suppressed_connections: Vec::new(),
             forced_failures: None,
@@ -227,6 +234,14 @@ impl DemoDriver {
         &mut self,
         request: EffectNodeRequest,
     ) -> BackendResult<EffectInstance> {
+        self.create_effect_node_with_topology_internal(request, None)
+    }
+
+    fn create_effect_node_with_topology_internal(
+        &mut self,
+        request: EffectNodeRequest,
+        topology_channels: Option<u16>,
+    ) -> BackendResult<EffectInstance> {
         if self.effects.contains_key(&request.instance_id) {
             return Err(BackendError::effect_already_exists(&request.instance_id));
         }
@@ -237,17 +252,58 @@ impl DemoDriver {
             .effect_host
             .create(&request.effect_id)
             .map_err(BackendError::effect_create_failed)?;
-        processor
-            .prepare(AudioSpec {
-                sample_rate: 48_000,
-                channels: 2,
-                max_frames: 1024,
-            })
+        let channels = self
+            .effect_host
+            .negotiate_channels(
+                &request.effect_id,
+                request.channel_policy,
+                topology_channels,
+            )
             .map_err(BackendError::native)?;
+        let spec = AudioSpec {
+            sample_rate: 48_000,
+            channels,
+            max_frames: 1024,
+        };
+        processor.prepare(spec).map_err(BackendError::native)?;
         pw_graph_effects::apply_parameters(&mut *processor, &request.parameters)
             .map_err(BackendError::native)?;
+        // Keep the compatibility path's initial state identical to the
+        // asynchronous/live backends. Stateful processors such as Hush need
+        // their aligned host bypass set before they are handed to the router;
+        // otherwise a restored disabled instance can emit wet audio until its
+        // first explicit toggle.
+        if !request.enabled {
+            processor.set_host_bypass(true);
+        }
+        self.create_effect_node_prepared_internal(
+            request,
+            PreparedEffect {
+                descriptor: processor.descriptor().clone(),
+                spec,
+                processor,
+                preparation_duration_ms: 0,
+            },
+        )
+    }
 
-        // `PortKey` identifies a saved/manual connection by node name and
+    fn create_effect_node_prepared_internal(
+        &mut self,
+        request: EffectNodeRequest,
+        prepared: PreparedEffect,
+    ) -> BackendResult<EffectInstance> {
+        if self.effects.contains_key(&request.instance_id) {
+            return Err(BackendError::effect_already_exists(&request.instance_id));
+        }
+        if prepared.descriptor.id != request.effect_id {
+            return Err(BackendError::native(format!(
+                "prepared effect {} does not match requested effect {}",
+                prepared.descriptor.id, request.effect_id
+            )));
+        }
+        let processor = prepared.processor;
+
+        // PortKey identifies a saved/manual connection by node name and
         // port name. Use the stable instance id in the visible node name so
         // several copies of the same effect never collapse into one routing
         // target when a patchbay or undo command is restored.
@@ -301,11 +357,226 @@ impl DemoDriver {
             destination: None,
             error: None,
             diagnostics: None,
+            lifecycle: pw_graph_effects::EffectLifecycle::Active,
+            health: pw_graph_effects::EffectHealth::Healthy,
         };
         self.effects
             .insert(instance.config.instance_id.clone(), instance.clone());
         self.effect_processors
             .insert(instance.config.instance_id.clone(), processor);
+        Ok(instance)
+    }
+
+    fn begin_create_effect_internal(
+        &mut self,
+        request: EffectCreateRequest,
+    ) -> BackendResult<EffectTicket> {
+        if request.instance_id.trim().is_empty() || request.effect_id.trim().is_empty() {
+            return Err(BackendError::native(
+                "effect instance and effect IDs cannot be empty",
+            ));
+        }
+        if self.effects.contains_key(&request.instance_id)
+            || self
+                .pending_effects
+                .values()
+                .any(|pending| pending.instance_id == request.instance_id)
+        {
+            return Err(BackendError::effect_already_exists(&request.instance_id));
+        }
+        if let EffectTarget::Insert {
+            source,
+            destination,
+            ..
+        } = &request.target
+        {
+            self.effect_link_endpoints(source, destination)?;
+        }
+        // The deterministic graph exposes one logical audio pair rather than
+        // PipeWire's physical port-capacity envelope. Use negotiated width in
+        // this compatibility backend; the real PipeWire backend uses
+        // `physical_channels_for_request` and separately publishes its active
+        // mask. This keeps a standalone Auto Hush instance mono in demo/tests
+        // without pretending the demo graph has an unrepresented second port.
+        let topology_channels = match &request.target {
+            EffectTarget::Standalone { .. } => None,
+            EffectTarget::Insert {
+                source,
+                destination,
+                ..
+            } => {
+                self.effect_link_endpoints(source, destination)?;
+                self.inferred_audio_channels(source)
+            }
+        };
+        let channels = self
+            .effect_host
+            .negotiate_channels(
+                &request.effect_id,
+                request.channel_policy,
+                topology_channels,
+            )
+            .map_err(BackendError::native)?;
+        let ticket = self
+            .effect_loader
+            .begin_prepare(
+                &self.effect_host,
+                EffectPrepareRequest {
+                    effect_id: request.effect_id.clone(),
+                    module_path: request.module_path.clone(),
+                    spec: AudioSpec {
+                        sample_rate: 48_000,
+                        channels,
+                        max_frames: 1024,
+                    },
+                    parameters: request.parameters.clone(),
+                    cancellation: pw_graph_effects::EffectCancellation::default(),
+                },
+            )
+            .map_err(BackendError::native)?;
+        self.pending_effects.insert(ticket, request);
+        Ok(ticket)
+    }
+
+    fn inferred_audio_channels(&self, source: &PortKey) -> Option<u16> {
+        if source.port_type != PortType::Audio || source.direction != Direction::Source {
+            return None;
+        }
+        let source_id = self.graph.resolve_port_key(source)?;
+        let source_port = self.graph.port(source_id)?;
+        if source_port.channel.as_deref().is_some_and(|channel| {
+            channel.eq_ignore_ascii_case("mono")
+                || channel.eq_ignore_ascii_case("fc")
+                || channel.eq_ignore_ascii_case("center")
+        }) {
+            return Some(1);
+        }
+        let node = self.graph.node(source_port.node_id)?;
+        let audio_outputs = node
+            .ports
+            .iter()
+            .filter_map(|id| self.graph.port(*id))
+            .filter(|port| port.direction == Direction::Source && port.port_type == PortType::Audio)
+            .count();
+        Some(audio_outputs.clamp(1, u16::MAX as usize) as u16)
+    }
+
+    fn poll_effect_lifecycle(&mut self) -> BackendResult<Vec<EffectEvent>> {
+        let preparation_events = self.effect_loader.poll_events();
+        let mut events = Vec::with_capacity(preparation_events.len());
+        for event in preparation_events {
+            match event {
+                EffectPreparationEvent::Loading { ticket, stage } => {
+                    events.push(EffectEvent::Loading { ticket, stage });
+                }
+                EffectPreparationEvent::Ready { ticket, prepared } => {
+                    let Some(request) = self.pending_effects.remove(&ticket) else {
+                        continue;
+                    };
+                    let result = match request.target {
+                        EffectTarget::Standalone { position } => self
+                            .create_effect_node_prepared_internal(
+                                EffectNodeRequest {
+                                    instance_id: request.instance_id,
+                                    effect_id: request.effect_id,
+                                    module_path: request.module_path,
+                                    enabled: request.enabled,
+                                    parameters: request.parameters,
+                                    channel_policy: request.channel_policy,
+                                    position,
+                                },
+                                prepared,
+                            ),
+                        EffectTarget::Insert {
+                            source,
+                            destination,
+                            position,
+                        } => self.insert_effect_prepared_internal(
+                            EffectInsertRequest {
+                                instance_id: request.instance_id,
+                                effect_id: request.effect_id,
+                                module_path: request.module_path,
+                                source,
+                                destination,
+                                enabled: request.enabled,
+                                parameters: request.parameters,
+                                channel_policy: request.channel_policy,
+                                position,
+                            },
+                            prepared,
+                        ),
+                    };
+                    match result {
+                        Ok(instance) => events.push(EffectEvent::Ready {
+                            ticket,
+                            instance: Box::new(instance),
+                        }),
+                        Err(error) => events.push(EffectEvent::Failed {
+                            ticket,
+                            error: error.to_string(),
+                        }),
+                    }
+                }
+                EffectPreparationEvent::Failed { ticket, error } => {
+                    self.pending_effects.remove(&ticket);
+                    events.push(EffectEvent::Failed {
+                        ticket,
+                        error: error.to_string(),
+                    });
+                }
+                EffectPreparationEvent::Cancelled { ticket } => {
+                    self.pending_effects.remove(&ticket);
+                    events.push(EffectEvent::Cancelled { ticket });
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn insert_effect_prepared_internal(
+        &mut self,
+        request: EffectInsertRequest,
+        prepared: PreparedEffect,
+    ) -> BackendResult<EffectInstance> {
+        let source = request.source.clone();
+        let destination = request.destination.clone();
+        let (output, input, original) = self.effect_link_endpoints(&source, &destination)?;
+        let instance = self.create_effect_node_prepared_internal(request.into(), prepared)?;
+
+        if let Err(error) = self.graph.remove_link(original.id) {
+            let mut rollback_errors = Vec::new();
+            if let Err(cleanup) = self.remove_effect_node_internal(&instance) {
+                rollback_errors.push(cleanup);
+            }
+            return Err(Self::rollback_error(error.into(), rollback_errors));
+        }
+        let first = self.allocate_link_id();
+        let second = self.allocate_link_id();
+        if let Err(error) = self.graph.add_link(first, output, instance.input_port) {
+            let mut rollback_errors = Vec::new();
+            if let Err(cleanup) = self.remove_effect_node_internal(&instance) {
+                rollback_errors.push(cleanup);
+            }
+            if let Err(restore) = self.graph.add_link(original.id, output, input) {
+                rollback_errors.push(restore.into());
+            }
+            return Err(Self::rollback_error(error.into(), rollback_errors));
+        }
+        if let Err(error) = self.graph.add_link(second, instance.output_port, input) {
+            let mut rollback_errors = Vec::new();
+            if let Err(cleanup) = self.remove_effect_node_internal(&instance) {
+                rollback_errors.push(cleanup);
+            }
+            if let Err(restore) = self.graph.add_link(original.id, output, input) {
+                rollback_errors.push(restore.into());
+            }
+            return Err(Self::rollback_error(error.into(), rollback_errors));
+        }
+        let mut instance = instance;
+        instance.source = Some(source);
+        instance.destination = Some(destination);
+        self.effects
+            .insert(instance.config.instance_id.clone(), instance.clone());
         Ok(instance)
     }
 
@@ -541,6 +812,25 @@ impl EffectDriver for DemoDriver {
         true
     }
 
+    fn begin_create_effect(&mut self, request: EffectCreateRequest) -> BackendResult<EffectTicket> {
+        self.begin_create_effect_internal(request)
+    }
+
+    fn poll_effect_events(&mut self) -> BackendResult<Vec<EffectEvent>> {
+        self.poll_effect_lifecycle()
+    }
+
+    fn cancel_effect(&mut self, ticket: EffectTicket) -> BackendResult<()> {
+        if self.effect_loader.cancel(ticket) {
+            Ok(())
+        } else {
+            Err(BackendError::native(format!(
+                "unknown or completed effect ticket {}",
+                ticket.0
+            )))
+        }
+    }
+
     fn create_effect_node(&mut self, request: EffectNodeRequest) -> BackendResult<EffectInstance> {
         self.create_effect_node_internal(request)
     }
@@ -550,7 +840,10 @@ impl EffectDriver for DemoDriver {
         let destination = request.destination.clone();
         let (output, input, original) = self.effect_link_endpoints(&source, &destination)?;
 
-        let mut instance = self.create_effect_node_internal(request.into())?;
+        let request_for_node: EffectNodeRequest = request.into();
+        let topology_channels = self.inferred_audio_channels(&source);
+        let mut instance =
+            self.create_effect_node_with_topology_internal(request_for_node, topology_channels)?;
 
         // Commit the link rewrite only after the free node has been fully
         // created. Every failure below removes that node and restores the
@@ -602,6 +895,13 @@ impl EffectDriver for DemoDriver {
             .effects
             .get_mut(instance_id)
             .ok_or_else(|| BackendError::unknown_effect_instance(instance_id))?;
+        if instance.config.enabled != enabled {
+            if let Some(processor) = self.effect_processors.get_mut(instance_id) {
+                if !processor.set_host_bypass(!enabled) {
+                    processor.reset();
+                }
+            }
+        }
         instance.config.enabled = enabled;
         Ok(())
     }

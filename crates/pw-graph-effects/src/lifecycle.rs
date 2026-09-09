@@ -39,7 +39,10 @@ impl EffectCancellation {
         self.flag.load(Ordering::Acquire)
     }
 
-    fn cancel(&self) {
+    /// Request cooperative cancellation for a preparation/resource load.
+    /// The manager uses this method when a ticket is cancelled; providers may
+    /// also forward the request to nested resource operations.
+    pub fn cancel(&self) {
         self.flag.store(true, Ordering::Release);
     }
 }
@@ -166,6 +169,12 @@ pub struct EffectComponentManager {
     _workers: Vec<JoinHandle<()>>,
 }
 
+impl Default for EffectComponentManager {
+    fn default() -> Self {
+        Self::new(2, 16)
+    }
+}
+
 impl EffectComponentManager {
     /// Create a manager with a bounded job queue and at most eight workers.
     pub fn new(worker_count: usize, queue_capacity: usize) -> Self {
@@ -264,7 +273,36 @@ impl EffectComponentManager {
     /// Drain all preparation events currently available to the control
     /// thread.  Terminal events remove their cancellation token.
     pub fn poll_events(&mut self) -> Vec<EffectPreparationEvent> {
-        let events: Vec<_> = self.events.try_iter().collect();
+        let mut events = Vec::new();
+        let mut cancelled_terminals = BTreeMap::new();
+        for event in self.events.try_iter() {
+            let ticket = match &event {
+                EffectPreparationEvent::Loading { ticket, .. }
+                | EffectPreparationEvent::Ready { ticket, .. }
+                | EffectPreparationEvent::Failed { ticket, .. }
+                | EffectPreparationEvent::Cancelled { ticket } => *ticket,
+            };
+            let cancelled = self
+                .cancellations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&ticket)
+                .is_some_and(EffectCancellation::is_cancelled);
+            if cancelled {
+                // A worker can publish Ready just before the control thread
+                // receives a cancellation request. Do not let that race
+                // activate a graph node: discard the prepared processor and
+                // expose one terminal Cancelled event instead.
+                if matches!(&event, EffectPreparationEvent::Loading { .. }) {
+                    continue;
+                }
+                if cancelled_terminals.insert(ticket, ()).is_none() {
+                    events.push(EffectPreparationEvent::Cancelled { ticket });
+                }
+                continue;
+            }
+            events.push(event);
+        }
         if !events.is_empty() {
             let mut cancellations = self
                 .cancellations
@@ -522,6 +560,39 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(cancelled, "cancellation event was not delivered");
+        assert_eq!(manager.pending_count(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_worker_publish_cannot_activate_a_ready_effect() {
+        let created = Arc::new(AtomicUsize::new(0));
+        let host = host(Duration::from_millis(10), created);
+        let mut manager = EffectComponentManager::new(1, 1);
+        let ticket = manager.begin_prepare(&host, request("test.slow")).unwrap();
+
+        // Allow the worker to publish Ready, but deliberately do not poll the
+        // manager before cancelling. This is the race between a completed
+        // loader and a control/UI cancellation request.
+        thread::sleep(Duration::from_millis(50));
+        assert!(manager.cancel(ticket));
+        let events = manager.poll_events();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EffectPreparationEvent::Cancelled {
+                    ticket: event_ticket
+                } if *event_ticket == ticket
+            )
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                EffectPreparationEvent::Ready {
+                    ticket: event_ticket,
+                    ..
+                } if *event_ticket == ticket
+            )
+        }));
         assert_eq!(manager.pending_count(), 0);
     }
 

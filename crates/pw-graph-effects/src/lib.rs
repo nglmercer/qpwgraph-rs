@@ -13,15 +13,19 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod adaptive_noise;
+mod hush_delay;
 mod hush_model;
 mod hush_noise;
+mod hush_overload;
+mod hush_queue;
 mod hush_worker;
 pub mod lifecycle;
 pub mod resources;
 pub mod wasm;
 pub use adaptive_noise::AdaptiveNoiseSuppressor;
 pub use hush_noise::HushNoiseSuppressor;
-pub use hush_worker::{HushDiagnostics, HushHealth, HushOverloadReason};
+pub use hush_overload::{HushHealth, HushOverloadReason};
+pub use hush_worker::HushDiagnostics;
 pub use lifecycle::{
     EffectCancellation, EffectComponentManager, EffectLifecycle, EffectLoadStage,
     EffectPreparationEvent, EffectPrepareRequest, EffectTicket, PreparedEffect,
@@ -36,6 +40,62 @@ pub use wasm::WasmEffectProvider;
 pub const NOISE_GATE_ID: &str = "builtin.noise-gate";
 pub const NOISE_SUPPRESSOR_ID: &str = "builtin.adaptive-noise-suppressor";
 pub use hush_noise::{DEFAULT_EFFECT_ID, HUSH_NOISE_SUPPRESSOR_ID};
+
+/// Generic health classification shared by built-in and plugin-backed
+/// effects.  Providers may expose richer metrics, but hosts should never
+/// need to parse provider-specific diagnostic text to decide whether an
+/// effect is usable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EffectHealth {
+    #[default]
+    Starting,
+    Healthy,
+    Degraded,
+    Overloaded,
+    Failed,
+    Bypassed,
+}
+
+impl EffectHealth {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "STARTING",
+            Self::Healthy => "HEALTHY",
+            Self::Degraded => "DEGRADED",
+            Self::Overloaded => "OVERLOADED",
+            Self::Failed => "FAILED",
+            Self::Bypassed => "BYPASSED",
+        }
+    }
+}
+
+/// A control-plane diagnostic snapshot.  Snapshot creation is allowed to
+/// allocate and lock provider-owned diagnostic state; it is never called by
+/// [`EffectProcessor::process`].
+#[derive(Clone, Debug)]
+pub struct EffectDiagnosticsSnapshot {
+    pub lifecycle: EffectLifecycle,
+    pub health: EffectHealth,
+    pub message: Option<String>,
+    pub metrics: BTreeMap<String, String>,
+}
+
+/// Generic diagnostics boundary for effect hosts and UI consumers.
+pub trait EffectDiagnostics: Send + Sync {
+    fn snapshot(&self) -> EffectDiagnosticsSnapshot;
+}
+
+impl From<HushHealth> for EffectHealth {
+    fn from(health: HushHealth) -> Self {
+        match health {
+            HushHealth::Starting => Self::Starting,
+            HushHealth::Healthy => Self::Healthy,
+            HushHealth::Degraded => Self::Degraded,
+            HushHealth::Overloaded => Self::Overloaded,
+            HushHealth::Failed => Self::Failed,
+        }
+    }
+}
 
 /// The user's channel-layout intent.  This is deliberately separate from
 /// the channel count negotiated with a live graph: `Auto` must remain `Auto`
@@ -71,11 +131,13 @@ impl<'de> Deserialize<'de> for ChannelPolicy {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Representation {
+            Null(()),
             Number(u16),
             Text(String),
         }
 
         match Representation::deserialize(deserializer)? {
+            Representation::Null(()) => Ok(Self::Auto),
             Representation::Number(channels) => Ok(Self::Fixed(channels)),
             Representation::Text(value) => {
                 let normalized = value.trim().to_ascii_lowercase();
@@ -334,6 +396,11 @@ pub trait EffectProcessor: Send {
     fn hush_diagnostics(&self) -> Option<std::sync::Arc<HushDiagnostics>> {
         None
     }
+    /// Obtain generic control-plane diagnostics.  Hosts may snapshot this
+    /// after processing; the realtime callback must not call it.
+    fn diagnostics(&self) -> Option<std::sync::Arc<dyn EffectDiagnostics>> {
+        None
+    }
     fn has_failed(&self) -> bool {
         false
     }
@@ -362,9 +429,18 @@ pub trait EffectProvider: Send + Sync {
         request: EffectPrepareRequest,
     ) -> Result<PreparedEffect, EffectError> {
         let started = std::time::Instant::now();
+        if request.cancellation.is_cancelled() {
+            return Err(EffectError::PreparationCancelled);
+        }
         let mut processor = self.create();
         processor.prepare(request.spec)?;
+        if request.cancellation.is_cancelled() {
+            return Err(EffectError::PreparationCancelled);
+        }
         apply_parameters(&mut *processor, &request.parameters)?;
+        if request.cancellation.is_cancelled() {
+            return Err(EffectError::PreparationCancelled);
+        }
         Ok(PreparedEffect {
             descriptor: self.descriptor().clone(),
             spec: request.spec,
@@ -959,5 +1035,18 @@ mod tests {
             physical_channels(ChannelPolicy::Fixed(1), capabilities, Some(2)).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn legacy_null_channel_value_migrates_to_auto() {
+        let config: EffectInstanceConfig = serde_json::from_str(
+            r#"{
+                "instance_id": "legacy-hush",
+                "effect_id": "builtin.hush-noise-suppressor",
+                "channels": null
+            }"#,
+        )
+        .expect("legacy nullable channel configuration should deserialize");
+        assert_eq!(config.channel_policy, ChannelPolicy::Auto);
     }
 }

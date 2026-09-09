@@ -13,10 +13,7 @@
 
 use super::filter_runtime::FilterRuntime;
 use super::*;
-use pw_graph_effects::{
-    AudioSpec, EffectHost, EffectInstanceConfig, EffectPrepareRequest, EffectProcessor,
-    PreparedEffect,
-};
+use pw_graph_effects::{EffectInstanceConfig, EffectProcessor, PreparedEffect};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
@@ -54,6 +51,7 @@ struct CallbackState {
     active_channel_mask: AtomicU32,
     enabled: AtomicBool,
     processor_failed: AtomicBool,
+    effect_diagnostics: Option<std::sync::Arc<dyn pw_graph_effects::EffectDiagnostics>>,
     hush_diagnostics: Option<std::sync::Arc<pw_graph_effects::HushDiagnostics>>,
     /// Bit 0/1 reports a missing FL/FR input while the matching output buffer
     /// is active. This is deliberately metadata only: it never participates in
@@ -85,12 +83,22 @@ impl CallbackState {
     }
 
     fn new_with_channels_and_mask(
-        processor: Box<dyn EffectProcessor>,
+        mut processor: Box<dyn EffectProcessor>,
         enabled: bool,
         channels: usize,
         active_channel_mask: u16,
     ) -> Self {
         let channels = channels.clamp(1, DSP_CHANNELS);
+        let effect_diagnostics = processor.diagnostics();
+        let hush_diagnostics = processor.hush_diagnostics();
+        // The callback's `enabled` flag is the host-level bypass state. Hush
+        // deliberately keeps processing its aligned dry path while disabled,
+        // so initialize that state before the processor becomes visible;
+        // otherwise a graph restored with `enabled = false` would emit wet
+        // audio until the first control-plane toggle.
+        if !enabled {
+            processor.set_host_bypass(true);
+        }
         Self {
             input_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             output_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
@@ -100,7 +108,8 @@ impl CallbackState {
             )),
             enabled: AtomicBool::new(enabled),
             processor_failed: AtomicBool::new(false),
-            hush_diagnostics: processor.hush_diagnostics(),
+            effect_diagnostics,
+            hush_diagnostics,
             dangling_inputs: AtomicU32::new(0),
             processor: Mutex::new(ProcessorState {
                 processor,
@@ -184,20 +193,23 @@ impl CallbackState {
         frames: u32,
     ) {
         let frame_count = frames as usize;
+        // The graph-derived mask is the persistent connection state. Buffer
+        // pointers below are only a per-quantum safety check; they must not
+        // become the authority for a stateful processor's generation.
+        let channel_mask = self.active_channel_mask.load(Ordering::Acquire) as u16
+            & channel_mask_for_count(self.channels);
         let mut dangling_inputs = 0_u32;
         for channel in 0..self.channels {
-            if !outputs[channel].is_null() && inputs[channel].is_null() {
+            if channel_mask & (1 << channel) != 0
+                && !outputs[channel].is_null()
+                && inputs[channel].is_null()
+            {
                 dangling_inputs |= 1 << channel;
             }
         }
         self.dangling_inputs
             .store(dangling_inputs, Ordering::Release);
 
-        // The graph-derived mask is the persistent connection state.  Buffer
-        // pointers below are only a per-quantum safety check; they must not
-        // become the authority for a stateful processor's generation.
-        let channel_mask = self.active_channel_mask.load(Ordering::Acquire) as u16
-            & channel_mask_for_count(self.channels);
         if let Ok(mut state) = self.processor.try_lock() {
             state.processor.set_channel_mask(channel_mask);
         }
@@ -205,7 +217,7 @@ impl CallbackState {
         // Publish a deterministic fallback before invoking user-extensible
         // DSP. If the processor returns an error or panics after mutating its
         // scratch buffer, these samples remain untouched and are still safe.
-        copy_inputs_to_outputs(inputs, outputs, frame_count);
+        copy_inputs_to_outputs(inputs, outputs, channel_mask, frame_count);
 
         let enabled = self.enabled.load(Ordering::Acquire);
         if !enabled && self.hush_diagnostics.is_none() {
@@ -309,12 +321,18 @@ unsafe fn input_sample(input: *mut c_void, frame: usize) -> f32 {
 unsafe fn copy_inputs_to_outputs(
     inputs: [*mut c_void; DSP_CHANNELS],
     outputs: [*mut c_void; DSP_CHANNELS],
+    active_channel_mask: u16,
     frames: usize,
 ) {
     for frame in 0..frames {
         for channel in 0..DSP_CHANNELS {
             if !outputs[channel].is_null() {
-                *outputs[channel].cast::<f32>().add(frame) = input_sample(inputs[channel], frame);
+                let sample = if active_channel_mask & (1 << channel) == 0 {
+                    0.0
+                } else {
+                    input_sample(inputs[channel], frame)
+                };
+                *outputs[channel].cast::<f32>().add(frame) = sample;
             }
         }
     }
@@ -374,47 +392,6 @@ pub(super) struct NativeEffect {
 }
 
 impl NativeEffect {
-    pub(super) fn create(
-        host: &EffectHost,
-        thread_loop: &pw::thread_loop::ThreadLoop,
-        request: EffectNodeRequest,
-        topology_channels: Option<u16>,
-    ) -> BackendResult<Self> {
-        validate_request(&request)?;
-
-        // Compatibility callers still get a synchronous API, but all setup
-        // is routed through the provider hook. The asynchronous backend path
-        // uses EffectComponentManager and reaches activate() directly, so it
-        // never performs this heavyweight work before publishing a node.
-        let channels = host
-            .physical_channels_for_request(
-                &request.effect_id,
-                request.module_path.as_deref(),
-                request.channel_policy,
-                topology_channels,
-            )
-            .map_err(BackendError::native)? as usize;
-        eprintln!(
-            "INFO effect: channel policy={:?} resolved_channels={} topology_channels={:?}",
-            request.channel_policy, channels, topology_channels
-        );
-        let spec = AudioSpec {
-            sample_rate: PREPARED_SAMPLE_RATE,
-            channels: channels as u16,
-            max_frames: MAX_DSP_FRAMES,
-        };
-        let prepared = host
-            .prepare_instance(EffectPrepareRequest {
-                effect_id: request.effect_id.clone(),
-                module_path: request.module_path.clone(),
-                spec,
-                parameters: request.parameters.clone(),
-                cancellation: pw_graph_effects::EffectCancellation::default(),
-            })
-            .map_err(BackendError::effect_create_failed)?;
-        Self::activate(thread_loop, request, prepared)
-    }
-
     /// Activate a processor that was fully prepared by the bounded loader
     /// pool. This method only creates the PipeWire-facing callback and ports;
     /// it never loads models, compiles modules, or calls `prepare()`.
@@ -473,6 +450,17 @@ impl NativeEffect {
             callback,
         )?;
 
+        // Hush exposes a live diagnostics handle and therefore starts in
+        // `STARTING` until its worker reports readiness.  Ordinary built-in
+        // processors have no asynchronous health source: reaching this point
+        // means their preparation already completed, so they must be
+        // reported as healthy rather than appearing to warm forever.
+        let initial_health = if runtime.callback().effect_diagnostics.is_some() {
+            pw_graph_effects::EffectHealth::Starting
+        } else {
+            pw_graph_effects::EffectHealth::Healthy
+        };
+
         let mut input_ports = [ptr::null_mut(); DSP_CHANNELS];
         let mut output_ports = [ptr::null_mut(); DSP_CHANNELS];
         let channel_names: [&str; DSP_CHANNELS] = if channels == 1 {
@@ -518,6 +506,8 @@ impl NativeEffect {
             destination: None,
             error: None,
             diagnostics: None,
+            lifecycle: pw_graph_effects::EffectLifecycle::Active,
+            health: initial_health,
         };
         Ok(Self {
             instance,
@@ -571,18 +561,29 @@ impl NativeEffect {
     pub(super) fn snapshot(&self) -> EffectInstance {
         let mut instance = self.instance.clone();
         let callback = self.runtime.callback();
+        if let Some(diagnostics) = &callback.effect_diagnostics {
+            let snapshot = diagnostics.snapshot();
+            instance.lifecycle = snapshot.lifecycle;
+            instance.health = snapshot.health;
+            instance.diagnostics = snapshot.message;
+        }
         if let Some(diagnostics) = &callback.hush_diagnostics {
             instance.diagnostics = Some(diagnostics.status_text());
             instance.error = diagnostics.failure_reason();
         }
         if callback.processor_failed.load(Ordering::Relaxed) && instance.error.is_none() {
             instance.error = Some("effect processor reported a realtime or worker failure".into());
+            instance.lifecycle = pw_graph_effects::EffectLifecycle::Degraded;
+            instance.health = pw_graph_effects::EffectHealth::Failed;
         } else if let Some(message) =
             dangling_input_message(callback.dangling_inputs.load(Ordering::Acquire))
         {
             // This is rendered from a control-thread snapshot. The realtime
             // callback only publishes the bit mask and never formats text.
             instance.error = Some(message.into());
+            if instance.health == pw_graph_effects::EffectHealth::Healthy {
+                instance.health = pw_graph_effects::EffectHealth::Degraded;
+            }
         }
         instance
     }
@@ -590,7 +591,7 @@ impl NativeEffect {
     pub(super) fn set_enabled(&mut self, enabled: bool) {
         let callback = self.runtime.callback();
         let previous = callback.enabled.swap(enabled, Ordering::AcqRel);
-        if previous != enabled && callback.hush_diagnostics.is_none() {
+        if previous != enabled {
             // An enabled/disabled transition is a bypass transition too. A
             // stateful processor must discard queued wet audio and recurrent
             // state before it is allowed back into the graph. This lock is
@@ -666,7 +667,7 @@ mod tests {
     use pw_graph_effects::{AudioSpec, EffectDescriptor, EffectError, EffectProcessor};
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
     use std::sync::Arc;
 
     #[derive(Clone, Copy)]
@@ -707,6 +708,36 @@ mod tests {
                 observed_channel_mask,
             }
         }
+    }
+
+    struct HostBypassProbe {
+        descriptor: EffectDescriptor,
+        bypassed: Arc<AtomicBool>,
+    }
+
+    impl EffectProcessor for HostBypassProbe {
+        fn descriptor(&self) -> &EffectDescriptor {
+            &self.descriptor
+        }
+
+        fn prepare(&mut self, spec: AudioSpec) -> Result<(), EffectError> {
+            spec.validate()
+        }
+
+        fn process(&mut self, _buffer: &mut [f32], _frames: u32) -> Result<(), EffectError> {
+            Ok(())
+        }
+
+        fn set_parameter(&mut self, _id: &str, _value: f32) -> Result<(), EffectError> {
+            Ok(())
+        }
+
+        fn set_host_bypass(&mut self, bypassed: bool) -> bool {
+            self.bypassed.store(bypassed, Ordering::Release);
+            false
+        }
+
+        fn reset(&mut self) {}
     }
 
     impl EffectProcessor for TestProcessor {
@@ -860,6 +891,36 @@ mod tests {
 
         assert_eq!(left, [0.0; 16]);
         assert_eq!(right, [0.0; 16]);
+    }
+
+    #[test]
+    fn disabled_effect_initializes_and_updates_processor_host_bypass() {
+        let bypassed = Arc::new(AtomicBool::new(false));
+        let state = CallbackState::new(
+            Box::new(HostBypassProbe {
+                descriptor: EffectDescriptor {
+                    id: "test.host-bypass".into(),
+                    name: "Host bypass probe".into(),
+                    vendor: "qpwgraph-rs".into(),
+                    version: "1".into(),
+                    parameters: Vec::new(),
+                },
+                bypassed: bypassed.clone(),
+            }),
+            false,
+        );
+        assert!(bypassed.load(Ordering::Acquire));
+
+        state.enabled.store(true, Ordering::Release);
+        let mut input = [0.25; 4];
+        let mut output = [0.0; 4];
+        run_buffers(
+            &state,
+            [Some(&mut input), None],
+            [Some(&mut output), None],
+            4,
+        );
+        assert!(!bypassed.load(Ordering::Acquire));
     }
 
     #[test]

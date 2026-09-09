@@ -13,8 +13,8 @@ use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::{Pod, Value};
 use pw::spa::utils::Direction as SpaDirection;
 use pw_graph_effects::{
-    AudioSpec, EffectComponentManager, EffectDescriptor, EffectHost, EffectPreparationEvent,
-    EffectPrepareRequest, EffectTicket, PreparedEffect,
+    AudioSpec, EffectComponentManager, EffectHost, EffectPreparationEvent, EffectPrepareRequest,
+    EffectTicket, PreparedEffect,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod effect_lifecycle;
 mod effect_topology;
 mod effects;
 mod filter_runtime;
@@ -787,27 +788,6 @@ impl PipewireDriver {
         })
     }
 
-    /// Create a live `pw_filter` and wait until the registry has published its
-    /// node and both ports. Callers hold the ThreadLoop lock for the entire
-    /// transaction, which makes callback-data destruction safe on rollback.
-    fn create_effect_node_locked(
-        &mut self,
-        request: EffectNodeRequest,
-        topology_channels: Option<u16>,
-    ) -> BackendResult<EffectInstance> {
-        if self.effects.contains_key(&request.instance_id) {
-            return Err(BackendError::effect_already_exists(&request.instance_id));
-        }
-        let instance_id = request.instance_id.clone();
-        let effect = NativeEffect::create(
-            &self.effect_host,
-            &self.thread_loop,
-            request,
-            topology_channels,
-        )?;
-        self.finish_create_effect_node_locked(instance_id, effect)
-    }
-
     fn create_effect_node_prepared_locked(
         &mut self,
         request: EffectNodeRequest,
@@ -928,54 +908,6 @@ impl PipewireDriver {
         }
         self.connect_locked(output, input)?;
         Ok(())
-    }
-
-    fn insert_effect_locked(
-        &mut self,
-        request: EffectInsertRequest,
-    ) -> BackendResult<EffectInstance> {
-        let source = request.source.clone();
-        let destination = request.destination.clone();
-        let EffectInsertRequest {
-            instance_id,
-            effect_id,
-            module_path,
-            enabled,
-            parameters,
-            channel_policy,
-            position,
-            ..
-        } = request;
-        let inferred_channels = self.inferred_audio_channels(&source);
-        // Verify the selected link before publishing a new node. It can still
-        // disappear while the effect initializes, so we resolve it once more
-        // immediately before disconnecting it below.
-        self.effect_link_endpoints_locked(&source, &destination)?;
-        let instance_request = EffectNodeRequest {
-            instance_id: instance_id.clone(),
-            effect_id,
-            module_path,
-            enabled,
-            parameters,
-            channel_policy,
-            position,
-        };
-        let resolved_channels = self
-            .effect_host
-            .physical_channels_for_request(
-                &instance_request.effect_id,
-                instance_request.module_path.as_deref(),
-                channel_policy,
-                inferred_channels,
-            )
-            .map_err(BackendError::native)?;
-        eprintln!(
-            "INFO effect: channel policy={:?} resolved_channels={} inferred_channels={:?} insertion=true",
-            channel_policy, resolved_channels, inferred_channels
-        );
-        let instance = self.create_effect_node_locked(instance_request, inferred_channels)?;
-
-        self.commit_insert_effect_locked(source, destination, instance_id, instance)
     }
 
     fn insert_effect_prepared_locked(
@@ -1574,82 +1506,6 @@ impl GraphDriver for PipewireDriver {
         self.with_loop(|driver| {
             driver.meters.clear();
             Ok(())
-        })
-    }
-}
-
-impl EffectDriver for PipewireDriver {
-    fn effect_descriptors(&self) -> Vec<EffectDescriptor> {
-        self.effect_host.descriptors()
-    }
-
-    fn effect_instances(&self) -> Vec<EffectInstance> {
-        self.effects.values().map(NativeEffect::snapshot).collect()
-    }
-
-    fn supports_effect_nodes(&self) -> bool {
-        true
-    }
-
-    fn begin_create_effect(&mut self, request: EffectCreateRequest) -> BackendResult<EffectTicket> {
-        self.begin_create_effect_async(request)
-    }
-
-    fn poll_effect_events(&mut self) -> BackendResult<Vec<EffectEvent>> {
-        self.poll_effect_lifecycle()
-    }
-
-    fn cancel_effect(&mut self, ticket: EffectTicket) -> BackendResult<()> {
-        if self.effect_loader.cancel(ticket) {
-            Ok(())
-        } else {
-            Err(BackendError::native(format!(
-                "unknown or completed effect ticket {}",
-                ticket.0
-            )))
-        }
-    }
-
-    fn create_effect_node(&mut self, request: EffectNodeRequest) -> BackendResult<EffectInstance> {
-        self.with_loop(|driver| {
-            driver.sync()?;
-            driver.create_effect_node_locked(request, None)
-        })
-    }
-
-    fn insert_effect(&mut self, request: EffectInsertRequest) -> BackendResult<EffectInstance> {
-        self.with_loop(|driver| {
-            driver.sync()?;
-            driver.insert_effect_locked(request)
-        })
-    }
-
-    fn set_effect_enabled(&mut self, instance_id: &str, enabled: bool) -> BackendResult<()> {
-        let effect = self
-            .effects
-            .get_mut(instance_id)
-            .ok_or_else(|| BackendError::unknown_effect_instance(instance_id))?;
-        effect.set_enabled(enabled);
-        Ok(())
-    }
-
-    fn set_effect_parameter(
-        &mut self,
-        instance_id: &str,
-        parameter: &str,
-        value: f32,
-    ) -> BackendResult<()> {
-        let effect = self
-            .effects
-            .get_mut(instance_id)
-            .ok_or_else(|| BackendError::unknown_effect_instance(instance_id))?;
-        effect.set_parameter(parameter, value)
-    }
-
-    fn remove_effect(&mut self, instance_id: &str) -> BackendResult<()> {
-        self.with_loop(|driver| {
-            driver.sync()?;
-            driver.remove_effect_locked(instance_id)
         })
     }
 }
@@ -2785,9 +2641,40 @@ fn ui_volume_to_spa_volume(volume: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{classify_port_type, ui_volume_to_spa_volume, PipewireDriver};
-    use crate::{EffectDriver, EffectNodeRequest, GraphDriver};
+    use crate::{EffectCreateRequest, EffectDriver, EffectEvent, GraphDriver};
     use pw_graph_core::{Direction, NodeType, PortType};
     use std::collections::BTreeMap;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn wait_for_effect(
+        driver: &mut PipewireDriver,
+        request: EffectCreateRequest,
+    ) -> crate::BackendResult<crate::EffectInstance> {
+        let ticket = driver.begin_create_effect(request)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            for event in driver.poll_effect_events()? {
+                match event {
+                    EffectEvent::Ready {
+                        ticket: ready_ticket,
+                        instance,
+                    } if ready_ticket == ticket => return Ok(*instance),
+                    EffectEvent::Failed {
+                        ticket: failed_ticket,
+                        error,
+                    } if failed_ticket == ticket => {
+                        return Err(crate::BackendError::native(error));
+                    }
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        Err(crate::BackendError::native(
+            "timed out waiting for effect preparation",
+        ))
+    }
 
     #[test]
     fn classifies_media_types_without_case_sensitive_metadata() {
@@ -2882,17 +2769,21 @@ mod tests {
         driver
             .refresh()
             .expect("PipeWire registry snapshot should succeed");
-        let instance = driver
-            .create_effect_node(EffectNodeRequest {
+        let instance = wait_for_effect(
+            &mut driver,
+            EffectCreateRequest {
                 instance_id: "qpwgraph-rs-test-effect".into(),
                 effect_id: pw_graph_effects::NOISE_SUPPRESSOR_ID.into(),
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
                 channel_policy: pw_graph_effects::ChannelPolicy::Auto,
-                position: [12.0, 34.0],
-            })
-            .expect("the raw PipeWire filter should publish a node and ports");
+                target: crate::EffectTarget::Standalone {
+                    position: [12.0, 34.0],
+                },
+            },
+        )
+        .expect("the raw PipeWire filter should publish a node and ports");
         let node = driver
             .graph()
             .node(instance.node_id)
@@ -2947,17 +2838,21 @@ mod tests {
             .refresh()
             .expect("PipeWire registry snapshot should succeed");
         let instance_id = "qpwgraph-rs-test-hush-effect";
-        let instance = driver
-            .create_effect_node(EffectNodeRequest {
+        let instance = wait_for_effect(
+            &mut driver,
+            EffectCreateRequest {
                 instance_id: instance_id.into(),
                 effect_id: pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID.into(),
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
                 channel_policy: pw_graph_effects::ChannelPolicy::Auto,
-                position: [56.0, 78.0],
-            })
-            .expect("the Hush PipeWire filter should publish a node and ports");
+                target: crate::EffectTarget::Standalone {
+                    position: [56.0, 78.0],
+                },
+            },
+        )
+        .expect("the Hush PipeWire filter should publish a node and ports");
         assert_eq!(
             instance.config.channel_policy,
             pw_graph_effects::ChannelPolicy::Auto
@@ -2972,7 +2867,10 @@ mod tests {
             .filter_map(|port_id| driver.graph().port(*port_id))
             .map(|port| port.name.as_str())
             .collect();
-        assert_eq!(port_names, ["input_MONO", "output_MONO"]);
+        assert_eq!(
+            port_names,
+            ["input_FL", "output_FL", "input_FR", "output_FR"]
+        );
         assert_eq!(
             driver
                 .graph()

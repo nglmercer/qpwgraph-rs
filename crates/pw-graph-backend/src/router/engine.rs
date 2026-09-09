@@ -557,6 +557,23 @@ impl RouterCore {
         }
         spec.validate()?;
         processor.prepare(spec)?;
+        self.add_prepared_processor(id, processor, spec)
+    }
+
+    /// Register a processor whose expensive preparation has already completed
+    /// on a loader thread. The router thread only takes ownership of the
+    /// prepared instance and validates its geometry; it never loads models or
+    /// initializes plugin runtimes here.
+    pub fn add_prepared_processor(
+        &mut self,
+        id: ProcessorId,
+        processor: Box<dyn EffectProcessor>,
+        spec: AudioSpec,
+    ) -> Result<(), RouterError> {
+        if self.processors.contains_key(&id) {
+            return Err(RouterError::DuplicateProcessor(id));
+        }
+        spec.validate()?;
         self.processors.insert(
             id,
             ProcessorSlot {

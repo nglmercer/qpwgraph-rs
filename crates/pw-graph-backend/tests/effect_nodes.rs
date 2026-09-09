@@ -6,11 +6,14 @@
 //! inserted into (and later removed from) an existing route.
 
 use pw_graph_backend::{
-    DemoDriver, EffectDriver, EffectInsertRequest, EffectNodeRequest, GraphDriver,
+    DemoDriver, EffectCreateRequest, EffectDriver, EffectEvent, EffectInsertRequest,
+    EffectNodeRequest, EffectTarget, GraphDriver,
 };
 use pw_graph_core::{Direction, NodeType, PortId, PortType};
 use pw_graph_effects::{ChannelPolicy, NOISE_GATE_ID, NOISE_GATE_THRESHOLD};
 use std::collections::BTreeMap;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn effect_request(instance_id: &str) -> EffectNodeRequest {
     EffectNodeRequest {
@@ -22,6 +25,67 @@ fn effect_request(instance_id: &str) -> EffectNodeRequest {
         channel_policy: ChannelPolicy::Auto,
         position: [240.0, 160.0],
     }
+}
+
+#[test]
+fn asynchronous_creation_returns_before_activation_and_publishes_ready_event() {
+    let mut driver = DemoDriver::demo();
+    let started = Instant::now();
+    let ticket = driver
+        .begin_create_effect(EffectCreateRequest {
+            instance_id: "async-gate".into(),
+            effect_id: NOISE_GATE_ID.into(),
+            module_path: None,
+            enabled: true,
+            parameters: BTreeMap::new(),
+            channel_policy: ChannelPolicy::Auto,
+            target: EffectTarget::Standalone {
+                position: [240.0, 160.0],
+            },
+        })
+        .expect("the request should be queued");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "begin_create_effect must not wait for processor preparation"
+    );
+    assert!(driver.effect_instances().is_empty());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut saw_loading = false;
+    let mut ready = None;
+    while Instant::now() < deadline {
+        for event in driver.poll_effect_events().expect("lifecycle polling") {
+            match event {
+                EffectEvent::Loading {
+                    ticket: event_ticket,
+                    ..
+                } if event_ticket == ticket => saw_loading = true,
+                EffectEvent::Ready {
+                    ticket: event_ticket,
+                    instance,
+                } if event_ticket == ticket => ready = Some(*instance),
+                EffectEvent::Failed {
+                    ticket: event_ticket,
+                    error,
+                } if event_ticket == ticket => panic!("effect preparation failed: {error}"),
+                _ => {}
+            }
+        }
+        if ready.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    assert!(saw_loading, "preparation must expose lifecycle stages");
+    let instance = ready.expect("the prepared effect should eventually activate");
+    assert_eq!(instance.config.instance_id, "async-gate");
+    assert_eq!(
+        instance.lifecycle,
+        pw_graph_effects::EffectLifecycle::Active
+    );
+    assert_eq!(instance.health, pw_graph_effects::EffectHealth::Healthy);
+    assert_eq!(driver.effect_instances(), vec![instance]);
 }
 
 #[test]

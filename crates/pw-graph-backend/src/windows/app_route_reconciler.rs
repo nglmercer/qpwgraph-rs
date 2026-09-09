@@ -20,6 +20,7 @@ pub enum ApplicationRouteState {
     WaitingForIsolation,
     ActivatingCapture,
     ResolvingDestination,
+    PreparingEffects,
     Active,
     UnsupportedOs,
     IdentityMismatch,
@@ -143,6 +144,25 @@ impl ApplicationRouteReconciler {
         }
     }
 
+    /// Preparation is deliberately a separate route state. The reconciled
+    /// activation remains attached to the plan so a refresh can compare it
+    /// with the pending request without rebuilding or mutating the graph.
+    pub fn mark_effects_preparing(&mut self, rule_index: usize, reason: String) {
+        if let Some(plan) = self.plans.get_mut(&rule_index) {
+            plan.state = ApplicationRouteState::PreparingEffects;
+            plan.reason = Some(reason);
+        }
+    }
+
+    /// Mark a route active only after its prepared processor chain and all
+    /// links have been committed successfully.
+    pub fn mark_effects_active(&mut self, rule_index: usize) {
+        if let Some(plan) = self.plans.get_mut(&rule_index) {
+            plan.state = ApplicationRouteState::Active;
+            plan.reason = None;
+        }
+    }
+
     /// Reconcile every persisted rule against the current live snapshot.
     ///
     /// More specific matching rules win.  A less specific duplicate is
@@ -166,7 +186,9 @@ impl ApplicationRouteReconciler {
             .filter(|plan| {
                 matches!(
                     plan.state,
-                    ApplicationRouteState::ActivatingCapture | ApplicationRouteState::Active
+                    ApplicationRouteState::ActivatingCapture
+                        | ApplicationRouteState::PreparingEffects
+                        | ApplicationRouteState::Active
                 )
             })
             .filter_map(|plan| {

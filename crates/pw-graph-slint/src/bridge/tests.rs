@@ -10,6 +10,7 @@ use pw_graph_core::Direction;
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{LogicalPosition, Model, ModelRc};
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -44,6 +45,7 @@ pub(super) fn demo_application() -> Application {
         effect_selection_id: None,
         effect_draft_enabled: true,
         effect_draft_parameters: BTreeMap::new(),
+        pending_effect_tickets: BTreeSet::new(),
         debug: false,
         last_refresh: Instant::now(),
         last_full_sync: Instant::now(),

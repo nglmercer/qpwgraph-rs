@@ -480,6 +480,11 @@ fn escape_topmost_layer(window: &MainWindow, application: &mut Application) {
         return;
     }
     if window.get_show_effects() {
+        // A completed Create action closes the setup subview while its ticket
+        // continues in the background. Closing the whole effects overlay is
+        // an explicit user cancellation for those still-pending interactive
+        // preparations.
+        cancel_effect_setup(window, application);
         window.set_show_effects(false);
         return;
     }

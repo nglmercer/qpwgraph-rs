@@ -5,6 +5,7 @@
 //! only sanitizes samples, advances a preallocated dry delay, and performs
 //! bounded SPSC queue operations.
 
+use crate::hush_delay::DryDelay;
 pub(crate) use crate::hush_model::{hush_model_load_info, shared_hush_model, HushModelLoadInfo};
 #[cfg(test)]
 pub(crate) use crate::hush_model::{load_hush_model_with_override, HUSH_MODEL_SHA256};
@@ -574,6 +575,12 @@ impl EffectProcessor for HushNoiseSuppressor {
         self.diagnostics.clone()
     }
 
+    fn diagnostics(&self) -> Option<Arc<dyn crate::EffectDiagnostics>> {
+        self.diagnostics
+            .clone()
+            .map(|diagnostics| diagnostics as Arc<dyn crate::EffectDiagnostics>)
+    }
+
     fn has_failed(&self) -> bool {
         self.diagnostics.as_ref().is_some_and(|diagnostics| {
             diagnostics
@@ -584,62 +591,6 @@ impl EffectProcessor for HushNoiseSuppressor {
 
     fn reset(&mut self) {
         self.next_generation(true);
-    }
-}
-
-struct DryDelay {
-    samples: Vec<f32>,
-    position: usize,
-    delay: usize,
-}
-
-impl DryDelay {
-    fn new(samples: usize) -> Self {
-        Self {
-            samples: vec![0.0; samples.max(1)],
-            position: 0,
-            delay: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.samples.fill(0.0);
-        self.position = 0;
-    }
-
-    fn set_delay(&mut self, delay: usize) {
-        let delay = delay.min(self.samples.len());
-        if self.delay != delay {
-            self.reset();
-            self.delay = delay;
-        }
-    }
-
-    /// Change the logical delay without clearing the history. The ring is
-    /// preallocated during prepare(), so quantum-aware latency growth remains
-    /// realtime safe and the dry timeline stays continuous during worker-only
-    /// recovery.
-    fn set_delay_preserve(&mut self, delay: usize) {
-        self.delay = delay.min(self.samples.len());
-        if self.delay > 0 {
-            self.position %= self.samples.len();
-        } else {
-            self.position = 0;
-        }
-    }
-
-    fn process(&mut self, input: &[f32], output: &mut [f32]) {
-        if self.delay == 0 {
-            output.copy_from_slice(input);
-            return;
-        }
-        let capacity = self.samples.len();
-        for (sample, delayed) in input.iter().zip(output.iter_mut()) {
-            let read = (self.position + capacity - self.delay % capacity) % capacity;
-            *delayed = self.samples[read];
-            self.samples[self.position] = *sample;
-            self.position = (self.position + 1) % capacity;
-        }
     }
 }
 

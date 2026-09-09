@@ -19,6 +19,7 @@ mod callbacks;
 mod config;
 mod connections;
 mod effects;
+mod effects_restore;
 mod events;
 #[cfg(test)]
 mod keyboard;

@@ -266,12 +266,10 @@ impl WindowsRouting {
         BLOCK_FRAMES as u32
     }
 
-    /// Register an effect node's processor and its two ports.
-    ///
-    /// The node is inert until something links into it: an effect with no
-    /// audio reaching its input simply is not on any route, which is exactly
-    /// what a free-standing effect node on the canvas should be.
-    pub(super) fn add_effect(
+    /// Register an already-prepared processor. Heavyweight preparation is
+    /// performed by the shared effect loader, so the paced router thread only
+    /// installs the realtime instance and never waits for model/plugin setup.
+    pub(super) fn add_prepared_effect(
         &mut self,
         input_port: PortId,
         output_port: PortId,
@@ -285,7 +283,7 @@ impl WindowsRouting {
         let diagnostics = self
             .router
             .with(move |core| {
-                core.add_processor(id, processor, spec)?;
+                core.add_prepared_processor(id, processor, spec)?;
                 Ok::<_, crate::router::engine::RouterError>(core.hush_diagnostics(id))
             })
             .map_err(router_stopped)?

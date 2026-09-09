@@ -5,9 +5,7 @@ use pw_graph_config::AppConfig;
 use pw_graph_core::PortKey;
 use pw_graph_i18n::I18n;
 use pw_graph_patchbay::Patchbay;
-use std::collections::BTreeMap;
-#[cfg(feature = "relay")]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -114,6 +112,11 @@ pub(crate) struct Application {
     pub(crate) effect_selection_id: Option<String>,
     pub(crate) effect_draft_enabled: bool,
     pub(crate) effect_draft_parameters: BTreeMap<String, f32>,
+    /// Interactive effect preparations that the user can still cancel by
+    /// closing the effects dialog. Restored effects are intentionally not in
+    /// this set: they are background graph restoration work, not a draft the
+    /// user just asked to abandon.
+    pub(crate) pending_effect_tickets: BTreeSet<pw_graph_backend::EffectTicket>,
     pub(crate) debug: bool,
     pub(crate) last_refresh: Instant,
     /// Last time the full model sync ran. The 50 ms pump only refreshes

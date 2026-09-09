@@ -11,7 +11,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
                 .map(|driver| driver.effect_descriptors())
                 .unwrap_or_default()
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_ref()
+                .map(|driver| driver.effect_descriptors())
+                .unwrap_or_default()
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             Vec::new()
         }
@@ -25,7 +32,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
                 .map(|driver| driver.effect_instances())
                 .unwrap_or_default()
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_ref()
+                .map(|driver| driver.effect_instances())
+                .unwrap_or_default()
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             Vec::new()
         }
@@ -38,7 +52,13 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
                 .as_ref()
                 .is_some_and(|driver| driver.supports_effect_nodes())
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_ref()
+                .is_some_and(|driver| driver.supports_effect_nodes())
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             false
         }
@@ -52,7 +72,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
         {
             self.pipewire_mut()?.begin_create_effect(request)
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+                .begin_create_effect(request)
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             let _ = request;
             Err(Self::unsupported("effect processing is unavailable"))
@@ -64,7 +91,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
         {
             self.pipewire_mut()?.poll_effect_events()
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .map(|driver| driver.poll_effect_events())
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             Ok(Vec::new())
         }
@@ -75,7 +109,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
         {
             self.pipewire_mut()?.cancel_effect(ticket)
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+                .cancel_effect(ticket)
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             let _ = ticket;
             Err(Self::unsupported("effect processing is unavailable"))
@@ -90,7 +131,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
         {
             self.mutate_pipewire(|driver| driver.create_effect_node(request))
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+                .create_effect_node(request)
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             let _ = request;
             Err(Self::unsupported("effect processing is unavailable"))
@@ -105,7 +153,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
         {
             self.mutate_pipewire(|driver| driver.insert_effect(request))
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+                .insert_effect(request)
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             let _ = request;
             Err(Self::unsupported("effect processing is unavailable"))
@@ -118,7 +173,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
             self.pipewire_mut()?
                 .set_effect_enabled(instance_id, enabled)
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+                .set_effect_enabled(instance_id, enabled)
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             let _ = (instance_id, enabled);
             Err(Self::unsupported("effect processing is unavailable"))
@@ -136,7 +198,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
             self.pipewire_mut()?
                 .set_effect_parameter(instance_id, parameter, value)
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+                .set_effect_parameter(instance_id, parameter, value)
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             let _ = (instance_id, parameter, value);
             Err(Self::unsupported("effect processing is unavailable"))
@@ -148,7 +217,14 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
         {
             self.mutate_pipewire(|driver| driver.remove_effect(instance_id))
         }
-        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_audio
+                .as_mut()
+                .ok_or_else(|| Self::unsupported("Windows audio backend is unavailable"))?
+                .remove_effect(instance_id)
+        }
+        #[cfg(not(any(all(target_os = "linux", feature = "pipewire"), target_os = "windows")))]
         {
             let _ = instance_id;
             Err(Self::unsupported("effect processing is unavailable"))

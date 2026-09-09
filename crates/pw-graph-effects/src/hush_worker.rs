@@ -5,272 +5,21 @@
 //! state, resampling, and frame assembly all live on the worker thread.
 
 use crate::hush_noise::HushModelLoadInfo;
+pub(crate) use crate::hush_overload::{
+    overload_cooldown_for_attempt, HushHealth, HushOverloadReason, HushPerformanceState,
+    HushWorkerState, HUSH_HEALTHY_OBSERVATIONS, HUSH_HEALTHY_REALTIME_FACTOR_LIMIT,
+    HUSH_MAX_AUTOMATIC_RETRIES, HUSH_MAX_BACKLOG_MS, HUSH_MIN_WORKER_HEADROOM_MS,
+    HUSH_OVERLOAD_OBSERVATIONS, HUSH_REALTIME_FACTOR_LIMIT, HUSH_RECOVERY_LEAD_MS,
+    HUSH_SCHEDULING_MS,
+};
+pub(crate) use crate::hush_queue::{read_timeline, AudioBlock, BlockQueue, HUSH_QUEUE_CAPACITY};
 use nnnoiseless::{HushDenoiser, HushModel, Resampler, HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE};
-use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// The queue is deliberately small and fixed.  A late worker loses a block
-/// and the processor uses its aligned dry path; latency cannot grow without
-/// bound.
-pub(crate) const HUSH_QUEUE_CAPACITY: usize = 128;
-/// Initial scheduling allowance, including model-frame assembly and sinc
-/// lookahead. The effective value grows when the host quantum or measured
-/// worker cost is measured separately for health diagnostics. Signal
-/// alignment adds the synthesis delay separately (see hush_noise).
-pub(crate) const HUSH_SCHEDULING_MS: u32 = 40;
-/// Minimum worker headroom added to the observed host quantum. Measured worker
-/// cost is exposed separately and drives overload/recovery state.
-pub(crate) const HUSH_MIN_WORKER_HEADROOM_MS: u32 = 10;
-/// Maximum amount of input that is useful to process after the realtime
-/// producer has advanced. Beyond this point the wet result cannot meet the
-/// fixed playout timeline and the worker must resynchronize.
-pub(crate) const HUSH_MAX_BACKLOG_MS: u32 = 80;
-/// Hysteresis for clearing the overload/recovery state. This is deliberately
-/// smaller than the overload threshold so a worker does not oscillate between
-/// running and recovering around one boundary.
-pub(crate) const HUSH_RECOVERY_LEAD_MS: u32 = 20;
-/// A permanently slow worker must not be reset for every rejected callback.
-/// Retry only after a control/worker-side cooldown, leaving the audio thread
-/// on its continuous aligned-dry timeline in the meantime.
-pub(crate) const HUSH_OVERLOAD_COOLDOWN_MS: u64 = 500;
-/// Rolling realtime-factor margin used before declaring a worker overloaded.
-pub(crate) const HUSH_REALTIME_FACTOR_LIMIT: f64 = 1.10;
-/// A worker must report this factor for several persistent observations before
-/// it is classified as permanently too slow.  The lower exit threshold gives
-/// temporary scheduler stalls room to recover without state flapping.
-pub(crate) const HUSH_HEALTHY_REALTIME_FACTOR_LIMIT: f64 = 0.90;
-pub(crate) const HUSH_PERFORMANCE_WINDOW_MS: u64 = 50;
-pub(crate) const HUSH_OVERLOAD_OBSERVATIONS: u32 = 3;
-pub(crate) const HUSH_HEALTHY_OBSERVATIONS: u32 = 3;
-pub(crate) const HUSH_MAX_AUTOMATIC_RETRIES: u32 = 3;
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HushOverloadReason {
-    None = 0,
-    CpuTooSlow = 1,
-    BacklogExceeded = 2,
-    InputQueueFull = 3,
-}
-
-fn overload_cooldown_for_attempt(attempt: u32) -> Duration {
-    if attempt >= 3 {
-        Duration::from_millis(5_000)
-    } else {
-        Duration::from_millis(HUSH_OVERLOAD_COOLDOWN_MS.saturating_mul(1_u64 << attempt))
-    }
-}
-
-impl HushOverloadReason {
-    fn as_u32(self) -> u32 {
-        self as u32
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::CpuTooSlow => "CPU throughput",
-            Self::BacklogExceeded => "backlog",
-            Self::InputQueueFull => "queue full",
-        }
-    }
-}
-
-/// Timing knowledge is deliberately independent from the mutable DSP
-/// pipeline.  In particular, `reset_hush_dsp` must never call `reset` on this
-/// value: a slow worker may need several wet resets before its service rate is
-/// confidently classified.
-#[derive(Clone, Debug)]
-struct HushPerformanceState {
-    ewma_realtime_factor: f64,
-    total_audio_frames: u64,
-    total_processing_ns: u64,
-    recent_audio_frames: u64,
-    recent_processing_ns: u64,
-    overload_windows: u32,
-    healthy_windows: u32,
-    last_factor: f64,
-    timing_samples: u64,
-    performance_windows: u64,
-    stable_p95_ns: f64,
-    stable_p99_ns: f64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct PerformanceObservation {
-    factor: f64,
-    ewma: f64,
-}
-
-impl Default for HushPerformanceState {
-    fn default() -> Self {
-        Self {
-            ewma_realtime_factor: 1.0,
-            total_audio_frames: 0,
-            total_processing_ns: 0,
-            recent_audio_frames: 0,
-            recent_processing_ns: 0,
-            overload_windows: 0,
-            healthy_windows: 0,
-            last_factor: 1.0,
-            timing_samples: 0,
-            performance_windows: 0,
-            stable_p95_ns: 0.0,
-            stable_p99_ns: 0.0,
-        }
-    }
-}
-
-impl HushPerformanceState {
-    fn observe(
-        &mut self,
-        audio_frames: u64,
-        processing_ns: u64,
-        sample_rate: u32,
-    ) -> PerformanceObservation {
-        if audio_frames == 0 {
-            return PerformanceObservation {
-                factor: self.last_factor,
-                ewma: self.ewma_realtime_factor,
-            };
-        }
-        self.total_audio_frames = self.total_audio_frames.saturating_add(audio_frames);
-        self.total_processing_ns = self.total_processing_ns.saturating_add(processing_ns);
-        self.recent_audio_frames = self.recent_audio_frames.saturating_add(audio_frames);
-        self.recent_processing_ns = self.recent_processing_ns.saturating_add(processing_ns);
-        self.observe_timing(processing_ns);
-
-        let window_frames =
-            (u64::from(sample_rate).saturating_mul(HUSH_PERFORMANCE_WINDOW_MS) / 1000).max(1);
-        let mut observation = PerformanceObservation {
-            factor: self.last_factor,
-            ewma: self.ewma_realtime_factor,
-        };
-        if self.recent_audio_frames >= window_frames {
-            let factor = self.recent_processing_ns as f64 * f64::from(sample_rate.max(1))
-                / (self.recent_audio_frames as f64 * 1e9);
-            self.last_factor = factor;
-            // Seed the EWMA with the first complete interval, but require
-            // multiple high intervals before entering overload. This means a
-            // single cold inference is visible in diagnostics without being a
-            // state transition by itself.
-            if self.performance_windows == 0 {
-                self.ewma_realtime_factor = factor;
-            } else {
-                const ALPHA: f64 = 0.75;
-                self.ewma_realtime_factor =
-                    ALPHA * self.ewma_realtime_factor + (1.0 - ALPHA) * factor;
-            }
-            self.recent_audio_frames = 0;
-            self.recent_processing_ns = 0;
-            if factor.is_finite()
-                && factor > HUSH_REALTIME_FACTOR_LIMIT
-                && self.ewma_realtime_factor > HUSH_REALTIME_FACTOR_LIMIT
-            {
-                self.overload_windows = self.overload_windows.saturating_add(1);
-                self.healthy_windows = 0;
-            } else if factor.is_finite()
-                && factor < HUSH_HEALTHY_REALTIME_FACTOR_LIMIT
-                && self.ewma_realtime_factor < HUSH_HEALTHY_REALTIME_FACTOR_LIMIT
-            {
-                self.healthy_windows = self.healthy_windows.saturating_add(1);
-                self.overload_windows = 0;
-            } else {
-                self.overload_windows = 0;
-                self.healthy_windows = 0;
-            }
-            self.performance_windows = self.performance_windows.saturating_add(1);
-            observation = PerformanceObservation {
-                factor,
-                ewma: self.ewma_realtime_factor,
-            };
-        }
-        observation
-    }
-
-    fn observe_timing(&mut self, duration_ns: u64) {
-        let duration = duration_ns as f64;
-        if self.timing_samples == 0 {
-            self.stable_p95_ns = duration;
-            self.stable_p99_ns = duration;
-            self.timing_samples = 1;
-            return;
-        }
-        // An inexpensive exponentially weighted high-percentile estimate is
-        // sufficient for scheduling. It responds quickly to a sustained slow
-        // worker and decays slowly after a one-off cold outlier.
-        let p95_rate = if duration > self.stable_p95_ns {
-            0.05
-        } else {
-            0.001
-        };
-        let p99_rate = if duration > self.stable_p99_ns {
-            0.02
-        } else {
-            0.0005
-        };
-        self.stable_p95_ns += p95_rate * (duration - self.stable_p95_ns);
-        self.stable_p99_ns += p99_rate * (duration - self.stable_p99_ns);
-        self.timing_samples = self.timing_samples.saturating_add(1);
-    }
-
-    fn lifetime_factor(&self, sample_rate: u32) -> f64 {
-        if self.total_audio_frames == 0 {
-            0.0
-        } else {
-            self.total_processing_ns as f64 * f64::from(sample_rate.max(1))
-                / (self.total_audio_frames as f64 * 1e9)
-        }
-    }
-}
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HushWorkerState {
-    Starting = 0,
-    Running = 1,
-    ResyncRequested = 2,
-    Warming = 3,
-    Failed = 4,
-    Recovering = 5,
-    Overloaded = 6,
-}
-
-impl HushWorkerState {
-    pub(crate) fn as_u32(self) -> u32 {
-        self as u32
-    }
-}
-
-/// User-facing health classification derived from delivery and worker
-/// telemetry.  It deliberately does not call an overloaded effect healthy
-/// merely because its worker thread is still alive.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HushHealth {
-    Starting = 0,
-    Healthy = 1,
-    Degraded = 2,
-    Overloaded = 3,
-    Failed = 4,
-}
-
-impl HushHealth {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Starting => "STARTING",
-            Self::Healthy => "HEALTHY",
-            Self::Degraded => "DEGRADED",
-            Self::Overloaded => "OVERLOADED",
-            Self::Failed => "FAILED",
-        }
-    }
-}
 
 #[inline]
 fn channel_is_connected(mask: u16, channel: usize) -> bool {
@@ -707,263 +456,68 @@ impl HushDiagnostics {
     pub fn failure_reason(&self) -> Option<String> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-}
 
-struct AudioBlock {
-    generation: u64,
-    wet_epoch: u64,
-    start_frame: u64,
-    frames: u32,
-    channels: u16,
-    channel_mask: u16,
-    samples: Vec<f32>,
-}
-
-impl AudioBlock {
-    fn new(max_samples: usize) -> Self {
-        Self {
-            generation: 0,
-            wet_epoch: 0,
-            start_frame: 0,
-            frames: 0,
-            channels: 0,
-            channel_mask: 0,
-            samples: vec![0.0; max_samples],
-        }
+    /// Whether the current dry output is intentional rather than caused by a
+    /// worker deadline miss. Hosts use this to render a distinct bypass state
+    /// without parsing the formatted diagnostic text.
+    pub fn is_bypassed(&self) -> bool {
+        self.bypass.load(Ordering::Acquire) || self.host_disabled.load(Ordering::Acquire)
     }
 }
 
-/// A single-producer/single-consumer ring.  The producer and consumer each
-/// own one side of the index pair, so no mutex is involved in `process()`.
-struct BlockQueue {
-    slots: Box<[UnsafeCell<AudioBlock>]>,
-    capacity: usize,
-    max_samples: usize,
-    write: AtomicUsize,
-    read: AtomicUsize,
-}
-
-// Each slot is accessed by exactly one side of the SPSC queue while it is
-// owned by that side.  Publication is ordered by the acquire/release indices.
-unsafe impl Send for BlockQueue {}
-unsafe impl Sync for BlockQueue {}
-
-impl BlockQueue {
-    fn new(capacity: usize, max_samples: usize) -> Self {
-        assert!(capacity.is_power_of_two());
-        let slots = (0..capacity)
-            .map(|_| UnsafeCell::new(AudioBlock::new(max_samples)))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            slots,
-            capacity,
-            max_samples,
-            write: AtomicUsize::new(0),
-            read: AtomicUsize::new(0),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn try_push_with(
-        &self,
-        generation: u64,
-        wet_epoch: u64,
-        start_frame: u64,
-        frames: u32,
-        channels: u16,
-        channel_mask: u16,
-        fill: impl FnOnce(&mut [f32]),
-    ) -> bool {
-        if frames as usize * channels as usize > self.max_samples {
-            return false;
-        }
-        let write = self.write.load(Ordering::Relaxed);
-        let read = self.read.load(Ordering::Acquire);
-        if write.wrapping_sub(read) >= self.capacity {
-            return false;
-        }
-        let slot = write % self.capacity;
-        // SAFETY: only the producer touches a slot between its read and the
-        // release publication below.
-        let block = unsafe { &mut *self.slots[slot].get() };
-        block.generation = generation;
-        block.wet_epoch = wet_epoch;
-        block.start_frame = start_frame;
-        block.frames = frames;
-        block.channels = channels;
-        block.channel_mask = channel_mask;
-        fill(&mut block.samples);
-        self.write.store(write.wrapping_add(1), Ordering::Release);
-        true
-    }
-
-    fn pop_with<R>(&self, read: impl FnOnce(&AudioBlock) -> R) -> Option<R> {
-        let read_index = self.read.load(Ordering::Relaxed);
-        let write = self.write.load(Ordering::Acquire);
-        if read_index == write {
-            return None;
-        }
-        let slot = read_index % self.capacity;
-        // SAFETY: only the consumer reads a slot after the producer's release
-        // publication and before releasing it below.
-        let block = unsafe { &*self.slots[slot].get() };
-        let result = read(block);
-        self.read
-            .store(read_index.wrapping_add(1), Ordering::Release);
-        Some(result)
-    }
-
-    fn peek_with<R>(&self, read: impl FnOnce(&AudioBlock) -> R) -> Option<R> {
-        let read_index = self.read.load(Ordering::Relaxed);
-        let write = self.write.load(Ordering::Acquire);
-        if read_index == write {
-            return None;
-        }
-        let slot = read_index % self.capacity;
-        // SAFETY: the consumer owns the front slot until it advances `read`.
-        // Peeking does not publish or mutate that slot.
-        let block = unsafe { &*self.slots[slot].get() };
-        Some(read(block))
-    }
-
-    fn max_samples(&self) -> usize {
-        self.max_samples
-    }
-
-    fn depth(&self) -> usize {
-        self.write
-            .load(Ordering::Acquire)
-            .wrapping_sub(self.read.load(Ordering::Acquire))
-            .min(self.capacity)
-    }
-}
-
-/// Copy overlaps, retaining a partially consumed front block. The destination
-/// already contains aligned dry samples for any holes. Only the consumer
-/// advances read; a producer must never drop the oldest slot itself.
-#[allow(clippy::too_many_arguments)]
-fn read_timeline(
-    queue: &BlockQueue,
-    generation: u64,
-    wet_epoch: u64,
-    start: u64,
-    frames: u32,
-    channels: u16,
-    diagnostics: Option<&HushDiagnostics>,
-    destination: &mut [f32],
-) -> usize {
-    if channels == 0 || destination.len() < frames as usize * channels as usize {
-        if let Some(diagnostics) = diagnostics {
-            diagnostics.wet_drop_other.fetch_add(1, Ordering::Relaxed);
-        }
-        return 0;
-    }
-    let end = start.saturating_add(frames as u64);
-    let mut copied = 0;
-    for _ in 0..HUSH_QUEUE_CAPACITY {
-        let Some((epoch, pipeline_epoch, first, last)) = queue.peek_with(|b| {
-            (
-                b.generation,
-                b.wet_epoch,
-                b.start_frame,
-                b.start_frame.saturating_add(b.frames as u64),
-            )
-        }) else {
-            break;
-        };
-        let metadata = queue.peek_with(|b| {
-            (
-                b.channels,
-                b.frames,
-                b.frames as usize * b.channels as usize <= b.samples.len(),
-            )
-        });
-        let Some((block_channels, block_frames, block_fits)) = metadata else {
-            break;
-        };
-        let drop_reason = if epoch != generation {
-            Some(0_u8)
-        } else if pipeline_epoch != wet_epoch {
-            Some(1_u8)
-        } else if block_frames == 0 || !block_fits {
-            Some(2_u8)
-        } else if block_channels != channels {
-            Some(3_u8)
-        } else if last <= start {
-            Some(4_u8)
+impl crate::EffectDiagnostics for HushDiagnostics {
+    fn snapshot(&self) -> crate::EffectDiagnosticsSnapshot {
+        let health = self.health();
+        let lifecycle = if matches!(health, HushHealth::Failed) {
+            crate::EffectLifecycle::Failed
+        } else if !self.worker_ready.load(Ordering::Acquire) {
+            crate::EffectLifecycle::Preparing
         } else {
-            None
+            crate::EffectLifecycle::Active
         };
-        if let Some(drop_reason) = drop_reason {
-            if let Some(diagnostics) = diagnostics {
-                diagnostics
-                    .stale_output_blocks_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-                diagnostics
-                    .wet_frames_dropped
-                    .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
-                match drop_reason {
-                    0 => {
-                        diagnostics
-                            .wet_drop_wrong_generation
-                            .fetch_add(1, Ordering::Relaxed);
-                        diagnostics
-                            .stale_wet_frames_dropped
-                            .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
-                    }
-                    1 => {
-                        diagnostics
-                            .wet_drop_wrong_sequence
-                            .fetch_add(1, Ordering::Relaxed);
-                        diagnostics
-                            .wet_frames_dropped_epoch
-                            .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
-                    }
-                    2 => {
-                        diagnostics
-                            .wet_drop_wrong_frame_count
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    3 => {
-                        diagnostics
-                            .wet_drop_wrong_channel_count
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    4 => {
-                        diagnostics.wet_drop_too_old.fetch_add(1, Ordering::Relaxed);
-                        diagnostics
-                            .stale_wet_frames_dropped
-                            .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
-                    }
-                    _ => {
-                        diagnostics.wet_drop_other.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            queue.pop_with(|_| ());
-            continue;
-        }
-        if first >= end {
-            break;
-        }
-        queue.peek_with(|b| {
-            let from = first.max(start);
-            let to = last.min(end);
-            let ch = channels as usize;
-            let src = (from - first) as usize * ch;
-            let dst = (from - start) as usize * ch;
-            let len = (to - from) as usize * ch;
-            destination[dst..dst + len].copy_from_slice(&b.samples[src..src + len]);
-            copied += (to - from) as usize;
-        });
-        if last <= end {
-            queue.pop_with(|_| ());
+        let total = self.wet_frames_output.load(Ordering::Relaxed)
+            + self.dry_frames_output.load(Ordering::Relaxed);
+        let wet_percent = if total == 0 {
+            0.0
         } else {
-            break;
+            self.wet_frames_output.load(Ordering::Relaxed) as f64 * 100.0 / total as f64
+        };
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert(
+            "physical_channels".into(),
+            self.channels.load(Ordering::Relaxed).to_string(),
+        );
+        metrics.insert(
+            "active_channels".into(),
+            self.active_hush_channels
+                .load(Ordering::Relaxed)
+                .to_string(),
+        );
+        metrics.insert(
+            "active_mask".into(),
+            format!("0x{:02x}", self.active_channel_mask.load(Ordering::Relaxed)),
+        );
+        metrics.insert("wet_percent".into(), format!("{wet_percent:.1}"));
+        metrics.insert(
+            "rt_factor".into(),
+            format!(
+                "{:.2}",
+                f64::from_bits(self.ewma_realtime_factor_bits.load(Ordering::Relaxed))
+            ),
+        );
+        crate::EffectDiagnosticsSnapshot {
+            lifecycle,
+            health: if self.bypass.load(Ordering::Acquire)
+                || self.host_disabled.load(Ordering::Acquire)
+            {
+                crate::EffectHealth::Bypassed
+            } else {
+                health.into()
+            },
+            message: Some(self.status_text()),
+            metrics,
         }
     }
-    copied
 }
 
 #[inline]

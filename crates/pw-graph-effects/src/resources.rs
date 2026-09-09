@@ -429,4 +429,91 @@ mod tests {
         assert!(error.message.contains("checksum mismatch"));
         assert_eq!(error.provenance.checksum.len(), 64);
     }
+
+    #[test]
+    fn missing_file_reports_exact_path_and_load_stage() {
+        let manager = EffectResourceManager::new();
+        let token = EffectCancellation::default();
+        let path = PathBuf::from(format!(
+            "/nonexistent/qpwgraph-effect-resource-{}",
+            std::process::id()
+        ));
+        let error = manager
+            .load::<Vec<u8>, _>(
+                "test:missing-file",
+                ResourceSource::file(path.clone(), None::<String>),
+                &token,
+                |bytes| Ok(bytes.to_vec()),
+            )
+            .unwrap_err();
+        assert!(error.message.contains(&path.display().to_string()));
+        assert!(error.provenance.load_started);
+        assert!(!error.provenance.load_completed);
+        assert_eq!(
+            error.provenance.path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn parse_failure_is_cached_and_does_not_run_a_second_parser() {
+        let manager = EffectResourceManager::new();
+        let token = EffectCancellation::default();
+        let parses = Arc::new(AtomicUsize::new(0));
+        let first_parses = parses.clone();
+        let first = manager
+            .load::<Vec<u8>, _>(
+                "test:parse-failure",
+                ResourceSource::embedded("broken", b"broken", None::<String>),
+                &token,
+                move |_| {
+                    first_parses.fetch_add(1, Ordering::Relaxed);
+                    Err("fixture is malformed".into())
+                },
+            )
+            .unwrap_err();
+        let second_parses = parses.clone();
+        let second = manager
+            .load::<Vec<u8>, _>(
+                "test:parse-failure",
+                ResourceSource::embedded("broken", b"broken", None::<String>),
+                &token,
+                move |_| {
+                    second_parses.fetch_add(1, Ordering::Relaxed);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(parses.load(Ordering::Relaxed), 1);
+        assert_eq!(first.message, second.message);
+        assert!(second.provenance.parse_started);
+        assert!(!second.provenance.parse_completed);
+    }
+
+    #[test]
+    fn cancelled_resource_load_is_not_cached_and_can_retry() {
+        let manager = EffectResourceManager::new();
+        let cancelled = EffectCancellation::default();
+        cancelled.cancel();
+        let error = manager
+            .load::<Vec<u8>, _>(
+                "test:cancelled-resource",
+                ResourceSource::embedded("cancelled", b"resource", None::<String>),
+                &cancelled,
+                |bytes| Ok(bytes.to_vec()),
+            )
+            .unwrap_err();
+        assert!(error.message.contains("cancelled"));
+
+        let retry = EffectCancellation::default();
+        let loaded = manager
+            .load::<Vec<u8>, _>(
+                "test:cancelled-resource",
+                ResourceSource::embedded("cancelled", b"resource", None::<String>),
+                &retry,
+                |bytes| Ok(bytes.to_vec()),
+            )
+            .unwrap();
+        assert_eq!(&*loaded.value, b"resource");
+    }
 }

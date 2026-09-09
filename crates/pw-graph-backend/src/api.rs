@@ -3,7 +3,9 @@
 use pw_graph_core::{
     Graph, GraphError, Link, LinkId, Node, NodeId, NodeType, PortId, PortKey, PortType,
 };
-use pw_graph_effects::{ChannelPolicy, EffectDescriptor, EffectInstanceConfig};
+use pw_graph_effects::{
+    ChannelPolicy, EffectDescriptor, EffectHealth, EffectInstanceConfig, EffectLifecycle,
+};
 pub use pw_graph_effects::{EffectLoadStage, EffectTicket};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -222,6 +224,12 @@ pub struct EffectInstance {
     pub error: Option<String>,
     /// Control-thread worker status, separate from an effect failure.
     pub diagnostics: Option<String>,
+    /// Generic lifecycle state. Heavyweight effects are not `Active` until
+    /// preparation and PipeWire activation have both completed.
+    pub lifecycle: EffectLifecycle,
+    /// Generic health state suitable for UI severity styling. Provider
+    /// diagnostics remain available in `diagnostics` for detailed inspection.
+    pub health: EffectHealth,
 }
 
 /// Effect operations are intentionally separate from topology operations. A

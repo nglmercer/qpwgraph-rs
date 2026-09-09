@@ -7,6 +7,7 @@
 use super::*;
 #[cfg(feature = "relay")]
 use crate::api;
+use crate::api::EffectTicket;
 
 /// Highest volume a routed node accepts.
 ///
@@ -85,6 +86,23 @@ struct RelayConfigOptions {
     trust_new_peers: bool,
 }
 
+/// A route whose effect processors are being prepared off the UI/control
+/// stack. No graph or router mutation occurs until every processor is ready.
+#[derive(Debug)]
+struct PendingApplicationRoute {
+    activation: ApplicationRouteActivation,
+    source: PortId,
+    destination: PortId,
+    prepared: BTreeMap<usize, pw_graph_effects::PreparedEffect>,
+}
+
+/// Identifies one private route processor in the shared preparation pool.
+#[derive(Debug)]
+struct PendingApplicationEffect {
+    rule_index: usize,
+    effect_index: usize,
+}
+
 /// Public Windows audio driver. The COM worker owns all Core Audio objects;
 /// this value only owns a graph snapshot, command channel, and lifecycle state.
 #[derive(Debug)]
@@ -119,6 +137,11 @@ pub struct WindowsAudioDriver {
     pub(super) application_route_links: BTreeMap<usize, Vec<LinkId>>,
     /// Private effect instances created for persisted application routes.
     pub(super) application_route_effects: BTreeMap<usize, Vec<String>>,
+    /// Pending private route preparation is kept separate from public effect
+    /// tickets. A route is not visible in the graph until this map is empty
+    /// and the complete chain can be activated transactionally.
+    pending_application_routes: BTreeMap<usize, PendingApplicationRoute>,
+    pending_application_effects: BTreeMap<EffectTicket, PendingApplicationEffect>,
     /// Last successfully installed activation. Keeping the accepted plan
     /// lets refreshes preserve realtime processors instead of tearing them
     /// down and recreating them when nothing actually changed.
@@ -242,6 +265,8 @@ impl WindowsAudioDriver {
             application_routes: ApplicationRouteReconciler::default(),
             application_route_links: BTreeMap::new(),
             application_route_effects: BTreeMap::new(),
+            pending_application_routes: BTreeMap::new(),
+            pending_application_effects: BTreeMap::new(),
             application_route_activations: BTreeMap::new(),
             process_captures: snapshot.process_captures,
             virtual_endpoint_identities: snapshot.virtual_endpoint_identities,
@@ -688,11 +713,25 @@ impl WindowsAudioDriver {
         Ok(self.application_routes.plans().cloned().collect())
     }
 
+    fn cancel_pending_application_route(&mut self, rule_index: usize) {
+        let tickets: Vec<_> = self
+            .pending_application_effects
+            .iter()
+            .filter_map(|(ticket, pending)| (pending.rule_index == rule_index).then_some(*ticket))
+            .collect();
+        for ticket in tickets {
+            let _ = self.effects.cancel_effect(ticket);
+            self.pending_application_effects.remove(&ticket);
+        }
+        self.pending_application_routes.remove(&rule_index);
+    }
+
     fn clear_application_route_links(&mut self) -> BackendResult<()> {
         let mut rules = BTreeSet::new();
         rules.extend(self.application_route_links.keys().copied());
         rules.extend(self.application_route_effects.keys().copied());
         rules.extend(self.application_route_activations.keys().copied());
+        rules.extend(self.pending_application_routes.keys().copied());
         for rule in rules {
             self.remove_application_route(rule)?;
         }
@@ -700,6 +739,7 @@ impl WindowsAudioDriver {
     }
 
     fn remove_application_route(&mut self, rule_index: usize) -> BackendResult<()> {
+        self.cancel_pending_application_route(rule_index);
         let links = self
             .application_route_links
             .remove(&rule_index)
@@ -808,13 +848,14 @@ impl WindowsAudioDriver {
             .keys()
             .chain(self.application_route_links.keys())
             .chain(self.application_route_effects.keys())
+            .chain(self.pending_application_routes.keys())
             .copied()
             .collect();
         for rule in existing {
             let keep = desired
                 .get(&rule)
                 .is_some_and(|(activation, source, destination)| {
-                    self.application_route_activations.get(&rule) == Some(activation)
+                    let active = self.application_route_activations.get(&rule) == Some(activation)
                         && self
                             .application_route_effects
                             .get(&rule)
@@ -828,7 +869,16 @@ impl WindowsAudioDriver {
                                             .as_ref()
                                             .is_some_and(|routing| routing.owns(*link))
                                     })
-                            })
+                            });
+                    let preparing =
+                        self.pending_application_routes
+                            .get(&rule)
+                            .is_some_and(|pending| {
+                                pending.activation == *activation
+                                    && pending.source == *source
+                                    && pending.destination == *destination
+                            });
+                    active || preparing
                 });
             if !keep {
                 self.remove_application_route(rule)?;
@@ -843,35 +893,177 @@ impl WindowsAudioDriver {
             if self.application_route_activations.get(&plan.rule_index) == Some(&activation) {
                 continue;
             }
-            if self.routing.is_none() {
-                self.routing = Some(WindowsRouting::start()?);
+            if self
+                .pending_application_routes
+                .get(&plan.rule_index)
+                .is_some_and(|pending| {
+                    pending.activation == activation
+                        && pending.source == source
+                        && pending.destination == destination
+                })
+            {
+                continue;
             }
-            match self.install_application_route(
+            if activation.effect_instances.is_empty() {
+                if self.routing.is_none() {
+                    self.routing = Some(WindowsRouting::start()?);
+                }
+                match self.install_application_route_prepared(
+                    plan.rule_index,
+                    activation.clone(),
+                    source,
+                    destination,
+                    Vec::new(),
+                ) {
+                    Ok((links, effects)) => {
+                        self.application_route_links.insert(plan.rule_index, links);
+                        self.application_route_effects
+                            .insert(plan.rule_index, effects);
+                        self.application_route_activations
+                            .insert(plan.rule_index, activation);
+                    }
+                    Err(error) => {
+                        self.application_routes.mark_degraded(
+                            plan.rule_index,
+                            format!("could not activate restored route: {error}"),
+                        );
+                    }
+                }
+            } else if let Err(error) = self.begin_application_route_preparation(
                 plan.rule_index,
-                activation.clone(),
+                activation,
                 source,
                 destination,
             ) {
-                Ok((links, effects)) => {
-                    self.application_route_links.insert(plan.rule_index, links);
-                    self.application_route_effects
-                        .insert(plan.rule_index, effects);
-                    self.application_route_activations
-                        .insert(plan.rule_index, activation);
-                }
-                Err(error) => {
-                    let reason = format!("could not activate restored route: {error}");
-                    if activation.effect_instances.is_empty() {
-                        self.application_routes
-                            .mark_degraded(plan.rule_index, reason);
-                    } else {
-                        self.application_routes
-                            .mark_effect_restore_failed(plan.rule_index, reason);
-                    }
-                }
+                self.application_routes.mark_effect_restore_failed(
+                    plan.rule_index,
+                    format!("could not prepare restored effect chain: {error}"),
+                );
             }
         }
         Ok(())
+    }
+
+    fn begin_application_route_preparation(
+        &mut self,
+        rule_index: usize,
+        activation: ApplicationRouteActivation,
+        source: PortId,
+        destination: PortId,
+    ) -> BackendResult<()> {
+        if activation.effect_instances.len() > 16 {
+            return Err(BackendError::unsupported(
+                "application effect chain exceeds the Windows route limit of 16 processors",
+            ));
+        }
+        let spec = WindowsRouting::effect_spec(WindowsRouting::block_frames());
+        let mut tickets = Vec::with_capacity(activation.effect_instances.len());
+        for (effect_index, config) in activation.effect_instances.iter().enumerate() {
+            let mut route_config = config.clone();
+            route_config.instance_id =
+                Self::route_effect_id(rule_index, effect_index, &config.instance_id);
+            let ticket = match self.effects.begin_prepare_config(&route_config, spec) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    for (_, ticket) in tickets {
+                        let _ = self.effects.cancel_effect(ticket);
+                    }
+                    return Err(error);
+                }
+            };
+            tickets.push((effect_index, ticket));
+        }
+        for (effect_index, ticket) in tickets {
+            self.pending_application_effects.insert(
+                ticket,
+                PendingApplicationEffect {
+                    rule_index,
+                    effect_index,
+                },
+            );
+        }
+        self.pending_application_routes.insert(
+            rule_index,
+            PendingApplicationRoute {
+                activation,
+                source,
+                destination,
+                prepared: BTreeMap::new(),
+            },
+        );
+        self.application_routes
+            .mark_effects_preparing(rule_index, "loading the saved effect chain".into());
+        Ok(())
+    }
+
+    fn handle_application_effect_ready(
+        &mut self,
+        ticket: EffectTicket,
+        prepared: pw_graph_effects::PreparedEffect,
+    ) -> BackendResult<()> {
+        let Some(pending_effect) = self.pending_application_effects.remove(&ticket) else {
+            // The route was cancelled or replaced while the loader was
+            // finishing. Dropping the prepared processor is intentional.
+            return Ok(());
+        };
+        let Some(route) = self
+            .pending_application_routes
+            .get_mut(&pending_effect.rule_index)
+        else {
+            return Ok(());
+        };
+        route.prepared.insert(pending_effect.effect_index, prepared);
+        if route.prepared.len() != route.activation.effect_instances.len() {
+            return Ok(());
+        }
+        let route = self
+            .pending_application_routes
+            .remove(&pending_effect.rule_index)
+            .expect("pending route was just inspected");
+        let PendingApplicationRoute {
+            activation,
+            source,
+            destination,
+            prepared,
+        } = route;
+        let prepared = prepared.into_values().collect();
+        match self.install_application_route_prepared(
+            pending_effect.rule_index,
+            activation.clone(),
+            source,
+            destination,
+            prepared,
+        ) {
+            Ok((links, effects)) => {
+                self.application_route_links
+                    .insert(pending_effect.rule_index, links);
+                self.application_route_effects
+                    .insert(pending_effect.rule_index, effects);
+                self.application_route_activations
+                    .insert(pending_effect.rule_index, activation);
+                self.application_routes
+                    .mark_effects_active(pending_effect.rule_index);
+                self.dirty.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.application_routes.mark_effect_restore_failed(
+                    pending_effect.rule_index,
+                    format!("could not activate restored effect chain: {error}"),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_application_effect_failure(&mut self, ticket: EffectTicket, reason: String) {
+        let Some(pending_effect) = self.pending_application_effects.remove(&ticket) else {
+            return;
+        };
+        let rule_index = pending_effect.rule_index;
+        self.cancel_pending_application_route(rule_index);
+        self.application_routes
+            .mark_effect_restore_failed(rule_index, reason);
     }
 
     fn route_effect_id(rule_index: usize, position: usize, instance_id: &str) -> String {
@@ -921,20 +1113,30 @@ impl WindowsAudioDriver {
         ]
     }
 
-    fn install_application_route(
+    fn install_application_route_prepared(
         &mut self,
         rule_index: usize,
         activation: ApplicationRouteActivation,
         source: PortId,
         destination: PortId,
+        prepared: Vec<pw_graph_effects::PreparedEffect>,
     ) -> BackendResult<(Vec<LinkId>, Vec<String>)> {
         if activation.effect_instances.len() > 16 {
             return Err(BackendError::unsupported(
                 "application effect chain exceeds the Windows route limit of 16 processors",
             ));
         }
+        if prepared.len() != activation.effect_instances.len() {
+            return Err(BackendError::native(format!(
+                "prepared {} processors for an effect chain that requires {}",
+                prepared.len(),
+                activation.effect_instances.len()
+            )));
+        }
         let mut effect_ids = Vec::with_capacity(activation.effect_instances.len());
-        for (index, config) in activation.effect_instances.iter().enumerate() {
+        for ((index, config), prepared) in
+            activation.effect_instances.iter().enumerate().zip(prepared)
+        {
             let mut route_config = config.clone();
             route_config.instance_id =
                 Self::route_effect_id(rule_index, index, &config.instance_id);
@@ -944,7 +1146,7 @@ impl WindowsAudioDriver {
                 index,
                 activation.effect_instances.len(),
             );
-            match self.create_application_effect(route_config, position) {
+            match self.create_application_effect_prepared(route_config, position, prepared) {
                 Ok(_) => effect_ids.push(Self::route_effect_id(
                     rule_index,
                     index,
@@ -2154,6 +2356,16 @@ impl crate::api::EffectDriver for WindowsAudioDriver {
             {
                 instance.diagnostics = Some(diagnostics.status_text());
                 instance.error = diagnostics.failure_reason();
+                instance.health = if diagnostics.is_bypassed() {
+                    pw_graph_effects::EffectHealth::Bypassed
+                } else {
+                    pw_graph_effects::EffectHealth::from(diagnostics.health())
+                };
+                instance.lifecycle = if instance.health == pw_graph_effects::EffectHealth::Failed {
+                    pw_graph_effects::EffectLifecycle::Degraded
+                } else {
+                    pw_graph_effects::EffectLifecycle::Active
+                };
             }
         }
         instances
@@ -2163,18 +2375,139 @@ impl crate::api::EffectDriver for WindowsAudioDriver {
         true
     }
 
+    fn begin_create_effect(
+        &mut self,
+        request: crate::api::EffectCreateRequest,
+    ) -> BackendResult<crate::api::EffectTicket> {
+        self.effects.begin_create_effect(request)
+    }
+
+    fn poll_effect_events(&mut self) -> BackendResult<Vec<crate::api::EffectEvent>> {
+        let mut events = Vec::new();
+        for event in self.effects.poll_preparation_events() {
+            let private_route_ticket = match &event {
+                pw_graph_effects::EffectPreparationEvent::Loading { ticket, .. }
+                | pw_graph_effects::EffectPreparationEvent::Ready { ticket, .. }
+                | pw_graph_effects::EffectPreparationEvent::Failed { ticket, .. }
+                | pw_graph_effects::EffectPreparationEvent::Cancelled { ticket } => {
+                    self.pending_application_effects.contains_key(ticket)
+                }
+            };
+            if private_route_ticket {
+                match event {
+                    pw_graph_effects::EffectPreparationEvent::Loading { .. } => {}
+                    pw_graph_effects::EffectPreparationEvent::Ready { ticket, prepared } => {
+                        self.handle_application_effect_ready(ticket, prepared)?;
+                    }
+                    pw_graph_effects::EffectPreparationEvent::Failed { ticket, error } => {
+                        self.handle_application_effect_failure(ticket, error.to_string());
+                    }
+                    pw_graph_effects::EffectPreparationEvent::Cancelled { ticket } => {
+                        self.handle_application_effect_failure(
+                            ticket,
+                            "effect preparation was cancelled".into(),
+                        );
+                    }
+                }
+                continue;
+            }
+            match event {
+                pw_graph_effects::EffectPreparationEvent::Loading { ticket, stage } => {
+                    events.push(crate::api::EffectEvent::Loading { ticket, stage });
+                }
+                pw_graph_effects::EffectPreparationEvent::Ready { ticket, prepared } => {
+                    let Some(request) = self.effects.take_pending(ticket) else {
+                        continue;
+                    };
+                    let result = match request.target {
+                        crate::api::EffectTarget::Standalone { position } => self
+                            .create_effect_prepared(
+                                crate::api::EffectNodeRequest {
+                                    instance_id: request.instance_id,
+                                    effect_id: request.effect_id,
+                                    module_path: request.module_path,
+                                    enabled: request.enabled,
+                                    parameters: request.parameters,
+                                    channel_policy: request.channel_policy,
+                                    position,
+                                },
+                                prepared,
+                            ),
+                        crate::api::EffectTarget::Insert {
+                            source,
+                            destination,
+                            position,
+                        } => self.insert_effect_prepared_into_link(
+                            crate::api::EffectInsertRequest {
+                                instance_id: request.instance_id,
+                                effect_id: request.effect_id,
+                                module_path: request.module_path,
+                                source,
+                                destination,
+                                enabled: request.enabled,
+                                parameters: request.parameters,
+                                channel_policy: request.channel_policy,
+                                position,
+                            },
+                            prepared,
+                        ),
+                    };
+                    match result {
+                        Ok(instance) => events.push(crate::api::EffectEvent::Ready {
+                            ticket,
+                            instance: Box::new(instance),
+                        }),
+                        Err(error) => events.push(crate::api::EffectEvent::Failed {
+                            ticket,
+                            error: error.to_string(),
+                        }),
+                    }
+                }
+                pw_graph_effects::EffectPreparationEvent::Failed { ticket, error } => {
+                    self.effects.take_pending(ticket);
+                    events.push(crate::api::EffectEvent::Failed {
+                        ticket,
+                        error: error.to_string(),
+                    });
+                }
+                pw_graph_effects::EffectPreparationEvent::Cancelled { ticket } => {
+                    self.effects.take_pending(ticket);
+                    events.push(crate::api::EffectEvent::Cancelled { ticket });
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn cancel_effect(&mut self, ticket: crate::api::EffectTicket) -> BackendResult<()> {
+        if self.effects.cancel_effect(ticket) {
+            Ok(())
+        } else {
+            Err(BackendError::native(format!(
+                "unknown or completed effect ticket {}",
+                ticket.0
+            )))
+        }
+    }
+
     fn create_effect_node(
         &mut self,
         request: crate::api::EffectNodeRequest,
     ) -> BackendResult<crate::api::EffectInstance> {
-        self.create_effect(request)
+        let _ = request;
+        Err(BackendError::unsupported(
+            "Windows effects must be created asynchronously with begin_create_effect",
+        ))
     }
 
     fn insert_effect(
         &mut self,
         request: crate::api::EffectInsertRequest,
     ) -> BackendResult<crate::api::EffectInstance> {
-        self.insert_effect_into_link(request)
+        let _ = request;
+        Err(BackendError::unsupported(
+            "Windows effects must be inserted asynchronously with begin_create_effect",
+        ))
     }
 
     fn set_effect_enabled(&mut self, instance_id: &str, enabled: bool) -> BackendResult<()> {

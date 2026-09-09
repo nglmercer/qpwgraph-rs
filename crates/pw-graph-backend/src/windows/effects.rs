@@ -20,18 +20,22 @@
 
 use super::*;
 
-use crate::api::{EffectInsertRequest, EffectInstance, EffectNodeRequest};
+use crate::api::{EffectCreateRequest, EffectInsertRequest, EffectInstance, EffectNodeRequest};
 
-use pw_graph_effects::{EffectDescriptor, EffectHost, EffectInstanceConfig};
+use pw_graph_effects::{
+    EffectComponentManager, EffectDescriptor, EffectHost, EffectInstanceConfig,
+    EffectPreparationEvent, EffectPrepareRequest, EffectTicket, PreparedEffect,
+};
 
 /// Effect instances this driver owns, and the factory that builds them.
 ///
 /// Kept next to the graph rather than inside the router: the router knows
 /// about processors and chains, not about nodes, ports, or the identity a
 /// patchbay file will use to find this effect again tomorrow.
-#[derive(Default)]
 pub(super) struct WindowsEffects {
     host: EffectHost,
+    loader: EffectComponentManager,
+    pending: BTreeMap<EffectTicket, EffectCreateRequest>,
     instances: BTreeMap<String, EffectInstance>,
     /// Effects owned by a persisted Windows application route are kept out
     /// of the public standalone-effect list. Their complete configuration
@@ -48,13 +52,101 @@ impl std::fmt::Debug for WindowsEffects {
     }
 }
 
+impl Default for WindowsEffects {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WindowsEffects {
     pub(super) fn new() -> Self {
         Self {
             host: EffectHost::new(),
+            loader: EffectComponentManager::new(2, 16),
+            pending: BTreeMap::new(),
             instances: BTreeMap::new(),
             route_instances: BTreeSet::new(),
         }
+    }
+
+    pub(super) fn begin_create_effect(
+        &mut self,
+        request: EffectCreateRequest,
+    ) -> BackendResult<EffectTicket> {
+        if self.instances.contains_key(&request.instance_id)
+            || self
+                .pending
+                .values()
+                .any(|pending| pending.instance_id == request.instance_id)
+        {
+            return Err(BackendError::effect_already_exists(&request.instance_id));
+        }
+        let spec = WindowsRouting::effect_spec(WindowsRouting::block_frames());
+        let config = EffectInstanceConfig {
+            instance_id: request.instance_id.clone(),
+            effect_id: request.effect_id.clone(),
+            module_path: request.module_path.clone(),
+            enabled: request.enabled,
+            parameters: request.parameters.clone(),
+            channel_policy: request.channel_policy,
+        };
+        let ticket = self.begin_prepare_config(&config, spec)?;
+        self.pending.insert(ticket, request);
+        Ok(ticket)
+    }
+
+    /// Queue preparation for both public nodes and private application-route
+    /// processors. Keeping this boundary in one place prevents a restore path
+    /// from accidentally reintroducing synchronous model/plugin setup.
+    pub(super) fn begin_prepare_config(
+        &mut self,
+        config: &EffectInstanceConfig,
+        spec: pw_graph_effects::AudioSpec,
+    ) -> BackendResult<EffectTicket> {
+        if config.instance_id.trim().is_empty() || config.effect_id.trim().is_empty() {
+            return Err(BackendError::native(
+                "effect instance and effect IDs cannot be empty",
+            ));
+        }
+        let physical = self
+            .host
+            .physical_channels_for_request(
+                &config.effect_id,
+                config.module_path.as_deref(),
+                config.channel_policy,
+                Some(spec.channels),
+            )
+            .map_err(BackendError::native)?;
+        if physical != spec.channels {
+            return Err(BackendError::unsupported(format!(
+                "Windows routing currently requires {} channels, provider negotiated {}",
+                spec.channels, physical
+            )));
+        }
+        self.loader
+            .begin_prepare(
+                &self.host,
+                EffectPrepareRequest {
+                    effect_id: config.effect_id.clone(),
+                    module_path: config.module_path.clone(),
+                    spec,
+                    parameters: config.parameters.clone(),
+                    cancellation: pw_graph_effects::EffectCancellation::default(),
+                },
+            )
+            .map_err(BackendError::native)
+    }
+
+    pub(super) fn poll_preparation_events(&mut self) -> Vec<EffectPreparationEvent> {
+        self.loader.poll_events()
+    }
+
+    pub(super) fn take_pending(&mut self, ticket: EffectTicket) -> Option<EffectCreateRequest> {
+        self.pending.remove(&ticket)
+    }
+
+    pub(super) fn cancel_effect(&self, ticket: EffectTicket) -> bool {
+        self.loader.cancel(ticket)
     }
 
     pub(super) fn descriptors(&self) -> Vec<EffectDescriptor> {
@@ -147,14 +239,14 @@ impl WindowsAudioDriver {
         Ok(())
     }
 
-    /// Create a free-standing effect node.
-    ///
-    /// Nothing is routed through it yet. That is the point: a node on the
-    /// canvas with two unconnected pins, which the user wires up with the same
-    /// drag they would use anywhere else.
-    pub(super) fn create_effect(
+    /// Activate an effect prepared by the shared lifecycle manager. This is
+    /// the only creation path used by the live Windows UI; the router receives
+    /// an initialized processor and therefore cannot block on model/plugin
+    /// setup.
+    pub(super) fn create_effect_prepared(
         &mut self,
         request: EffectNodeRequest,
+        prepared: PreparedEffect,
     ) -> BackendResult<EffectInstance> {
         if self.effects.get(&request.instance_id).is_some() {
             return Err(BackendError::native(format!(
@@ -162,34 +254,22 @@ impl WindowsAudioDriver {
                 request.instance_id
             )));
         }
-        if request.module_path.is_some() {
-            return Err(BackendError::unsupported(
-                "Windows effect modules are not yet hosted by the realtime effect runtime",
-            ));
+        if prepared.descriptor.id != request.effect_id {
+            return Err(BackendError::native(format!(
+                "prepared effect {} does not match requested effect {}",
+                prepared.descriptor.id, request.effect_id
+            )));
         }
-        let descriptor = self
-            .effects
-            .descriptors()
-            .into_iter()
-            .find(|descriptor| descriptor.id == request.effect_id)
-            .ok_or_else(|| {
-                BackendError::unsupported(format!("unknown effect: {}", request.effect_id))
-            })?;
-
-        let mut processor = self
-            .effects
-            .host
-            .create(&request.effect_id)
-            .map_err(|error| BackendError::native(format!("effect creation failed: {error}")))?;
-        // Parameters are applied before the processor reaches the router, so
-        // the first block it ever sees is already configured rather than
-        // running a default the user did not ask for.
-        for (parameter, value) in &request.parameters {
-            processor
-                .set_parameter(parameter, *value)
-                .map_err(|error| BackendError::native(format!("effect parameter: {error}")))?;
+        let expected_spec = WindowsRouting::effect_spec(WindowsRouting::block_frames());
+        if prepared.spec != expected_spec {
+            return Err(BackendError::native(format!(
+                "prepared effect audio spec {:?} does not match Windows route spec {:?}",
+                prepared.spec, expected_spec
+            )));
         }
-
+        let spec = prepared.spec;
+        let descriptor = prepared.descriptor;
+        let processor = prepared.processor;
         let ids = effect_ids(&request.instance_id);
         let instance = EffectInstance {
             config: EffectInstanceConfig {
@@ -207,30 +287,24 @@ impl WindowsAudioDriver {
             destination: None,
             error: None,
             diagnostics: None,
+            lifecycle: pw_graph_effects::EffectLifecycle::Active,
+            health: pw_graph_effects::EffectHealth::Healthy,
         };
 
         if self.routing.is_none() {
             self.routing = Some(WindowsRouting::start()?);
         }
         let routing = self.routing.as_mut().expect("routing was just started");
-        routing.add_effect(
-            ids.input,
-            ids.output,
-            processor,
-            WindowsRouting::effect_spec(WindowsRouting::block_frames()),
-        )?;
+        routing.add_prepared_effect(ids.input, ids.output, processor, spec)?;
         if !request.enabled {
             routing.set_effect_bypassed(ids.input, true)?;
         }
-
         if let Err(error) = Self::draw_effect(
             &mut self.graph,
             &instance,
             &descriptor.name,
             request.position,
         ) {
-            // The node could not be drawn, so nothing must be left behind in
-            // the router either.
             let routing = self.routing.as_mut().expect("routing exists");
             let _ = routing.remove_effect(ids.input);
             return Err(error);
@@ -242,97 +316,40 @@ impl WindowsAudioDriver {
         Ok(instance)
     }
 
-    /// Create an effect owned by one persisted application route.
+    /// Activate a prepared effect owned by one persisted application route.
     ///
     /// Route effects use the same realtime host and processor registry as
     /// ordinary effect nodes, but remain private to the route owner so they
     /// cannot be serialized as a second, free-standing effect by the UI.
-    pub(super) fn create_application_effect(
+    pub(super) fn create_application_effect_prepared(
         &mut self,
         config: EffectInstanceConfig,
         position: [f32; 2],
+        prepared: PreparedEffect,
     ) -> BackendResult<EffectInstance> {
-        if config.instance_id.trim().is_empty() {
-            return Err(BackendError::native(
-                "a persisted application effect needs a non-empty instance ID",
-            ));
-        }
-        if config.module_path.is_some() {
-            return Err(BackendError::unsupported(
-                "Windows effect modules are not yet hosted by the realtime effect runtime",
-            ));
-        }
-        if self.effects.instances.contains_key(&config.instance_id) {
-            return Err(BackendError::native(format!(
-                "an effect instance already exists as {}",
-                config.instance_id
-            )));
-        }
-        let descriptor = self
-            .effects
-            .descriptors()
-            .into_iter()
-            .find(|descriptor| descriptor.id == config.effect_id)
-            .ok_or_else(|| {
-                BackendError::unsupported(format!("unknown effect: {}", config.effect_id))
-            })?;
-        let mut processor = self
-            .effects
-            .host
-            .create(&config.effect_id)
-            .map_err(|error| BackendError::native(format!("effect creation failed: {error}")))?;
-        for (parameter, value) in &config.parameters {
-            processor
-                .set_parameter(parameter, *value)
-                .map_err(|error| BackendError::native(format!("effect parameter: {error}")))?;
-        }
-
-        let ids = effect_ids(&config.instance_id);
-        let instance = EffectInstance {
-            config: config.clone(),
-            node_id: ids.node,
-            input_port: ids.input,
-            output_port: ids.output,
-            source: None,
-            destination: None,
-            error: None,
-            diagnostics: None,
-        };
-        if self.routing.is_none() {
-            self.routing = Some(WindowsRouting::start()?);
-        }
-        let routing = self.routing.as_mut().expect("routing was just started");
-        routing.add_effect(
-            ids.input,
-            ids.output,
-            processor,
-            WindowsRouting::effect_spec(WindowsRouting::block_frames()),
+        let instance = self.create_effect_prepared(
+            EffectNodeRequest {
+                instance_id: config.instance_id.clone(),
+                effect_id: config.effect_id.clone(),
+                module_path: config.module_path.clone(),
+                enabled: config.enabled,
+                parameters: config.parameters.clone(),
+                channel_policy: config.channel_policy,
+                position,
+            },
+            prepared,
         )?;
-        if !config.enabled {
-            if let Err(error) = routing.set_effect_bypassed(ids.input, true) {
-                let _ = routing.remove_effect(ids.input);
-                return Err(error);
-            }
-        }
-
-        if let Err(error) =
-            Self::draw_effect(&mut self.graph, &instance, &descriptor.name, position)
-        {
-            let _ = routing.remove_effect(ids.input);
-            return Err(error);
-        }
-        self.positions.insert(ids.node, position);
-        self.effect_positions
-            .insert(config.instance_id.clone(), position);
-        self.effects.remember(instance.clone());
         self.effects.mark_route_instance(config.instance_id);
         Ok(instance)
     }
 
-    /// Cut an existing link and put a new effect in the gap.
-    pub(super) fn insert_effect_into_link(
+    /// Transactional insertion for an already-prepared processor. The direct
+    /// link is left untouched until node activation has succeeded, and every
+    /// subsequent routing failure rolls back to the original endpoints.
+    pub(super) fn insert_effect_prepared_into_link(
         &mut self,
         request: EffectInsertRequest,
+        prepared: PreparedEffect,
     ) -> BackendResult<EffectInstance> {
         let source = request.source.clone();
         let destination = request.destination.clone();
@@ -346,19 +363,14 @@ impl WindowsAudioDriver {
             .ok_or_else(|| BackendError::native("the link to insert into is no longer present"))?;
 
         let instance_id = request.instance_id.clone();
-        let instance = self.create_effect(request.into())?;
-
+        let instance = self.create_effect_prepared(request.into(), prepared)?;
         let inserted = (|| {
             self.disconnect(direct)?;
             self.connect(output, instance.input_port)?;
             self.connect(instance.output_port, input)?;
             Ok::<(), BackendError>(())
         })();
-
         if let Err(error) = inserted {
-            // Put the graph back exactly as it was: destroy the node, then
-            // restore the link it was supposed to sit inside. A half-inserted
-            // effect leaves audio going nowhere.
             let cleanup = self.destroy_effect(&instance_id);
             let restore = if self.graph.link(direct).is_some() {
                 Ok(())
@@ -384,20 +396,14 @@ impl WindowsAudioDriver {
                 also.join("; ")
             )));
         }
-
-        // Recorded only once the routing succeeded, so a failed insertion
-        // never leaves endpoints that removal would try to restore.
-        let instance = {
-            let stored = self
-                .effects
-                .instances
-                .get_mut(&instance_id)
-                .expect("the instance was just created");
-            stored.source = Some(source);
-            stored.destination = Some(destination);
-            stored.clone()
-        };
-        Ok(instance)
+        let stored = self
+            .effects
+            .instances
+            .get_mut(&instance_id)
+            .expect("the instance was just created");
+        stored.source = Some(source);
+        stored.destination = Some(destination);
+        Ok(stored.clone())
     }
 
     /// Remove an effect, restoring the link it was inserted into.

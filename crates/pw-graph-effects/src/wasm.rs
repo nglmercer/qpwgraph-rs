@@ -110,12 +110,16 @@ impl WasmEffectProvider {
     pub fn new(path: impl Into<PathBuf>, requested_id: impl Into<String>) -> Self {
         let path = path.into();
         let requested_id = requested_id.into();
-        let (descriptor, io) = sidecar_metadata(&path, &requested_id);
+        // Request-time providers are deliberately filesystem-free. The
+        // manager may construct this lightweight descriptor while the UI is
+        // queuing an effect; the module and optional sidecar are validated on
+        // the bounded preparation worker instead.
+        let descriptor = default_descriptor(&path, &requested_id);
         Self {
             path,
             requested_id,
             descriptor,
-            io,
+            io: EffectIoCapabilities::stereo(),
         }
     }
 
@@ -185,6 +189,7 @@ impl EffectProvider for WasmEffectProvider {
             return Err(EffectError::PreparationCancelled);
         }
         let started = std::time::Instant::now();
+        let sidecar = read_sidecar_manifest(&self.path)?;
         let component = self.load_component(&request.cancellation)?;
         let mut processor = WasmProcessor::instantiate(&component, request.spec)?;
         if processor.descriptor.id != request.effect_id
@@ -194,6 +199,14 @@ impl EffectProvider for WasmEffectProvider {
                 "module descriptor id '{}' does not match requested effect '{}'",
                 processor.descriptor.id, request.effect_id
             )));
+        }
+        if let Some(sidecar) = sidecar {
+            if sidecar.descriptor.id != processor.descriptor.id {
+                return Err(EffectError::InvalidWasmManifest(format!(
+                    "sidecar descriptor id '{}' does not match module descriptor id '{}'",
+                    sidecar.descriptor.id, processor.descriptor.id
+                )));
+            }
         }
         apply_parameters(&mut processor, &request.parameters)?;
         if request.cancellation.is_cancelled() {
@@ -221,8 +234,8 @@ fn sidecar_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(feature = "wasm")]
-fn sidecar_metadata(path: &Path, requested_id: &str) -> (EffectDescriptor, EffectIoCapabilities) {
-    let default_descriptor = EffectDescriptor {
+fn default_descriptor(path: &Path, requested_id: &str) -> EffectDescriptor {
+    EffectDescriptor {
         id: requested_id.to_owned(),
         name: path
             .file_stem()
@@ -232,14 +245,25 @@ fn sidecar_metadata(path: &Path, requested_id: &str) -> (EffectDescriptor, Effec
         vendor: "WASM".into(),
         version: "unknown".into(),
         parameters: Vec::new(),
-    };
-    let Ok(bytes) = std::fs::read(sidecar_path(path)) else {
-        return (default_descriptor, EffectIoCapabilities::stereo());
-    };
-    match WasmManifest::from_json(&bytes) {
-        Ok(manifest) => (manifest.descriptor, manifest.io),
-        Err(_) => (default_descriptor, EffectIoCapabilities::stereo()),
     }
+}
+
+#[cfg(feature = "wasm")]
+fn read_sidecar_manifest(path: &Path) -> Result<Option<WasmManifest>, EffectError> {
+    let sidecar = sidecar_path(path);
+    let bytes = match std::fs::read(&sidecar) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(EffectError::InvalidWasmManifest(format!(
+                "could not read {}: {error}",
+                sidecar.display()
+            )));
+        }
+    };
+    WasmManifest::from_json(&bytes).map(Some).map_err(|error| {
+        EffectError::InvalidWasmManifest(format!("could not parse {}: {error}", sidecar.display()))
+    })
 }
 
 #[cfg(feature = "wasm")]
@@ -719,6 +743,32 @@ mod runtime_tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("WASM"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_sidecar_manifest_fails_visibly_during_preparation() {
+        let path = unique_module_path();
+        let sidecar = path.with_extension("json");
+        fs::write(&path, test_module()).unwrap();
+        fs::write(&sidecar, b"{ not valid json").unwrap();
+        let provider = WasmEffectProvider::new(&path, "test.wasm");
+        let error = provider
+            .prepare_instance(EffectPrepareRequest {
+                effect_id: "test.wasm".into(),
+                module_path: Some(path.display().to_string()),
+                spec: AudioSpec {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    max_frames: 32,
+                },
+                parameters: BTreeMap::new(),
+                cancellation: EffectCancellation::default(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("could not parse"));
+        assert!(error.to_string().contains(&sidecar.display().to_string()));
+        fs::remove_file(sidecar).unwrap();
         fs::remove_file(path).unwrap();
     }
 

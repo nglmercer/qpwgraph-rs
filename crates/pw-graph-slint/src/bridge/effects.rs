@@ -2,7 +2,7 @@ use crate::source::ApplicationDriver;
 use pw_graph_backend::{
     EffectCreateRequest, EffectEvent, EffectInstance, EffectTarget, GraphDriver,
 };
-use pw_graph_config::{AppConfig, PersistedEffect};
+use pw_graph_config::PersistedEffect;
 use pw_graph_effects::{ChannelPolicy, EffectDescriptor, EffectParameter};
 use pw_graph_i18n::I18n;
 use slint::{Model, ModelRc, SharedString, VecModel};
@@ -13,6 +13,8 @@ use std::time::Instant;
 
 use super::app::Application;
 use super::{EffectParameterRow, EffectRow, MainWindow};
+
+pub(crate) use super::effects_restore::{restore_inserted_effects, restore_standalone_effects};
 
 fn default_parameters(descriptor: &EffectDescriptor) -> BTreeMap<String, f32> {
     descriptor
@@ -28,98 +30,6 @@ fn available_descriptors(driver: &dyn GraphDriver) -> Vec<EffectDescriptor> {
         pw_graph_effects::EffectHost::new().descriptors()
     } else {
         descriptors
-    }
-}
-
-pub(crate) fn restore_standalone_effects(
-    source: &mut ApplicationDriver,
-    config: &AppConfig,
-    status: &mut String,
-    i18n: &I18n,
-) {
-    let saved = config
-        .effects
-        .iter()
-        .filter(|effect| effect.source.is_none() && effect.destination.is_none())
-        .cloned()
-        .collect::<Vec<_>>();
-    restore_saved_effects(source, saved, status, i18n);
-}
-
-pub(crate) fn restore_inserted_effects(
-    source: &mut ApplicationDriver,
-    config: &AppConfig,
-    status: &mut String,
-    i18n: &I18n,
-) {
-    let saved = config
-        .effects
-        .iter()
-        .filter(|effect| effect.source.is_some() && effect.destination.is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    restore_saved_effects(source, saved, status, i18n);
-}
-
-fn restore_saved_effects(
-    source: &mut ApplicationDriver,
-    saved: Vec<PersistedEffect>,
-    status: &mut String,
-    i18n: &I18n,
-) {
-    if saved.is_empty() {
-        return;
-    }
-    if !source.supports_effect_nodes() {
-        status.push_str(" · ");
-        status.push_str(&i18n.format(
-            "status.restore_effects_unavailable",
-            &[("count", saved.len().to_string())],
-        ));
-        return;
-    }
-
-    for saved in saved {
-        let result = match (&saved.source, &saved.destination) {
-            (Some(source_port), Some(destination_port)) => source
-                .connect_by_key_if_missing(source_port, destination_port)
-                .map(|_| ())
-                .and_then(|_| {
-                    source
-                        .begin_create_effect(EffectCreateRequest {
-                            instance_id: saved.instance.instance_id.clone(),
-                            effect_id: saved.instance.effect_id.clone(),
-                            module_path: saved.instance.module_path.clone(),
-                            enabled: saved.instance.enabled,
-                            parameters: saved.instance.parameters.clone(),
-                            channel_policy: saved.instance.channel_policy,
-                            target: EffectTarget::Insert {
-                                source: source_port.clone(),
-                                destination: destination_port.clone(),
-                                position: saved.position,
-                            },
-                        })
-                        .map(|_| ())
-                }),
-            (None, None) => source
-                .begin_create_effect(EffectCreateRequest {
-                    instance_id: saved.instance.instance_id.clone(),
-                    effect_id: saved.instance.effect_id.clone(),
-                    module_path: saved.instance.module_path.clone(),
-                    enabled: saved.instance.enabled,
-                    parameters: saved.instance.parameters.clone(),
-                    channel_policy: saved.instance.channel_policy,
-                    target: EffectTarget::Standalone {
-                        position: saved.position,
-                    },
-                })
-                .map(|_| ()),
-            _ => Err("effect routing is incomplete".into()),
-        };
-        if let Err(error) = result {
-            status.push_str(" · ");
-            status.push_str(&i18n.format("status.restore_effect", &[("error", error)]));
-        }
     }
 }
 
@@ -188,7 +98,8 @@ pub(crate) fn create_effect(window: &MainWindow, application: &mut Application) 
     match result {
         Ok(ticket) => {
             let name = descriptor.name.clone();
-            cancel_effect_setup(window, application);
+            application.pending_effect_tickets.insert(ticket);
+            finish_effect_setup(window, application);
             application.status = format!("{name}: loading (ticket {})", ticket.0);
         }
         Err(error) => {
@@ -212,6 +123,15 @@ pub(crate) fn poll_effect_events(application: &mut Application) -> bool {
     let mut changed = false;
     for event in events {
         changed = true;
+        let terminal_ticket = match &event {
+            EffectEvent::Ready { ticket, .. }
+            | EffectEvent::Failed { ticket, .. }
+            | EffectEvent::Cancelled { ticket } => Some(*ticket),
+            EffectEvent::Loading { .. } => None,
+        };
+        if let Some(ticket) = terminal_ticket {
+            application.pending_effect_tickets.remove(&ticket);
+        }
         match event {
             EffectEvent::Loading { ticket, stage } => {
                 application.status = format!("Effect ticket {}: {stage:?}", ticket.0);
@@ -529,6 +449,7 @@ pub(crate) fn effect_rows(source: &ApplicationDriver, i18n: &I18n) -> Vec<Effect
                 instance_id: SharedString::from(instance.config.instance_id.clone()),
                 name: SharedString::from(name),
                 vendor: SharedString::from(vendor),
+                health: SharedString::from(instance.health.label()),
                 diagnostics: SharedString::from(diagnostics),
                 description: SharedString::from(description),
                 enabled: instance.config.enabled,
@@ -643,6 +564,7 @@ pub(crate) fn sync_effect_rows(
             instance_id: SharedString::from(instance.config.instance_id),
             name: SharedString::from(name),
             vendor: SharedString::from(vendor),
+            health: SharedString::from(instance.health.label()),
             diagnostics: SharedString::from(diagnostics),
             description: current_row.description.clone(),
             enabled: instance.config.enabled,
@@ -770,10 +692,32 @@ pub(crate) fn prepare_effect_draft(window: &MainWindow, application: &mut Applic
 }
 
 pub(crate) fn cancel_effect_setup(window: &MainWindow, application: &mut Application) {
+    cancel_pending_effects(application);
+    finish_effect_setup(window, application);
+}
+
+/// Close the setup form after a successful queue operation. This must not
+/// cancel the ticket that was just returned: preparation continues while the
+/// dialog is closed and the control pump will publish its terminal event.
+fn finish_effect_setup(window: &MainWindow, application: &mut Application) {
     application.effect_draft_id = None;
     application.effect_draft_enabled = true;
     application.effect_draft_parameters.clear();
     window.set_effect_configuring(false);
+}
+
+/// Cancel only user-created pending tickets. Restore tickets are owned by the
+/// backend restore lifecycle and are deliberately allowed to finish in the
+/// background. A race with a terminal event is harmless; the backend reports
+/// that ticket as completed and the next pump removes it from this set.
+pub(crate) fn cancel_pending_effects(application: &mut Application) {
+    let tickets = std::mem::take(&mut application.pending_effect_tickets);
+    for ticket in tickets {
+        if let Err(error) = application.source.cancel_effect(ticket) {
+            application.status =
+                format!("Effect ticket {} could not be cancelled: {error}", ticket.0);
+        }
+    }
 }
 
 pub(crate) fn select_effect_draft(
