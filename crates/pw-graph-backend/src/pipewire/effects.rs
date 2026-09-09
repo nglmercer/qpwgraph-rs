@@ -49,6 +49,7 @@ struct CallbackState {
     output_ports: [AtomicPtr<c_void>; DSP_CHANNELS],
     enabled: AtomicBool,
     processor_failed: AtomicBool,
+    hush_diagnostics: Option<std::sync::Arc<pw_graph_effects::HushDiagnostics>>,
     /// Bit 0/1 reports a missing FL/FR input while the matching output buffer
     /// is active. This is deliberately metadata only: it never participates in
     /// sample generation.
@@ -70,6 +71,7 @@ impl CallbackState {
             output_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             enabled: AtomicBool::new(enabled),
             processor_failed: AtomicBool::new(false),
+            hush_diagnostics: processor.hush_diagnostics(),
             dangling_inputs: AtomicU32::new(0),
             processor: Mutex::new(ProcessorState {
                 processor,
@@ -176,7 +178,7 @@ impl CallbackState {
         copy_inputs_to_outputs(inputs, outputs, frame_count);
 
         let enabled = self.enabled.load(Ordering::Acquire);
-        if !enabled {
+        if !enabled && self.hush_diagnostics.is_none() {
             // Disabled effects remain transparent for connected channels and
             // produce exact silence for dangling or non-finite inputs.
             return;
@@ -204,6 +206,7 @@ impl CallbackState {
             processor,
             interleaved,
         } = &mut *state;
+        processor.set_host_bypass(!enabled);
         let samples = &mut interleaved[..frame_count * DSP_CHANNELS];
         for frame in 0..frame_count {
             for channel in 0..DSP_CHANNELS {
@@ -408,6 +411,7 @@ impl NativeEffect {
             source: None,
             destination: None,
             error: None,
+            diagnostics: None,
         };
         Ok(Self {
             instance,
@@ -453,7 +457,11 @@ impl NativeEffect {
     pub(super) fn snapshot(&self) -> EffectInstance {
         let mut instance = self.instance.clone();
         let callback = self.runtime.callback();
-        if callback.processor_failed.load(Ordering::Relaxed) {
+        if let Some(diagnostics) = &callback.hush_diagnostics {
+            instance.diagnostics = Some(diagnostics.status_text());
+            instance.error = diagnostics.failure_reason();
+        }
+        if callback.processor_failed.load(Ordering::Relaxed) && instance.error.is_none() {
             instance.error = Some("effect processor reported a realtime or worker failure".into());
         } else if let Some(message) =
             dangling_input_message(callback.dangling_inputs.load(Ordering::Acquire))
@@ -468,30 +476,38 @@ impl NativeEffect {
     pub(super) fn set_enabled(&mut self, enabled: bool) {
         let callback = self.runtime.callback();
         let previous = callback.enabled.swap(enabled, Ordering::AcqRel);
-        if previous != enabled {
+        if previous != enabled && callback.hush_diagnostics.is_none() {
             // An enabled/disabled transition is a bypass transition too. A
             // stateful processor must discard queued wet audio and recurrent
             // state before it is allowed back into the graph. This lock is
             // taken only by the control path; the realtime callback uses
             // `try_lock` and never waits for it.
             if let Ok(mut state) = callback.processor.lock() {
-                state.processor.reset();
+                if !state.processor.set_host_bypass(!enabled) {
+                    state.processor.reset();
+                }
             }
         }
         self.instance.config.enabled = enabled;
     }
 
     pub(super) fn set_parameter(&mut self, parameter: &str, value: f32) -> BackendResult<()> {
-        let mut state = self
-            .runtime
-            .callback()
-            .processor
-            .lock()
-            .map_err(|_| BackendError::native("effect processor lock was poisoned"))?;
-        state
-            .processor
-            .set_parameter(parameter, value)
-            .map_err(BackendError::native)?;
+        if let Some(diagnostics) = &self.runtime.callback().hush_diagnostics {
+            diagnostics
+                .set_control_parameter(parameter, value)
+                .map_err(BackendError::native)?;
+        } else {
+            let mut state = self
+                .runtime
+                .callback()
+                .processor
+                .lock()
+                .map_err(|_| BackendError::native("effect processor lock was poisoned"))?;
+            state
+                .processor
+                .set_parameter(parameter, value)
+                .map_err(BackendError::native)?;
+        }
         self.instance
             .config
             .parameters

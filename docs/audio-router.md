@@ -182,3 +182,17 @@ Over four seconds the same route reports 191,520 frames and no fault at all.
 A route read very soon after connecting can still report `SourceStarved`: the
 capture device takes a moment to fill its first buffer, and the route honestly
 had a short block. It clears itself once the device is running.
+
+## Hush timeline and diagnostics
+
+Hush's asynchronous scheduling is implemented in `pw-graph-effects`, shared by
+PipeWire, the Windows router, and tests. It schedules continuous host-frame
+ranges, independent of the router cycle size, with 50 ms total wet/dry latency.
+Host bypass uses `set_host_bypass`: Hush continues advancing its delayed dry
+stream; legacy effects retain their existing bypass behavior.
+
+Router setup exposes a shared `HushDiagnostics` handle. Windows effect snapshots
+read this control-thread handle to show worker state and failure details without
+locking the audio processor. PipeWire captures the same handle during setup.
+See [Hush runtime validation](hush-runtime-validation.md) for tests, queue policy,
+measurements, and remaining platform validation.

@@ -95,6 +95,7 @@ impl DeviceEndpoint {
 /// input, so continue from its output".
 struct Effect {
     processor: ProcessorId,
+    diagnostics: Option<std::sync::Arc<pw_graph_effects::HushDiagnostics>>,
     output_port: PortId,
 }
 
@@ -281,19 +282,33 @@ impl WindowsRouting {
             return Err(BackendError::native("that effect is already registered"));
         }
         let id = ProcessorId(self.take_id());
-        self.router
-            .with(move |core| core.add_processor(id, processor, spec))
+        let diagnostics = self
+            .router
+            .with(move |core| {
+                core.add_processor(id, processor, spec)?;
+                Ok::<_, crate::router::engine::RouterError>(core.hush_diagnostics(id))
+            })
             .map_err(router_stopped)?
             .map_err(router_error)?;
         self.effects.insert(
             input_port,
             Effect {
                 processor: id,
+                diagnostics,
                 output_port,
             },
         );
         self.effect_outputs.insert(output_port, input_port);
         Ok(())
+    }
+
+    pub(super) fn effect_diagnostics(
+        &self,
+        input_port: PortId,
+    ) -> Option<&pw_graph_effects::HushDiagnostics> {
+        self.effects
+            .get(&input_port)
+            .and_then(|effect| effect.diagnostics.as_deref())
     }
 
     /// Remove an effect node, along with any links that touched it.

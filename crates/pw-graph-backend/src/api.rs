@@ -162,6 +162,8 @@ pub struct EffectInstance {
     pub source: Option<PortKey>,
     pub destination: Option<PortKey>,
     pub error: Option<String>,
+    /// Control-thread worker status, separate from an effect failure.
+    pub diagnostics: Option<String>,
 }
 
 /// Effect operations are intentionally separate from topology operations. A

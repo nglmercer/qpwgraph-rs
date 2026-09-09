@@ -2,11 +2,22 @@ name: Hush model tests
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "vendor/nnnoiseless/**"
+      - "crates/pw-graph-effects/**"
+      - "crates/pw-graph-backend/**"
+      - "crates/pw-graph-slint/**"
+      - ".github/workflows/hush.yml"
+      - "Cargo.lock"
   pull_request:
     paths:
       - "vendor/nnnoiseless/**"
       - "crates/pw-graph-effects/**"
-      - "crates/pw-graph-effects/resources/hush/**"
+      - "crates/pw-graph-backend/**"
+      - "crates/pw-graph-slint/**"
+      - ".github/workflows/hush.yml"
       - "Cargo.lock"
 
 permissions:

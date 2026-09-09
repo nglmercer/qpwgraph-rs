@@ -457,6 +457,7 @@ pub(crate) fn effect_rows(source: &ApplicationDriver, i18n: &I18n) -> Vec<Effect
                 }
                 None => vendor,
             };
+            let diagnostics = instance.diagnostics.unwrap_or_default();
             let parameters = descriptor
                 .map(|descriptor| {
                     descriptor
@@ -484,6 +485,7 @@ pub(crate) fn effect_rows(source: &ApplicationDriver, i18n: &I18n) -> Vec<Effect
                 instance_id: SharedString::from(instance.config.instance_id.clone()),
                 name: SharedString::from(name),
                 vendor: SharedString::from(vendor),
+                diagnostics: SharedString::from(diagnostics),
                 description: SharedString::from(description),
                 enabled: instance.config.enabled,
                 parameters: ModelRc::from(Rc::new(VecModel::from(parameters))),
@@ -538,6 +540,7 @@ pub(crate) fn sync_effect_rows(
             Some(error) => i18n.format("effects.error", &[("vendor", vendor), ("error", error)]),
             None => vendor,
         };
+        let diagnostics = instance.diagnostics.unwrap_or_default();
         let parameter_rows = descriptor
             .map(|descriptor| {
                 descriptor
@@ -596,6 +599,7 @@ pub(crate) fn sync_effect_rows(
             instance_id: SharedString::from(instance.config.instance_id),
             name: SharedString::from(name),
             vendor: SharedString::from(vendor),
+            diagnostics: SharedString::from(diagnostics),
             description: current_row.description.clone(),
             enabled: instance.config.enabled,
             parameters,

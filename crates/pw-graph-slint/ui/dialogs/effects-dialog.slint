@@ -34,12 +34,18 @@ export component EffectsDialog inherits DialogShell {
                 spacing: 8px;
                 if root.effects.length == 0: Text { text: UiI18n.localized("effects.no_available"); color: #9eafbc; font-size: 11px * UiTheme.panel-scale; }
                 for effect in root.effects: Rectangle {
-                    height: 76px + effect.parameters.length * 30px; background: #2a333d; border-color: #40505f; border-width: 1px; border-radius: 5px;
+                    property <length> diagnostics-height: effect.diagnostics == "" ? 0px : diagnostic.height + 8px;
+                    height: 76px + effect.parameters.length * 30px + self.diagnostics-height; background: #2a333d; border-color: #40505f; border-width: 1px; border-radius: 5px;
                     Text { x: 11px; y: 8px; width: parent.width - 180px; height: 17px; text: effect.name; color: #edf3f7; font-size: 12px * UiTheme.panel-scale; overflow: elide; }
                     Text { x: 11px; y: 27px; width: parent.width - 180px; height: 15px; text: effect.vendor; color: #96a8b6; font-size: 9px * UiTheme.panel-scale; overflow: elide; }
                     Text { x: 11px; y: 47px; width: parent.width - 180px; height: 18px; text: effect.description; color: #b9c7d1; font-size: 10px * UiTheme.panel-scale; overflow: elide; }
+                    diagnostic := Text {
+                        x: 11px; y: 70px; width: parent.width - 22px;
+                        text: effect.diagnostics; visible: effect.diagnostics != "";
+                        color: #b9c7d1; font-size: 10px * UiTheme.panel-scale; wrap: word-wrap;
+                    }
                     for parameter[index] in effect.parameters: Rectangle {
-                        y: 72px + (index * 30px);
+                        y: 72px + parent.diagnostics-height + (index * 30px);
                         height: 26px;
                         Text { x: 11px; width: 102px; height: parent.height; text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : ""); color: #aebdca; font-size: 9px * UiTheme.panel-scale; vertical-alignment: center; overflow: elide; }
                         if parameter.boolean: CheckBox {

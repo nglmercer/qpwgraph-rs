@@ -568,6 +568,16 @@ impl RouterCore {
         Ok(())
     }
 
+    /// Control-thread diagnostics handle; audio callbacks only update atomics.
+    pub fn hush_diagnostics(
+        &self,
+        id: ProcessorId,
+    ) -> Option<Arc<pw_graph_effects::HushDiagnostics>> {
+        self.processors
+            .get(&id)
+            .and_then(|slot| slot.processor.hush_diagnostics())
+    }
+
     /// Remove a source, handing it back so it is dropped on the caller's
     /// thread rather than the router's.
     pub fn remove_source(&mut self, id: SourceId) -> Result<Box<dyn AudioSource>, RouterError> {
@@ -647,7 +657,9 @@ impl RouterCore {
             slot.bypassed = bypassed;
             // Coming out of bypass with a tail from before the gap would play
             // audio that never went in.
-            slot.processor.reset();
+            if !slot.processor.set_host_bypass(bypassed) {
+                slot.processor.reset();
+            }
         }
         Ok(())
     }
@@ -1005,7 +1017,8 @@ impl RouterCore {
                     let Some(slot) = processors.get_mut(id) else {
                         continue;
                     };
-                    if slot.bypassed {
+                    let aligned_bypass = slot.processor.set_host_bypass(slot.bypassed);
+                    if slot.bypassed && !aligned_bypass {
                         continue;
                     }
                     branch.fallback[..samples].copy_from_slice(block);

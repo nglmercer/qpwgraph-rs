@@ -16,6 +16,7 @@ mod hush_worker;
 pub mod wasm;
 pub use adaptive_noise::AdaptiveNoiseSuppressor;
 pub use hush_noise::HushNoiseSuppressor;
+pub use hush_worker::HushDiagnostics;
 
 pub const NOISE_GATE_ID: &str = "builtin.noise-gate";
 pub const NOISE_SUPPRESSOR_ID: &str = "builtin.adaptive-noise-suppressor";
@@ -111,10 +112,19 @@ pub trait EffectProcessor: Send {
     /// to force disconnected stateful channels to silence and to invalidate
     /// stale worker generations.
     fn set_channel_mask(&mut self, _mask: u16) {}
+    /// Set host bypass without a timeline discontinuity. Return true when
+    /// process() must still run to maintain the processor's aligned dry path.
+    fn set_host_bypass(&mut self, _bypassed: bool) -> bool {
+        false
+    }
     /// Report a persistent control/worker failure while still allowing the
     /// processor to publish its deterministic audio fallback. Hosts can
     /// surface the condition without replacing that aligned fallback with an
     /// instantaneous dry copy.
+    /// Obtain a shared diagnostic handle during control-thread setup.
+    fn hush_diagnostics(&self) -> Option<std::sync::Arc<HushDiagnostics>> {
+        None
+    }
     fn has_failed(&self) -> bool {
         false
     }

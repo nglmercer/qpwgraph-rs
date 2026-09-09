@@ -27,3 +27,10 @@ feature table is reduced to qpwgraph's library use: the CLI, microphone
 example, DASP adapters, and browser bindings are not enabled. qpwgraph adds
 the `hush` feature to `pw-graph-effects`; production model loading is handled
 by that crate on a control/worker thread and never by `process()`.
+
+The September 2026 qpwgraph adapter fix changes no vendor DSP or neural weights.
+It replaces callback-sequence scheduling with host-frame timelines, preserves
+native frame assembly/resampler continuity, and synchronously acknowledges
+worker initialization. The resampler's centered sinc lookahead delays sample
+availability without shifting sample positions. Direct model tests and a
+separate qpwgraph-to-direct-Hush reference test cover the two layers independently.

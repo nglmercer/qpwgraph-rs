@@ -205,6 +205,7 @@ impl WindowsAudioDriver {
             source: None,
             destination: None,
             error: None,
+            diagnostics: None,
         };
 
         if self.routing.is_none() {
@@ -294,6 +295,7 @@ impl WindowsAudioDriver {
             source: None,
             destination: None,
             error: None,
+            diagnostics: None,
         };
         if self.routing.is_none() {
             self.routing = Some(WindowsRouting::start()?);

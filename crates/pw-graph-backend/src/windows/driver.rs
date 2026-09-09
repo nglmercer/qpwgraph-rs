@@ -2145,7 +2145,18 @@ impl crate::api::EffectDriver for WindowsAudioDriver {
     }
 
     fn effect_instances(&self) -> Vec<crate::api::EffectInstance> {
-        self.effects.instances()
+        let mut instances = self.effects.instances();
+        for instance in &mut instances {
+            if let Some(diagnostics) = self
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.effect_diagnostics(instance.input_port))
+            {
+                instance.diagnostics = Some(diagnostics.status_text());
+                instance.error = diagnostics.failure_reason();
+            }
+        }
+        instances
     }
 
     fn supports_effect_nodes(&self) -> bool {

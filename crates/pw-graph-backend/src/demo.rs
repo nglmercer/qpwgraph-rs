@@ -299,6 +299,7 @@ impl DemoDriver {
             source: None,
             destination: None,
             error: None,
+            diagnostics: None,
         };
         self.effects
             .insert(instance.config.instance_id.clone(), instance.clone());
