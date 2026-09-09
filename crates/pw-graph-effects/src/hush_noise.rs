@@ -28,6 +28,24 @@ fn channel_is_connected(mask: u16, channel: usize) -> bool {
     channel < u16::BITS as usize && mask & (1u16 << channel) != 0
 }
 
+/// Return the only portion of a callback that is safe to read from the wet
+/// timeline. The callback's input is submitted immediately before this
+/// request, so the requested interval must end no later than its start.
+#[inline]
+fn safe_wet_request(
+    callback_start: u64,
+    frames: u32,
+    scheduling_frames: usize,
+) -> (u64, u32, usize) {
+    let prefix = (scheduling_frames as u64)
+        .saturating_sub(callback_start)
+        .min(frames as u64) as usize;
+    let start = callback_start.saturating_sub(scheduling_frames as u64);
+    let requested_frames = frames - prefix as u32;
+    debug_assert!(start.saturating_add(requested_frames as u64) <= callback_start);
+    (start, requested_frames, prefix)
+}
+
 fn descriptor() -> EffectDescriptor {
     EffectDescriptor {
         id: HUSH_NOISE_SUPPRESSOR_ID.into(),
@@ -127,6 +145,7 @@ impl HushNoiseSuppressor {
         self.input_frame_position = 0;
         if let Some(runtime) = &self.runtime {
             runtime.set_generation(self.generation);
+            runtime.request_generation_retry();
         }
         if reset_delay {
             if let Some(delay) = &mut self.dry_delay {
@@ -303,19 +322,17 @@ impl EffectProcessor for HushNoiseSuppressor {
                     .attenuation_bits
                     .load(std::sync::atomic::Ordering::Acquire),
             ) < 0.01;
+        let (wet_start, wet_frames, prefix) =
+            safe_wet_request(self.input_frame_position, frames, self.scheduling_frames);
         let wet_frames_available = if !runtime
             .diagnostics()
             .worker_failed
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            let prefix = (self.scheduling_frames as u64)
-                .saturating_sub(self.input_frame_position)
-                .min(frames as u64) as usize;
             runtime.pop_ready(
                 self.generation,
-                self.input_frame_position
-                    .saturating_sub(self.scheduling_frames as u64),
-                frames - prefix as u32,
+                wet_start,
+                wet_frames,
                 spec.channels,
                 &mut self.wet[prefix * spec.channels as usize..expected],
             )
@@ -440,7 +457,13 @@ impl EffectProcessor for HushNoiseSuppressor {
     }
 
     fn set_host_bypass(&mut self, bypassed: bool) -> bool {
+        let changed = self.host_bypass != bypassed;
         self.host_bypass = bypassed;
+        if changed && !bypassed {
+            if let Some(runtime) = &self.runtime {
+                runtime.request_retry();
+            }
+        }
         true
     }
 
@@ -470,7 +493,7 @@ impl EffectProcessor for HushNoiseSuppressor {
 
 /// Load the model once, on the caller's setup/control thread.  The audio
 /// callback never reads the filesystem or initializes Tract.
-fn shared_hush_model() -> Result<Arc<HushModel>, String> {
+pub(crate) fn shared_hush_model() -> Result<Arc<HushModel>, String> {
     static MODEL: OnceLock<Result<Arc<HushModel>, String>> = OnceLock::new();
     MODEL
         .get_or_init(|| {
@@ -740,6 +763,23 @@ mod tests {
         assert!(wet_changed, "bypass OFF never emitted wet Hush audio");
 
         assert!(host_disabled.set_host_bypass(false));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while host_disabled
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .resync_completed
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            let mut block = vec![0.2; 256];
+            let mut expected = vec![0.0; 256];
+            dry.process(&vec![0.2; 256], &mut expected);
+            host_disabled.process(&mut block, 256).unwrap();
+            assert!(Instant::now() < deadline, "host re-enable reset timed out");
+            thread::yield_now();
+        }
+        host_disabled.runtime.as_ref().unwrap().wait_idle();
         let mut resumed_wet = false;
         for block_index in 0..30 {
             let mut block = vec![0.2; 256];
@@ -984,25 +1024,39 @@ mod tests {
         })
         .unwrap();
         let d = p.diagnostics.as_ref().unwrap().clone();
-        // This is intentionally slower than the realtime budget. The worker
-        // must shed stale work and keep the producer bounded instead of
-        // accumulating seconds of latency.
-        d.frame_delay_ms.store(100, Release);
-        for _ in 0..240 {
+        // Prime a healthy worker first. The following phase then slows each
+        // native inference to a sustained factor above realtime, allowing the
+        // persistent estimator—not merely queue overflow—to classify it.
+        for _ in 0..24 {
             p.process(&mut [0.2; 128], 128).unwrap();
+            p.runtime.as_ref().unwrap().wait_idle();
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while d.resync_requests.load(Acquire) == 0 {
+        d.frame_delay_ms.store(6, Release);
+        let overload_deadline = Instant::now() + Duration::from_secs(30);
+        while d.worker_state.load(Acquire)
+            != crate::hush_worker::HushWorkerState::Overloaded.as_u32()
+        {
+            p.process(&mut [0.2; 128], 128).unwrap();
             assert!(
-                Instant::now() < deadline,
-                "slow worker never requested resync"
+                Instant::now() < overload_deadline,
+                "slow worker never became overloaded"
             );
-            thread::yield_now();
+            thread::sleep(Duration::from_micros(2_700));
         }
-        assert!(d.input_blocks_rejected.load(Relaxed) > 0);
+        p.process(&mut [0.2; 128], 128).unwrap();
+        assert!(d.input_blocks_skipped_overloaded.load(Relaxed) > 0);
         assert!(d.dry_frames_output.load(Relaxed) > 0);
         assert!(d.max_input_queue_depth.load(Relaxed) <= 128);
         assert!(!d.worker_failed.load(Acquire));
+        assert_eq!(
+            d.overload_reason.load(Acquire),
+            crate::hush_worker::HushOverloadReason::CpuTooSlow as u32
+        );
+        assert!(d.resync_requests.load(Relaxed) <= 1);
+        assert_eq!(
+            d.resync_completed.load(Relaxed),
+            d.resync_requests.load(Relaxed)
+        );
     }
 
     #[test]
@@ -1048,7 +1102,7 @@ mod tests {
         p.reset();
         p.process(&mut [0.2; 128], 128).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
-        while d.generation_resets.load(Acquire) == 0 {
+        while d.recovery_attempts.load(Acquire) == 0 {
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
@@ -1187,6 +1241,64 @@ mod tests {
     }
 
     #[test]
+    fn mono_and_partial_stereo_routes_only_run_connected_hush_channels() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut mono = HushNoiseSuppressor::default();
+        mono.prepare(AudioSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            max_frames: 480,
+        })
+        .unwrap();
+        for _ in 0..12 {
+            mono.process(&mut [0.2; 480], 480).unwrap();
+            mono.runtime.as_ref().unwrap().wait_idle();
+        }
+        let mono_diagnostics = mono.diagnostics.as_ref().unwrap();
+        assert_eq!(mono_diagnostics.active_hush_channels.load(Relaxed), 1);
+        assert!(mono_diagnostics.hush_frames_processed.load(Relaxed) > 0);
+
+        let mut partial = HushNoiseSuppressor::default();
+        partial
+            .prepare(AudioSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                max_frames: 480,
+            })
+            .unwrap();
+        partial.set_channel_mask(1);
+        let diagnostics = partial.diagnostics.as_ref().unwrap().clone();
+        let reset_deadline = Instant::now() + Duration::from_secs(90);
+        while diagnostics
+            .resync_completed
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            assert!(
+                Instant::now() < reset_deadline,
+                "mono channel-mask reset did not complete"
+            );
+            thread::yield_now();
+        }
+        for _ in 0..12 {
+            let mut block = vec![0.2; 960];
+            partial.process(&mut block, 480).unwrap();
+            partial.runtime.as_ref().unwrap().wait_idle();
+            assert!(block.chunks_exact(2).all(|stereo| stereo[1] == 0.0));
+        }
+        assert_eq!(diagnostics.active_hush_channels.load(Relaxed), 1);
+        // `hush_frames_processed` counts native inference calls. With the
+        // right input disconnected, it must not double as it would for two
+        // independent stereo denoisers.
+        assert!(diagnostics.hush_frames_processed.load(Relaxed) >= 8);
+        assert_eq!(
+            diagnostics.hush_channel_frames_processed.load(Relaxed),
+            diagnostics.hush_frames_processed.load(Relaxed) * 160
+        );
+    }
+
+    #[test]
     fn bypass_uses_fixed_fifty_ms_latency() {
         let mut processor = HushNoiseSuppressor::default();
         processor
@@ -1311,6 +1423,22 @@ mod tests {
         processor.process(&mut small, 128).unwrap();
         assert!(processor.scheduling_frames >= grown);
         assert!(grown >= initial);
+    }
+
+    #[test]
+    fn wet_request_never_includes_the_callback_just_submitted() {
+        for callback_start in [0, 1, 511, 512, 4_096, 48_000] {
+            for frames in [1, 128, 512, 2_048] {
+                for schedule in [40, 512, 2_048, 4_096] {
+                    let schedule = schedule.max(frames as usize);
+                    let (start, requested, _) = safe_wet_request(callback_start, frames, schedule);
+                    assert!(
+                        start + requested as u64 <= callback_start,
+                        "callback_start={callback_start} frames={frames} schedule={schedule}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1495,12 +1623,18 @@ mod tests {
                     .realtime_factor_bits
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
-            println!("frames={frames} duration_ms={:.3} latency_ms={:.3} worker_p95_us={} worker_p99_us={} wet_blocks_output={} dry_fallback_blocks={} wet_frames_output={} dry_frames_output={} wet_ratio={:.3} resync={}/{} stale_input/wet={}/{} realtime_factor={:.3} input_frames_rejected={} output_overruns={}", frames as f64 * 1000.0 / sample_rate as f64, latency_frames as f64 * 1000.0 / sample_rate as f64, percentile(95), percentile(99), diagnostics.wet_blocks_output.load(std::sync::atomic::Ordering::Relaxed), diagnostics.dry_fallback_blocks.load(std::sync::atomic::Ordering::Relaxed), wet_frames, dry_frames, wet_frames as f64 / (wet_frames + dry_frames).max(1) as f64, diagnostics.resync_requests.load(std::sync::atomic::Ordering::Relaxed), diagnostics.resync_completed.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_input_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_output_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), realtime_factor, diagnostics.input_frames_rejected.load(std::sync::atomic::Ordering::Relaxed), diagnostics.output_overruns.load(std::sync::atomic::Ordering::Relaxed));
+            println!("rate={sample_rate} channels={channels} quantum={frames} callback_audio_ms={:.3} latency_ms={:.3} worker_p95_us={} worker_p99_us={} wet_blocks_output={} dry_fallback_blocks={} wet_frames_output={} dry_frames_output={} wet_ratio={:.3} resync={}/{} stale_input/wet={}/{} lifetime_rt_factor={:.3} ewma_rt_factor={:.3} input_frames_rejected={} skipped_overload={} queue_overruns={} output_overruns={}", frames as f64 * 1000.0 / sample_rate as f64, latency_frames as f64 * 1000.0 / sample_rate as f64, percentile(95), percentile(99), diagnostics.wet_blocks_output.load(std::sync::atomic::Ordering::Relaxed), diagnostics.dry_fallback_blocks.load(std::sync::atomic::Ordering::Relaxed), wet_frames, dry_frames, wet_frames as f64 / (wet_frames + dry_frames).max(1) as f64, diagnostics.resync_requests.load(std::sync::atomic::Ordering::Relaxed), diagnostics.resync_completed.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_input_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_output_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), realtime_factor, f64::from_bits(diagnostics.ewma_realtime_factor_bits.load(std::sync::atomic::Ordering::Relaxed)), diagnostics.input_frames_rejected.load(std::sync::atomic::Ordering::Relaxed), diagnostics.input_blocks_skipped_overloaded.load(std::sync::atomic::Ordering::Relaxed), diagnostics.input_queue_overruns.load(std::sync::atomic::Ordering::Relaxed), diagnostics.output_overruns.load(std::sync::atomic::Ordering::Relaxed));
             println!(
-                "rate={sample_rate} channels={channels} callback_avg_us={average:.2} callback_p95_us={p95} callback_p99_us={p99} input_blocks={processed} hush_frames={} worker_avg_us={inference_average:.2} worker_max_us={inference_max} max_input_queue_depth={} max_output_queue_depth={} max_backlog_frames={} underruns={} input_overruns={} output_overruns={} input_blocks_pushed={} input_blocks_rejected={} input_frames_rejected={}",
+                "rate={sample_rate} channels={channels} quantum={frames} callback_avg_us={average:.2} callback_p95_us={p95} callback_p99_us={p99} input_blocks={processed} hush_inferences={} hush_channel_samples={} active_hush_channels={} worker_avg_us={inference_average:.2} worker_max_us={inference_max} stable_p95_us={} stable_p99_us={} max_input_queue_depth={} max_output_queue_depth={} max_backlog_frames={} underruns={} input_overruns={} input_queue_overruns={} output_overruns={} input_blocks_pushed={} input_blocks_rejected={} skipped_recovery={} skipped_overloaded={} input_frames_rejected={} resets={} recovery_attempts={} recovery_successes={}",
                 diagnostics
                     .hush_frames_processed
                     .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .hush_channel_frames_processed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics.active_hush_channels.load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics.stable_worker_p95_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000,
+                diagnostics.stable_worker_p99_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000,
                 diagnostics
                     .max_input_queue_depth
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -1517,6 +1651,9 @@ mod tests {
                     .input_overruns
                     .load(std::sync::atomic::Ordering::Relaxed),
                 diagnostics
+                    .input_queue_overruns
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
                     .output_overruns
                     .load(std::sync::atomic::Ordering::Relaxed),
                 diagnostics
@@ -1526,8 +1663,81 @@ mod tests {
                     .input_blocks_rejected
                     .load(std::sync::atomic::Ordering::Relaxed),
                 diagnostics
+                    .input_blocks_skipped_recovery
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .input_blocks_skipped_overloaded
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
                     .input_frames_rejected
                     .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .generation_resets
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .recovery_attempts
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .recovery_successes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release baseline for native nnnoiseless Hush"]
+    fn benchmark_direct_hush_rates() {
+        use nnnoiseless::{HushDenoiser, HUSH_FRAME_SIZE};
+
+        if cfg!(debug_assertions) {
+            eprintln!("run this native Hush baseline in release mode");
+            return;
+        }
+        let model = shared_hush_model().expect("embedded Hush model should prepare");
+        let input_frames: Vec<[f32; HUSH_FRAME_SIZE]> = (0..160)
+            .map(|frame_index| {
+                std::array::from_fn(|sample_index| {
+                    let sample = frame_index * HUSH_FRAME_SIZE + sample_index;
+                    0.18 * (sample as f32 * 0.071).sin() + 0.11 * (sample as f32 * 0.913).sin()
+                })
+            })
+            .collect();
+        for channels in [1_usize, 2] {
+            let mut denoisers: Vec<HushDenoiser> = (0..channels)
+                .map(|_| {
+                    model
+                        .denoiser_with_attenuation_db(40.0)
+                        .expect("native Hush denoiser should initialize")
+                })
+                .collect();
+            let mut timings = Vec::with_capacity(input_frames.len());
+            for input in &input_frames {
+                let started = Instant::now();
+                for denoiser in &mut denoisers {
+                    let mut output = [0.0; HUSH_FRAME_SIZE];
+                    denoiser
+                        .process_frame(&mut output, input)
+                        .expect("native Hush inference should succeed");
+                }
+                timings.push(started.elapsed().as_nanos() as u64);
+            }
+            timings.sort_unstable();
+            let total_ns: u64 = timings.iter().sum();
+            let percentile = |pct: usize| {
+                timings
+                    .get(timings.len() * pct / 100)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let factor =
+                total_ns as f64 * 16_000.0 / ((input_frames.len() * HUSH_FRAME_SIZE) as f64 * 1e9);
+            println!(
+                "direct rate=16000 channels={channels} frames={} avg_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} rt_factor={factor:.3}",
+                input_frames.len() * HUSH_FRAME_SIZE,
+                total_ns as f64 / timings.len() as f64 / 1e6,
+                percentile(95) as f64 / 1e6,
+                percentile(99) as f64 / 1e6,
+                timings.last().copied().unwrap_or_default() as f64 / 1e6,
             );
         }
     }

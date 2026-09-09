@@ -941,6 +941,7 @@ mod live {
                     module_path: None,
                     enabled: true,
                     parameters,
+                    channels: None,
                     position: [240.0, 160.0],
                 })
                 .map_err(|error| format!("create live noise gate: {error}"))?;

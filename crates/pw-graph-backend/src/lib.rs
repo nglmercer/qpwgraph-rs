@@ -185,6 +185,7 @@ mod tests {
                 destination,
                 enabled: true,
                 parameters: BTreeMap::new(),
+                channels: None,
                 position: [250.0, 180.0],
             })
             .unwrap();

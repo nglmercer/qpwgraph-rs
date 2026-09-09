@@ -19,6 +19,7 @@ fn effect_request(instance_id: &str) -> EffectNodeRequest {
         module_path: None,
         enabled: true,
         parameters: BTreeMap::new(),
+        channels: None,
         position: [240.0, 160.0],
     }
 }
@@ -139,6 +140,7 @@ fn inserted_effect_restores_the_original_route_when_removed() {
             destination: destination.clone(),
             enabled: true,
             parameters: BTreeMap::new(),
+            channels: None,
             position: [310.0, 190.0],
         })
         .expect("insertion should replace the direct route with an effect");

@@ -116,6 +116,11 @@ pub struct EffectNodeRequest {
     pub module_path: Option<String>,
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
+    /// Requested audio channel count for layout-aware effects. `None` keeps
+    /// the backend's legacy default; Hush uses this to select a mono or
+    /// independent stereo path. Other effects retain their established
+    /// stereo layout.
+    pub channels: Option<u16>,
     /// Initial canvas position in logical scene coordinates. Backends that do
     /// not persist layouts may still use it for their in-memory graph model.
     pub position: [f32; 2],
@@ -133,6 +138,10 @@ pub struct EffectInsertRequest {
     pub destination: PortKey,
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
+    /// Optional layout override for layout-aware effects. When omitted, the
+    /// native PipeWire backend derives Hush's mono/stereo layout from the
+    /// selected source route.
+    pub channels: Option<u16>,
     /// Position for the newly inserted effect node.
     pub position: [f32; 2],
 }
@@ -145,6 +154,7 @@ impl From<EffectInsertRequest> for EffectNodeRequest {
             module_path: request.module_path,
             enabled: request.enabled,
             parameters: request.parameters,
+            channels: request.channels,
             position: request.position,
         }
     }

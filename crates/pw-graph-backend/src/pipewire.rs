@@ -325,7 +325,7 @@ impl PipewireDriver {
                     .find(|(_, port)| {
                         port.node_id == native_node_id(node_id)
                             && port.direction.is_sink()
-                            && port.name == "input_FL"
+                            && (port.name == "input_FL" || port.name == "input_MONO")
                     })
                     .map(|(id, _)| PortId(graph_id(*id as u64)))?;
                 let output_port = state
@@ -334,7 +334,7 @@ impl PipewireDriver {
                     .find(|(_, port)| {
                         port.node_id == native_node_id(node_id)
                             && port.direction.is_source()
-                            && port.name == "output_FL"
+                            && (port.name == "output_FL" || port.name == "output_MONO")
                     })
                     .map(|(id, _)| PortId(graph_id(*id as u64)))?;
                 Some((instance_id.clone(), node_id, input_port, output_port))
@@ -861,12 +861,30 @@ impl PipewireDriver {
     ) -> BackendResult<EffectInstance> {
         let source = request.source.clone();
         let destination = request.destination.clone();
+        let EffectInsertRequest {
+            instance_id,
+            effect_id,
+            module_path,
+            enabled,
+            parameters,
+            channels,
+            position,
+            ..
+        } = request;
         // Verify the selected link before publishing a new node. It can still
         // disappear while the effect initializes, so we resolve it once more
         // immediately before disconnecting it below.
         self.effect_link_endpoints_locked(&source, &destination)?;
-        let instance_id = request.instance_id.clone();
-        let instance = self.create_effect_node_locked(request.into())?;
+        let instance_request = EffectNodeRequest {
+            instance_id: instance_id.clone(),
+            effect_id,
+            module_path,
+            enabled,
+            parameters,
+            channels: channels.or_else(|| self.inferred_hush_channels(&source)),
+            position,
+        };
+        let instance = self.create_effect_node_locked(instance_request)?;
 
         let result = (|| {
             let (output, input, direct_link) =
@@ -914,6 +932,35 @@ impl PipewireDriver {
             )));
         }
         result
+    }
+
+    /// Infer only Hush's layout from the selected source node. A mono source
+    /// normally has one `MONO` audio output; a stereo source still has both
+    /// FL/FR ports even when the selected link is only one side. Legacy
+    /// effects intentionally ignore this and remain stereo.
+    fn inferred_hush_channels(&self, source: &PortKey) -> Option<u16> {
+        if source.port_type != PortType::Audio
+            || source.node_type != NodeType::PipeWire && source.node_type != NodeType::Effect
+        {
+            return None;
+        }
+        let source_id = self.graph.resolve_port_key(source)?;
+        let source_port = self.graph.port(source_id)?;
+        if source_port.channel.as_deref().is_some_and(|channel| {
+            channel.eq_ignore_ascii_case("mono")
+                || channel.eq_ignore_ascii_case("fc")
+                || channel.eq_ignore_ascii_case("center")
+        }) {
+            return Some(1);
+        }
+        let node = self.graph.node(source_port.node_id)?;
+        let audio_outputs = node
+            .ports
+            .iter()
+            .filter_map(|id| self.graph.port(*id))
+            .filter(|port| port.direction == Direction::Source && port.port_type == PortType::Audio)
+            .count();
+        Some(if audio_outputs <= 1 { 1 } else { 2 })
     }
 
     fn remove_effect_locked(&mut self, instance_id: &str) -> BackendResult<()> {
@@ -2490,6 +2537,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
+                channels: None,
                 position: [12.0, 34.0],
             })
             .expect("the raw PipeWire filter should publish a node and ports");
@@ -2554,6 +2602,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
+                channels: None,
                 position: [56.0, 78.0],
             })
             .expect("the Hush PipeWire filter should publish a node and ports");

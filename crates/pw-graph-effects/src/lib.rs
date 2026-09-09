@@ -16,7 +16,7 @@ mod hush_worker;
 pub mod wasm;
 pub use adaptive_noise::AdaptiveNoiseSuppressor;
 pub use hush_noise::HushNoiseSuppressor;
-pub use hush_worker::HushDiagnostics;
+pub use hush_worker::{HushDiagnostics, HushOverloadReason};
 
 pub const NOISE_GATE_ID: &str = "builtin.noise-gate";
 pub const NOISE_SUPPRESSOR_ID: &str = "builtin.adaptive-noise-suppressor";
@@ -180,6 +180,11 @@ pub struct EffectInstanceConfig {
     pub enabled: bool,
     #[serde(default)]
     pub parameters: BTreeMap<String, f32>,
+    /// Persisted layout hint for layout-aware effects such as Hush. `None`
+    /// preserves legacy configurations and lets the backend infer inserted
+    /// Hush topology from its source route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u16>,
 }
 
 fn default_true() -> bool {

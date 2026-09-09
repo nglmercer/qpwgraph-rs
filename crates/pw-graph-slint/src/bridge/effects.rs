@@ -91,6 +91,7 @@ fn restore_saved_effects(
                         destination: destination_port.clone(),
                         enabled: saved.instance.enabled,
                         parameters: saved.instance.parameters.clone(),
+                        channels: saved.instance.channels,
                         position: saved.position,
                     })
                 }),
@@ -100,6 +101,7 @@ fn restore_saved_effects(
                 module_path: saved.instance.module_path.clone(),
                 enabled: saved.instance.enabled,
                 parameters: saved.instance.parameters.clone(),
+                channels: saved.instance.channels,
                 position: saved.position,
             }),
             _ => Err("effect routing is incomplete".into()),
@@ -166,6 +168,7 @@ pub(crate) fn create_effect(window: &MainWindow, application: &mut Application) 
                         destination,
                         enabled,
                         parameters: parameters.clone(),
+                        channels: None,
                         position,
                     })
                 })
@@ -177,6 +180,7 @@ pub(crate) fn create_effect(window: &MainWindow, application: &mut Application) 
                 module_path: None,
                 enabled,
                 parameters,
+                channels: None,
                 position,
             })
         });

@@ -7,11 +7,10 @@
 //! requires before a callback data pointer may be released.
 //!
 //! The current effect SDK has one builtin processor and no native WASM host.
-//! Consequently this runtime exposes a stereo FL/FR pair of F32 DSP ports.
-//! The callback converts PipeWire's planar buffers into the interleaved form
-//! expected by the built-in processors, without allocating on the realtime
-//! thread. Out-of-process/WASM module hosting still needs a richer realtime
-//! control channel before it can be added safely.
+//! Built-in effects retain their established stereo FL/FR ports. Hush is
+//! layout-aware and may instead expose one MONO pair; the callback still uses
+//! a fixed two-pointer storage envelope so changing the selected layout never
+//! reallocates on the realtime thread.
 
 use super::filter_runtime::FilterRuntime;
 use super::*;
@@ -47,6 +46,7 @@ struct ProcessorState {
 struct CallbackState {
     input_ports: [AtomicPtr<c_void>; DSP_CHANNELS],
     output_ports: [AtomicPtr<c_void>; DSP_CHANNELS],
+    channels: usize,
     enabled: AtomicBool,
     processor_failed: AtomicBool,
     hush_diagnostics: Option<std::sync::Arc<pw_graph_effects::HushDiagnostics>>,
@@ -65,17 +65,28 @@ struct CallbackState {
 }
 
 impl CallbackState {
+    #[cfg(test)]
     fn new(processor: Box<dyn EffectProcessor>, enabled: bool) -> Self {
+        Self::new_with_channels(processor, enabled, DSP_CHANNELS)
+    }
+
+    fn new_with_channels(
+        processor: Box<dyn EffectProcessor>,
+        enabled: bool,
+        channels: usize,
+    ) -> Self {
+        let channels = channels.clamp(1, DSP_CHANNELS);
         Self {
             input_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             output_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            channels,
             enabled: AtomicBool::new(enabled),
             processor_failed: AtomicBool::new(false),
             hush_diagnostics: processor.hush_diagnostics(),
             dangling_inputs: AtomicU32::new(0),
             processor: Mutex::new(ProcessorState {
                 processor,
-                interleaved: vec![0.0; MAX_DSP_FRAMES as usize * DSP_CHANNELS],
+                interleaved: vec![0.0; MAX_DSP_FRAMES as usize * channels],
             }),
         }
     }
@@ -156,7 +167,7 @@ impl CallbackState {
     ) {
         let frame_count = frames as usize;
         let mut dangling_inputs = 0_u32;
-        for channel in 0..DSP_CHANNELS {
+        for channel in 0..self.channels {
             if !outputs[channel].is_null() && inputs[channel].is_null() {
                 dangling_inputs |= 1 << channel;
             }
@@ -167,7 +178,7 @@ impl CallbackState {
         // A stateful effect must learn about route changes before it queues
         // this block. The default implementation is a no-op; Hush uses the
         // atomic/generation-only hook to reset disconnected denoiser state.
-        let channel_mask = (!dangling_inputs) as u16 & ((1u16 << DSP_CHANNELS) - 1);
+        let channel_mask = (!dangling_inputs) as u16 & ((1u16 << self.channels) - 1);
         if let Ok(mut state) = self.processor.try_lock() {
             state.processor.set_channel_mask(channel_mask);
         }
@@ -207,10 +218,10 @@ impl CallbackState {
             interleaved,
         } = &mut *state;
         processor.set_host_bypass(!enabled);
-        let samples = &mut interleaved[..frame_count * DSP_CHANNELS];
+        let samples = &mut interleaved[..frame_count * self.channels];
         for frame in 0..frame_count {
-            for channel in 0..DSP_CHANNELS {
-                samples[frame * DSP_CHANNELS + channel] = input_sample(inputs[channel], frame);
+            for channel in 0..self.channels {
+                samples[frame * self.channels + channel] = input_sample(inputs[channel], frame);
             }
         }
         // No Rust panic may cross the C callback boundary. Builtin processors
@@ -220,7 +231,13 @@ impl CallbackState {
             processor.process(samples, frames)
         }));
         if matches!(result, Ok(Ok(()))) && samples.iter().all(|sample| sample.is_finite()) {
-            copy_processed_to_outputs(samples, outputs, dangling_inputs, frame_count);
+            copy_processed_to_outputs(
+                samples,
+                outputs,
+                dangling_inputs,
+                frame_count,
+                self.channels,
+            );
             // A Hush worker can fail while still returning its aligned dry
             // fallback. Preserve that audio and publish the diagnostic
             // separately instead of replacing it with an instantaneous pass-
@@ -277,9 +294,10 @@ unsafe fn copy_processed_to_outputs(
     outputs: [*mut c_void; DSP_CHANNELS],
     dangling_inputs: u32,
     frames: usize,
+    channels: usize,
 ) {
     for frame in 0..frames {
-        for channel in 0..DSP_CHANNELS {
+        for channel in 0..channels {
             if !outputs[channel].is_null() {
                 let sample = if dangling_inputs & (1 << channel) != 0 {
                     // A stateful processor may still have a queued tail after
@@ -287,7 +305,7 @@ unsafe fn copy_processed_to_outputs(
                     // passive meter into an audio source.
                     0.0
                 } else {
-                    samples[frame * DSP_CHANNELS + channel]
+                    samples[frame * channels + channel]
                 };
                 *outputs[channel].cast::<f32>().add(frame) = sample;
             }
@@ -331,15 +349,28 @@ impl NativeEffect {
         }
 
         // All setup and parameter validation happens before the raw filter is
-        // published to PipeWire. Each filter exposes a planar FL/FR pair while
-        // the processor receives the matching interleaved stereo buffer.
+        // published to PipeWire. Legacy effects always retain their planar
+        // FL/FR pair. Hush can use one MONO pair when the caller selected a
+        // mono route, which avoids constructing/running a second denoiser.
+        let channels = if request.effect_id == pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID {
+            match request.channels.unwrap_or(DSP_CHANNELS as u16) {
+                1 | 2 => request.channels.unwrap_or(DSP_CHANNELS as u16) as usize,
+                count => {
+                    return Err(BackendError::native(format!(
+                        "Hush supports one or two channels, requested {count}"
+                    )))
+                }
+            }
+        } else {
+            DSP_CHANNELS
+        };
         let mut processor = host
             .create(&request.effect_id)
             .map_err(BackendError::effect_create_failed)?;
         processor
             .prepare(AudioSpec {
                 sample_rate: PREPARED_SAMPLE_RATE,
-                channels: DSP_CHANNELS as u16,
+                channels: channels as u16,
                 max_frames: MAX_DSP_FRAMES,
             })
             .map_err(BackendError::native)?;
@@ -352,7 +383,11 @@ impl NativeEffect {
         // same persistence/undo endpoint after a registry refresh.
         let node_name = format!("{effect_name} ({})", request.instance_id);
 
-        let callback = Box::new(CallbackState::new(processor, request.enabled));
+        let callback = Box::new(CallbackState::new_with_channels(
+            processor,
+            request.enabled,
+            channels,
+        ));
         let filter_properties = pw::properties::properties! {
             NODE_NAME => node_name.as_str(),
             NODE_DESCRIPTION => node_name.as_str(),
@@ -378,7 +413,12 @@ impl NativeEffect {
 
         let mut input_ports = [ptr::null_mut(); DSP_CHANNELS];
         let mut output_ports = [ptr::null_mut(); DSP_CHANNELS];
-        for (index, channel) in ["FL", "FR"].iter().enumerate() {
+        let channel_names: [&str; DSP_CHANNELS] = if channels == 1 {
+            ["MONO", ""]
+        } else {
+            ["FL", "FR"]
+        };
+        for (index, channel) in channel_names.iter().take(channels).enumerate() {
             input_ports[index] = runtime.add_port(
                 pw::spa::sys::SPA_DIRECTION_INPUT,
                 &format!("input_{channel}"),
@@ -404,6 +444,7 @@ impl NativeEffect {
                 module_path: request.module_path,
                 enabled: request.enabled,
                 parameters: request.parameters,
+                channels: request.channels,
             },
             node_id: NodeId(UNRESOLVED_ID),
             input_port: PortId(UNRESOLVED_ID),
@@ -759,6 +800,26 @@ mod tests {
         assert_eq!(left_output, [0.0; 4]);
         assert_eq!(right_output, [0.25, -0.5, 0.75, -1.0]);
         assert_eq!(state.dangling_inputs.load(Ordering::Acquire), DANGLING_FL);
+    }
+
+    #[test]
+    fn mono_callback_uses_one_interleaved_channel_and_one_output_port() {
+        let state = CallbackState::new_with_channels(
+            Box::new(TestProcessor::new(ProcessBehavior::Gain)),
+            true,
+            1,
+        );
+        let mut input = [0.25, -0.5, 0.75, -1.0];
+        let mut output = [9.0; 4];
+        run_buffers(
+            &state,
+            [Some(&mut input), None],
+            [Some(&mut output), None],
+            4,
+        );
+        assert_eq!(output, [0.5, -1.0, 1.5, -2.0]);
+        assert_eq!(state.channels, 1);
+        assert_eq!(state.dangling_inputs.load(Ordering::Acquire), 0);
     }
 
     #[test]

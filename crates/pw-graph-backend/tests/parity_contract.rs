@@ -192,6 +192,7 @@ fn an_effect_node_offers_no_audio_controls_or_meter() {
             destination,
             enabled: true,
             parameters: BTreeMap::new(),
+            channels: None,
             position: [0.0, 0.0],
         })
         .expect("demo backend hosts effects");

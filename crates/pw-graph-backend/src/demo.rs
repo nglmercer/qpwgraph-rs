@@ -292,6 +292,7 @@ impl DemoDriver {
                 module_path: request.module_path,
                 enabled: request.enabled,
                 parameters: request.parameters,
+                channels: request.channels,
             },
             node_id,
             input_port,

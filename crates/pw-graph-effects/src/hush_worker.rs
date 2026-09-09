@@ -31,17 +31,205 @@ pub(crate) const HUSH_MAX_BACKLOG_MS: u32 = 80;
 /// Hysteresis for clearing the overload/recovery state. This is deliberately
 /// smaller than the overload threshold so a worker does not oscillate between
 /// running and recovering around one boundary.
-pub(crate) const HUSH_RECOVERY_LEAD_MS: u32 = 40;
+pub(crate) const HUSH_RECOVERY_LEAD_MS: u32 = 20;
 /// A permanently slow worker must not be reset for every rejected callback.
 /// Retry only after a control/worker-side cooldown, leaving the audio thread
 /// on its continuous aligned-dry timeline in the meantime.
 pub(crate) const HUSH_OVERLOAD_COOLDOWN_MS: u64 = 500;
 /// Rolling realtime-factor margin used before declaring a worker overloaded.
 pub(crate) const HUSH_REALTIME_FACTOR_LIMIT: f64 = 1.10;
+/// A worker must report this factor for several persistent observations before
+/// it is classified as permanently too slow.  The lower exit threshold gives
+/// temporary scheduler stalls room to recover without state flapping.
+pub(crate) const HUSH_HEALTHY_REALTIME_FACTOR_LIMIT: f64 = 0.90;
+pub(crate) const HUSH_PERFORMANCE_WINDOW_MS: u64 = 50;
+pub(crate) const HUSH_OVERLOAD_OBSERVATIONS: u32 = 3;
+pub(crate) const HUSH_HEALTHY_OBSERVATIONS: u32 = 3;
+pub(crate) const HUSH_MAX_AUTOMATIC_RETRIES: u32 = 3;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HushOverloadReason {
+    None = 0,
+    CpuTooSlow = 1,
+    BacklogExceeded = 2,
+    InputQueueFull = 3,
+}
+
+fn overload_cooldown_for_attempt(attempt: u32) -> Duration {
+    if attempt >= 3 {
+        Duration::from_millis(5_000)
+    } else {
+        Duration::from_millis(HUSH_OVERLOAD_COOLDOWN_MS.saturating_mul(1_u64 << attempt))
+    }
+}
+
+impl HushOverloadReason {
+    fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CpuTooSlow => "CPU throughput",
+            Self::BacklogExceeded => "backlog",
+            Self::InputQueueFull => "queue full",
+        }
+    }
+}
+
+/// Timing knowledge is deliberately independent from the mutable DSP
+/// pipeline.  In particular, `reset_hush_dsp` must never call `reset` on this
+/// value: a slow worker may need several wet resets before its service rate is
+/// confidently classified.
+#[derive(Clone, Debug)]
+struct HushPerformanceState {
+    ewma_realtime_factor: f64,
+    total_audio_frames: u64,
+    total_processing_ns: u64,
+    recent_audio_frames: u64,
+    recent_processing_ns: u64,
+    overload_windows: u32,
+    healthy_windows: u32,
+    last_factor: f64,
+    timing_samples: u64,
+    performance_windows: u64,
+    stable_p95_ns: f64,
+    stable_p99_ns: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PerformanceObservation {
+    factor: f64,
+    ewma: f64,
+}
+
+impl Default for HushPerformanceState {
+    fn default() -> Self {
+        Self {
+            ewma_realtime_factor: 1.0,
+            total_audio_frames: 0,
+            total_processing_ns: 0,
+            recent_audio_frames: 0,
+            recent_processing_ns: 0,
+            overload_windows: 0,
+            healthy_windows: 0,
+            last_factor: 1.0,
+            timing_samples: 0,
+            performance_windows: 0,
+            stable_p95_ns: 0.0,
+            stable_p99_ns: 0.0,
+        }
+    }
+}
+
+impl HushPerformanceState {
+    fn observe(
+        &mut self,
+        audio_frames: u64,
+        processing_ns: u64,
+        sample_rate: u32,
+    ) -> PerformanceObservation {
+        if audio_frames == 0 {
+            return PerformanceObservation {
+                factor: self.last_factor,
+                ewma: self.ewma_realtime_factor,
+            };
+        }
+        self.total_audio_frames = self.total_audio_frames.saturating_add(audio_frames);
+        self.total_processing_ns = self.total_processing_ns.saturating_add(processing_ns);
+        self.recent_audio_frames = self.recent_audio_frames.saturating_add(audio_frames);
+        self.recent_processing_ns = self.recent_processing_ns.saturating_add(processing_ns);
+        self.observe_timing(processing_ns);
+
+        let window_frames =
+            (u64::from(sample_rate).saturating_mul(HUSH_PERFORMANCE_WINDOW_MS) / 1000).max(1);
+        let mut observation = PerformanceObservation {
+            factor: self.last_factor,
+            ewma: self.ewma_realtime_factor,
+        };
+        if self.recent_audio_frames >= window_frames {
+            let factor = self.recent_processing_ns as f64 * f64::from(sample_rate.max(1))
+                / (self.recent_audio_frames as f64 * 1e9);
+            self.last_factor = factor;
+            // Seed the EWMA with the first complete interval, but require
+            // multiple high intervals before entering overload. This means a
+            // single cold inference is visible in diagnostics without being a
+            // state transition by itself.
+            if self.performance_windows == 0 {
+                self.ewma_realtime_factor = factor;
+            } else {
+                const ALPHA: f64 = 0.75;
+                self.ewma_realtime_factor =
+                    ALPHA * self.ewma_realtime_factor + (1.0 - ALPHA) * factor;
+            }
+            self.recent_audio_frames = 0;
+            self.recent_processing_ns = 0;
+            if factor.is_finite()
+                && factor > HUSH_REALTIME_FACTOR_LIMIT
+                && self.ewma_realtime_factor > HUSH_REALTIME_FACTOR_LIMIT
+            {
+                self.overload_windows = self.overload_windows.saturating_add(1);
+                self.healthy_windows = 0;
+            } else if factor.is_finite()
+                && factor < HUSH_HEALTHY_REALTIME_FACTOR_LIMIT
+                && self.ewma_realtime_factor < HUSH_HEALTHY_REALTIME_FACTOR_LIMIT
+            {
+                self.healthy_windows = self.healthy_windows.saturating_add(1);
+                self.overload_windows = 0;
+            } else {
+                self.overload_windows = 0;
+                self.healthy_windows = 0;
+            }
+            self.performance_windows = self.performance_windows.saturating_add(1);
+            observation = PerformanceObservation {
+                factor,
+                ewma: self.ewma_realtime_factor,
+            };
+        }
+        observation
+    }
+
+    fn observe_timing(&mut self, duration_ns: u64) {
+        let duration = duration_ns as f64;
+        if self.timing_samples == 0 {
+            self.stable_p95_ns = duration;
+            self.stable_p99_ns = duration;
+            self.timing_samples = 1;
+            return;
+        }
+        // An inexpensive exponentially weighted high-percentile estimate is
+        // sufficient for scheduling. It responds quickly to a sustained slow
+        // worker and decays slowly after a one-off cold outlier.
+        let p95_rate = if duration > self.stable_p95_ns {
+            0.05
+        } else {
+            0.001
+        };
+        let p99_rate = if duration > self.stable_p99_ns {
+            0.02
+        } else {
+            0.0005
+        };
+        self.stable_p95_ns += p95_rate * (duration - self.stable_p95_ns);
+        self.stable_p99_ns += p99_rate * (duration - self.stable_p99_ns);
+        self.timing_samples = self.timing_samples.saturating_add(1);
+    }
+
+    fn lifetime_factor(&self, sample_rate: u32) -> f64 {
+        if self.total_audio_frames == 0 {
+            0.0
+        } else {
+            self.total_processing_ns as f64 * f64::from(sample_rate.max(1))
+                / (self.total_audio_frames as f64 * 1e9)
+        }
+    }
+}
 
 #[repr(u32)]
 #[derive(Clone, Copy)]
-enum HushWorkerState {
+pub(crate) enum HushWorkerState {
     Starting = 0,
     Running = 1,
     ResyncRequested = 2,
@@ -52,7 +240,7 @@ enum HushWorkerState {
 }
 
 impl HushWorkerState {
-    fn as_u32(self) -> u32 {
+    pub(crate) fn as_u32(self) -> u32 {
         self as u32
     }
 }
@@ -113,17 +301,40 @@ pub struct HushDiagnostics {
     pub max_worker_backlog_frames: AtomicU64,
     pub generation_resets: AtomicU64,
     pub processed_blocks: AtomicU64,
+    /// Total worker time, including resampling, buffer handling, and Hush.
     pub inference_ns: AtomicU64,
     pub max_inference_ns: AtomicU64,
+    pub input_resample_ns: AtomicU64,
+    pub hush_inference_ns: AtomicU64,
+    pub output_resample_ns: AtomicU64,
     pub worker_audio_frames_processed: AtomicU64,
     pub worker_processing_ns: AtomicU64,
     pub realtime_factor_bits: AtomicU64,
+    pub ewma_realtime_factor_bits: AtomicU64,
+    pub last_realtime_factor_bits: AtomicU64,
+    pub stable_worker_p95_ns: AtomicU64,
+    pub stable_worker_p99_ns: AtomicU64,
+    pub performance_windows: AtomicU64,
+    pub overload_windows: AtomicU32,
+    pub healthy_windows: AtomicU32,
     pub recovery_attempts: AtomicU64,
     pub recovery_successes: AtomicU64,
     pub recovery_failures: AtomicU64,
     pub input_blocks_consumed: AtomicU64,
     pub input_frames_consumed: AtomicU64,
     pub warmup_frames: AtomicU64,
+    /// One count is one native 160-sample Hush inference for one channel.
+    pub hush_channel_frames_processed: AtomicU64,
+    pub active_hush_channels: AtomicU16,
+    pub input_blocks_skipped_recovery: AtomicU64,
+    pub input_frames_skipped_recovery: AtomicU64,
+    pub input_blocks_skipped_overloaded: AtomicU64,
+    pub input_frames_skipped_overloaded: AtomicU64,
+    pub input_queue_overruns: AtomicU64,
+    pub stale_wet_frames_dropped: AtomicU64,
+    pub wet_frames_dropped_queue_full: AtomicU64,
+    pub wet_frames_dropped_epoch: AtomicU64,
+    pub overload_reason: AtomicU32,
     pub worker_ready: AtomicBool,
     pub worker_failed: AtomicBool,
     pub worker_overloaded: AtomicBool,
@@ -133,6 +344,8 @@ pub struct HushDiagnostics {
     pub worker_input_frame: AtomicU64,
     pub latest_wet_frame: AtomicU64,
     pub playout_frame: AtomicU64,
+    pub latest_submitted_frame: AtomicU64,
+    pub latest_completed_input_frame: AtomicU64,
 }
 
 fn panic_reason(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -193,6 +406,11 @@ impl HushDiagnostics {
             .copied()
             .collect();
         times.sort_unstable();
+        let average = if processed == 0 {
+            0.0
+        } else {
+            load(&self.inference_ns) as f64 / processed as f64 / 1e6
+        };
         let p95 = times.get(times.len() * 95 / 100).copied().unwrap_or(0) as f64 / 1e6;
         let p99 = times.get(times.len() * 99 / 100).copied().unwrap_or(0) as f64 / 1e6;
         let total_frames = load(&self.wet_frames_output) + load(&self.dry_frames_output);
@@ -202,26 +420,80 @@ impl HushDiagnostics {
             load(&self.wet_frames_output) as f64 * 100.0 / total_frames as f64
         };
         let backlog_frames = self
-            .latest_input_frame
+            .latest_submitted_frame
             .load(Ordering::Relaxed)
-            .saturating_sub(self.worker_input_frame.load(Ordering::Relaxed));
+            .saturating_sub(self.latest_completed_input_frame.load(Ordering::Relaxed));
         let max_backlog_ms = load(&self.max_worker_backlog_frames) as f64 * 1000.0
             / self.sample_rate.load(Ordering::Relaxed).max(1) as f64;
         let sample_rate = self.sample_rate.load(Ordering::Relaxed).max(1);
         let scheduling_frames = self.scheduling_frames.load(Ordering::Relaxed);
         let total_latency_frames = self.total_latency_frames.load(Ordering::Relaxed);
         let realtime_factor = f64::from_bits(self.realtime_factor_bits.load(Ordering::Relaxed));
+        let ewma_factor = f64::from_bits(self.ewma_realtime_factor_bits.load(Ordering::Relaxed));
+        let last_factor = f64::from_bits(self.last_realtime_factor_bits.load(Ordering::Relaxed));
         let measured_headroom_frames = load(&self.measured_worker_headroom_frames);
-        let worker_audio_frames = load(&self.worker_audio_frames_processed);
-        let worker_ns = load(&self.worker_processing_ns);
-        let measured_factor = if worker_audio_frames == 0 {
-            realtime_factor
-        } else {
-            worker_ns as f64 * sample_rate as f64 / (worker_audio_frames as f64 * 1e9)
+        let overload_reason = match self.overload_reason.load(Ordering::Relaxed) {
+            1 => HushOverloadReason::CpuTooSlow,
+            2 => HushOverloadReason::BacklogExceeded,
+            3 => HushOverloadReason::InputQueueFull,
+            _ => HushOverloadReason::None,
         };
-        format!("Hush: {state} {error} | {} Hz / {} ch / quantum {} (max {}) | latency: {:.1} ms (schedule {} frames, measured headroom {} frames) | wet: {} blocks / {} frames ({wet_ratio:.1}%) dry: {} blocks / {} frames [startup:{} bypass:{} host-off:{} underrun:{} resync:{} failure:{}] | underruns: {} | input/output overruns: {}/{} | input blocks pushed/rejected: {pushed}/{} ({} frames) | wet frames dropped: {} | resync: {}/{} | stale input/wet: {}/{} | queue peaks: {}/{} | backlog: {:.1}/{:.1} ms (limit {:.1} ms) | processed: {processed} Hush frames: {} resets: {} | worker avg/p95/p99/max: {:.2}/{p95:.2}/{p99:.2}/{:.2} ms | RT factor: {:.2}x (measured {:.2}x) | recovery: {}/{}",
-            sample_rate, self.channels.load(Ordering::Relaxed), self.host_quantum.load(Ordering::Relaxed), self.max_host_quantum.load(Ordering::Relaxed), total_latency_frames as f64 * 1000.0 / sample_rate as f64, scheduling_frames,
-            measured_headroom_frames, load(&self.wet_blocks_output), load(&self.wet_frames_output), load(&self.dry_fallback_blocks), load(&self.dry_frames_output), load(&self.dry_startup_blocks), load(&self.dry_bypass_blocks), load(&self.dry_host_disabled_blocks), load(&self.dry_underrun_blocks), load(&self.dry_resync_blocks), load(&self.dry_worker_failure_blocks), load(&self.underruns), load(&self.input_overruns), load(&self.output_overruns), load(&self.input_blocks_rejected), load(&self.input_frames_rejected), load(&self.wet_frames_dropped), load(&self.resync_requests), load(&self.resync_completed), load(&self.stale_input_blocks_dropped), load(&self.stale_output_blocks_dropped), load(&self.max_input_queue_depth), load(&self.max_output_queue_depth), backlog_frames as f64 * 1000.0 / sample_rate as f64, max_backlog_ms, load(&self.max_backlog_frames) as f64 * 1000.0 / sample_rate as f64, load(&self.hush_frames_processed), load(&self.generation_resets), load(&self.inference_ns) as f64 / processed.max(1) as f64 / 1e6, load(&self.max_inference_ns) as f64 / 1e6, realtime_factor, measured_factor, load(&self.recovery_successes), load(&self.recovery_attempts))
+        format!(
+            "Hush: {state} | Wet: {wet_ratio:.1}% | RT factor: {ewma_factor:.2}x (last {last_factor:.2}x, lifetime {realtime_factor:.2}x) | cause: {} | error: {} | {} Hz / {} ch / quantum {} (max {}) | latency: {:.1} ms (schedule {} frames, synthesis {} frames, measured headroom {} frames) | wet: {} blocks / {} frames dry: {} blocks / {} frames [startup:{} bypass:{} host-off:{} underrun:{} resync:{} failure:{}] | underruns: {} | queue overruns: input {} / output {} | input pushed: {pushed} queue-rejected: {} ({} frames), skipped recovery: {} ({} frames), skipped overloaded: {} ({} frames) | wet dropped: {} (stale {} epoch {} queue {}) | resync: {}/{} | stale input/wet blocks: {}/{} | queue peaks: {}/{} | backlog: {:.1}/{:.1} ms (limit {:.1} ms) | processed blocks: {processed} native Hush channel-frames: {} active channels: {} resets: {} | worker avg/p95/p99/max: {average:.2}/{p95:.2}/{p99:.2}/{:.2} ms | components input/Hush/output: {:.2}/{:.2}/{:.2} ms | recovery: {}/{} (confidence overload/healthy: {}/{})",
+            overload_reason.label(),
+            error,
+            sample_rate,
+            self.channels.load(Ordering::Relaxed),
+            self.host_quantum.load(Ordering::Relaxed),
+            self.max_host_quantum.load(Ordering::Relaxed),
+            total_latency_frames as f64 * 1000.0 / sample_rate as f64,
+            scheduling_frames,
+            load(&self.synthesis_delay_frames),
+            measured_headroom_frames,
+            load(&self.wet_blocks_output),
+            load(&self.wet_frames_output),
+            load(&self.dry_fallback_blocks),
+            load(&self.dry_frames_output),
+            load(&self.dry_startup_blocks),
+            load(&self.dry_bypass_blocks),
+            load(&self.dry_host_disabled_blocks),
+            load(&self.dry_underrun_blocks),
+            load(&self.dry_resync_blocks),
+            load(&self.dry_worker_failure_blocks),
+            load(&self.underruns),
+            load(&self.input_queue_overruns),
+            load(&self.output_overruns),
+            load(&self.input_blocks_rejected),
+            load(&self.input_frames_rejected),
+            load(&self.input_blocks_skipped_recovery),
+            load(&self.input_frames_skipped_recovery),
+            load(&self.input_blocks_skipped_overloaded),
+            load(&self.input_frames_skipped_overloaded),
+            load(&self.wet_frames_dropped),
+            load(&self.stale_wet_frames_dropped),
+            load(&self.wet_frames_dropped_epoch),
+            load(&self.wet_frames_dropped_queue_full),
+            load(&self.resync_requests),
+            load(&self.resync_completed),
+            load(&self.stale_input_blocks_dropped),
+            load(&self.stale_output_blocks_dropped),
+            load(&self.max_input_queue_depth),
+            load(&self.max_output_queue_depth),
+            backlog_frames as f64 * 1000.0 / sample_rate as f64,
+            max_backlog_ms,
+            load(&self.max_backlog_frames) as f64 * 1000.0 / sample_rate as f64,
+            load(&self.hush_channel_frames_processed),
+            self.active_hush_channels.load(Ordering::Relaxed),
+            load(&self.generation_resets),
+            load(&self.max_inference_ns) as f64 / 1e6,
+            load(&self.input_resample_ns) as f64 / 1e6,
+            load(&self.hush_inference_ns) as f64 / 1e6,
+            load(&self.output_resample_ns) as f64 / 1e6,
+            load(&self.recovery_successes),
+            load(&self.recovery_attempts),
+            self.overload_windows.load(Ordering::Relaxed),
+            self.healthy_windows.load(Ordering::Relaxed),
+        )
     }
     pub fn failure_reason(&self) -> Option<String> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -393,6 +665,15 @@ fn read_timeline(
                 diagnostics
                     .wet_frames_dropped
                     .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+                if epoch != generation || last <= start {
+                    diagnostics
+                        .stale_wet_frames_dropped
+                        .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+                } else {
+                    diagnostics
+                        .wet_frames_dropped_epoch
+                        .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+                }
             }
             queue.pop_with(|_| ());
             continue;
@@ -456,6 +737,8 @@ pub(crate) struct HushRuntime {
     generation: Arc<AtomicU64>,
     wet_epoch: Arc<AtomicU64>,
     resync_requested: Arc<AtomicBool>,
+    retry_requested: Arc<AtomicBool>,
+    retry_generation: Arc<AtomicBool>,
     accept_input: Arc<AtomicBool>,
     attenuation_bits: Arc<AtomicU32>,
     diagnostics: Arc<HushDiagnostics>,
@@ -486,6 +769,8 @@ impl HushRuntime {
         let generation = Arc::new(AtomicU64::new(initial_generation));
         let wet_epoch = Arc::new(AtomicU64::new(0));
         let resync_requested = Arc::new(AtomicBool::new(false));
+        let retry_requested = Arc::new(AtomicBool::new(false));
+        let retry_generation = Arc::new(AtomicBool::new(false));
         let accept_input = Arc::new(AtomicBool::new(true));
         let attenuation_bits = Arc::new(AtomicU32::new(attenuation_db.to_bits()));
         let diagnostics = Arc::new(HushDiagnostics {
@@ -496,6 +781,15 @@ impl HushRuntime {
             .sample_rate
             .store(sample_rate, Ordering::Relaxed);
         diagnostics.channels.store(channels, Ordering::Relaxed);
+        diagnostics
+            .realtime_factor_bits
+            .store(1.0_f64.to_bits(), Ordering::Relaxed);
+        diagnostics
+            .ewma_realtime_factor_bits
+            .store(1.0_f64.to_bits(), Ordering::Relaxed);
+        diagnostics
+            .last_realtime_factor_bits
+            .store(1.0_f64.to_bits(), Ordering::Relaxed);
         let base_schedule_frames =
             (sample_rate as usize * HUSH_SCHEDULING_MS as usize).div_ceil(1000);
         let synthesis_delay_frames =
@@ -528,6 +822,8 @@ impl HushRuntime {
         let worker_generation = generation.clone();
         let worker_wet_epoch = wet_epoch.clone();
         let worker_resync_requested = resync_requested.clone();
+        let worker_retry_requested = retry_requested.clone();
+        let worker_retry_generation = retry_generation.clone();
         let worker_accept_input = accept_input.clone();
         let worker_attenuation = attenuation_bits.clone();
         let worker_diagnostics = diagnostics.clone();
@@ -566,6 +862,8 @@ impl HushRuntime {
                         worker_generation,
                         worker_wet_epoch,
                         worker_resync_requested,
+                        worker_retry_requested,
+                        worker_retry_generation,
                         worker_accept_input,
                         worker_attenuation,
                         worker_diagnostics,
@@ -602,6 +900,8 @@ impl HushRuntime {
             generation,
             wet_epoch,
             resync_requested,
+            retry_requested,
+            retry_generation,
             accept_input,
             attenuation_bits,
             diagnostics,
@@ -627,23 +927,32 @@ impl HushRuntime {
         self.diagnostics
             .latest_input_frame
             .store(start_frame + frames as u64, Ordering::Release);
+        self.diagnostics
+            .latest_submitted_frame
+            .store(start_frame + frames as u64, Ordering::Release);
         if self.diagnostics.worker_failed.load(Ordering::Acquire) {
-            self.diagnostics
-                .input_blocks_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            self.diagnostics
-                .input_frames_rejected
-                .fetch_add(frames as u64, Ordering::Relaxed);
             return true;
         }
         if !self.accept_input.load(Ordering::Acquire) {
-            self.diagnostics
-                .input_blocks_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            self.diagnostics
-                .input_frames_rejected
-                .fetch_add(frames as u64, Ordering::Relaxed);
-            return false;
+            match self.diagnostics.worker_state.load(Ordering::Acquire) {
+                state if state == HushWorkerState::Overloaded.as_u32() => {
+                    self.diagnostics
+                        .input_blocks_skipped_overloaded
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.diagnostics
+                        .input_frames_skipped_overloaded
+                        .fetch_add(frames as u64, Ordering::Relaxed);
+                }
+                _ => {
+                    self.diagnostics
+                        .input_blocks_skipped_recovery
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.diagnostics
+                        .input_frames_skipped_recovery
+                        .fetch_add(frames as u64, Ordering::Relaxed);
+                }
+            }
+            return true;
         }
         if channels == 0 || samples.len() != frames as usize * channels as usize {
             return false;
@@ -684,7 +993,10 @@ impl HushRuntime {
                 self.diagnostics
                     .input_overruns
                     .fetch_add(1, Ordering::Relaxed);
-                self.request_resync();
+                self.diagnostics
+                    .input_queue_overruns
+                    .fetch_add(1, Ordering::Relaxed);
+                self.request_resync(HushOverloadReason::InputQueueFull);
                 let remaining_frames = frames as usize - frame_offset - chunk_frames;
                 if remaining_frames > 0 {
                     self.diagnostics.input_blocks_rejected.fetch_add(
@@ -735,12 +1047,26 @@ impl HushRuntime {
             .measured_worker_headroom_frames
             .store(measured_headroom, Ordering::Relaxed);
         let minimum_headroom = (sample_rate * HUSH_MIN_WORKER_HEADROOM_MS as usize).div_ceil(1000);
-        // Measured cost is reported for health/overload policy. The logical
-        // playout schedule only grows from the observed host quantum; changing
-        // it from a timing sample would move a bypassed/dry timeline whenever
-        // a cold inference completes.
+        // Once several worker observations exist, use the stable p99 rather
+        // than one cold outlier as the timing budget. The schedule is
+        // grow-only for the lifetime of this prepared stream, so the dry/wet
+        // timeline cannot move earlier during normal operation.
+        let stable_p99_frames = if self.diagnostics.performance_windows.load(Ordering::Acquire)
+            >= HUSH_OVERLOAD_OBSERVATIONS as u64
+        {
+            (self
+                .diagnostics
+                .stable_worker_p99_ns
+                .load(Ordering::Acquire) as u128
+                * sample_rate as u128)
+                .div_ceil(1_000_000_000)
+                .min(usize::MAX as u128) as usize
+        } else {
+            0
+        };
         let target = frames
             .saturating_add(minimum_headroom)
+            .max(stable_p99_frames.saturating_add(frames))
             .max((sample_rate * HUSH_SCHEDULING_MS as usize).div_ceil(1000));
         let mut current = self.diagnostics.scheduling_frames.load(Ordering::Acquire) as usize;
         while current < target {
@@ -801,13 +1127,16 @@ impl HushRuntime {
         )
     }
 
-    fn request_resync(&self) {
+    fn request_resync(&self, reason: HushOverloadReason) {
         let state = self.diagnostics.worker_state.load(Ordering::Acquire);
         if state == HushWorkerState::Overloaded.as_u32()
             || state == HushWorkerState::Failed.as_u32()
         {
             return;
         }
+        self.diagnostics
+            .overload_reason
+            .store(reason.as_u32(), Ordering::Release);
         if state == HushWorkerState::Warming.as_u32() {
             // A queue-full partial push while the fresh epoch is warming is
             // already a failed recovery attempt. Keep the dry timeline and
@@ -834,6 +1163,43 @@ impl HushRuntime {
                 .worker_state
                 .store(HushWorkerState::ResyncRequested.as_u32(), Ordering::Release);
         }
+    }
+
+    /// Retry request. It only flips atomics; all DSP reset and queue draining
+    /// remains off the realtime path. The worker polls its bounded wait, so
+    /// this method is also safe when a host delivers a bypass transition from
+    /// its audio callback.
+    pub fn request_retry(&self) {
+        self.request_retry_with_generation(false);
+    }
+
+    /// Request a wet retry and record that the caller also advanced the host
+    /// stream generation. This keeps generation-reset diagnostics distinct
+    /// from worker-only retries such as host re-enable.
+    pub fn request_generation_retry(&self) {
+        self.request_retry_with_generation(true);
+    }
+
+    fn request_retry_with_generation(&self, count_generation: bool) {
+        if self.diagnostics.worker_failed.load(Ordering::Acquire) {
+            return;
+        }
+        self.retry_requested.store(true, Ordering::Release);
+        if count_generation {
+            self.retry_generation.store(true, Ordering::Release);
+        }
+        self.accept_input.store(false, Ordering::Release);
+        if !self.resync_requested.swap(true, Ordering::AcqRel) {
+            self.diagnostics
+                .resync_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.diagnostics
+            .overload_reason
+            .store(HushOverloadReason::None.as_u32(), Ordering::Release);
+        self.diagnostics
+            .worker_state
+            .store(HushWorkerState::ResyncRequested.as_u32(), Ordering::Release);
     }
 
     pub fn set_generation(&self, generation: u64) {
@@ -900,9 +1266,7 @@ struct HushWorker {
     warmup_remaining: usize,
     input_position: u64,
     output_position: u64,
-    realtime_window_audio_frames: u64,
-    realtime_window_processing_ns: u64,
-    realtime_window_ready: bool,
+    performance: HushPerformanceState,
 }
 
 impl HushWorker {
@@ -974,9 +1338,7 @@ impl HushWorker {
                 .div_ceil(HUSH_SAMPLE_RATE),
             input_position: 0,
             output_position: 0,
-            realtime_window_audio_frames: 0,
-            realtime_window_processing_ns: 0,
-            realtime_window_ready: false,
+            performance: HushPerformanceState::default(),
             last_mask: if channels >= 16 {
                 u16::MAX
             } else {
@@ -996,9 +1358,6 @@ impl HushWorker {
         self.warmup_remaining = self.synthesis_frames;
         self.generation = generation;
         self.last_mask = mask;
-        self.realtime_window_audio_frames = 0;
-        self.realtime_window_processing_ns = 0;
-        self.realtime_window_ready = false;
         if count_generation {
             diagnostics
                 .generation_resets
@@ -1067,7 +1426,16 @@ impl HushWorker {
             return Err("Hush worker received an invalid audio block".into());
         }
         self.input_position = block.start_frame + block.frames as u64;
-        let inference_start = Instant::now();
+        let worker_start = Instant::now();
+        let mut input_resample_ns = 0_u64;
+        let mut hush_inference_ns = 0_u64;
+        let mut output_resample_ns = 0_u64;
+        let connected_channels = (0..self.channels)
+            .filter(|&channel| channel_is_connected(block.channel_mask, channel))
+            .count();
+        diagnostics
+            .active_hush_channels
+            .store(connected_channels as u16, Ordering::Release);
         for channel in 0..self.channels {
             if !channel_is_connected(block.channel_mask, channel) {
                 self.input_pending[channel].clear();
@@ -1078,6 +1446,7 @@ impl HushWorker {
 
                 continue;
             }
+            let input_started = Instant::now();
             for frame in 0..frames {
                 self.input_mono[frame] = block.samples[frame * self.channels + channel];
             }
@@ -1085,6 +1454,8 @@ impl HushWorker {
             self.input_resamplers[channel]
                 .process(&self.input_mono[..frames], &mut self.at_model_rate);
             self.input_pending[channel].extend_from_slice(&self.at_model_rate);
+            input_resample_ns = input_resample_ns
+                .saturating_add(input_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             while self.input_pending[channel].len() >= HUSH_FRAME_SIZE {
                 self.frame_input
                     .copy_from_slice(&self.input_pending[channel][..HUSH_FRAME_SIZE]);
@@ -1092,6 +1463,7 @@ impl HushWorker {
                 self.input_pending[channel].copy_within(HUSH_FRAME_SIZE.., 0);
                 self.input_pending[channel].truncate(pending_len - HUSH_FRAME_SIZE);
                 self.frame_output.fill(0.0);
+                let hush_started = Instant::now();
                 #[cfg(test)]
                 thread::sleep(Duration::from_millis(
                     diagnostics.frame_delay_ms.load(Ordering::Relaxed),
@@ -1099,66 +1471,92 @@ impl HushWorker {
                 self.denoisers[channel]
                     .process_frame(&mut self.frame_output, &self.frame_input)
                     .map_err(|error| error.to_string())?;
+                hush_inference_ns = hush_inference_ns
+                    .saturating_add(hush_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
                 diagnostics
                     .hush_frames_processed
                     .fetch_add(1, Ordering::Relaxed);
+                diagnostics
+                    .hush_channel_frames_processed
+                    .fetch_add(HUSH_FRAME_SIZE as u64, Ordering::Relaxed);
                 if self.frame_output.iter().any(|sample| !sample.is_finite()) {
                     return Err("Hush produced a non-finite frame".into());
                 }
+                let output_started = Instant::now();
                 self.at_host_rate.clear();
                 self.output_resamplers[channel].process(&self.frame_output, &mut self.at_host_rate);
+                output_resample_ns = output_resample_ns.saturating_add(
+                    output_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
                 if self.at_host_rate.iter().any(|sample| !sample.is_finite()) {
                     return Err("Hush output resampler produced non-finite audio".into());
                 }
                 self.output_pending[channel].extend_from_slice(&self.at_host_rate);
             }
         }
-        let inference_ns = inference_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let has_connected_channel =
-            (0..self.channels).any(|channel| channel_is_connected(block.channel_mask, channel));
-        if has_connected_channel {
-            self.realtime_window_audio_frames = self
-                .realtime_window_audio_frames
-                .saturating_add(block.frames as u64);
-            self.realtime_window_processing_ns = self
-                .realtime_window_processing_ns
-                .saturating_add(inference_ns);
+        let worker_total_ns = worker_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        diagnostics
+            .input_resample_ns
+            .fetch_add(input_resample_ns, Ordering::Relaxed);
+        diagnostics
+            .hush_inference_ns
+            .fetch_add(hush_inference_ns, Ordering::Relaxed);
+        diagnostics
+            .output_resample_ns
+            .fetch_add(output_resample_ns, Ordering::Relaxed);
+        if connected_channels != 0 {
             diagnostics
                 .worker_audio_frames_processed
                 .fetch_add(block.frames as u64, Ordering::Relaxed);
             diagnostics
                 .worker_processing_ns
-                .fetch_add(inference_ns, Ordering::Relaxed);
-            let factor = self.realtime_window_processing_ns as f64 * self.sample_rate.max(1) as f64
-                / (self.realtime_window_audio_frames.max(1) as f64 * 1e9);
+                .fetch_add(worker_total_ns, Ordering::Relaxed);
+            let observation =
+                self.performance
+                    .observe(block.frames as u64, worker_total_ns, self.sample_rate);
+            diagnostics.realtime_factor_bits.store(
+                self.performance.lifetime_factor(self.sample_rate).to_bits(),
+                Ordering::Release,
+            );
             diagnostics
-                .realtime_factor_bits
-                .store(factor.to_bits(), Ordering::Release);
-            // Keep a rolling half-second window. This avoids declaring a
-            // worker overloaded because of one cold-start inference while
-            // still reacting before the bounded queue fills.
-            let window_frames = (self.sample_rate as u64 / 2).max(1);
-            if self.realtime_window_audio_frames >= window_frames {
-                self.realtime_window_audio_frames = 0;
-                self.realtime_window_processing_ns = 0;
-                self.realtime_window_ready = true;
-            }
+                .ewma_realtime_factor_bits
+                .store(observation.ewma.to_bits(), Ordering::Release);
+            diagnostics
+                .last_realtime_factor_bits
+                .store(observation.factor.to_bits(), Ordering::Release);
+            diagnostics
+                .overload_windows
+                .store(self.performance.overload_windows, Ordering::Release);
+            diagnostics
+                .healthy_windows
+                .store(self.performance.healthy_windows, Ordering::Release);
+            diagnostics
+                .performance_windows
+                .store(self.performance.performance_windows, Ordering::Release);
+            diagnostics.stable_worker_p95_ns.store(
+                self.performance.stable_p95_ns.max(0.0) as u64,
+                Ordering::Relaxed,
+            );
+            diagnostics.stable_worker_p99_ns.store(
+                self.performance.stable_p99_ns.max(0.0) as u64,
+                Ordering::Relaxed,
+            );
         }
         if let Ok(mut timings) = diagnostics.timings.lock() {
             if timings.len() == 4096 {
                 timings.pop_front();
             }
-            timings.push_back(inference_ns);
+            timings.push_back(worker_total_ns);
         }
         diagnostics.processed_blocks.fetch_add(1, Ordering::Relaxed);
         diagnostics
             .inference_ns
-            .fetch_add(inference_ns, Ordering::Relaxed);
+            .fetch_add(worker_total_ns, Ordering::Relaxed);
         let mut maximum = diagnostics.max_inference_ns.load(Ordering::Relaxed);
-        while maximum < inference_ns {
+        while maximum < worker_total_ns {
             match diagnostics.max_inference_ns.compare_exchange_weak(
                 maximum,
-                inference_ns,
+                worker_total_ns,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -1228,6 +1626,9 @@ impl HushWorker {
             if !pushed {
                 diagnostics.output_overruns.fetch_add(1, Ordering::Relaxed);
                 diagnostics
+                    .wet_frames_dropped_queue_full
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                diagnostics
                     .wet_frames_dropped
                     .fetch_add(count as u64, Ordering::Relaxed);
             } else {
@@ -1251,6 +1652,8 @@ fn worker_loop(
     generation: Arc<AtomicU64>,
     wet_epoch: Arc<AtomicU64>,
     resync_requested: Arc<AtomicBool>,
+    retry_requested: Arc<AtomicBool>,
+    retry_generation: Arc<AtomicBool>,
     accept_input: Arc<AtomicBool>,
     attenuation: Arc<AtomicU32>,
     diagnostics: Arc<HushDiagnostics>,
@@ -1285,10 +1688,23 @@ fn worker_loop(
     };
 
     while !stop.load(Ordering::Acquire) && !diagnostics.worker_failed.load(Ordering::Acquire) {
+        // A realtime producer may enter the terminal state while reporting a
+        // queue-full recovery failure. Mirror that atomic state into the
+        // worker-local state machine before the next scheduling decision; the
+        // worker must not remain in Warming with input acceptance disabled.
+        if diagnostics.worker_state.load(Ordering::Acquire) == HushWorkerState::Overloaded.as_u32()
+            && !matches!(state, HushWorkerState::Overloaded)
+        {
+            state = HushWorkerState::Overloaded;
+            accept_input.store(false, Ordering::Release);
+            cooldown_until = Instant::now() + overload_cooldown_for_attempt(overload_attempts);
+        }
         // A resync is consumed by the worker exactly once. The producer is
         // gated while queues are drained, so no stale block can restart the
         // reset loop.
         if resync_requested.load(Ordering::Acquire) {
+            let _manual_retry = retry_requested.swap(false, Ordering::AcqRel);
+            let count_generation = retry_generation.swap(false, Ordering::AcqRel);
             diagnostics.worker_active.store(true, Ordering::Release);
             diagnostics
                 .recovery_attempts
@@ -1304,6 +1720,9 @@ fn worker_loop(
                     diagnostics
                         .wet_frames_dropped
                         .fetch_add(block.frames as u64, Ordering::Relaxed);
+                    diagnostics
+                        .wet_frames_dropped_epoch
+                        .fetch_add(block.frames as u64, Ordering::Relaxed);
                 })
                 .is_some()
             {}
@@ -1315,15 +1734,21 @@ fn worker_loop(
                     diagnostics
                         .wet_frames_dropped
                         .fetch_add(block.frames as u64, Ordering::Relaxed);
+                    diagnostics
+                        .wet_frames_dropped_epoch
+                        .fetch_add(block.frames as u64, Ordering::Relaxed);
                 })
                 .is_some()
             {}
 
             let current_generation = generation.load(Ordering::Acquire);
             let next_epoch = wet_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-            if let Err(error) =
-                worker.reset(current_generation, worker.last_mask, &diagnostics, false)
-            {
+            if let Err(error) = worker.reset(
+                current_generation,
+                worker.last_mask,
+                &diagnostics,
+                count_generation,
+            ) {
                 *diagnostics.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
                 diagnostics.worker_failed.store(true, Ordering::Release);
                 diagnostics.worker_active.store(false, Ordering::Release);
@@ -1331,6 +1756,9 @@ fn worker_loop(
                 break;
             }
             worker.wet_epoch = next_epoch;
+            diagnostics
+                .latest_completed_input_frame
+                .store(latest_frame.load(Ordering::Acquire), Ordering::Release);
             diagnostics
                 .worker_input_frame
                 .store(latest_frame.load(Ordering::Acquire), Ordering::Release);
@@ -1356,6 +1784,9 @@ fn worker_loop(
                     diagnostics
                         .wet_frames_dropped
                         .fetch_add(block.frames as u64, Ordering::Relaxed);
+                    diagnostics
+                        .wet_frames_dropped_epoch
+                        .fetch_add(block.frames as u64, Ordering::Relaxed);
                 })
                 .is_some()
             {}
@@ -1365,19 +1796,27 @@ fn worker_loop(
             diagnostics
                 .worker_input_frame
                 .store(latest_frame.load(Ordering::Acquire), Ordering::Release);
-            if Instant::now() < cooldown_until {
+            diagnostics
+                .latest_completed_input_frame
+                .store(latest_frame.load(Ordering::Acquire), Ordering::Release);
+            let manual_retry = retry_requested.swap(false, Ordering::AcqRel);
+            if Instant::now() < cooldown_until && !manual_retry {
                 if !wait_briefly(&signal, &stop) {
                     break;
                 }
                 continue;
             }
             // Retry on a bounded exponential cooldown. A temporary scheduler
-            // stall can recover; a permanently slow model settles into an
-            // increasingly quiet dry-fallback mode instead of a reset storm.
-            overload_attempts = overload_attempts.saturating_add(1);
-            diagnostics.resync_requests.fetch_add(1, Ordering::Relaxed);
-            resync_requested.store(true, Ordering::Release);
-            set_state(HushWorkerState::ResyncRequested, &diagnostics);
+            // stall can recover; after a small number of automatic attempts a
+            // permanently slow model remains idle in stable dry fallback.
+            if manual_retry || overload_attempts < HUSH_MAX_AUTOMATIC_RETRIES {
+                overload_attempts = overload_attempts.saturating_add(1);
+                diagnostics.resync_requests.fetch_add(1, Ordering::Relaxed);
+                resync_requested.store(true, Ordering::Release);
+                set_state(HushWorkerState::ResyncRequested, &diagnostics);
+            } else if !wait_briefly(&signal, &stop) {
+                break;
+            }
             continue;
         }
 
@@ -1407,6 +1846,10 @@ fn worker_loop(
         record_maximum(&diagnostics.max_worker_backlog_frames, backlog as usize);
         if backlog > backlog_limit {
             accept_input.store(false, Ordering::Release);
+            diagnostics.overload_reason.store(
+                HushOverloadReason::BacklogExceeded.as_u32(),
+                Ordering::Release,
+            );
             if matches!(state, HushWorkerState::Warming) {
                 // Warming already follows a completed wet-pipeline reset. If
                 // the fresh worker cannot establish lead before the useful
@@ -1418,11 +1861,7 @@ fn worker_loop(
                     .fetch_add(1, Ordering::Relaxed);
                 state = HushWorkerState::Overloaded;
                 set_state(state, &diagnostics);
-                let shift = overload_attempts.min(3);
-                let cooldown_ms = HUSH_OVERLOAD_COOLDOWN_MS
-                    .saturating_mul(1_u64 << shift)
-                    .min(5_000);
-                cooldown_until = Instant::now() + Duration::from_millis(cooldown_ms);
+                cooldown_until = Instant::now() + overload_cooldown_for_attempt(overload_attempts);
             } else if !resync_requested.swap(true, Ordering::AcqRel) {
                 diagnostics.resync_requests.fetch_add(1, Ordering::Relaxed);
                 diagnostics.worker_overloaded.store(true, Ordering::Release);
@@ -1443,9 +1882,6 @@ fn worker_loop(
                 diagnostics
                     .input_frames_consumed
                     .fetch_add(block.frames as u64, Ordering::Relaxed);
-                diagnostics
-                    .worker_input_frame
-                    .store(block_end, Ordering::Release);
                 let current_backlog = latest_frame
                     .load(Ordering::Acquire)
                     .saturating_sub(block_end);
@@ -1458,6 +1894,10 @@ fn worker_loop(
                 }
                 if current_backlog > backlog_limit {
                     accept_input.store(false, Ordering::Release);
+                    diagnostics.overload_reason.store(
+                        HushOverloadReason::BacklogExceeded.as_u32(),
+                        Ordering::Release,
+                    );
                     if matches!(state, HushWorkerState::Warming) {
                         diagnostics.worker_overloaded.store(true, Ordering::Release);
                         diagnostics
@@ -1465,11 +1905,8 @@ fn worker_loop(
                             .fetch_add(1, Ordering::Relaxed);
                         state = HushWorkerState::Overloaded;
                         set_state(state, &diagnostics);
-                        let shift = overload_attempts.min(3);
-                        let cooldown_ms = HUSH_OVERLOAD_COOLDOWN_MS
-                            .saturating_mul(1_u64 << shift)
-                            .min(5_000);
-                        cooldown_until = Instant::now() + Duration::from_millis(cooldown_ms);
+                        cooldown_until =
+                            Instant::now() + overload_cooldown_for_attempt(overload_attempts);
                     } else if !resync_requested.swap(true, Ordering::AcqRel) {
                         diagnostics.resync_requests.fetch_add(1, Ordering::Relaxed);
                         diagnostics.worker_overloaded.store(true, Ordering::Release);
@@ -1548,43 +1985,66 @@ fn worker_loop(
                     set_state(HushWorkerState::Failed, &diagnostics);
                     return;
                 }
+                // This is a completed horizon, not merely a block removed
+                // from the input queue.  Keeping the distinction explicit is
+                // what makes the wet timeline safe while inference is still
+                // running.
+                diagnostics
+                    .worker_input_frame
+                    .store(block_end, Ordering::Release);
+                diagnostics
+                    .latest_completed_input_frame
+                    .store(block_end, Ordering::Release);
 
                 if matches!(state, HushWorkerState::Starting) {
                     set_state(HushWorkerState::Running, &diagnostics);
                     state = HushWorkerState::Running;
                 }
-                let factor =
-                    f64::from_bits(diagnostics.realtime_factor_bits.load(Ordering::Acquire));
-                if worker.realtime_window_ready {
-                    worker.realtime_window_ready = false;
-                    // Offline callers may submit blocks faster than wall
-                    // clock by design. A high processing ratio alone is not
-                    // an overload signal; require a real queued/backlogged
-                    // stream as well. Live PipeWire producers satisfy this
-                    // condition as soon as the worker cannot keep up.
-                    let live_backlog =
-                        current_backlog > recovery_lead || input.depth() > HUSH_QUEUE_CAPACITY / 4;
-                    if factor.is_finite() && factor > HUSH_REALTIME_FACTOR_LIMIT && live_backlog {
-                        diagnostics.worker_overloaded.store(true, Ordering::Release);
-                        diagnostics
-                            .recovery_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        accept_input.store(false, Ordering::Release);
-                        state = HushWorkerState::Overloaded;
-                        set_state(state, &diagnostics);
-                        let shift = overload_attempts.min(3);
-                        let cooldown_ms = HUSH_OVERLOAD_COOLDOWN_MS
-                            .saturating_mul(1_u64 << shift)
-                            .min(5_000);
-                        cooldown_until = Instant::now() + Duration::from_millis(cooldown_ms);
-                    }
+                let ewma_factor = f64::from_bits(
+                    diagnostics
+                        .ewma_realtime_factor_bits
+                        .load(Ordering::Acquire),
+                );
+                let overload_confident = diagnostics.overload_windows.load(Ordering::Acquire)
+                    >= HUSH_OVERLOAD_OBSERVATIONS;
+                let live_backlog = latest_frame
+                    .load(Ordering::Acquire)
+                    .saturating_sub(block_end)
+                    > recovery_lead
+                    || input.depth() > HUSH_QUEUE_CAPACITY / 4;
+                if overload_confident
+                    && ewma_factor.is_finite()
+                    && ewma_factor > HUSH_REALTIME_FACTOR_LIMIT
+                    && live_backlog
+                {
+                    diagnostics
+                        .overload_reason
+                        .store(HushOverloadReason::CpuTooSlow.as_u32(), Ordering::Release);
+                    diagnostics.worker_overloaded.store(true, Ordering::Release);
+                    diagnostics
+                        .recovery_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    accept_input.store(false, Ordering::Release);
+                    state = HushWorkerState::Overloaded;
+                    set_state(state, &diagnostics);
+                    cooldown_until =
+                        Instant::now() + overload_cooldown_for_attempt(overload_attempts);
                 }
+                let fresh_wet_lead = diagnostics
+                    .latest_wet_frame
+                    .load(Ordering::Acquire)
+                    .saturating_sub(diagnostics.playout_frame.load(Ordering::Acquire));
+                let healthy_confident = diagnostics.healthy_windows.load(Ordering::Acquire)
+                    >= HUSH_HEALTHY_OBSERVATIONS;
+                let post_backlog = latest_frame
+                    .load(Ordering::Acquire)
+                    .saturating_sub(block_end);
                 if matches!(state, HushWorkerState::Warming)
-                    && diagnostics
-                        .latest_wet_frame
-                        .load(Ordering::Acquire)
-                        .saturating_sub(diagnostics.playout_frame.load(Ordering::Acquire))
-                        >= recovery_lead
+                    && healthy_confident
+                    && ewma_factor.is_finite()
+                    && ewma_factor < HUSH_HEALTHY_REALTIME_FACTOR_LIMIT
+                    && fresh_wet_lead >= recovery_lead
+                    && post_backlog <= recovery_lead
                 {
                     diagnostics
                         .worker_overloaded
@@ -1595,6 +2055,9 @@ fn worker_loop(
                     set_state(HushWorkerState::Running, &diagnostics);
                     state = HushWorkerState::Running;
                     overload_attempts = 0;
+                    diagnostics
+                        .overload_reason
+                        .store(HushOverloadReason::None.as_u32(), Ordering::Release);
                 }
             });
             diagnostics.worker_active.store(false, Ordering::Release);
@@ -1611,6 +2074,79 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observe_windows(performance: &mut HushPerformanceState, factor: u64, count: usize) {
+        for _ in 0..count {
+            // 2,400 frames at 48 kHz are one 50 ms performance window.
+            performance.observe(2_400, factor * 50_000_000, 48_000);
+        }
+    }
+
+    #[test]
+    fn performance_estimator_survives_a_dsp_reset_boundary() {
+        let mut performance = HushPerformanceState::default();
+        observe_windows(&mut performance, 2, HUSH_OVERLOAD_OBSERVATIONS as usize);
+        assert!(performance.overload_windows >= HUSH_OVERLOAD_OBSERVATIONS);
+        let ewma_before_reset = performance.ewma_realtime_factor;
+
+        // Exercise the real reset boundary: only the worker's DSP-owned
+        // state is rebuilt, while the persistent estimator remains intact.
+        let model = crate::hush_noise::shared_hush_model().unwrap();
+        let diagnostics = HushDiagnostics::default();
+        let mut worker = HushWorker::new(model, 48_000, 1, 128, 25.0).unwrap();
+        worker.performance = performance.clone();
+        worker.reset(0, 1, &diagnostics, false).unwrap();
+
+        assert!(performance.overload_windows >= HUSH_OVERLOAD_OBSERVATIONS);
+        assert_eq!(worker.performance.ewma_realtime_factor, ewma_before_reset);
+        assert!(worker.performance.overload_windows >= HUSH_OVERLOAD_OBSERVATIONS);
+    }
+
+    #[test]
+    fn performance_state_distinguishes_healthy_temporary_and_permanent_load() {
+        let mut healthy = HushPerformanceState::default();
+        observe_windows(&mut healthy, 0, HUSH_HEALTHY_OBSERVATIONS as usize);
+        assert!(healthy.healthy_windows >= HUSH_HEALTHY_OBSERVATIONS);
+        assert!(healthy.overload_windows < HUSH_OVERLOAD_OBSERVATIONS);
+
+        let mut temporary = HushPerformanceState::default();
+        observe_windows(&mut temporary, 0, HUSH_HEALTHY_OBSERVATIONS as usize);
+        // The EWMA deliberately filters a short spike. Five observations are
+        // long enough to classify this as overload, while the healthy tail
+        // below proves that confidence can recover without reconstructing the
+        // performance state.
+        observe_windows(&mut temporary, 2, 5);
+        assert!(temporary.overload_windows >= HUSH_OVERLOAD_OBSERVATIONS);
+        observe_windows(&mut temporary, 0, 8);
+        assert!(temporary.healthy_windows >= HUSH_HEALTHY_OBSERVATIONS);
+        assert!(temporary.overload_windows < HUSH_OVERLOAD_OBSERVATIONS);
+
+        let mut permanent = HushPerformanceState::default();
+        observe_windows(&mut permanent, 2, 12);
+        assert!(permanent.overload_windows >= HUSH_OVERLOAD_OBSERVATIONS);
+        assert_eq!(permanent.healthy_windows, 0);
+    }
+
+    #[test]
+    fn overload_cooldown_is_exponential_and_bounded() {
+        assert_eq!(overload_cooldown_for_attempt(0), Duration::from_millis(500));
+        assert_eq!(
+            overload_cooldown_for_attempt(1),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            overload_cooldown_for_attempt(2),
+            Duration::from_millis(2_000)
+        );
+        assert_eq!(
+            overload_cooldown_for_attempt(3),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            overload_cooldown_for_attempt(20),
+            Duration::from_millis(5_000)
+        );
+    }
 
     #[test]
     fn queue_is_bounded_and_fifo() {

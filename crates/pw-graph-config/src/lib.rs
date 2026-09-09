@@ -1096,6 +1096,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: [("threshold-db".into(), -42.0)].into_iter().collect(),
+                channels: None,
             },
             source: Some(PortKey {
                 node_name: "Capture".into(),
@@ -1193,6 +1194,7 @@ enabled = true
                     module_path: None,
                     enabled: false,
                     parameters: effect_parameters,
+                    channels: None,
                 }],
                 ..WindowsApplicationRoute::default()
             });
@@ -1245,6 +1247,7 @@ enabled = true
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
+                channels: None,
             }],
             ..WindowsApplicationRoute::default()
         };

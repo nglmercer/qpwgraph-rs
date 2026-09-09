@@ -30,6 +30,12 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["qpwgraph-rs contributors"]
 
+# Keep the production Hush benchmark explicit.  Target-specific CPU tuning is
+# intentionally left to downstream packaging so distributed binaries do not
+# require this machine's exact instruction set.
+[profile.release]
+opt-level = 3
+
 [workspace.dependencies]
 anyhow = "1.0"
 slint = { version = "=1.17.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "renderer-software"] }

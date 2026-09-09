@@ -1,113 +1,123 @@
 # Hush runtime validation
 
-Validated 2026-09-09 against the Hush timeline and overload-recovery changes in
-the qpwgraph working tree. The live probe used the physical PipeWire capture
-route at 48 kHz, stereo, quantum 256.
+Validated against commit `5117ecfde56ddfdaae818caa66cd05de4e14a73e` with the
+working-tree changes in this checkout on 2026-09-09.
 
-## Implementation report
+## Root cause
 
-1. **Root cause:** output acceptance required callback sequence `N - 1`, so any inference longer than one host quantum was discarded forever. Once timeline scheduling was fixed, live diagnostics exposed a second defect: a slow worker could fill the input queue and keep processing audio that was already too late to play.
-2. **Architecture:** input/output blocks carry stream generation, wet epoch, and absolute host-rate `start_frame`. Native 160-sample assembly, resampling, and wet output are continuous timelines. A separate wet epoch lets overload recovery reset only the wet pipeline while the aligned dry delay remains continuous.
-3. **Old behavior:** a result missing its exact next callback was dropped.
-4. **New behavior:** the callback requests the delayed stream range; expired ranges are discarded, future/partial ranges remain queued, and unavailable ranges use the same-position dry samples.
-5. **Latency:** fixed 50 ms: 40 ms worker/frame-assembly scheduling allowance plus 10 ms Hush synthesis alignment. The 40 ms allowance is conservative against the measured release stereo worst case (6.13 ms live, 4.68 ms in the expanded benchmark) and leaves room for callback jitter. The 320-sample algorithmic metadata is not counted again.
-6. **Queue:** 128 power-of-two SPSC slots per direction. Slot size is at most 10 ms, independent of PipeWire's 16,384-frame preparation ceiling.
-7. **Underruns:** never block RT; retain aligned sanitized dry. Wet resumes automatically when its timeline catches up. Permanent worker failure is reported separately from temporary late output.
-8. **Overflow:** input returns immediately and counts rejected blocks/frames; a partial multi-chunk enqueue requests a wet resynchronization. Output drops the newly computed range while advancing its timeline. Backlog over 80 ms also requests one resynchronization; stale input is discarded rather than sent through DeepFilterNet.
-9. **Generations:** reset/reprepare, sample-rate/channel changes, connection-mask changes, and real stream gaps invalidate the stream generation. Callback quantum, jitter, parameter changes, bypass, and wet-only overload recovery do not. Wet epochs are monotonic and prevent old wet data from re-entering after recovery.
-10. **Resampler delay:** centered sinc lookahead affects availability, not sample position. Impulse tests at 16/44.1/48/96 kHz stay within one host frame.
-11. **Initialization/errors:** Tract remains owned by the worker because it is not `Send`; startup is synchronously acknowledged to `prepare()`. Initialization, inference, resampler, non-finite output, and panic errors retain their real reason.
-12. **Realtime safety:** `process()` only sanitizes, copies, delays, uses bounded SPSC operations, and updates atomics. No allocation, inference, filesystem I/O, blocking wait, mutex lock, or join occurs there. The producer wakes the worker only when a queue changes from empty to non-empty; the worker also uses a 500 µs timed poll. Shutdown wakes/joins off RT.
-13. **Bypass/reduction:** bypass is aligned delayed dry. Reduction updates use atomics and apply to the next worker chunk. Below 0.01 dB, aligned dry is selected while the worker stays warm at 0.01 dB because DeepFilterNet otherwise changes delay.
-14. **Diagnostics:** exposed rate, channels, host quantum, latency, wet/dry blocks and frames, fallback reasons, underruns, queue peaks/overruns, rejected frames, stale drops, resync requests/completions, backlog, Hush frames, resets, worker average/p95/p99/max timing, readiness, overload state, and failure reason. PipeWire, Windows, and UI snapshots use the control-side diagnostic handle.
-15. **Tests:** wet-vs-dry integration, direct Hush reference, 64/128/256/480/512/1024 quantums, variable quantums, artificial delay, catch-up, partial enqueue, repeated and permanently slow overload, reset-storm prevention, recovery warmup, future/partial/expired ranges, SPSC wraparound, impulse alignment, allocation-free processing, disconnect silence, non-finite input, bypass/host-disable separation, and existing adaptive/UI/backend regressions.
-16. **CI:** `.github/workflows/hush.yml` now runs on relevant `main` pushes as well as pull requests and manual dispatch. The normal effects suite contains the wet-output regression.
+The audited runtime had two interacting failures. The worker was slower than
+realtime in the debug/live configuration, and its rolling realtime-factor
+window was erased by every wet-pipeline reset. A slow worker therefore kept
+restarting before it could become confidently classified as permanently slow.
+
+The fix separates mutable Hush DSP state from persistent worker-performance
+state. A wet reset clears denoisers, resamplers, pending buffers, warmup, and
+the wet epoch, but retains lifetime timing, EWMA service rate, high-percentile
+timing, and overload confidence.
+
+## Runtime policy
+
+- A complete 50 ms performance interval updates the lifetime factor and a
+  persistent EWMA. The EWMA smoothing coefficient is 0.75, so a cold sample
+  is visible without immediately changing state.
+- Overload entry requires raw and EWMA realtime factor above `1.10` for three
+  observations plus real backlog. Exit requires both below `0.90` for three
+  observations, fresh wet lead, and a bounded post-recovery backlog.
+- `Overloaded` stops accepting normal input, drains stale work, keeps the
+  aligned dry timeline running, and does not reset Hush on every callback.
+  The overload cause is reported as CPU throughput, backlog, or queue full.
+- Automatic retry cooldowns are 500 ms, 1 s, 2 s, then 5 s. Automatic retries
+  stop after three attempts; an explicit control-path retry remains available
+  after re-enable, layout, sample-rate, or generation changes.
+- The wet request is computed from an absolute callback start and is asserted
+  to end no later than that start. `latest_submitted_frame`,
+  `latest_completed_input_frame`, and `latest_wet_frame` are published
+  explicitly.
+- Scheduling starts at 40 ms, is always at least the active host quantum plus
+  minimum headroom, and only grows during a prepared stream. At 48 kHz it is
+  1,920 frames for quantum 512 and 2,528 frames for quantum 2,048. With the
+  480-frame Hush synthesis delay, those total latencies are 50.0 ms and
+  62.7 ms.
+- PipeWire creates mono Hush ports and one denoiser for mono routes. Stereo
+  routes retain independent FL/FR denoisers. A disconnected channel is not
+  inferred as audio and does not run inference; its output is exact zero.
+  Layout hints are persisted, while old configurations without a hint keep
+  their legacy behavior or infer inserted Hush layout from the source route.
 
 ## Measurements
 
-Release benchmark on Linux, AMD BC-250, 12 logical CPUs. Each case ran at its
-callback cadence and consumed a 100 ms tail so the output queue was drained as
-a real host would do:
+The audited report showed approximately 2.04x EWMA and 2.27x measured worker
+factor in its slow configuration. The release build on this machine is
+materially different: direct native Hush is 0.111x mono and 0.229x for two
+independent channels, so the model itself is not the source of the audited 2x
+result.
 
-| rate/channels/quantum | worker avg / p95 / p99 / max (µs) | wet / dry | underruns / input / output overruns |
-|---|---:|---:|---:|
-| 16k/1/160 | 1,480 / 1,988 / 2,057 / 2,092 | 125 / 5 | 0 / 0 / 0 |
-| 44.1k/1/441 | 1,748 / 2,365 / 2,400 / 2,408 | 125 / 5 | 0 / 0 / 0 |
-| 48k/1/480 | 1,609 / 2,274 / 2,669 / 2,688 | 125 / 5 | 0 / 0 / 0 |
-| 48k/2/480 | 2,903 / 3,303 / 3,581 / 4,030 | 125 / 5 | 0 / 0 / 0 |
-| 48k/1/64 | 190 / 1,702 / 2,054 / 2,199 | 158 / 38 | 0 / 0 / 0 |
-| 48k/1/128 | 458 / 2,078 / 2,162 / 2,178 | 139 / 19 | 0 / 0 / 0 |
-| 48k/1/256 | 959 / 2,210 / 2,343 / 2,368 | 129 / 10 | 0 / 0 / 0 |
-| 48k/1/512 | 856 / 1,982 / 2,374 / 2,471 | 125 / 5 | 0 / 0 / 0 |
-| 48k/1/1024 | 1,241 / 2,380 / 2,573 / 2,675 | 122 / 3 | 0 / 0 / 0 |
-| 48k/2/64 | 320 / 2,733 / 3,073 / 3,074 | 158 / 38 | 0 / 0 / 0 |
-| 48k/2/128 | 738 / 2,976 / 3,560 / 3,648 | 139 / 19 | 0 / 0 / 0 |
-| 48k/2/256 | 1,580 / 3,238 / 3,461 / 3,577 | 129 / 10 | 0 / 0 / 0 |
-| 48k/2/512 | 1,572 / 3,284 / 3,928 / 4,056 | 125 / 5 | 0 / 0 / 0 |
-| 48k/2/1024 | 2,150 / 3,759 / 4,531 / 4,677 | 122 / 3 | 0 / 0 / 0 |
-| 96k/1/256 | 570 / 2,492 / 2,556 / 2,583 | 139 / 19 | 0 / 0 / 0 |
-| 96k/1/480 | 1,111 / 2,650 / 2,775 / 2,777 | 130 / 10 | 0 / 0 / 0 |
-| 96k/1/1024 | 1,164 / 2,974 / 3,063 / 3,381 | 125 / 5 | 0 / 0 / 0 |
-| 96k/2/256 | 854 / 3,278 / 3,417 / 3,486 | 139 / 19 | 0 / 0 / 0 |
-| 96k/2/480 | 1,738 / 3,583 / 4,579 / 4,663 | 130 / 10 | 0 / 0 / 0 |
-| 96k/2/1024 | 1,924 / 4,050 / 4,643 / 4,734 | 125 / 5 | 0 / 0 / 0 |
+The qpwgraph benchmark uses the complete resampling, worker, queue, and wet
+timeline path. Its wet ratio includes the initial 50 ms dry startup period;
+the sustained 30-second release test measures the post-startup health.
 
-The deterministic wet-path run reported `wet_blocks_output = 73`, `dry_fallback_blocks = 8`, `underruns = 0`, `input_overruns = 0`, and `output_overruns = 0` for 96 kHz stereo variable callbacks. The direct-adapter comparison passed within `2e-5`.
+| build | rate / channels / quantum | worker avg / p95 / p99 / max | lifetime / EWMA RT | wet ratio | queue overruns / resync |
+|---|---|---:|---:|---:|---:|
+| debug | 48k / 1 / 512 | 4.726 / 9.684 / 9.782 / 9.929 ms | 0.886 / 0.808x | 96.4% | 0 / 0 |
+| debug | 48k / 2 / 512 | 9.708 / 18.869 / 18.869 / 18.869 ms | 1.731 / 1.739x | 0.8% | 0 / 1/1 |
+| debug | 48k / 1 / 2,048 | 7.871 / 9.956 / 11.425 / 13.068 ms | 0.922 / 0.808x | 95.7% | 0 / 0 |
+| debug | 48k / 2 / 2,048 | 15.135 / 18.503 / 18.503 / 18.503 ms | 1.724 / 1.727x | 0.3% | 0 / 1/1 |
+| release | 48k / 1 / 512 | 0.880 / 2.009 / 2.396 / 2.450 ms | 0.165 / 0.157x | 96.4% | 0 / 0 |
+| release | 48k / 2 / 512 | 1.572 / 3.321 / 3.916 / 4.184 ms | 0.295 / 0.273x | 96.4% | 0 / 0 |
+| release | 48k / 1 / 2,048 | 1.433 / 2.445 / 2.771 / 4.705 ms | 0.168 / 0.151x | 98.3% | 0 / 0 |
+| release | 48k / 2 / 2,048 | 2.488 / 3.659 / 4.342 / 4.801 ms | 0.292 / 0.258x | 98.3% | 0 / 0 |
 
-## Validation commands
+In that release run, input pushes were 258 for quantum 512 and 610 for
+quantum 2,048. All four headline cases had zero input blocks rejected, zero
+intentional-overload skips, zero queue overruns, and zero stale wet drops;
+active Hush channels were 1/2 for mono/stereo respectively. The 2,048-frame
+cases recorded 24 partial-output underrun callbacks under this host's test
+pacing, while retaining 98.3% wet frames; the sustained 256-frame test had
+zero underruns and 99.8% wet frames.
 
-Passed:
+The sustained 48 kHz/stereo/256 release test produced 1,437,600 wet frames
+and 2,400 startup dry frames: 99.8% wet, zero underruns, zero input/output
+queue overruns, and zero resyncs.
+
+The direct native 16 kHz benchmark processed 160 native frames per channel:
+
+| direct path | avg / p95 / p99 / max | RT factor |
+|---|---:|---:|
+| Hush mono | 1.106 / 1.144 / 1.226 / 1.351 ms | 0.111x |
+| Hush, two independent channels | 2.287 / 2.870 / 2.959 / 2.992 ms | 0.229x |
+
+CPU percentage was not instrumented by the benchmark; timing and realtime
+factor are the authoritative measurements currently available.
+
+## Validation
+
+Passed in this checkout:
 
 ```text
 cargo fmt --all -- --check
 cargo check --workspace --all-features
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test -p pw-graph-effects --all-features
-cargo test -p pw-graph-backend --all-features
-cargo test -p pw-graph-app --all-features
-HUSH_MODEL=$PWD/crates/pw-graph-effects/resources/hush/advanced_dfnet16k_model_best_onnx.tar.gz cargo test -p nnnoiseless --features hush --test hush --test hush_buffer -- --nocapture
-cargo check -p pw-graph-backend --all-features --target x86_64-pc-windows-gnu
-cargo test -p pw-graph-effects benchmark_hush_rates -- --ignored --nocapture
+HUSH_MODEL=../../crates/pw-graph-effects/resources/hush/advanced_dfnet16k_model_best_onnx.tar.gz cargo test -p nnnoiseless --features hush --test hush --test hush_buffer -- --nocapture
+cargo test --release -p pw-graph-effects benchmark_direct_hush_rates -- --ignored --nocapture
 cargo test --release -p pw-graph-effects benchmark_hush_rates -- --ignored --nocapture
-
 cargo test --release -p pw-graph-effects sustained_48k_stereo_256_keeps_wet_audio_dominant -- --ignored --nocapture
-
-cargo run --release -p pw-graph-backend --example hush_probe --features pipewire -- --seconds 35 --reduction 40
 ```
 
-`pw-graph-slint` is not a Cargo package in this checkout; its package is `pw-graph-app`, whose 141 tests passed.
+The model-test path is relative to Cargo's package working directory; using
+an absolute `HUSH_MODEL` path is also valid.
 
-## Live PipeWire check
+The live release probe was run with `--channels 2`. It successfully loaded
+and published the Hush node, but this environment had no probe links, so
+PipeWire delivered zero callbacks (`quantum 0`, wet 0, processed blocks 0).
+The final cleanup round-trip returned a PipeWire `unknown resource` error;
+this is a daemon/registry teardown issue, not an Hush inference result. A
+connected microphone-to-sink probe remains required on a real PipeWire graph.
 
-The release `hush_probe --seconds 35 --reduction 40` was wired from the
-physical stereo microphone to a null playback sink at 48 kHz/256 frames. At
-the end of the run it reported:
+`cargo check -p pw-graph-backend --all-features --target x86_64-pc-windows-gnu`
+passed. No Windows/WASAPI listening machine was available, so no Windows
+runtime result is claimed here.
 
-```text
-wet_blocks_output = 4,091
-dry_fallback_blocks = 10
-wet_frames_output = 1,047,200
-dry_frames_output = 2,400
-wet_ratio = 99.8%
-underruns = 0
-input_overruns = 0
-output_overruns = 0
-resync_requests/completed = 0/0
-max_input_queue_depth = 2
-max_output_queue_depth = 4
-worker avg/p99/max = 1.79/3.87/6.13 ms
-```
-
-This is the user's failing workload and demonstrates that qpwgraph is
-emitting wet Hush audio rather than continuously returning dry fallback. The
-debug probe remained bounded but was overloaded by Tract scheduling: it
-reported zero input/output overruns, repeated controlled resyncs, and stayed
-in aligned dry recovery. That is expected for this unoptimized build; the
-release path is the production performance result.
-
-No native Windows/WASAPI machine was available for listening, and no
-controlled competing-speaker/fan recording was performed. Those remain manual
-validation items. Slow debug builds or sustained CPU overload use bounded,
-aligned dry fallback and expose `Hush: recovering` rather than accumulating
-unbounded latency.
+The legacy `builtin.adaptive-noise-suppressor` path and existing UI selection,
+typed callbacks, persistence, bypass, silence, and monitoring-safety tests
+remain covered by the workspace suite.

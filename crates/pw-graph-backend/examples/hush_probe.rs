@@ -5,6 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use pw_graph_backend::{EffectDriver, EffectNodeRequest, PipewireDriver};
     let mut seconds = 30u64;
     let mut fixed_reduction = None;
+    let mut channels = 2u16;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -19,8 +20,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .clamp(0.0, 60.0),
                 );
             }
+            "--channels" => {
+                channels = args
+                    .next()
+                    .ok_or("--channels needs a value")?
+                    .parse::<u16>()?;
+                if !matches!(channels, 1 | 2) {
+                    return Err("--channels must be 1 or 2".into());
+                }
+            }
             "--help" | "-h" => {
-                println!("usage: hush_probe [--seconds N] [--reduction DB]");
+                println!("usage: hush_probe [--seconds N] [--reduction DB] [--channels 1|2]");
                 return Ok(());
             }
             unknown => return Err(format!("unknown argument: {unknown}").into()),
@@ -33,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         module_path: None,
         enabled: true,
         parameters: Default::default(),
+        channels: Some(channels),
         position: [0.0, 0.0],
     })?;
     for second in 0..seconds {
