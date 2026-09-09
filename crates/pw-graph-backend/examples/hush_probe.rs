@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         module_path: None,
         enabled: true,
         parameters: Default::default(),
-        channels: Some(channels),
+        channel_policy: pw_graph_effects::ChannelPolicy::Fixed(channels),
         position: [0.0, 0.0],
     })?;
     for second in 0..seconds {

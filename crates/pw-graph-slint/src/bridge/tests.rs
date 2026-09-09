@@ -405,7 +405,7 @@ fn effect_parameter_model_is_kept_in_place_during_slider_updates() {
             module_path: None,
             enabled: true,
             parameters: std::collections::BTreeMap::new(),
-            channels: None,
+            channel_policy: pw_graph_effects::ChannelPolicy::Auto,
             position: [0.0, 0.0],
         })
         .expect("demo effect should be created");

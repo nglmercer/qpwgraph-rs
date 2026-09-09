@@ -46,6 +46,23 @@ The practical consequence: anything that a second frontend would also need
 belongs in `pw-graph-app-core` or below, and anything that only makes sense
 for the Slint shell belongs in `pw-graph-app`.
 
+## Effect lifecycle
+
+The effect SDK separates persisted intent, provider metadata, preparation, and
+realtime processing. `ChannelPolicy` records `Auto` or an explicit fixed
+layout; backend negotiation produces the live `AudioSpec` without rewriting
+that policy. `EffectProvider` owns effect-specific construction and can
+override its non-realtime `prepare_instance` hook for model or module-backed
+resources. `EffectComponentManager` runs those hooks on a small bounded loader
+pool and emits ticketed progress/ready/failure events.
+
+PipeWire activates a prepared processor only after `Ready`, then publishes the
+filter and performs any link replacement. `EffectProcessor::process` remains a
+synchronous, preallocated realtime interface. Model loading, module
+initialization, filesystem access, waits, and worker joins stay outside the
+audio callback; Hush additionally sends deferred worker joins to a bounded
+reaper.
+
 ## Backend namespacing
 
 Graph IDs use explicit backend namespaces, so each native driver receives only

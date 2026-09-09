@@ -1,7 +1,9 @@
 use crate::source::ApplicationDriver;
-use pw_graph_backend::{EffectInsertRequest, EffectInstance, EffectNodeRequest, GraphDriver};
+use pw_graph_backend::{
+    EffectCreateRequest, EffectEvent, EffectInstance, EffectTarget, GraphDriver,
+};
 use pw_graph_config::{AppConfig, PersistedEffect};
-use pw_graph_effects::{EffectDescriptor, EffectParameter};
+use pw_graph_effects::{ChannelPolicy, EffectDescriptor, EffectParameter};
 use pw_graph_i18n::I18n;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::collections::BTreeMap;
@@ -83,27 +85,35 @@ fn restore_saved_effects(
                 .connect_by_key_if_missing(source_port, destination_port)
                 .map(|_| ())
                 .and_then(|_| {
-                    source.insert_effect(EffectInsertRequest {
-                        instance_id: saved.instance.instance_id.clone(),
-                        effect_id: saved.instance.effect_id.clone(),
-                        module_path: saved.instance.module_path.clone(),
-                        source: source_port.clone(),
-                        destination: destination_port.clone(),
-                        enabled: saved.instance.enabled,
-                        parameters: saved.instance.parameters.clone(),
-                        channels: saved.instance.channels,
-                        position: saved.position,
-                    })
+                    source
+                        .begin_create_effect(EffectCreateRequest {
+                            instance_id: saved.instance.instance_id.clone(),
+                            effect_id: saved.instance.effect_id.clone(),
+                            module_path: saved.instance.module_path.clone(),
+                            enabled: saved.instance.enabled,
+                            parameters: saved.instance.parameters.clone(),
+                            channel_policy: saved.instance.channel_policy,
+                            target: EffectTarget::Insert {
+                                source: source_port.clone(),
+                                destination: destination_port.clone(),
+                                position: saved.position,
+                            },
+                        })
+                        .map(|_| ())
                 }),
-            (None, None) => source.create_effect_node(EffectNodeRequest {
-                instance_id: saved.instance.instance_id.clone(),
-                effect_id: saved.instance.effect_id.clone(),
-                module_path: saved.instance.module_path.clone(),
-                enabled: saved.instance.enabled,
-                parameters: saved.instance.parameters.clone(),
-                channels: saved.instance.channels,
-                position: saved.position,
-            }),
+            (None, None) => source
+                .begin_create_effect(EffectCreateRequest {
+                    instance_id: saved.instance.instance_id.clone(),
+                    effect_id: saved.instance.effect_id.clone(),
+                    module_path: saved.instance.module_path.clone(),
+                    enabled: saved.instance.enabled,
+                    parameters: saved.instance.parameters.clone(),
+                    channel_policy: saved.instance.channel_policy,
+                    target: EffectTarget::Standalone {
+                        position: saved.position,
+                    },
+                })
+                .map(|_| ()),
             _ => Err("effect routing is incomplete".into()),
         };
         if let Err(error) = result {
@@ -152,61 +162,91 @@ pub(crate) fn create_effect(window: &MainWindow, application: &mut Application) 
         .selected_links
         .iter()
         .find_map(|id| application.source.graph().link(*id).cloned());
-    let result = selected_link
+    let target = selected_link
         .and_then(|link| {
             application
                 .source
                 .graph()
                 .port_key(link.output_port)
                 .zip(application.source.graph().port_key(link.input_port))
-                .map(|(source, destination)| {
-                    application.source.insert_effect(EffectInsertRequest {
-                        instance_id: instance_id.clone(),
-                        effect_id: descriptor.id.clone(),
-                        module_path: None,
-                        source,
-                        destination,
-                        enabled,
-                        parameters: parameters.clone(),
-                        channels: None,
-                        position,
-                    })
+                .map(|(source, destination)| EffectTarget::Insert {
+                    source,
+                    destination,
+                    position,
                 })
         })
-        .unwrap_or_else(|| {
-            application.source.create_effect_node(EffectNodeRequest {
-                instance_id,
-                effect_id: descriptor.id.clone(),
-                module_path: None,
-                enabled,
-                parameters,
-                channels: None,
-                position,
-            })
-        });
+        .unwrap_or(EffectTarget::Standalone { position });
+    let result = application.source.begin_create_effect(EffectCreateRequest {
+        instance_id,
+        effect_id: descriptor.id.clone(),
+        module_path: None,
+        enabled,
+        parameters,
+        channel_policy: ChannelPolicy::Auto,
+        target,
+    });
     match result {
-        Ok(instance) => {
+        Ok(ticket) => {
             let name = descriptor.name.clone();
-            persist_effect(application, instance);
-            match application.source.refresh() {
-                Ok(()) => application.last_refresh = Instant::now(),
-                Err(error) => {
-                    application.status = application.tf(
-                        "status.effect_refresh_failed",
-                        &[("error", error.to_string())],
-                    );
-                    return;
-                }
-            }
-            application.sync_patchbay_connections();
-            application.autosave_patchbay();
             cancel_effect_setup(window, application);
-            application.status = application.tf("status.effect_created", &[("name", name)]);
+            application.status = format!("{name}: loading (ticket {})", ticket.0);
         }
         Err(error) => {
             application.status = application.tf("status.effect_create_failed", &[("error", error)])
         }
     }
+}
+
+/// Consume backend lifecycle events on the UI/control thread.  A Ready event
+/// is the first point at which a prepared effect is persisted and presented
+/// as part of the graph; Failed preparation therefore leaves an inserted
+/// route untouched.
+pub(crate) fn poll_effect_events(application: &mut Application) -> bool {
+    let events = match application.source.poll_effect_events() {
+        Ok(events) => events,
+        Err(error) => {
+            application.status = application.tf("status.effect_create_failed", &[("error", error)]);
+            return true;
+        }
+    };
+    let mut changed = false;
+    for event in events {
+        changed = true;
+        match event {
+            EffectEvent::Loading { ticket, stage } => {
+                application.status = format!("Effect ticket {}: {stage:?}", ticket.0);
+            }
+            EffectEvent::Ready { ticket, instance } => {
+                let name = application
+                    .source
+                    .graph()
+                    .node(instance.node_id)
+                    .map(|node| node.name.clone())
+                    .unwrap_or_else(|| instance.config.effect_id.clone());
+                persist_effect(application, *instance);
+                match application.source.refresh() {
+                    Ok(()) => application.last_refresh = Instant::now(),
+                    Err(error) => {
+                        application.status = application.tf(
+                            "status.effect_refresh_failed",
+                            &[("error", error.to_string())],
+                        );
+                        continue;
+                    }
+                }
+                application.sync_patchbay_connections();
+                application.autosave_patchbay();
+                application.status = format!("{name}: ready (ticket {})", ticket.0);
+            }
+            EffectEvent::Failed { ticket, error } => {
+                application.status = format!("Effect ticket {} failed: {error}", ticket.0);
+            }
+            EffectEvent::Cancelled { ticket } => {
+                application.status = format!("Effect ticket {} cancelled", ticket.0);
+            }
+        }
+    }
+    changed
 }
 
 pub(crate) fn toggle_effect(application: &mut Application, instance_id: &str) {

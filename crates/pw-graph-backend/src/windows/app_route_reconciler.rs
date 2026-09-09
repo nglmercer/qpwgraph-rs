@@ -934,7 +934,7 @@ mod tests {
                 module_path: None,
                 enabled: false,
                 parameters: [("threshold-db".into(), -42.0)].into_iter().collect(),
-                channels: None,
+                channel_policy: pw_graph_effects::ChannelPolicy::Auto,
             }],
             gain: 0.75,
             ..WindowsApplicationRoute::default()
@@ -975,7 +975,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: None,
+                channel_policy: pw_graph_effects::ChannelPolicy::Auto,
             }],
             ..WindowsApplicationRoute::default()
         };

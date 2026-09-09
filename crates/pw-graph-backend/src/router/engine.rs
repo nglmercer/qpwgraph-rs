@@ -556,7 +556,7 @@ impl RouterCore {
             return Err(RouterError::DuplicateProcessor(id));
         }
         spec.validate()?;
-        processor.prepare(spec.clone())?;
+        processor.prepare(spec)?;
         self.processors.insert(
             id,
             ProcessorSlot {

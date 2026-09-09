@@ -12,7 +12,10 @@ use pw::spa::param::ParamType;
 use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::{Pod, Value};
 use pw::spa::utils::Direction as SpaDirection;
-use pw_graph_effects::{EffectDescriptor, EffectHost};
+use pw_graph_effects::{
+    AudioSpec, EffectComponentManager, EffectDescriptor, EffectHost, EffectPreparationEvent,
+    EffectPrepareRequest, EffectTicket, PreparedEffect,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
@@ -52,6 +55,10 @@ const LINK_OUTPUT_PORT: &str = "link.output.port";
 const LINK_INPUT_PORT: &str = "link.input.port";
 const NODE_INTERFACE_VERSION: u32 = 3;
 
+struct PendingEffect {
+    request: EffectCreateRequest,
+}
+
 /// Property keys for the client-owned helper nodes (`pw_filter`s and meter
 /// streams). Shared by the effect, relay, and metering runtimes so a property
 /// name only needs to be spelled once.
@@ -61,27 +68,6 @@ const PROP_NODE_GROUP: &str = "node.group";
 const PROP_MEDIA_CATEGORY: &str = "media.category";
 const PROP_MEDIA_ROLE: &str = "media.role";
 const PROP_FORMAT_DSP_VALUE: &str = "32 bit float mono audio";
-
-/// Resolve the layout used by a Hush filter.
-///
-/// `None` is the persisted/API representation of the old automatic layout.
-/// A free-standing filter has no topology to inspect yet, so its safe
-/// unresolved layout is mono.  Link insertion supplies the source topology as
-/// `inferred`; explicit requests always win over inference.  Keeping this in
-/// one helper is important because a Hush node can be created through the
-/// standalone, insertion, or restore paths.
-pub(super) fn resolve_hush_channels(
-    requested: Option<u16>,
-    inferred: Option<u16>,
-) -> BackendResult<u16> {
-    let channels = requested.or(inferred).unwrap_or(1);
-    match channels {
-        1 | 2 => Ok(channels),
-        count => Err(BackendError::native(format!(
-            "Hush supports one or two channels, requested {count}"
-        ))),
-    }
-}
 
 /// Media classes and roles shared by the virtual nodes the backend creates.
 const MEDIA_CLASS_AUDIO_FILTER: &str = "Audio/Filter";
@@ -148,6 +134,11 @@ pub struct PipewireDriver {
     /// lifecycle match the PipeWire thread loop and lets graph snapshots map
     /// transient global IDs back to stable effect instance IDs.
     effects: BTreeMap<String, NativeEffect>,
+    /// Heavyweight effect preparation is deliberately separate from
+    /// PipeWire publication.  The loader owns no graph state; completed
+    /// processors are activated on the driver/control thread.
+    effect_loader: EffectComponentManager,
+    pending_effects: BTreeMap<EffectTicket, PendingEffect>,
     /// Manual disconnects are kept as stable endpoint pairs. WirePlumber may
     /// recreate an application's link when it resumes; the next synchronized
     /// snapshot removes only those links the user explicitly deleted.
@@ -207,6 +198,8 @@ impl PipewireDriver {
             audio_controls: BTreeMap::new(),
             effect_host: EffectHost::new(),
             effects: BTreeMap::new(),
+            effect_loader: EffectComponentManager::new(2, 16),
+            pending_effects: BTreeMap::new(),
             blocked_connections: Vec::new(),
             #[cfg(all(target_os = "linux", feature = "relay"))]
             relay: None,
@@ -766,12 +759,39 @@ impl PipewireDriver {
     fn create_effect_node_locked(
         &mut self,
         request: EffectNodeRequest,
+        topology_channels: Option<u16>,
     ) -> BackendResult<EffectInstance> {
         if self.effects.contains_key(&request.instance_id) {
             return Err(BackendError::effect_already_exists(&request.instance_id));
         }
         let instance_id = request.instance_id.clone();
-        let effect = NativeEffect::create(&self.effect_host, &self.thread_loop, request)?;
+        let effect = NativeEffect::create(
+            &self.effect_host,
+            &self.thread_loop,
+            request,
+            topology_channels,
+        )?;
+        self.finish_create_effect_node_locked(instance_id, effect)
+    }
+
+    fn create_effect_node_prepared_locked(
+        &mut self,
+        request: EffectNodeRequest,
+        prepared: PreparedEffect,
+    ) -> BackendResult<EffectInstance> {
+        if self.effects.contains_key(&request.instance_id) {
+            return Err(BackendError::effect_already_exists(&request.instance_id));
+        }
+        let instance_id = request.instance_id.clone();
+        let effect = NativeEffect::activate(&self.thread_loop, request, prepared)?;
+        self.finish_create_effect_node_locked(instance_id, effect)
+    }
+
+    fn finish_create_effect_node_locked(
+        &mut self,
+        instance_id: String,
+        effect: NativeEffect,
+    ) -> BackendResult<EffectInstance> {
         self.effects.insert(instance_id.clone(), effect);
 
         let result = (|| {
@@ -888,16 +908,11 @@ impl PipewireDriver {
             module_path,
             enabled,
             parameters,
-            channels,
+            channel_policy,
             position,
             ..
         } = request;
-        let is_hush = effect_id == pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID;
-        let inferred_hush_channels = if is_hush {
-            self.inferred_hush_channels(&source)
-        } else {
-            None
-        };
+        let inferred_channels = self.inferred_audio_channels(&source);
         // Verify the selected link before publishing a new node. It can still
         // disappear while the effect initializes, so we resolve it once more
         // immediately before disconnecting it below.
@@ -908,23 +923,64 @@ impl PipewireDriver {
             module_path,
             enabled,
             parameters,
-            channels: if is_hush {
-                Some(resolve_hush_channels(channels, inferred_hush_channels)?)
-            } else {
-                channels
-            },
+            channel_policy,
             position,
         };
-        if is_hush {
-            eprintln!(
-                "INFO hush: channel mode={} resolved_channels={} inferred_channels={:?} insertion=true",
-                if channels.is_some() { "Explicit" } else { "Auto" },
-                instance_request.channels.unwrap_or(1),
-                inferred_hush_channels
-            );
-        }
-        let instance = self.create_effect_node_locked(instance_request)?;
+        let resolved_channels = self
+            .effect_host
+            .negotiate_channels(
+                &instance_request.effect_id,
+                channel_policy,
+                inferred_channels,
+            )
+            .map_err(BackendError::native)?;
+        eprintln!(
+            "INFO effect: channel policy={:?} resolved_channels={} inferred_channels={:?} insertion=true",
+            channel_policy, resolved_channels, inferred_channels
+        );
+        let instance = self.create_effect_node_locked(instance_request, inferred_channels)?;
 
+        self.commit_insert_effect_locked(source, destination, instance_id, instance)
+    }
+
+    fn insert_effect_prepared_locked(
+        &mut self,
+        request: EffectInsertRequest,
+        prepared: PreparedEffect,
+    ) -> BackendResult<EffectInstance> {
+        let source = request.source.clone();
+        let destination = request.destination.clone();
+        let EffectInsertRequest {
+            instance_id,
+            effect_id,
+            module_path,
+            enabled,
+            parameters,
+            channel_policy,
+            position,
+            ..
+        } = request;
+        self.effect_link_endpoints_locked(&source, &destination)?;
+        let instance_request = EffectNodeRequest {
+            instance_id: instance_id.clone(),
+            effect_id,
+            module_path,
+            enabled,
+            parameters,
+            channel_policy,
+            position,
+        };
+        let instance = self.create_effect_node_prepared_locked(instance_request, prepared)?;
+        self.commit_insert_effect_locked(source, destination, instance_id, instance)
+    }
+
+    fn commit_insert_effect_locked(
+        &mut self,
+        source: PortKey,
+        destination: PortKey,
+        instance_id: String,
+        instance: EffectInstance,
+    ) -> BackendResult<EffectInstance> {
         let result = (|| {
             let (output, input, direct_link) =
                 self.effect_link_endpoints_locked(&source, &destination)?;
@@ -973,11 +1029,171 @@ impl PipewireDriver {
         result
     }
 
-    /// Infer only Hush's layout from the selected source node. A mono source
-    /// normally has one `MONO` audio output; a stereo source still has both
-    /// FL/FR ports even when the selected link is only one side. Legacy
-    /// effects intentionally ignore this and remain stereo.
-    fn inferred_hush_channels(&self, source: &PortKey) -> Option<u16> {
+    fn begin_create_effect_async(
+        &mut self,
+        request: EffectCreateRequest,
+    ) -> BackendResult<EffectTicket> {
+        if request.instance_id.trim().is_empty() {
+            return Err(BackendError::native("effect instance id cannot be empty"));
+        }
+        if request.effect_id.trim().is_empty() {
+            return Err(BackendError::native("effect id cannot be empty"));
+        }
+        if request.module_path.is_some() {
+            return Err(BackendError::unsupported(
+                "WASM/native effect modules are not yet hosted by the PipeWire filter runtime",
+            ));
+        }
+        if self.effects.contains_key(&request.instance_id)
+            || self
+                .pending_effects
+                .values()
+                .any(|pending| pending.request.instance_id == request.instance_id)
+        {
+            return Err(BackendError::effect_already_exists(&request.instance_id));
+        }
+
+        let topology_channels = match &request.target {
+            EffectTarget::Standalone { .. } => None,
+            EffectTarget::Insert {
+                source,
+                destination,
+                ..
+            } => self.with_loop(|driver| {
+                driver.sync()?;
+                driver
+                    .effect_link_endpoints_locked(source, destination)
+                    .map(|_| driver.inferred_audio_channels(source))
+            })?,
+        };
+        let channels = self
+            .effect_host
+            .negotiate_channels(
+                &request.effect_id,
+                request.channel_policy,
+                topology_channels,
+            )
+            .map_err(BackendError::native)?;
+        let ticket = self
+            .effect_loader
+            .begin_prepare(
+                &self.effect_host,
+                EffectPrepareRequest {
+                    effect_id: request.effect_id.clone(),
+                    module_path: request.module_path.clone(),
+                    spec: AudioSpec {
+                        sample_rate: effects::PREPARED_SAMPLE_RATE,
+                        channels,
+                        max_frames: effects::MAX_DSP_FRAMES,
+                    },
+                    parameters: request.parameters.clone(),
+                    cancellation: pw_graph_effects::EffectCancellation::default(),
+                },
+            )
+            .map_err(BackendError::native)?;
+        self.pending_effects
+            .insert(ticket, PendingEffect { request });
+        Ok(ticket)
+    }
+
+    fn activate_pending_effect(
+        &mut self,
+        ticket: EffectTicket,
+        pending: PendingEffect,
+        prepared: PreparedEffect,
+    ) -> BackendResult<EffectInstance> {
+        match pending.request.target {
+            EffectTarget::Standalone { position } => {
+                let request = EffectNodeRequest {
+                    instance_id: pending.request.instance_id,
+                    effect_id: pending.request.effect_id,
+                    module_path: pending.request.module_path,
+                    enabled: pending.request.enabled,
+                    parameters: pending.request.parameters,
+                    channel_policy: pending.request.channel_policy,
+                    position,
+                };
+                self.with_loop(|driver| {
+                    driver.sync()?;
+                    driver.create_effect_node_prepared_locked(request, prepared)
+                })
+            }
+            EffectTarget::Insert {
+                source,
+                destination,
+                position,
+            } => {
+                let request = EffectInsertRequest {
+                    instance_id: pending.request.instance_id,
+                    effect_id: pending.request.effect_id,
+                    module_path: pending.request.module_path,
+                    source,
+                    destination,
+                    enabled: pending.request.enabled,
+                    parameters: pending.request.parameters,
+                    channel_policy: pending.request.channel_policy,
+                    position,
+                };
+                self.with_loop(|driver| {
+                    driver.sync()?;
+                    driver.insert_effect_prepared_locked(request, prepared)
+                })
+            }
+        }
+        .map_err(|error| {
+            BackendError::Native(format!(
+                "effect ticket {} could not be activated: {error}",
+                ticket.0
+            ))
+        })
+    }
+
+    fn poll_effect_lifecycle(&mut self) -> BackendResult<Vec<EffectEvent>> {
+        let preparation_events = self.effect_loader.poll_events();
+        let mut events = Vec::with_capacity(preparation_events.len());
+        for event in preparation_events {
+            match event {
+                EffectPreparationEvent::Loading { ticket, stage } => {
+                    events.push(EffectEvent::Loading { ticket, stage });
+                }
+                EffectPreparationEvent::Ready { ticket, prepared } => {
+                    let Some(pending) = self.pending_effects.remove(&ticket) else {
+                        // A cancelled/removed request may finish racing with
+                        // the control poll. Its prepared processor is dropped
+                        // here and can never mutate the graph.
+                        continue;
+                    };
+                    match self.activate_pending_effect(ticket, pending, prepared) {
+                        Ok(instance) => events.push(EffectEvent::Ready {
+                            ticket,
+                            instance: Box::new(instance),
+                        }),
+                        Err(error) => events.push(EffectEvent::Failed {
+                            ticket,
+                            error: error.to_string(),
+                        }),
+                    }
+                }
+                EffectPreparationEvent::Failed { ticket, error } => {
+                    self.pending_effects.remove(&ticket);
+                    events.push(EffectEvent::Failed {
+                        ticket,
+                        error: error.to_string(),
+                    });
+                }
+                EffectPreparationEvent::Cancelled { ticket } => {
+                    self.pending_effects.remove(&ticket);
+                    events.push(EffectEvent::Cancelled { ticket });
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    /// Infer the selected source's connected audio width for generic effect
+    /// negotiation.  The effect provider decides whether that width is
+    /// supported; the backend does not branch on a concrete effect ID.
+    fn inferred_audio_channels(&self, source: &PortKey) -> Option<u16> {
         if source.port_type != PortType::Audio
             || source.node_type != NodeType::PipeWire && source.node_type != NodeType::Effect
         {
@@ -1344,10 +1560,29 @@ impl EffectDriver for PipewireDriver {
         true
     }
 
+    fn begin_create_effect(&mut self, request: EffectCreateRequest) -> BackendResult<EffectTicket> {
+        self.begin_create_effect_async(request)
+    }
+
+    fn poll_effect_events(&mut self) -> BackendResult<Vec<EffectEvent>> {
+        self.poll_effect_lifecycle()
+    }
+
+    fn cancel_effect(&mut self, ticket: EffectTicket) -> BackendResult<()> {
+        if self.effect_loader.cancel(ticket) {
+            Ok(())
+        } else {
+            Err(BackendError::native(format!(
+                "unknown or completed effect ticket {}",
+                ticket.0
+            )))
+        }
+    }
+
     fn create_effect_node(&mut self, request: EffectNodeRequest) -> BackendResult<EffectInstance> {
         self.with_loop(|driver| {
             driver.sync()?;
-            driver.create_effect_node_locked(request)
+            driver.create_effect_node_locked(request, None)
         })
     }
 
@@ -2518,9 +2753,7 @@ fn ui_volume_to_spa_volume(volume: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        classify_port_type, resolve_hush_channels, ui_volume_to_spa_volume, PipewireDriver,
-    };
+    use super::{classify_port_type, ui_volume_to_spa_volume, PipewireDriver};
     use crate::{EffectDriver, EffectNodeRequest, GraphDriver};
     use pw_graph_core::{Direction, NodeType, PortType};
     use std::collections::BTreeMap;
@@ -2559,22 +2792,49 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_hush_layout_is_safe_mono_and_shared_by_all_creation_paths() {
-        assert_eq!(resolve_hush_channels(None, None).unwrap(), 1);
-        assert_eq!(resolve_hush_channels(None, Some(1)).unwrap(), 1);
-        assert_eq!(resolve_hush_channels(None, Some(2)).unwrap(), 2);
+    fn channel_policy_negotiation_is_shared_by_all_creation_paths() {
+        let host = pw_graph_effects::EffectHost::new();
+        let id = pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID;
+        assert_eq!(
+            host.negotiate_channels(id, pw_graph_effects::ChannelPolicy::Auto, None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            host.negotiate_channels(id, pw_graph_effects::ChannelPolicy::Auto, Some(1))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            host.negotiate_channels(id, pw_graph_effects::ChannelPolicy::Auto, Some(2))
+                .unwrap(),
+            2
+        );
         // An explicit saved/API layout wins over topology inference.
-        assert_eq!(resolve_hush_channels(Some(1), Some(2)).unwrap(), 1);
-        assert_eq!(resolve_hush_channels(Some(2), Some(1)).unwrap(), 2);
+        assert_eq!(
+            host.negotiate_channels(id, pw_graph_effects::ChannelPolicy::Fixed(1), Some(2))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            host.negotiate_channels(id, pw_graph_effects::ChannelPolicy::Fixed(2), Some(1))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
     fn hush_layout_rejects_invalid_channel_counts_instead_of_defaulting() {
-        for requested in [Some(0), Some(3), Some(u16::MAX)] {
-            let error = resolve_hush_channels(requested, None).unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("Hush supports one or two channels"));
+        let host = pw_graph_effects::EffectHost::new();
+        for requested in [0, 3, u16::MAX] {
+            let error = host
+                .negotiate_channels(
+                    pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID,
+                    pw_graph_effects::ChannelPolicy::Fixed(requested),
+                    None,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("does not support"));
         }
     }
 
@@ -2598,7 +2858,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: None,
+                channel_policy: pw_graph_effects::ChannelPolicy::Auto,
                 position: [12.0, 34.0],
             })
             .expect("the raw PipeWire filter should publish a node and ports");
@@ -2663,11 +2923,14 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: None,
+                channel_policy: pw_graph_effects::ChannelPolicy::Auto,
                 position: [56.0, 78.0],
             })
             .expect("the Hush PipeWire filter should publish a node and ports");
-        assert_eq!(instance.config.channels, Some(1));
+        assert_eq!(
+            instance.config.channel_policy,
+            pw_graph_effects::ChannelPolicy::Auto
+        );
         let node = driver
             .graph()
             .node(instance.node_id)

@@ -941,7 +941,7 @@ mod live {
                     module_path: None,
                     enabled: true,
                     parameters,
-                    channels: None,
+                    channel_policy: pw_graph_effects::ChannelPolicy::Auto,
                     position: [240.0, 160.0],
                 })
                 .map_err(|error| format!("create live noise gate: {error}"))?;

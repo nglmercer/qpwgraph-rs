@@ -9,7 +9,8 @@ use nnnoiseless::{HushDenoiser, HushModel, Resampler, HUSH_FRAME_SIZE, HUSH_SAMP
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1010,9 +1011,10 @@ impl HushRuntime {
         // Slot size is at most 10 ms, independent of the host's capacity
         // ceiling. Large callbacks are copied in bounded chunks on enqueue.
         let max_frames = max_frames.min(sample_rate.div_ceil(100).max(1));
-        // Tract contains Rc/OpState and is !Send. Construct on its owning
-        // thread, but synchronously acknowledge initialization to prepare().
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        // Tract contains Rc/OpState and is !Send. Construct it on the worker
+        // that owns it. Readiness is published through diagnostics so the
+        // component loader can decide when to activate without making this
+        // runtime constructor block its caller.
         let max_samples = max_frames as usize * channels as usize;
         let input = Arc::new(BlockQueue::new(HUSH_QUEUE_CAPACITY, max_samples));
         let output = Arc::new(BlockQueue::new(HUSH_QUEUE_CAPACITY, max_samples));
@@ -1112,11 +1114,11 @@ impl HushRuntime {
                         .min(u128::from(u64::MAX)) as u64,
                     Ordering::Release,
                 );
+                worker_diagnostics
+                    .model_init_completed
+                    .store(true, Ordering::Release);
                 let mut worker = match initialized {
                     Ok(mut worker) => {
-                        worker_diagnostics
-                            .model_init_completed
-                            .store(true, Ordering::Release);
                         worker_diagnostics
                             .model_initialized
                             .store(true, Ordering::Release);
@@ -1132,7 +1134,6 @@ impl HushRuntime {
                                 .load(Ordering::Acquire)
                         );
                         worker.generation = initial_generation;
-                        let _ = ready_tx.send(Ok(()));
                         worker
                     }
                     Err(error) => {
@@ -1151,7 +1152,6 @@ impl HushRuntime {
                             .worker_state
                             .store(HushWorkerState::Failed.as_u32(), Ordering::Release);
                         eprintln!("ERROR hush: model initialization failed: {error}");
-                        let _ = ready_tx.send(Err(error));
                         return;
                     }
                 };
@@ -1192,13 +1192,6 @@ impl HushRuntime {
             })
             .map_err(|error| format!("could not start Hush worker: {error}"))?;
 
-        if let Err(error) = ready_rx
-            .recv()
-            .unwrap_or_else(|_| Err("Hush initialization channel closed".into()))
-        {
-            let _ = worker.join();
-            return Err(error);
-        }
         Ok(Self {
             input,
             output,
@@ -1536,7 +1529,13 @@ impl HushRuntime {
     #[cfg(test)]
     pub fn wait_idle(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while self.input.depth() != 0 || self.diagnostics.worker_active.load(Ordering::Acquire) {
+        while !self
+            .diagnostics
+            .model_init_completed
+            .load(Ordering::Acquire)
+            || self.input.depth() != 0
+            || self.diagnostics.worker_active.load(Ordering::Acquire)
+        {
             assert!(
                 !self.diagnostics.worker_failed.load(Ordering::Acquire),
                 "{:?}",
@@ -1558,9 +1557,45 @@ impl Drop for HushRuntime {
         self.signal.condition.notify_one();
 
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            // A processor can be released by a UI/control operation while
+            // the worker is still inside a model frame.  Joining here would
+            // make effect removal wait on inference.  Hand the join handle to
+            // the bounded reaper instead; if its queue is full, dropping the
+            // handle detaches the worker after the stop request and remains
+            // non-blocking.
+            if let Some(reaper) = hush_worker_reaper() {
+                match reaper.try_send(worker) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(worker) | TrySendError::Disconnected(worker)) => {
+                        drop(worker);
+                    }
+                }
+            } else {
+                drop(worker);
+            }
         }
     }
+}
+
+/// One bounded supervisor owns deferred Hush joins.  This avoids creating an
+/// unbounded reaper thread per effect removal while keeping all join waits off
+/// UI, control, and realtime threads.
+fn hush_worker_reaper() -> Option<&'static SyncSender<JoinHandle<()>>> {
+    static REAPER: OnceLock<Option<SyncSender<JoinHandle<()>>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<JoinHandle<()>>(64);
+            let spawned = thread::Builder::new()
+                .name("qpwgraph-hush-reaper".into())
+                .spawn(move || {
+                    while let Ok(worker) = receiver.recv() {
+                        let _ = worker.join();
+                    }
+                })
+                .is_ok();
+            spawned.then_some(sender)
+        })
+        .as_ref()
 }
 
 struct HushWorker {

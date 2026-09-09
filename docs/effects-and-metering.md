@@ -27,8 +27,12 @@ stereo probe), rather than a callback-count assumption.
 The immutable model is embedded and checksum verified. Development and CI may
 override it with `QPWGRAPH_HUSH_MODEL` (preferred) or `HUSH_MODEL`; the winning
 source, path, byte counts, and checksum are reported, and an invalid override
-does not silently fall back to the embedded model. Preparation waits for the
-worker's initialization acknowledgement and returns the real setup error.
+does not silently fall back to the embedded model. Effect creation is split
+into a bounded preparation phase and a PipeWire activation phase: the UI gets
+an effect ticket immediately, model/denoiser setup runs on a loader worker,
+and the node is published only after a `Ready` event. `HushRuntime::spawn()`
+does not wait on the denoiser thread; the loader waits for readiness off the
+UI/control and realtime threads and forwards initialization errors visibly.
 Tract state is not `Send`, so construction and ownership stay on the worker;
 no unsafe cross-thread transfer is used.
 
@@ -76,7 +80,9 @@ uses bounded SPSC operations, and updates atomics. It neither allocates nor
 locks, waits, joins, loads a model, or invokes Tract. The producer notifies the
 worker only when a queue transitions from empty to non-empty; the worker also
 uses a 500 µs timed wait. Expensive resets and shutdown joins stay outside
-realtime processing.
+realtime processing. Hush worker joins are handed to one bounded reaper, so
+removing an effect does not make the UI or callback wait for an in-flight
+inference.
 
 PipeWire Hush parameter updates use shared atomics rather than the generic
 processor mutex, so slider and bypass changes do not introduce an instantaneous
@@ -92,10 +98,13 @@ window. Wet and dry block counters can both increment for a callback containing
 a partial wet range. Underruns exclude startup, intentional bypass, worker
 failure/recovery, and fully disconnected input.
 
-For Hush, an explicit 1/2-channel request is honored. `channels = None` is
-automatic: insertion derives the source layout, while an unresolved standalone
-node safely starts mono. The effective layout is persisted so restoration does
-not turn a resolved mono node back into stereo. The original
+For all effects, `ChannelPolicy::Auto` and `ChannelPolicy::Fixed(n)` are kept
+separate from the negotiated runtime width. Legacy `channels = 1/2` values
+migrate to `Fixed(1/2)`; an absent legacy value migrates to `Auto`. For Hush,
+insertion derives the source layout, while an unresolved standalone node
+safely starts mono. The policy, rather than that first runtime resolution, is
+persisted, so restoration does not accidentally turn `Auto` into `Fixed(1)`.
+The original
 `builtin.adaptive-noise-suppressor` remains the compatibility
 implementation for saved configurations. Its persisted reduction, adaptation,
 voice-preserve, and bypass parameters are not migrated to Hush. If an override

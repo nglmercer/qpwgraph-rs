@@ -13,9 +13,9 @@ use super::connections::{
     easy_connect_from_pin, easy_connect_nodes, handle_link_requested, handle_link_rerouted,
 };
 use super::effects::{
-    cancel_effect_setup, create_effect, inspect_effect, remove_effect, select_effect_draft,
-    set_effect_draft_enabled, set_effect_draft_parameter_typed, set_effect_parameter_typed,
-    toggle_effect,
+    cancel_effect_setup, create_effect, inspect_effect, poll_effect_events, remove_effect,
+    select_effect_draft, set_effect_draft_enabled, set_effect_draft_parameter_typed,
+    set_effect_parameter_typed, toggle_effect,
 };
 use super::meters::refresh_meters;
 use super::models::{shortcut_rows, sync_meter_rows, sync_models, vec_model_rows_equal};
@@ -60,6 +60,7 @@ pub(crate) fn pump(
     }
     poll_relay_usb_hotplug(&mut application);
     poll_relay_events(&mut application);
+    let effect_events_changed = poll_effect_events(&mut application);
     let mut graph_changed = application.source.graph_dirty();
     if graph_changed || application.last_refresh.elapsed() >= refresh_interval(&application) {
         if let Err(error) = application.source.refresh_if_needed() {
@@ -76,7 +77,13 @@ pub(crate) fn pump(
         || window.get_toast_visible() != toast_visible(&application);
     let full_sync_due = application.last_full_sync.elapsed() >= FULL_SYNC_INTERVAL
         || application.snapshot.nodes.is_empty();
-    if had_events || view_changed || graph_changed || toast_changed || full_sync_due {
+    if had_events
+        || view_changed
+        || graph_changed
+        || effect_events_changed
+        || toast_changed
+        || full_sync_due
+    {
         autosave_config(&mut application);
         sync_shortcuts(window, &application, shortcuts);
         sync_models(

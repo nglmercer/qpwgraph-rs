@@ -6,23 +6,172 @@
 //! same API usable from a PipeWire realtime callback and from an offline test.
 
 use adaptive_noise::AdaptiveNoiseSuppressorFactory;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeserializeError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use thiserror::Error;
 
 mod adaptive_noise;
 mod hush_noise;
 mod hush_worker;
+pub mod lifecycle;
 pub mod wasm;
 pub use adaptive_noise::AdaptiveNoiseSuppressor;
 pub use hush_noise::HushNoiseSuppressor;
 pub use hush_worker::{HushDiagnostics, HushHealth, HushOverloadReason};
+pub use lifecycle::{
+    EffectCancellation, EffectComponentManager, EffectLifecycle, EffectLoadStage,
+    EffectPreparationEvent, EffectPrepareRequest, EffectTicket, PreparedEffect,
+};
 
 pub const NOISE_GATE_ID: &str = "builtin.noise-gate";
 pub const NOISE_SUPPRESSOR_ID: &str = "builtin.adaptive-noise-suppressor";
 pub use hush_noise::{DEFAULT_EFFECT_ID, HUSH_NOISE_SUPPRESSOR_ID};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// The user's channel-layout intent.  This is deliberately separate from
+/// the channel count negotiated with a live graph: `Auto` must remain `Auto`
+/// when an effect is saved, even if the first topology observed at runtime is
+/// mono.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ChannelPolicy {
+    #[default]
+    Auto,
+    Fixed(u16),
+}
+
+impl Serialize for ChannelPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            // Keep explicit layouts compact and readable.  This also means
+            // new config files remain easy to consume by older tooling that
+            // understood numeric `channels` values.
+            Self::Fixed(channels) => serializer.serialize_u16(*channels),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChannelPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Number(u16),
+            Text(String),
+        }
+
+        match Representation::deserialize(deserializer)? {
+            Representation::Number(channels) => Ok(Self::Fixed(channels)),
+            Representation::Text(value) => {
+                let normalized = value.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "auto" => Ok(Self::Auto),
+                    "mono" => Ok(Self::Fixed(1)),
+                    "stereo" => Ok(Self::Fixed(2)),
+                    value if value.strip_prefix("fixed:").is_some() => value
+                        .strip_prefix("fixed:")
+                        .and_then(|channels| channels.parse::<u16>().ok())
+                        .map(Self::Fixed)
+                        .ok_or_else(|| {
+                            D::Error::custom(format!(
+                                "invalid fixed channel policy '{value}'"
+                            ))
+                        }),
+                    _ => Err(D::Error::custom(format!(
+                        "invalid channel policy '{value}', expected auto, mono, stereo, or a channel count"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+impl ChannelPolicy {
+    pub const fn requested_channels(self) -> Option<u16> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(channels) => Some(channels),
+        }
+    }
+}
+
+/// Generic IO constraints advertised by an effect provider.  The backend
+/// uses these constraints for negotiation instead of branching on a concrete
+/// effect ID.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EffectIoCapabilities {
+    pub min_channels: u16,
+    pub max_channels: u16,
+    pub independent_channels: bool,
+    /// Safe channel count when `ChannelPolicy::Auto` has no topology yet.
+    pub preferred_channels: u16,
+}
+
+impl EffectIoCapabilities {
+    pub const fn stereo() -> Self {
+        Self {
+            min_channels: 1,
+            max_channels: 2,
+            independent_channels: false,
+            preferred_channels: 2,
+        }
+    }
+
+    pub const fn independent(min_channels: u16, max_channels: u16) -> Self {
+        Self {
+            min_channels,
+            max_channels,
+            independent_channels: true,
+            preferred_channels: min_channels,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), EffectError> {
+        if self.min_channels == 0
+            || self.min_channels > self.max_channels
+            || self.preferred_channels < self.min_channels
+            || self.preferred_channels > self.max_channels
+        {
+            return Err(EffectError::InvalidIoCapabilities {
+                min_channels: self.min_channels,
+                max_channels: self.max_channels,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Resolve a persisted channel policy against currently known topology.  The
+/// fallback only applies when `Auto` has no topology yet; it is a runtime
+/// choice and must never be written back as a fixed policy.
+pub fn negotiate_channels(
+    policy: ChannelPolicy,
+    capabilities: EffectIoCapabilities,
+    topology_channels: Option<u16>,
+) -> Result<u16, EffectError> {
+    capabilities.validate()?;
+    let channels = match policy {
+        ChannelPolicy::Fixed(channels) => channels,
+        ChannelPolicy::Auto => topology_channels.unwrap_or(capabilities.preferred_channels),
+    };
+    if channels < capabilities.min_channels || channels > capabilities.max_channels {
+        return Err(EffectError::UnsupportedChannelCount {
+            channels,
+            min_channels: capabilities.min_channels,
+            max_channels: capabilities.max_channels,
+        });
+    }
+    Ok(channels)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AudioSpec {
     pub sample_rate: u32,
     pub channels: u16,
@@ -97,6 +246,23 @@ pub enum EffectError {
     ModelUnavailable(String),
     #[error("Hush worker unavailable: {0}")]
     WorkerUnavailable(String),
+    #[error("invalid effect IO capabilities: channel range {min_channels}..={max_channels}")]
+    InvalidIoCapabilities {
+        min_channels: u16,
+        max_channels: u16,
+    },
+    #[error(
+        "effect does not support {channels} channels (supported range {min_channels}..={max_channels})"
+    )]
+    UnsupportedChannelCount {
+        channels: u16,
+        min_channels: u16,
+        max_channels: u16,
+    },
+    #[error("effect preparation queue is full")]
+    PreparationQueueFull,
+    #[error("effect preparation was cancelled")]
+    PreparationCancelled,
 }
 
 /// A processor is created and prepared off the realtime thread.
@@ -131,14 +297,48 @@ pub trait EffectProcessor: Send {
     fn reset(&mut self);
 }
 
-pub trait EffectFactory: Send + Sync {
+/// A source of effect instances and the metadata needed to negotiate them.
+///
+/// The provider owns the non-realtime construction boundary.  The default
+/// implementation is sufficient for built-in processors; resource-backed
+/// providers (Hush, WASM, and future native providers) can override
+/// `prepare_instance` to load or validate their component before an instance
+/// is activated by a host.
+pub trait EffectProvider: Send + Sync {
     fn descriptor(&self) -> &EffectDescriptor;
     fn create(&self) -> Box<dyn EffectProcessor>;
+    fn io_capabilities(&self) -> EffectIoCapabilities {
+        EffectIoCapabilities::stereo()
+    }
+
+    /// Prepare one instance entirely outside the realtime path.  This hook is
+    /// called by [`EffectComponentManager`](crate::EffectComponentManager)
+    /// on its bounded loader pool.
+    fn prepare_instance(
+        &self,
+        request: EffectPrepareRequest,
+    ) -> Result<PreparedEffect, EffectError> {
+        let started = std::time::Instant::now();
+        let mut processor = self.create();
+        processor.prepare(request.spec)?;
+        apply_parameters(&mut *processor, &request.parameters)?;
+        Ok(PreparedEffect {
+            descriptor: self.descriptor().clone(),
+            spec: request.spec,
+            processor,
+            preparation_duration_ms: started.elapsed().as_millis() as u64,
+        })
+    }
 }
 
-#[derive(Default)]
+/// Compatibility name for callers written before providers became the
+/// lifecycle abstraction.  It is an alias, not a second trait, so existing
+/// implementations and registrations remain source-compatible.
+pub use EffectProvider as EffectFactory;
+
+#[derive(Clone, Default)]
 pub struct EffectHost {
-    factories: BTreeMap<String, Box<dyn EffectFactory>>,
+    providers: BTreeMap<String, Arc<dyn EffectProvider>>,
 }
 
 impl EffectHost {
@@ -150,22 +350,62 @@ impl EffectHost {
         host
     }
 
-    pub fn register(&mut self, factory: Box<dyn EffectFactory>) {
-        let id = factory.descriptor().id.clone();
-        self.factories.insert(id, factory);
+    pub fn register(&mut self, provider: Box<dyn EffectProvider>) {
+        let id = provider.descriptor().id.clone();
+        self.providers.insert(id, Arc::from(provider));
     }
 
     pub fn descriptors(&self) -> Vec<EffectDescriptor> {
-        self.factories
+        self.providers
             .values()
-            .map(|factory| factory.descriptor().clone())
+            .map(|provider| provider.descriptor().clone())
             .collect()
     }
 
-    pub fn create(&self, id: &str) -> Result<Box<dyn EffectProcessor>, EffectError> {
-        self.factories
+    pub fn io_capabilities(&self, id: &str) -> Result<EffectIoCapabilities, EffectError> {
+        self.providers
             .get(id)
-            .map(|factory| factory.create())
+            .map(|provider| provider.io_capabilities())
+            .ok_or_else(|| EffectError::UnknownEffect(id.into()))
+    }
+
+    /// Negotiate an effect's runtime channel count without changing the
+    /// persisted policy.  Hosts should call this for standalone creation,
+    /// link insertion, and restore paths alike.
+    pub fn negotiate_channels(
+        &self,
+        id: &str,
+        policy: ChannelPolicy,
+        topology_channels: Option<u16>,
+    ) -> Result<u16, EffectError> {
+        negotiate_channels(policy, self.io_capabilities(id)?, topology_channels)
+    }
+
+    pub fn create(&self, id: &str) -> Result<Box<dyn EffectProcessor>, EffectError> {
+        self.providers
+            .get(id)
+            .map(|provider| provider.create())
+            .ok_or_else(|| EffectError::UnknownEffect(id.into()))
+    }
+
+    /// Synchronously prepare one instance through its provider.  This is a
+    /// compatibility API for hosts that still expose a synchronous create
+    /// operation; heavyweight callers should use [`EffectComponentManager`]
+    /// instead so this work runs on its bounded loader pool.
+    pub fn prepare_instance(
+        &self,
+        request: EffectPrepareRequest,
+    ) -> Result<PreparedEffect, EffectError> {
+        self.providers
+            .get(&request.effect_id)
+            .ok_or_else(|| EffectError::UnknownEffect(request.effect_id.clone()))?
+            .prepare_instance(request)
+    }
+
+    pub(crate) fn provider(&self, id: &str) -> Result<Arc<dyn EffectProvider>, EffectError> {
+        self.providers
+            .get(id)
+            .cloned()
             .ok_or_else(|| EffectError::UnknownEffect(id.into()))
     }
 }
@@ -180,12 +420,12 @@ pub struct EffectInstanceConfig {
     pub enabled: bool,
     #[serde(default)]
     pub parameters: BTreeMap<String, f32>,
-    /// Persisted layout hint for layout-aware effects such as Hush. `None` is
-    /// the legacy/automatic representation; the PipeWire backend resolves it
-    /// from topology for insertion and persists the effective 1/2-channel
-    /// layout for live standalone nodes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channels: Option<u16>,
+    /// Persisted channel intent.  The `channels` alias is read for backward
+    /// compatibility with configurations written before channel policy was a
+    /// first-class type; `channels = 1/2` migrates to `Fixed(1/2)` and an
+    /// omitted value migrates to `Auto`.
+    #[serde(default, alias = "channels")]
+    pub channel_policy: ChannelPolicy,
 }
 
 fn default_true() -> bool {
@@ -255,7 +495,7 @@ fn noise_gate_descriptor() -> EffectDescriptor {
 
 struct NoiseGateFactory;
 
-impl EffectFactory for NoiseGateFactory {
+impl EffectProvider for NoiseGateFactory {
     fn descriptor(&self) -> &EffectDescriptor {
         static DESCRIPTOR: std::sync::OnceLock<EffectDescriptor> = std::sync::OnceLock::new();
         DESCRIPTOR.get_or_init(noise_gate_descriptor)

@@ -9,7 +9,7 @@ use pw_graph_backend::{
     DemoDriver, EffectDriver, EffectInsertRequest, EffectNodeRequest, GraphDriver,
 };
 use pw_graph_core::{Direction, NodeType, PortId, PortType};
-use pw_graph_effects::{NOISE_GATE_ID, NOISE_GATE_THRESHOLD};
+use pw_graph_effects::{ChannelPolicy, NOISE_GATE_ID, NOISE_GATE_THRESHOLD};
 use std::collections::BTreeMap;
 
 fn effect_request(instance_id: &str) -> EffectNodeRequest {
@@ -19,7 +19,7 @@ fn effect_request(instance_id: &str) -> EffectNodeRequest {
         module_path: None,
         enabled: true,
         parameters: BTreeMap::new(),
-        channels: None,
+        channel_policy: ChannelPolicy::Auto,
         position: [240.0, 160.0],
     }
 }
@@ -140,7 +140,7 @@ fn inserted_effect_restores_the_original_route_when_removed() {
             destination: destination.clone(),
             enabled: true,
             parameters: BTreeMap::new(),
-            channels: None,
+            channel_policy: ChannelPolicy::Auto,
             position: [310.0, 190.0],
         })
         .expect("insertion should replace the direct route with an effect");

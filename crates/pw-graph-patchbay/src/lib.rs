@@ -966,7 +966,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: None,
+                channel_policy: Default::default(),
                 position: [260.0, 180.0],
             })
             .unwrap();
@@ -985,7 +985,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: None,
+                channel_policy: Default::default(),
                 position: [260.0, 180.0],
             })
             .unwrap();

@@ -198,7 +198,7 @@ impl WindowsAudioDriver {
                 module_path: request.module_path.clone(),
                 enabled: request.enabled,
                 parameters: request.parameters.clone(),
-                channels: request.channels,
+                channel_policy: request.channel_policy,
             },
             node_id: ids.node,
             input_port: ids.input,

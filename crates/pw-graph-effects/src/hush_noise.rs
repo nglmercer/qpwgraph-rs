@@ -7,13 +7,15 @@
 
 use crate::hush_worker::{HushDiagnostics, HushRuntime, HUSH_MAX_BACKLOG_MS, HUSH_SCHEDULING_MS};
 use crate::{
-    AudioSpec, EffectDescriptor, EffectError, EffectFactory, EffectParameter, EffectProcessor,
+    apply_parameters, AudioSpec, EffectDescriptor, EffectError, EffectIoCapabilities,
+    EffectParameter, EffectPrepareRequest, EffectProcessor, EffectProvider, PreparedEffect,
 };
 use nnnoiseless::{HushModel, HUSH_SYNTHESIS_DELAY_SAMPLES};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const HUSH_NOISE_SUPPRESSOR_ID: &str = "builtin.hush-noise-suppressor";
 pub const DEFAULT_EFFECT_ID: &str = HUSH_NOISE_SUPPRESSOR_ID;
@@ -98,7 +100,7 @@ fn descriptor() -> EffectDescriptor {
 
 struct HushNoiseSuppressorFactory;
 
-impl EffectFactory for HushNoiseSuppressorFactory {
+impl EffectProvider for HushNoiseSuppressorFactory {
     fn descriptor(&self) -> &EffectDescriptor {
         static DESCRIPTOR: OnceLock<EffectDescriptor> = OnceLock::new();
         DESCRIPTOR.get_or_init(descriptor)
@@ -106,6 +108,67 @@ impl EffectFactory for HushNoiseSuppressorFactory {
 
     fn create(&self) -> Box<dyn EffectProcessor> {
         Box::new(HushNoiseSuppressor::default())
+    }
+
+    fn io_capabilities(&self) -> EffectIoCapabilities {
+        EffectIoCapabilities::independent(1, 2)
+    }
+
+    fn prepare_instance(
+        &self,
+        request: EffectPrepareRequest,
+    ) -> Result<PreparedEffect, EffectError> {
+        // HushRuntime::spawn() starts its Tract-owning thread and returns
+        // immediately. The component-manager worker waits here so a Ready
+        // event still means the instance can actually process audio; no UI,
+        // PipeWire control, or realtime caller waits for initialization.
+        let started = Instant::now();
+        if request.cancellation.is_cancelled() {
+            return Err(EffectError::PreparationCancelled);
+        }
+        let mut processor = HushNoiseSuppressor::default();
+        processor.prepare(request.spec)?;
+        apply_parameters(&mut processor, &request.parameters)?;
+        if request.cancellation.is_cancelled() {
+            return Err(EffectError::PreparationCancelled);
+        }
+        let diagnostics = processor.hush_diagnostics().ok_or_else(|| {
+            EffectError::WorkerUnavailable("Hush did not expose worker diagnostics".into())
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if request.cancellation.is_cancelled() {
+                return Err(EffectError::PreparationCancelled);
+            }
+            if diagnostics
+                .worker_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            if diagnostics
+                .worker_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(EffectError::WorkerUnavailable(
+                    diagnostics
+                        .failure_reason()
+                        .unwrap_or_else(|| "Hush worker failed during initialization".into()),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(EffectError::WorkerUnavailable(
+                    "timed out waiting for Hush worker initialization".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(PreparedEffect {
+            descriptor: processor.descriptor().clone(),
+            spec: request.spec,
+            processor: Box::new(processor),
+            preparation_duration_ms: started.elapsed().as_millis() as u64,
+        })
     }
 }
 
@@ -151,7 +214,7 @@ impl Default for HushNoiseSuppressor {
 }
 
 impl HushNoiseSuppressor {
-    pub(crate) fn factory() -> Box<dyn EffectFactory> {
+    pub(crate) fn factory() -> Box<dyn EffectProvider> {
         Box::new(HushNoiseSuppressorFactory)
     }
 
@@ -281,7 +344,7 @@ impl EffectProcessor for HushNoiseSuppressor {
         // `AudioSpec` is a small copyable value. Taking an owned snapshot
         // keeps the subsequent generation/quantum update independent of the
         // processor's mutable lifecycle fields and does not allocate.
-        let Some(spec) = self.spec.clone() else {
+        let Some(spec) = self.spec else {
             return Err(EffectError::NotPrepared);
         };
         if frames > spec.max_frames {
@@ -992,13 +1055,13 @@ mod tests {
         let mut wet = HushNoiseSuppressor::default();
         wet.set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
             .unwrap();
-        wet.prepare(spec.clone()).unwrap();
+        wet.prepare(spec).unwrap();
 
         let mut parameter_bypass = HushNoiseSuppressor::default();
         parameter_bypass
             .set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
             .unwrap();
-        parameter_bypass.prepare(spec.clone()).unwrap();
+        parameter_bypass.prepare(spec).unwrap();
         parameter_bypass
             .set_parameter(HUSH_NOISE_SUPPRESSOR_BYPASS, 1.0)
             .unwrap();

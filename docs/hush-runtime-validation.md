@@ -1,6 +1,7 @@
 # Hush runtime validation
 
-Validated in the working tree based on commit `1e4d481` on 2026-09-09.
+Validated in the working tree based on commit `21d2584` plus the asynchronous
+effect-lifecycle changes on 2026-09-09.
 
 ## Root cause
 
@@ -18,13 +19,24 @@ its rolling realtime-factor window was erased by every wet-pipeline reset. A
 slow worker therefore kept restarting before it could become confidently
 classified as permanently slow.
 
-The fix uses one shared Hush channel resolver: explicit 1/2-channel requests
-win, insertion derives 1/2 from source topology, and unresolved standalone
-`None` is safely mono. Effective Hush layout is persisted after creation. The
-worker also separates mutable Hush DSP state from persistent performance
+The fix uses one generic provider-owned channel negotiation path: explicit
+`ChannelPolicy::Fixed(1/2)` requests win, insertion derives 1/2 from source
+topology, and unresolved standalone `ChannelPolicy::Auto` safely starts mono.
+The policy is persisted separately from the runtime resolution, so restoring a
+mono first-run `Auto` node does not silently make it permanently fixed mono.
+The worker also separates mutable Hush DSP state from persistent performance
 state. A wet reset clears denoisers, resamplers, pending buffers, warmup, and
 the wet epoch, but retains lifetime timing, EWMA service rate, high-percentile
 timing, and overload confidence.
+
+Effect creation now has two phases. `EffectComponentManager::begin_prepare`
+returns an `EffectTicket` without waiting; its bounded loader invokes the
+provider preparation hook. Hush loads the shared model and starts its
+Tract-owning worker there, waits for the worker's readiness only on that loader
+thread, and reports a failed initialization as a failed ticket. PipeWire
+publication and link replacement happen only after `Ready`, leaving the
+original route intact when preparation fails. Destruction uses a bounded Hush
+reaper rather than joining a worker from the UI/control path.
 
 ## Runtime policy
 
@@ -52,9 +64,10 @@ timing, and overload confidence.
 - PipeWire creates mono Hush ports and one denoiser for mono routes. Stereo
   routes retain independent FL/FR denoisers. A disconnected channel is not
   inferred as audio and does not run inference; its output is exact zero.
-  Effective layout hints are persisted. Legacy configurations without a hint
-  now use mono for an unresolved standalone node and topology inference for a
-  link insertion.
+  `ChannelPolicy` is persisted; only legacy numeric `channels` values become
+  `Fixed(n)`. Legacy configurations without a hint use `Auto`, which starts
+  mono for an unresolved standalone node and uses topology inference for link
+  insertion.
 
 ## Measurements
 

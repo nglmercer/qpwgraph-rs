@@ -3,7 +3,8 @@
 use pw_graph_core::{
     Graph, GraphError, Link, LinkId, Node, NodeId, NodeType, PortId, PortKey, PortType,
 };
-use pw_graph_effects::{EffectDescriptor, EffectInstanceConfig};
+use pw_graph_effects::{ChannelPolicy, EffectDescriptor, EffectInstanceConfig};
+pub use pw_graph_effects::{EffectLoadStage, EffectTicket};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -106,6 +107,55 @@ backend_error_constructors! {
 
 pub type BackendResult<T> = Result<T, BackendError>;
 
+/// Where a prepared effect will be activated. Preparation itself does not
+/// mutate the graph, which keeps insertion transactional until the processor
+/// is ready.
+#[derive(Clone, Debug)]
+pub enum EffectTarget {
+    Standalone {
+        position: [f32; 2],
+    },
+    Insert {
+        source: PortKey,
+        destination: PortKey,
+        position: [f32; 2],
+    },
+}
+
+/// Unified request used by asynchronous creation and restore paths.
+#[derive(Clone, Debug)]
+pub struct EffectCreateRequest {
+    pub instance_id: String,
+    pub effect_id: String,
+    pub module_path: Option<String>,
+    pub enabled: bool,
+    pub parameters: BTreeMap<String, f32>,
+    pub channel_policy: ChannelPolicy,
+    pub target: EffectTarget,
+}
+
+/// Lifecycle notifications emitted by a backend after a heavyweight effect
+/// has been queued.  The UI/control thread consumes these rather than
+/// waiting inside the Create action.
+#[derive(Clone, Debug)]
+pub enum EffectEvent {
+    Loading {
+        ticket: EffectTicket,
+        stage: EffectLoadStage,
+    },
+    Ready {
+        ticket: EffectTicket,
+        instance: Box<EffectInstance>,
+    },
+    Failed {
+        ticket: EffectTicket,
+        error: String,
+    },
+    Cancelled {
+        ticket: EffectTicket,
+    },
+}
+
 /// Parameters used to create a free-standing effect node. The node has one
 /// audio input and one audio output, so callers can patch it like any other
 /// node in the graph.
@@ -116,11 +166,10 @@ pub struct EffectNodeRequest {
     pub module_path: Option<String>,
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
-    /// Requested audio channel count for layout-aware effects. `None` means
-    /// automatic layout: Hush resolves connected topology when available and
-    /// uses a safe mono layout while standalone topology is unresolved. Other
-    /// effects retain their established stereo layout.
-    pub channels: Option<u16>,
+    /// Persisted channel intent.  Runtime negotiation resolves this policy
+    /// against topology; an unresolved `Auto` must never be rewritten as a
+    /// fixed channel count.
+    pub channel_policy: ChannelPolicy,
     /// Initial canvas position in logical scene coordinates. Backends that do
     /// not persist layouts may still use it for their in-memory graph model.
     pub position: [f32; 2],
@@ -138,10 +187,9 @@ pub struct EffectInsertRequest {
     pub destination: PortKey,
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
-    /// Optional layout override for layout-aware effects. When omitted, the
-    /// native PipeWire backend derives Hush's mono/stereo layout from the
-    /// selected source route.
-    pub channels: Option<u16>,
+    /// Persisted channel intent.  `Auto` is resolved from the selected source
+    /// topology when the effect is prepared.
+    pub channel_policy: ChannelPolicy,
     /// Position for the newly inserted effect node.
     pub position: [f32; 2],
 }
@@ -154,7 +202,7 @@ impl From<EffectInsertRequest> for EffectNodeRequest {
             module_path: request.module_path,
             enabled: request.enabled,
             parameters: request.parameters,
-            channels: request.channels,
+            channel_policy: request.channel_policy,
             position: request.position,
         }
     }
@@ -193,6 +241,24 @@ pub trait EffectDriver {
     /// presenting an enabled Create action on a backend that cannot host DSP.
     fn supports_effect_nodes(&self) -> bool {
         false
+    }
+
+    /// Begin preparation without mutating the graph. Backends with a
+    /// heavyweight loader return a ticket immediately; lightweight backends
+    /// may implement this by queueing an already-completed Ready event.
+    fn begin_create_effect(
+        &mut self,
+        _request: EffectCreateRequest,
+    ) -> BackendResult<EffectTicket> {
+        Err(unsupported_effect())
+    }
+
+    fn poll_effect_events(&mut self) -> BackendResult<Vec<EffectEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn cancel_effect(&mut self, _ticket: EffectTicket) -> BackendResult<()> {
+        Err(unsupported_effect())
     }
 
     /// Create an unconnected effect node which can be linked through normal

@@ -15,7 +15,8 @@
 use super::filter_runtime::FilterRuntime;
 use super::*;
 use pw_graph_effects::{
-    apply_parameters, AudioSpec, EffectHost, EffectInstanceConfig, EffectProcessor,
+    AudioSpec, EffectHost, EffectInstanceConfig, EffectPrepareRequest, EffectProcessor,
+    PreparedEffect,
 };
 use std::ffi::c_void;
 use std::ptr;
@@ -25,8 +26,8 @@ use std::sync::{Mutex, TryLockError};
 /// PipeWire's standard quantum is normally far smaller than this.  Keeping a
 /// finite ceiling lets the callback build an exactly-sized Rust slice without
 /// trusting an arbitrarily large duration supplied by an external graph.
-const MAX_DSP_FRAMES: u32 = 16_384;
-const PREPARED_SAMPLE_RATE: u32 = 48_000;
+pub(super) const MAX_DSP_FRAMES: u32 = 16_384;
+pub(super) const PREPARED_SAMPLE_RATE: u32 = 48_000;
 const DSP_CHANNELS: usize = 2;
 const UNRESOLVED_ID: u64 = u64::MAX;
 const DANGLING_FL: u32 = 1 << 0;
@@ -351,6 +352,7 @@ impl NativeEffect {
         host: &EffectHost,
         thread_loop: &pw::thread_loop::ThreadLoop,
         request: EffectNodeRequest,
+        topology_channels: Option<u16>,
     ) -> BackendResult<Self> {
         validate_request(&request)?;
         if request.module_path.is_some() {
@@ -359,38 +361,60 @@ impl NativeEffect {
             ));
         }
 
-        // All setup and parameter validation happens before the raw filter is
-        // published to PipeWire. Legacy effects always retain their planar
-        // FL/FR pair. Hush can use one MONO pair when the caller selected a
-        // mono route, which avoids constructing/running a second denoiser.
-        let is_hush = request.effect_id == pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID;
-        let channels = if is_hush {
-            super::resolve_hush_channels(request.channels, None)? as usize
-        } else {
-            DSP_CHANNELS
+        // Compatibility callers still get a synchronous API, but all setup
+        // is routed through the provider hook. The asynchronous backend path
+        // uses EffectComponentManager and reaches activate() directly, so it
+        // never performs this heavyweight work before publishing a node.
+        let channels = host
+            .negotiate_channels(
+                &request.effect_id,
+                request.channel_policy,
+                topology_channels,
+            )
+            .map_err(BackendError::native)? as usize;
+        eprintln!(
+            "INFO effect: channel policy={:?} resolved_channels={} topology_channels={:?}",
+            request.channel_policy, channels, topology_channels
+        );
+        let spec = AudioSpec {
+            sample_rate: PREPARED_SAMPLE_RATE,
+            channels: channels as u16,
+            max_frames: MAX_DSP_FRAMES,
         };
-        if is_hush {
-            eprintln!(
-                "INFO hush: channel mode={} resolved_channels={} standalone=true",
-                if request.channels.is_some() {
-                    "Explicit"
-                } else {
-                    "Auto"
-                },
-                channels
-            );
-        }
-        let mut processor = host
-            .create(&request.effect_id)
-            .map_err(BackendError::effect_create_failed)?;
-        processor
-            .prepare(AudioSpec {
-                sample_rate: PREPARED_SAMPLE_RATE,
-                channels: channels as u16,
-                max_frames: MAX_DSP_FRAMES,
+        let prepared = host
+            .prepare_instance(EffectPrepareRequest {
+                effect_id: request.effect_id.clone(),
+                module_path: request.module_path.clone(),
+                spec,
+                parameters: request.parameters.clone(),
+                cancellation: pw_graph_effects::EffectCancellation::default(),
             })
-            .map_err(BackendError::native)?;
-        apply_parameters(&mut *processor, &request.parameters).map_err(BackendError::native)?;
+            .map_err(BackendError::effect_create_failed)?;
+        Self::activate(thread_loop, request, prepared)
+    }
+
+    /// Activate a processor that was fully prepared by the bounded loader
+    /// pool. This method only creates the PipeWire-facing callback and ports;
+    /// it never loads models, compiles modules, or calls `prepare()`.
+    pub(super) fn activate(
+        thread_loop: &pw::thread_loop::ThreadLoop,
+        request: EffectNodeRequest,
+        prepared: PreparedEffect,
+    ) -> BackendResult<Self> {
+        validate_request(&request)?;
+        if request.module_path.is_some() {
+            return Err(BackendError::unsupported(
+                "WASM/native effect modules are not yet hosted by the PipeWire filter runtime",
+            ));
+        }
+        prepared.spec.validate().map_err(BackendError::native)?;
+        let channels = prepared.spec.channels as usize;
+        if channels == 0 || channels > DSP_CHANNELS {
+            return Err(BackendError::unsupported(format!(
+                "PipeWire builtin effect host supports at most {DSP_CHANNELS} channels, got {channels}"
+            )));
+        }
+        let processor = prepared.processor;
 
         let effect_name = processor.descriptor().name.clone();
         validate_pipewire_text("effect name", &effect_name)?;
@@ -460,14 +484,10 @@ impl NativeEffect {
                 module_path: request.module_path,
                 enabled: request.enabled,
                 parameters: request.parameters,
-                // Persist the effective Hush layout.  Writing `None` here
-                // would make a restored standalone mono node silently become
-                // stereo again.  Non-Hush effects retain their legacy config.
-                channels: if is_hush {
-                    Some(channels as u16)
-                } else {
-                    request.channels
-                },
+                // Persist intent, not the first topology-derived runtime
+                // resolution.  An Auto effect must be able to adapt when a
+                // second channel is connected later.
+                channel_policy: request.channel_policy,
             },
             node_id: NodeId(UNRESOLVED_ID),
             input_port: PortId(UNRESOLVED_ID),

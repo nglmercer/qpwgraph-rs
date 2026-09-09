@@ -876,6 +876,7 @@ pub fn config_path(app_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pw_graph_effects::ChannelPolicy;
 
     #[test]
     fn defaults_round_trip() {
@@ -1096,7 +1097,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: [("threshold-db".into(), -42.0)].into_iter().collect(),
-                channels: None,
+                channel_policy: ChannelPolicy::Auto,
             },
             source: Some(PortKey {
                 node_name: "Capture".into(),
@@ -1124,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn hush_resolved_channels_round_trip_and_legacy_auto_is_preserved() {
+    fn channel_policy_round_trips_and_legacy_channels_migrate_without_losing_intent() {
         let mut config = AppConfig::default();
         config.effects.push(PersistedEffect {
             instance: EffectInstanceConfig {
@@ -1133,7 +1134,7 @@ mod tests {
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: Some(1),
+                channel_policy: ChannelPolicy::Auto,
             },
             source: None,
             destination: None,
@@ -1141,13 +1142,28 @@ mod tests {
         });
         let text = toml::to_string(&config).unwrap();
         let restored: AppConfig = toml::from_str(&text).unwrap();
-        assert_eq!(restored.effects[0].instance.channels, Some(1));
+        assert_eq!(
+            restored.effects[0].instance.channel_policy,
+            ChannelPolicy::Auto
+        );
 
-        let legacy: AppConfig = toml::from_str(
+        let legacy_auto: AppConfig = toml::from_str(
             "effects = [{ instance = { instance_id = 'legacy-hush', effect_id = 'builtin.hush-noise-suppressor' } }]",
         )
         .unwrap();
-        assert_eq!(legacy.effects[0].instance.channels, None);
+        assert_eq!(
+            legacy_auto.effects[0].instance.channel_policy,
+            ChannelPolicy::Auto
+        );
+
+        let legacy_mono: AppConfig = toml::from_str(
+            "effects = [{ instance = { instance_id = 'legacy-hush', effect_id = 'builtin.hush-noise-suppressor', channels = 1 } }]",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_mono.effects[0].instance.channel_policy,
+            ChannelPolicy::Fixed(1)
+        );
     }
 
     #[test]
@@ -1221,7 +1237,7 @@ enabled = true
                     module_path: None,
                     enabled: false,
                     parameters: effect_parameters,
-                    channels: None,
+                    channel_policy: ChannelPolicy::Auto,
                 }],
                 ..WindowsApplicationRoute::default()
             });
@@ -1274,7 +1290,7 @@ enabled = true
                 module_path: None,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: None,
+                channel_policy: ChannelPolicy::Auto,
             }],
             ..WindowsApplicationRoute::default()
         };

@@ -10,8 +10,9 @@ use pw_graph_app_core::{BackendAvailability, CompositeDriver};
 #[cfg(all(feature = "relay", target_os = "windows"))]
 use pw_graph_backend::RelayEndpoints;
 use pw_graph_backend::{
-    AudioMeter, BackendCapabilities, DemoDriver, EffectDriver, EffectInsertRequest, EffectInstance,
-    EffectNodeRequest, GraphDriver, MeterPolicy,
+    AudioMeter, BackendCapabilities, BackendError, DemoDriver, EffectCreateRequest, EffectDriver,
+    EffectEvent, EffectInsertRequest, EffectInstance, EffectNodeRequest, EffectTarget,
+    EffectTicket, GraphDriver, MeterPolicy,
 };
 #[cfg(feature = "relay")]
 use pw_graph_backend::{
@@ -22,7 +23,7 @@ use pw_graph_backend::{
 use pw_graph_core::{Graph, Node, NodeId, PortKey, PortType};
 use pw_graph_effects::EffectDescriptor;
 use pw_graph_i18n::I18n;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Instant;
 
 enum BackendKind {
@@ -37,6 +38,10 @@ pub(crate) struct ApplicationDriver {
     backend_name: String,
     meter_policy: MeterPolicy,
     meter_epoch: Instant,
+    /// Compatibility completions for backends that still expose only the
+    /// legacy synchronous effect API (demo and the current Windows router).
+    local_effect_events: VecDeque<EffectEvent>,
+    next_local_effect_ticket: u64,
 }
 
 impl ApplicationDriver {
@@ -47,6 +52,8 @@ impl ApplicationDriver {
                 backend_name: "demo".to_owned(),
                 meter_policy,
                 meter_epoch: Instant::now(),
+                local_effect_events: VecDeque::new(),
+                next_local_effect_ticket: 1,
             };
             let _ = source.refresh();
             let _ = source.set_meter_policy(meter_policy);
@@ -60,6 +67,8 @@ impl ApplicationDriver {
             backend_name,
             meter_policy,
             meter_epoch: Instant::now(),
+            local_effect_events: VecDeque::new(),
+            next_local_effect_ticket: 1,
         };
         let mut status = if source.backend_name == "none" {
             i18n.text("status.backend_unavailable")
@@ -327,6 +336,89 @@ impl ApplicationDriver {
 
     pub(crate) fn supports_effect_nodes(&self) -> bool {
         EffectDriver::supports_effect_nodes(self)
+    }
+
+    /// Queue a heavyweight effect for preparation.  PipeWire uses its
+    /// background component loader.  Backends that have not adopted the
+    /// lifecycle API yet retain their behavior through a local Ready event,
+    /// so the UI has one event-driven contract during the migration.
+    pub(crate) fn begin_create_effect(
+        &mut self,
+        request: EffectCreateRequest,
+    ) -> Result<EffectTicket, String> {
+        if let BackendKind::Live(driver) = &mut self.backend {
+            match EffectDriver::begin_create_effect(driver.as_mut(), request.clone()) {
+                Ok(ticket) => return Ok(ticket),
+                Err(BackendError::Unsupported(_)) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        let instance = match request.target.clone() {
+            EffectTarget::Standalone { position } => {
+                self.create_effect_node(EffectNodeRequest {
+                    instance_id: request.instance_id,
+                    effect_id: request.effect_id,
+                    module_path: request.module_path,
+                    enabled: request.enabled,
+                    parameters: request.parameters,
+                    channel_policy: request.channel_policy,
+                    position,
+                })?
+            }
+            EffectTarget::Insert {
+                source,
+                destination,
+                position,
+            } => self.insert_effect(EffectInsertRequest {
+                instance_id: request.instance_id,
+                effect_id: request.effect_id,
+                module_path: request.module_path,
+                source,
+                destination,
+                enabled: request.enabled,
+                parameters: request.parameters,
+                channel_policy: request.channel_policy,
+                position,
+            })?,
+        };
+        let ticket = EffectTicket(self.next_local_effect_ticket);
+        self.next_local_effect_ticket = self.next_local_effect_ticket.wrapping_add(1).max(1);
+        self.local_effect_events.push_back(EffectEvent::Ready {
+            ticket,
+            instance: Box::new(instance),
+        });
+        Ok(ticket)
+    }
+
+    pub(crate) fn poll_effect_events(&mut self) -> Result<Vec<EffectEvent>, String> {
+        let mut events: Vec<_> = self.local_effect_events.drain(..).collect();
+        if let BackendKind::Live(driver) = &mut self.backend {
+            events.extend(
+                EffectDriver::poll_effect_events(driver.as_mut())
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(events)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cancel_effect(&mut self, ticket: EffectTicket) -> Result<(), String> {
+        if let BackendKind::Live(driver) = &mut self.backend {
+            return EffectDriver::cancel_effect(driver.as_mut(), ticket)
+                .map_err(|error| error.to_string());
+        }
+        let before = self.local_effect_events.len();
+        self.local_effect_events.retain(|event| {
+            !matches!(event, EffectEvent::Ready { ticket: event_ticket, .. } if *event_ticket == ticket)
+        });
+        if self.local_effect_events.len() != before {
+            self.local_effect_events
+                .push_back(EffectEvent::Cancelled { ticket });
+            Ok(())
+        } else {
+            Err(format!("unknown or completed effect ticket {}", ticket.0))
+        }
     }
 
     pub(crate) fn create_effect_node(
@@ -1211,6 +1303,8 @@ mod tests {
             backend_name: "test".into(),
             meter_policy: MeterPolicy::Disabled,
             meter_epoch: Instant::now(),
+            local_effect_events: VecDeque::new(),
+            next_local_effect_ticket: 1,
         };
 
         assert!(!application.is_link_mutable(link.id));

@@ -10,7 +10,7 @@
 //! mutates those buffers; it does not allocate, lock, or perform I/O.
 
 use crate::{
-    AudioSpec, EffectDescriptor, EffectError, EffectFactory, EffectParameter, EffectProcessor,
+    AudioSpec, EffectDescriptor, EffectError, EffectParameter, EffectProcessor, EffectProvider,
     NOISE_SUPPRESSOR_ADAPTATION, NOISE_SUPPRESSOR_BYPASS, NOISE_SUPPRESSOR_ID,
     NOISE_SUPPRESSOR_REDUCTION, NOISE_SUPPRESSOR_VOICE_PRESERVE,
 };
@@ -68,7 +68,7 @@ pub(crate) fn descriptor() -> EffectDescriptor {
 
 pub(crate) struct AdaptiveNoiseSuppressorFactory;
 
-impl EffectFactory for AdaptiveNoiseSuppressorFactory {
+impl EffectProvider for AdaptiveNoiseSuppressorFactory {
     fn descriptor(&self) -> &EffectDescriptor {
         static DESCRIPTOR: std::sync::OnceLock<EffectDescriptor> = std::sync::OnceLock::new();
         DESCRIPTOR.get_or_init(descriptor)
@@ -460,7 +460,7 @@ impl AdaptiveNoiseSuppressor {
     }
 
     fn rebuild_stream(&mut self) -> Result<(), EffectError> {
-        let Some(spec) = self.spec.clone() else {
+        let Some(spec) = self.spec else {
             return Ok(());
         };
         self.stream = Some(NeuralStream::new(&spec, self.denoise_params())?);

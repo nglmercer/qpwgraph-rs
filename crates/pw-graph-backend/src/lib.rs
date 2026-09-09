@@ -185,7 +185,7 @@ mod tests {
                 destination,
                 enabled: true,
                 parameters: BTreeMap::new(),
-                channels: None,
+                channel_policy: pw_graph_effects::ChannelPolicy::Auto,
                 position: [250.0, 180.0],
             })
             .unwrap();

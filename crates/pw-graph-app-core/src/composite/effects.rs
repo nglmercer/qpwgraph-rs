@@ -44,6 +44,44 @@ impl pw_graph_backend::EffectDriver for CompositeDriver {
         }
     }
 
+    fn begin_create_effect(
+        &mut self,
+        request: pw_graph_backend::EffectCreateRequest,
+    ) -> BackendResult<pw_graph_backend::EffectTicket> {
+        #[cfg(all(target_os = "linux", feature = "pipewire"))]
+        {
+            self.pipewire_mut()?.begin_create_effect(request)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        {
+            let _ = request;
+            Err(Self::unsupported("effect processing is unavailable"))
+        }
+    }
+
+    fn poll_effect_events(&mut self) -> BackendResult<Vec<pw_graph_backend::EffectEvent>> {
+        #[cfg(all(target_os = "linux", feature = "pipewire"))]
+        {
+            self.pipewire_mut()?.poll_effect_events()
+        }
+        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn cancel_effect(&mut self, ticket: pw_graph_backend::EffectTicket) -> BackendResult<()> {
+        #[cfg(all(target_os = "linux", feature = "pipewire"))]
+        {
+            self.pipewire_mut()?.cancel_effect(ticket)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        {
+            let _ = ticket;
+            Err(Self::unsupported("effect processing is unavailable"))
+        }
+    }
+
     fn create_effect_node(
         &mut self,
         request: pw_graph_backend::EffectNodeRequest,
