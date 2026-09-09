@@ -19,7 +19,10 @@ mono frames. Its 320-sample algorithmic latency metadata and 160-sample
 streaming overlap-add synthesis delay describe different aspects of the model;
 they are **not additive**. qpwgraph schedules the raw streaming output 40 ms
 later and aligns the dry path by another 10 ms of synthesis delay: **50 ms total**
-(800 / 2,205 / 2,400 / 4,800 frames at 16 / 44.1 / 48 / 96 kHz).
+(800 / 2,205 / 2,400 / 4,800 frames at 16 / 44.1 / 48 / 96 kHz). The 40 ms
+scheduling allowance is a conservative margin over the measured release worker
+maximum (4.68 ms in the expanded benchmark and 6.13 ms in the live 48 kHz
+stereo probe), rather than a callback-count assumption.
 
 The immutable model is embedded and checksum verified. Development and CI may
 override it with `QPWGRAPH_HUSH_MODEL` or `HUSH_MODEL`. Preparation waits for the
@@ -39,10 +42,14 @@ Larger host callbacks are split during bounded copying. At 48 kHz stereo the two
 queues reserve about 960 KiB of sample storage, even with a 16,384-frame host
 capacity ceiling. Input overruns never wait. Output overruns drop the newly
 computed range but advance its timeline, so subsequent wet samples cannot move
-in time. The worker skips input over 100 ms behind the latest callback, resets
-state on a real gap, and adopts a fresh origin. If rebuilding Tract itself takes
-longer than that budget, the fresh runtime discards stale input without rebuilding
-again. This prevents an overload-induced reset loop. The first synthesis-delay
+in time. The worker tracks absolute input, playout, and wet positions instead of
+inferring load from queue depth. More than 80 ms of useful backlog, a partial
+enqueue, or an irrecoverably late wet range requests one wet-pipeline
+resynchronization. The worker drains stale input/output, advances a wet epoch,
+resets Hush and both resamplers, and adopts a recent live origin. Old-epoch
+blocks are dropped without triggering another reset. The aligned dry delay
+remains continuous across this wet-only recovery. A 40 ms recovery lead is
+required before the worker leaves its recovering state. The first synthesis-delay
 samples after a fresh origin are not published as wet; aligned dry remains in
 place until output represents valid input from that origin.
 
@@ -64,21 +71,24 @@ measurements and the limits of the live tests.
 
 `process()` only sanitizes/copies samples, advances preallocated delay storage,
 uses bounded SPSC operations, and updates atomics. It neither allocates nor
-locks, wakes, joins, loads a model, or invokes Tract. The worker polls with a
-500 µs timed wait; only shutdown notifies its condition variable. Expensive
-resets and shutdown joins stay outside realtime processing.
+locks, waits, joins, loads a model, or invokes Tract. The producer notifies the
+worker only when a queue transitions from empty to non-empty; the worker also
+uses a 500 µs timed wait. Expensive resets and shutdown joins stay outside
+realtime processing.
 
 PipeWire Hush parameter updates use shared atomics rather than the generic
 processor mutex, so slider and bypass changes do not introduce an instantaneous
 host fallback. The existing typed events and stable parameter models are retained.
 
 The Effects status exposes rate, channels, quantum, fixed latency, wet/dry
-counts, underruns, queue peaks/overruns, resets, worker average/p99/max timing,
-and the actual persistent failure reason. Timing is **worker input-chunk time**,
-including conversion and any inference; small chunks do not all run inference.
-Percentiles use a bounded 4,096-observation window. Wet and dry block counters
-can both increment for a callback containing a partial wet range. Underruns
-exclude startup, intentional bypass, and fully disconnected input.
+counts and frames, fallback reasons, wet ratio, underruns, queue peaks/overruns,
+rejected/stale frames, resync state, backlog, Hush frame count, resets, worker
+average/p95/p99/max timing, and the actual persistent failure reason. Timing is
+**worker input-chunk time**, including conversion and any inference; small
+chunks do not all run inference. Percentiles use a bounded 4,096-observation
+window. Wet and dry block counters can both increment for a callback containing
+a partial wet range. Underruns exclude startup, intentional bypass, worker
+failure/recovery, and fully disconnected input.
 
 The original `builtin.adaptive-noise-suppressor` remains the compatibility
 implementation for saved configurations. Its persisted reduction, adaptation,

@@ -3,6 +3,29 @@
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use pw_graph_backend::{EffectDriver, EffectNodeRequest, PipewireDriver};
+    let mut seconds = 30u64;
+    let mut fixed_reduction = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--seconds" => {
+                seconds = args.next().ok_or("--seconds needs a value")?.parse()?;
+            }
+            "--reduction" => {
+                fixed_reduction = Some(
+                    args.next()
+                        .ok_or("--reduction needs a value")?
+                        .parse::<f32>()?
+                        .clamp(0.0, 60.0),
+                );
+            }
+            "--help" | "-h" => {
+                println!("usage: hush_probe [--seconds N] [--reduction DB]");
+                return Ok(());
+            }
+            unknown => return Err(format!("unknown argument: {unknown}").into()),
+        }
+    }
     let mut driver = PipewireDriver::new()?;
     driver.create_effect_node(EffectNodeRequest {
         instance_id: "hush-probe".into(),
@@ -12,9 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         parameters: Default::default(),
         position: [0.0, 0.0],
     })?;
-    for second in 0..30 {
-        if second % 5 == 0 && second < 20 {
-            let db = (second / 5 * 20) as f32;
+    for second in 0..seconds {
+        if let Some(db) = fixed_reduction
+            .or_else(|| (second % 5 == 0 && second < 20).then_some((second / 5 * 20) as f32))
+        {
             driver.set_effect_parameter("hush-probe", "reduction-db", db)?;
             println!("Reduction: {db} dB");
         }

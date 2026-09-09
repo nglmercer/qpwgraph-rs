@@ -6,6 +6,7 @@
 
 use nnnoiseless::{HushDenoiser, HushModel, Resampler, HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE};
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,6 +19,30 @@ pub(crate) const HUSH_QUEUE_CAPACITY: usize = 128;
 /// Fixed scheduling allowance, including model-frame assembly and sinc lookahead.
 /// Signal alignment adds the synthesis delay separately (see hush_noise).
 pub(crate) const HUSH_SCHEDULING_MS: u32 = 40;
+/// Maximum amount of input that is useful to process after the realtime
+/// producer has advanced. Beyond this point the wet result cannot meet the
+/// fixed playout timeline and the worker must resynchronize.
+pub(crate) const HUSH_MAX_BACKLOG_MS: u32 = 80;
+/// Hysteresis for clearing the overload/recovery state. This is deliberately
+/// smaller than the overload threshold so a worker does not oscillate between
+/// running and recovering around one boundary.
+pub(crate) const HUSH_RECOVERY_LEAD_MS: u32 = 40;
+
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum HushWorkerState {
+    Starting = 0,
+    Running = 1,
+    ResyncRequested = 2,
+    Warming = 3,
+    Failed = 4,
+}
+
+impl HushWorkerState {
+    fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
 
 #[inline]
 fn channel_is_connected(mask: u16, channel: usize) -> bool {
@@ -33,8 +58,16 @@ pub struct HushDiagnostics {
     pub(crate) bypass: AtomicBool,
     pub wet_blocks_output: AtomicU64,
     pub dry_fallback_blocks: AtomicU64,
+    pub wet_frames_output: AtomicU64,
+    pub dry_frames_output: AtomicU64,
+    pub dry_startup_blocks: AtomicU64,
+    pub dry_bypass_blocks: AtomicU64,
+    pub dry_underrun_blocks: AtomicU64,
+    pub dry_worker_failure_blocks: AtomicU64,
+    pub dry_resync_blocks: AtomicU64,
+    pub dry_host_disabled_blocks: AtomicU64,
     pub(crate) error: Mutex<Option<String>>,
-    pub(crate) timings: Mutex<Vec<u64>>,
+    pub(crate) timings: Mutex<VecDeque<u64>>,
     #[cfg(test)]
     pub(crate) frame_delay_ms: AtomicU64,
     #[cfg(test)]
@@ -46,14 +79,31 @@ pub struct HushDiagnostics {
     pub underruns: AtomicU64,
     pub input_overruns: AtomicU64,
     pub output_overruns: AtomicU64,
+    pub input_blocks_pushed: AtomicU64,
+    pub input_blocks_rejected: AtomicU64,
+    pub input_frames_rejected: AtomicU64,
+    pub wet_frames_dropped: AtomicU64,
+    pub stale_input_blocks_dropped: AtomicU64,
+    pub stale_output_blocks_dropped: AtomicU64,
+    pub resync_requests: AtomicU64,
+    pub resync_completed: AtomicU64,
+    pub hush_frames_processed: AtomicU64,
     pub max_input_queue_depth: AtomicU64,
     pub max_output_queue_depth: AtomicU64,
+    pub max_worker_backlog_frames: AtomicU64,
     pub generation_resets: AtomicU64,
     pub processed_blocks: AtomicU64,
     pub inference_ns: AtomicU64,
     pub max_inference_ns: AtomicU64,
     pub worker_ready: AtomicBool,
     pub worker_failed: AtomicBool,
+    pub worker_overloaded: AtomicBool,
+    pub worker_state: AtomicU32,
+    pub worker_active: AtomicBool,
+    pub latest_input_frame: AtomicU64,
+    pub worker_input_frame: AtomicU64,
+    pub latest_wet_frame: AtomicU64,
+    pub playout_frame: AtomicU64,
 }
 
 fn panic_reason(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -90,8 +140,11 @@ impl HushDiagnostics {
     pub fn status_text(&self) -> String {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let processed = load(&self.processed_blocks);
+        let pushed = load(&self.input_blocks_pushed);
         let state = if self.worker_failed.load(Ordering::Acquire) {
             "failed"
+        } else if self.worker_overloaded.load(Ordering::Acquire) {
+            "recovering"
         } else if self.worker_ready.load(Ordering::Acquire) {
             "ready"
         } else {
@@ -103,16 +156,31 @@ impl HushDiagnostics {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_default();
-        let mut times = self
+        let mut times: Vec<u64> = self
             .timings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .iter()
+            .copied()
+            .collect();
         times.sort_unstable();
+        let p95 = times.get(times.len() * 95 / 100).copied().unwrap_or(0) as f64 / 1e6;
         let p99 = times.get(times.len() * 99 / 100).copied().unwrap_or(0) as f64 / 1e6;
-        format!("Hush: {state} {error} | {} Hz / {} ch / quantum {} | latency: 50 ms | wet: {} dry: {} underruns: {} | input/output overruns: {}/{} | queue peaks: {}/{} | processed: {processed} resets: {} | worker avg/p99/max: {:.2}/{p99:.2}/{:.2} ms",
+        let total_frames = load(&self.wet_frames_output) + load(&self.dry_frames_output);
+        let wet_ratio = if total_frames == 0 {
+            0.0
+        } else {
+            load(&self.wet_frames_output) as f64 * 100.0 / total_frames as f64
+        };
+        let backlog_frames = self
+            .latest_input_frame
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.worker_input_frame.load(Ordering::Relaxed));
+        let max_backlog_ms = load(&self.max_worker_backlog_frames) as f64 * 1000.0
+            / self.sample_rate.load(Ordering::Relaxed).max(1) as f64;
+        format!("Hush: {state} {error} | {} Hz / {} ch / quantum {} | latency: 50 ms | wet: {} blocks / {} frames ({wet_ratio:.1}%) dry: {} blocks / {} frames [startup:{} bypass:{} host-off:{} underrun:{} resync:{} failure:{}] | underruns: {} | input/output overruns: {}/{} | input blocks pushed/rejected: {pushed}/{} ({} frames) | wet frames dropped: {} | resync: {}/{} | stale input/wet: {}/{} | queue peaks: {}/{} | backlog: {:.1}/{max_backlog_ms:.1} ms | processed: {processed} Hush frames: {} resets: {} | worker avg/p95/p99/max: {:.2}/{p95:.2}/{p99:.2}/{:.2} ms",
             self.sample_rate.load(Ordering::Relaxed), self.channels.load(Ordering::Relaxed), self.host_quantum.load(Ordering::Relaxed),
-            load(&self.wet_blocks_output), load(&self.dry_fallback_blocks), load(&self.underruns), load(&self.input_overruns), load(&self.output_overruns), load(&self.max_input_queue_depth), load(&self.max_output_queue_depth), load(&self.generation_resets), load(&self.inference_ns) as f64 / processed.max(1) as f64 / 1e6, load(&self.max_inference_ns) as f64 / 1e6)
+            load(&self.wet_blocks_output), load(&self.wet_frames_output), load(&self.dry_fallback_blocks), load(&self.dry_frames_output), load(&self.dry_startup_blocks), load(&self.dry_bypass_blocks), load(&self.dry_host_disabled_blocks), load(&self.dry_underrun_blocks), load(&self.dry_resync_blocks), load(&self.dry_worker_failure_blocks), load(&self.underruns), load(&self.input_overruns), load(&self.output_overruns), load(&self.input_blocks_rejected), load(&self.input_frames_rejected), load(&self.wet_frames_dropped), load(&self.resync_requests), load(&self.resync_completed), load(&self.stale_input_blocks_dropped), load(&self.stale_output_blocks_dropped), load(&self.max_input_queue_depth), load(&self.max_output_queue_depth), backlog_frames as f64 * 1000.0 / self.sample_rate.load(Ordering::Relaxed).max(1) as f64, load(&self.hush_frames_processed), load(&self.generation_resets), load(&self.inference_ns) as f64 / processed.max(1) as f64 / 1e6, load(&self.max_inference_ns) as f64 / 1e6)
     }
     pub fn failure_reason(&self) -> Option<String> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -121,6 +189,7 @@ impl HushDiagnostics {
 
 struct AudioBlock {
     generation: u64,
+    wet_epoch: u64,
     start_frame: u64,
     frames: u32,
     channels: u16,
@@ -132,6 +201,7 @@ impl AudioBlock {
     fn new(max_samples: usize) -> Self {
         Self {
             generation: 0,
+            wet_epoch: 0,
             start_frame: 0,
             frames: 0,
             channels: 0,
@@ -172,9 +242,11 @@ impl BlockQueue {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_push_with(
         &self,
         generation: u64,
+        wet_epoch: u64,
         start_frame: u64,
         frames: u32,
         channels: u16,
@@ -194,6 +266,7 @@ impl BlockQueue {
         // release publication below.
         let block = unsafe { &mut *self.slots[slot].get() };
         block.generation = generation;
+        block.wet_epoch = wet_epoch;
         block.start_frame = start_frame;
         block.frames = frames;
         block.channels = channels;
@@ -247,23 +320,39 @@ impl BlockQueue {
 /// Copy overlaps, retaining a partially consumed front block. The destination
 /// already contains aligned dry samples for any holes. Only the consumer
 /// advances read; a producer must never drop the oldest slot itself.
+#[allow(clippy::too_many_arguments)]
 fn read_timeline(
     queue: &BlockQueue,
     generation: u64,
+    wet_epoch: u64,
     start: u64,
     frames: u32,
     channels: u16,
+    diagnostics: Option<&HushDiagnostics>,
     destination: &mut [f32],
 ) -> usize {
     let end = start + frames as u64;
     let mut copied = 0;
     for _ in 0..HUSH_QUEUE_CAPACITY {
-        let Some((epoch, first, last)) =
-            queue.peek_with(|b| (b.generation, b.start_frame, b.start_frame + b.frames as u64))
-        else {
+        let Some((epoch, pipeline_epoch, first, last)) = queue.peek_with(|b| {
+            (
+                b.generation,
+                b.wet_epoch,
+                b.start_frame,
+                b.start_frame + b.frames as u64,
+            )
+        }) else {
             break;
         };
-        if epoch != generation || last <= start {
+        if epoch != generation || pipeline_epoch != wet_epoch || last <= start {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics
+                    .stale_output_blocks_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                diagnostics
+                    .wet_frames_dropped
+                    .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+            }
             queue.pop_with(|_| ());
             continue;
         }
@@ -324,6 +413,9 @@ pub(crate) struct HushRuntime {
     stop: Arc<AtomicBool>,
     signal: Arc<WorkerSignal>,
     generation: Arc<AtomicU64>,
+    wet_epoch: Arc<AtomicU64>,
+    resync_requested: Arc<AtomicBool>,
+    accept_input: Arc<AtomicBool>,
     attenuation_bits: Arc<AtomicU32>,
     diagnostics: Arc<HushDiagnostics>,
     latest_frame: Arc<AtomicU64>,
@@ -351,6 +443,9 @@ impl HushRuntime {
         let stop = Arc::new(AtomicBool::new(false));
         let signal = Arc::new(WorkerSignal::default());
         let generation = Arc::new(AtomicU64::new(initial_generation));
+        let wet_epoch = Arc::new(AtomicU64::new(0));
+        let resync_requested = Arc::new(AtomicBool::new(false));
+        let accept_input = Arc::new(AtomicBool::new(true));
         let attenuation_bits = Arc::new(AtomicU32::new(attenuation_db.to_bits()));
         let diagnostics = Arc::new(HushDiagnostics {
             attenuation_bits: attenuation_bits.clone(),
@@ -368,6 +463,9 @@ impl HushRuntime {
         let worker_stop = stop.clone();
         let worker_signal = signal.clone();
         let worker_generation = generation.clone();
+        let worker_wet_epoch = wet_epoch.clone();
+        let worker_resync_requested = resync_requested.clone();
+        let worker_accept_input = accept_input.clone();
         let worker_attenuation = attenuation_bits.clone();
         let worker_diagnostics = diagnostics.clone();
         let worker = thread::Builder::new()
@@ -403,10 +501,14 @@ impl HushRuntime {
                         worker_stop,
                         worker_signal,
                         worker_generation,
+                        worker_wet_epoch,
+                        worker_resync_requested,
+                        worker_accept_input,
                         worker_attenuation,
                         worker_diagnostics,
                         worker_latest,
-                        sample_rate as u64 / 10,
+                        (sample_rate as u64 * HUSH_MAX_BACKLOG_MS as u64) / 1000,
+                        (sample_rate as u64 * HUSH_RECOVERY_LEAD_MS as u64) / 1000,
                     );
                 }));
                 if let Err(payload) = result {
@@ -435,6 +537,9 @@ impl HushRuntime {
             stop,
             signal,
             generation,
+            wet_epoch,
+            resync_requested,
+            accept_input,
             attenuation_bits,
             diagnostics,
             latest_frame,
@@ -456,25 +561,82 @@ impl HushRuntime {
             .store(frames, Ordering::Relaxed);
         self.latest_frame
             .store(start_frame + frames as u64, Ordering::Release);
+        self.diagnostics
+            .latest_input_frame
+            .store(start_frame + frames as u64, Ordering::Release);
         if self.diagnostics.worker_failed.load(Ordering::Acquire) {
+            self.diagnostics
+                .input_blocks_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .input_frames_rejected
+                .fetch_add(frames as u64, Ordering::Relaxed);
             return true;
+        }
+        if !self.accept_input.load(Ordering::Acquire) {
+            self.diagnostics
+                .input_blocks_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .input_frames_rejected
+                .fetch_add(frames as u64, Ordering::Relaxed);
+            return false;
         }
         if channels == 0 || samples.len() != frames as usize * channels as usize {
             return false;
         }
-        let chunk_samples = self.input.max_samples();
+        let slot_frames = self.input.max_samples() / channels as usize;
         let mut complete = true;
-        for (index, chunk) in samples.chunks(chunk_samples).enumerate() {
-            let chunk_frames = chunk.len() / channels as usize;
+        let wet_epoch = self.wet_epoch.load(Ordering::Acquire);
+        let mut frame_offset = 0usize;
+        while frame_offset < frames as usize {
+            let chunk_frames = (frames as usize - frame_offset).min(slot_frames);
+            let sample_start = frame_offset * channels as usize;
+            let sample_end = (frame_offset + chunk_frames) * channels as usize;
+            let chunk = &samples[sample_start..sample_end];
+            let was_empty = self.input.depth() == 0;
             let pushed = self.input.try_push_with(
                 generation,
-                start_frame + (index * chunk_samples / channels as usize) as u64,
+                wet_epoch,
+                start_frame + frame_offset as u64,
                 chunk_frames as u32,
                 channels,
                 channel_mask,
                 |destination| destination[..chunk.len()].copy_from_slice(chunk),
             );
+            if pushed {
+                self.diagnostics
+                    .input_blocks_pushed
+                    .fetch_add(1, Ordering::Relaxed);
+                if was_empty {
+                    self.signal.condition.notify_one();
+                }
+            } else {
+                self.diagnostics
+                    .input_blocks_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                self.diagnostics
+                    .input_frames_rejected
+                    .fetch_add(chunk_frames as u64, Ordering::Relaxed);
+                self.diagnostics
+                    .input_overruns
+                    .fetch_add(1, Ordering::Relaxed);
+                self.request_resync();
+                let remaining_frames = frames as usize - frame_offset - chunk_frames;
+                if remaining_frames > 0 {
+                    self.diagnostics.input_blocks_rejected.fetch_add(
+                        remaining_frames.div_ceil(slot_frames) as u64,
+                        Ordering::Relaxed,
+                    );
+                    self.diagnostics
+                        .input_frames_rejected
+                        .fetch_add(remaining_frames as u64, Ordering::Relaxed);
+                }
+                complete = false;
+                break;
+            }
             complete &= pushed;
+            frame_offset += chunk_frames;
         }
         record_maximum(&self.diagnostics.max_input_queue_depth, self.input.depth());
         complete
@@ -488,14 +650,40 @@ impl HushRuntime {
         channels: u16,
         destination: &mut [f32],
     ) -> usize {
+        self.diagnostics
+            .playout_frame
+            .store(start_frame, Ordering::Release);
         read_timeline(
             &self.output,
             generation,
+            self.wet_epoch.load(Ordering::Acquire),
             start_frame,
             frames,
             channels,
+            Some(&self.diagnostics),
             destination,
         )
+    }
+
+    pub fn is_resyncing(&self) -> bool {
+        !self.accept_input.load(Ordering::Acquire)
+            || self.resync_requested.load(Ordering::Acquire)
+            || self.diagnostics.worker_overloaded.load(Ordering::Acquire)
+    }
+
+    fn request_resync(&self) {
+        self.accept_input.store(false, Ordering::Release);
+        if !self.resync_requested.swap(true, Ordering::AcqRel) {
+            self.diagnostics
+                .resync_requests
+                .fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .worker_overloaded
+                .store(true, Ordering::Release);
+            self.diagnostics
+                .worker_state
+                .store(HushWorkerState::ResyncRequested.as_u32(), Ordering::Release);
+        }
     }
 
     pub fn set_generation(&self, generation: u64) {
@@ -510,7 +698,7 @@ impl HushRuntime {
     #[cfg(test)]
     pub fn wait_idle(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while self.input.depth() != 0 {
+        while self.input.depth() != 0 || self.diagnostics.worker_active.load(Ordering::Acquire) {
             assert!(
                 !self.diagnostics.worker_failed.load(Ordering::Acquire),
                 "{:?}",
@@ -554,6 +742,7 @@ struct HushWorker {
     max_frames: usize,
     attenuation_db: f32,
     generation: u64,
+    wet_epoch: u64,
     last_mask: u16,
     pristine: bool,
     synthesis_frames: usize,
@@ -622,6 +811,7 @@ impl HushWorker {
             max_frames,
             attenuation_db,
             generation: 0,
+            wet_epoch: 0,
             pristine: true,
             synthesis_frames: (sample_rate as usize * nnnoiseless::HUSH_SYNTHESIS_DELAY_SAMPLES)
                 .div_ceil(HUSH_SAMPLE_RATE),
@@ -642,14 +832,17 @@ impl HushWorker {
         generation: u64,
         mask: u16,
         diagnostics: &HushDiagnostics,
+        count_generation: bool,
     ) -> Result<(), String> {
         self.pristine = true;
         self.warmup_remaining = self.synthesis_frames;
         self.generation = generation;
         self.last_mask = mask;
-        diagnostics
-            .generation_resets
-            .fetch_add(1, Ordering::Relaxed);
+        if count_generation {
+            diagnostics
+                .generation_resets
+                .fetch_add(1, Ordering::Relaxed);
+        }
         #[cfg(test)]
         {
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -677,34 +870,31 @@ impl HushWorker {
         block: &AudioBlock,
         output: &Arc<BlockQueue>,
         generation: &AtomicU64,
+        wet_epoch: &AtomicU64,
         diagnostics: &HushDiagnostics,
-        latest_frame: &AtomicU64,
-        max_backlog_frames: u64,
     ) -> Result<(), String> {
         #[cfg(test)]
         if diagnostics.inject_error.swap(false, Ordering::AcqRel) {
             return Err("injected inference failure".into());
         }
-        if block.generation != generation.load(Ordering::Acquire) {
+        if block.generation != generation.load(Ordering::Acquire)
+            || block.wet_epoch != wet_epoch.load(Ordering::Acquire)
+        {
+            diagnostics
+                .stale_input_blocks_dropped
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        if block.generation != self.generation
-            || block.channel_mask != self.last_mask
-            || (!self.pristine && block.start_frame != self.input_position)
-        {
-            self.reset(block.generation, block.channel_mask, diagnostics)?;
+        // The producer controls the monotonic stream generation. Equality is
+        // the only safe comparison here: it also handles the extremely rare
+        // u64 wrap without treating the wrapped value as an old generation.
+        if block.generation != self.generation || block.channel_mask != self.last_mask {
+            self.reset(block.generation, block.channel_mask, diagnostics, true)?;
         }
-        // Rebuilding Tract may take longer than our entire backlog budget.
-        // Do not feed the pre-reset block to that fresh runtime. Keep it
-        // pristine while draining stale input, then adopt the next fresh
-        // origin WITHOUT rebuilding again. Otherwise overload causes an
-        // endless reset -> stale block -> reset cycle.
-        if block.generation != generation.load(Ordering::Acquire)
-            || latest_frame
-                .load(Ordering::Acquire)
-                .saturating_sub(block.start_frame + block.frames as u64)
-                > max_backlog_frames
-        {
+        if block.wet_epoch != self.wet_epoch {
+            diagnostics
+                .stale_input_blocks_dropped
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         if self.pristine {
@@ -748,6 +938,9 @@ impl HushWorker {
                 self.denoisers[channel]
                     .process_frame(&mut self.frame_output, &self.frame_input)
                     .map_err(|error| error.to_string())?;
+                diagnostics
+                    .hush_frames_processed
+                    .fetch_add(1, Ordering::Relaxed);
                 if self.frame_output.iter().any(|sample| !sample.is_finite()) {
                     return Err("Hush produced a non-finite frame".into());
                 }
@@ -762,9 +955,9 @@ impl HushWorker {
         let inference_ns = inference_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         if let Ok(mut timings) = diagnostics.timings.lock() {
             if timings.len() == 4096 {
-                timings.remove(0);
+                timings.pop_front();
             }
-            timings.push(inference_ns);
+            timings.push_back(inference_ns);
         }
         diagnostics.processed_blocks.fetch_add(1, Ordering::Relaxed);
         diagnostics
@@ -810,6 +1003,7 @@ impl HushWorker {
             let count = remaining.min(self.max_frames);
             let pushed = output.try_push_with(
                 block.generation,
+                self.wet_epoch,
                 self.output_position,
                 count as u32,
                 block.channels,
@@ -842,8 +1036,14 @@ impl HushWorker {
             remaining -= count;
             if !pushed {
                 diagnostics.output_overruns.fetch_add(1, Ordering::Relaxed);
+                diagnostics
+                    .wet_frames_dropped
+                    .fetch_add(count as u64, Ordering::Relaxed);
             } else {
                 record_maximum(&diagnostics.max_output_queue_depth, output.depth());
+                diagnostics
+                    .latest_wet_frame
+                    .store(self.output_position, Ordering::Release);
             }
         }
         Ok(())
@@ -858,34 +1058,160 @@ fn worker_loop(
     stop: Arc<AtomicBool>,
     signal: Arc<WorkerSignal>,
     generation: Arc<AtomicU64>,
+    wet_epoch: Arc<AtomicU64>,
+    resync_requested: Arc<AtomicBool>,
+    accept_input: Arc<AtomicBool>,
     attenuation: Arc<AtomicU32>,
     diagnostics: Arc<HushDiagnostics>,
     latest_frame: Arc<AtomicU64>,
     max_backlog_frames: u64,
+    recovery_lead_frames: u64,
 ) {
+    let mut state = HushWorkerState::Starting;
+    diagnostics
+        .worker_state
+        .store(state.as_u32(), Ordering::Release);
     while !stop.load(Ordering::Acquire) && !diagnostics.worker_failed.load(Ordering::Acquire) {
+        if resync_requested.load(Ordering::Acquire) {
+            diagnostics.worker_active.store(true, Ordering::Release);
+            state = HushWorkerState::ResyncRequested;
+            diagnostics
+                .worker_state
+                .store(state.as_u32(), Ordering::Release);
+            accept_input.store(false, Ordering::Release);
+
+            // The worker is the sole consumer and can safely drain both
+            // queues. The realtime producer is gated by accept_input; a race
+            // that publishes an old-epoch block is rejected below by epoch.
+            while input
+                .pop_with(|_| {
+                    diagnostics
+                        .stale_input_blocks_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                })
+                .is_some()
+            {}
+            while output
+                .pop_with(|block| {
+                    diagnostics
+                        .stale_output_blocks_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    diagnostics
+                        .wet_frames_dropped
+                        .fetch_add(block.frames as u64, Ordering::Relaxed);
+                })
+                .is_some()
+            {}
+
+            let current_generation = generation.load(Ordering::Acquire);
+            let next_epoch = wet_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            if let Err(error) =
+                worker.reset(current_generation, worker.last_mask, &diagnostics, false)
+            {
+                *diagnostics.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                diagnostics.worker_failed.store(true, Ordering::Release);
+                diagnostics.worker_active.store(false, Ordering::Release);
+                diagnostics
+                    .worker_state
+                    .store(HushWorkerState::Failed.as_u32(), Ordering::Release);
+                break;
+            }
+            worker.wet_epoch = next_epoch;
+            // Re-anchor progress at the live producer position. Input that
+            // arrives after this point belongs to the fresh wet epoch; using
+            // the old progress value here would immediately trip the backlog
+            // guard again and create a resync loop.
+            diagnostics
+                .worker_input_frame
+                .store(latest_frame.load(Ordering::Acquire), Ordering::Release);
+            diagnostics.resync_completed.fetch_add(1, Ordering::Relaxed);
+            diagnostics
+                .worker_state
+                .store(HushWorkerState::Warming.as_u32(), Ordering::Release);
+            state = HushWorkerState::Warming;
+            resync_requested.store(false, Ordering::Release);
+            accept_input.store(true, Ordering::Release);
+            diagnostics.worker_active.store(false, Ordering::Release);
+            continue;
+        }
         #[cfg(test)]
         if diagnostics.paused.load(Ordering::Acquire) {
             thread::sleep(Duration::from_micros(500));
             continue;
         }
+        let latest = latest_frame.load(Ordering::Acquire);
+        let progress = diagnostics.worker_input_frame.load(Ordering::Acquire);
+        let backlog = latest.saturating_sub(progress);
+        record_maximum(&diagnostics.max_worker_backlog_frames, backlog as usize);
+        if backlog > max_backlog_frames {
+            accept_input.store(false, Ordering::Release);
+            if !resync_requested.swap(true, Ordering::AcqRel) {
+                diagnostics.resync_requests.fetch_add(1, Ordering::Relaxed);
+                diagnostics.worker_overloaded.store(true, Ordering::Release);
+                diagnostics
+                    .worker_state
+                    .store(HushWorkerState::ResyncRequested.as_u32(), Ordering::Release);
+            }
+            continue;
+        }
         let mut did_work = false;
         for _ in 0..HUSH_QUEUE_CAPACITY {
-            let Some(()) = input.pop_with(|block| {
+            let popped = input.pop_with(|block| {
                 did_work = true;
+                diagnostics.worker_active.store(true, Ordering::Release);
+                let block_end = block.start_frame + block.frames as u64;
+                diagnostics
+                    .worker_input_frame
+                    .store(block_end, Ordering::Release);
+                let backlog = latest_frame
+                    .load(Ordering::Acquire)
+                    .saturating_sub(block_end);
+                record_maximum(&diagnostics.max_worker_backlog_frames, backlog as usize);
                 if diagnostics.worker_failed.load(Ordering::Acquire) {
                     return;
                 }
+                if backlog > max_backlog_frames {
+                    accept_input.store(false, Ordering::Release);
+                    if !resync_requested.swap(true, Ordering::AcqRel) {
+                        diagnostics.resync_requests.fetch_add(1, Ordering::Relaxed);
+                        diagnostics.worker_overloaded.store(true, Ordering::Release);
+                        diagnostics
+                            .worker_state
+                            .store(HushWorkerState::ResyncRequested.as_u32(), Ordering::Release);
+                    }
+                    diagnostics
+                        .stale_input_blocks_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 if block.generation != generation.load(Ordering::Acquire)
-                    || latest_frame
-                        .load(Ordering::Acquire)
-                        .saturating_sub(block.start_frame + block.frames as u64)
-                        > max_backlog_frames
+                    || block.wet_epoch != wet_epoch.load(Ordering::Acquire)
                 {
-                    // A reset/disconnect invalidates queued input before it
-                    // reaches the denoiser. This keeps obsolete speech from
-                    // consuming worker time or creating a tail block that
-                    // could otherwise compete with the new generation.
+                    diagnostics
+                        .stale_input_blocks_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                if !worker.pristine && block.start_frame != worker.input_position {
+                    accept_input.store(false, Ordering::Release);
+                    if !resync_requested.swap(true, Ordering::AcqRel) {
+                        diagnostics.resync_requests.fetch_add(1, Ordering::Relaxed);
+                        diagnostics.worker_overloaded.store(true, Ordering::Release);
+                        diagnostics
+                            .worker_state
+                            .store(HushWorkerState::ResyncRequested.as_u32(), Ordering::Release);
+                    }
+                    diagnostics
+                        .stale_input_blocks_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                if block.generation != generation.load(Ordering::Acquire)
+                    || block.wet_epoch != worker.wet_epoch
+                {
+                    diagnostics
+                        .stale_input_blocks_dropped
+                        .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 // The runtime parameter update is deliberately applied here,
@@ -903,14 +1229,7 @@ fn worker_loop(
                     worker.attenuation_db = requested;
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker.process_block(
-                        block,
-                        &output,
-                        &generation,
-                        &diagnostics,
-                        &latest_frame,
-                        max_backlog_frames,
-                    )
+                    worker.process_block(block, &output, &generation, &wet_epoch, &diagnostics)
                 }));
                 let error = match result {
                     Ok(Ok(())) => None,
@@ -927,8 +1246,32 @@ fn worker_loop(
                 if let Some(error) = error {
                     *diagnostics.error.lock().unwrap() = Some(error);
                     diagnostics.worker_failed.store(true, Ordering::Release);
+                    diagnostics
+                        .worker_state
+                        .store(HushWorkerState::Failed.as_u32(), Ordering::Release);
+                } else if matches!(state, HushWorkerState::Starting) {
+                    diagnostics
+                        .worker_state
+                        .store(HushWorkerState::Running.as_u32(), Ordering::Release);
+                    state = HushWorkerState::Running;
+                } else if matches!(state, HushWorkerState::Warming)
+                    && diagnostics
+                        .latest_wet_frame
+                        .load(Ordering::Acquire)
+                        .saturating_sub(diagnostics.playout_frame.load(Ordering::Acquire))
+                        >= recovery_lead_frames
+                {
+                    diagnostics
+                        .worker_overloaded
+                        .store(false, Ordering::Release);
+                    diagnostics
+                        .worker_state
+                        .store(HushWorkerState::Running.as_u32(), Ordering::Release);
+                    state = HushWorkerState::Running;
                 }
-            }) else {
+            });
+            diagnostics.worker_active.store(false, Ordering::Release);
+            let Some(()) = popped else {
                 break;
             };
         }
@@ -954,9 +1297,9 @@ mod tests {
     #[test]
     fn queue_is_bounded_and_fifo() {
         let queue = BlockQueue::new(2, 4);
-        assert!(queue.try_push_with(1, 0, 1, 1, 1, |samples| samples[0] = 0.25));
-        assert!(queue.try_push_with(1, 1, 1, 1, 1, |samples| samples[0] = 0.5));
-        assert!(!queue.try_push_with(1, 2, 1, 1, 1, |_| {}));
+        assert!(queue.try_push_with(1, 0, 0, 1, 1, 1, |samples: &mut [f32]| samples[0] = 0.25));
+        assert!(queue.try_push_with(1, 0, 1, 1, 1, 1, |samples: &mut [f32]| samples[0] = 0.5));
+        assert!(!queue.try_push_with(1, 0, 2, 1, 1, 1, |_samples: &mut [f32]| {}));
         let first = queue.pop_with(|block| (block.start_frame, block.samples[0]));
         let second = queue.pop_with(|block| (block.start_frame, block.samples[0]));
         assert_eq!(first, Some((0, 0.25)));
@@ -967,7 +1310,11 @@ mod tests {
     #[test]
     fn future_output_is_not_consumed_by_an_earlier_start_frame() {
         let queue = BlockQueue::new(4, 1);
-        assert!(queue.try_push_with(7, 2, 1, 1, 1, |samples| { samples[0] = 0.75 }));
+        assert!(
+            queue.try_push_with(7, 0, 2, 1, 1, 1, |samples: &mut [f32]| {
+                samples[0] = 0.75
+            })
+        );
         assert_eq!(
             queue.peek_with(|block| (block.generation, block.start_frame)),
             Some((7, 2))
@@ -978,18 +1325,18 @@ mod tests {
     #[test]
     fn timeline_preserves_future_and_partial_blocks_and_discards_only_expired() {
         let q = BlockQueue::new(4, 8);
-        q.try_push_with(3, 10, 8, 1, 1, |s| {
+        q.try_push_with(3, 0, 10, 8, 1, 1, |s: &mut [f32]| {
             for (i, v) in s.iter_mut().enumerate() {
                 *v = (10 + i) as f32;
             }
         });
         let mut out = [-1.0; 4];
-        assert_eq!(read_timeline(&q, 3, 0, 4, 1, &mut out), 0);
+        assert_eq!(read_timeline(&q, 3, 0, 0, 4, 1, None, &mut out), 0);
         assert_eq!(q.depth(), 1);
-        assert_eq!(read_timeline(&q, 3, 8, 4, 1, &mut out), 2);
+        assert_eq!(read_timeline(&q, 3, 0, 8, 4, 1, None, &mut out), 2);
         assert_eq!(out, [-1.0, -1.0, 10.0, 11.0]);
         assert_eq!(q.depth(), 1);
-        assert_eq!(read_timeline(&q, 3, 14, 4, 1, &mut out), 4);
+        assert_eq!(read_timeline(&q, 3, 0, 14, 4, 1, None, &mut out), 4);
         assert_eq!(out, [14.0, 15.0, 16.0, 17.0]);
         assert_eq!(q.depth(), 0);
     }
@@ -1003,7 +1350,9 @@ mod tests {
         let producer = q.clone();
         let writer = thread::spawn(move || {
             for i in 0..20_000u64 {
-                while !producer.try_push_with(i / 100, i * 4, 4, 2, 3, |s| s.fill(i as f32)) {
+                while !producer
+                    .try_push_with(i / 100, 0, i * 4, 4, 2, 3, |s: &mut [f32]| s.fill(i as f32))
+                {
                     thread::yield_now();
                 }
             }

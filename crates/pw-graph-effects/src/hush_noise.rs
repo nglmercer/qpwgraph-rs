@@ -254,19 +254,14 @@ impl EffectProcessor for HushNoiseSuppressor {
         let Some(runtime) = &self.runtime else {
             return Err(EffectError::NotPrepared);
         };
-        if !runtime.push(
+        runtime.push(
             self.generation,
             self.input_frame_position,
             frames,
             spec.channels,
             self.channel_mask,
             &self.wet[..expected],
-        ) {
-            runtime
-                .diagnostics()
-                .input_overruns
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        );
         self.wet[..expected].copy_from_slice(&self.fallback[..expected]);
         // DeepFilterNet short-circuits synthesis below 0.01 dB, changing
         // its signal delay. Select exact aligned dry at that setting while
@@ -282,7 +277,7 @@ impl EffectProcessor for HushNoiseSuppressor {
                     .attenuation_bits
                     .load(std::sync::atomic::Ordering::Acquire),
             ) < 0.01;
-        let wet_frames = if !runtime
+        let wet_frames_available = if !runtime
             .diagnostics()
             .worker_failed
             .load(std::sync::atomic::Ordering::Acquire)
@@ -301,7 +296,8 @@ impl EffectProcessor for HushNoiseSuppressor {
         } else {
             0
         };
-        if wet_frames > 0 && !bypassed {
+        let mut wet_frames_output = 0usize;
+        if wet_frames_available > 0 && !bypassed {
             for channel in 0..spec.channels as usize {
                 if !channel_is_connected(self.channel_mask, channel) {
                     for frame in 0..frames as usize {
@@ -314,13 +310,63 @@ impl EffectProcessor for HushNoiseSuppressor {
                 .diagnostics()
                 .wet_blocks_output
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            wet_frames_output = wet_frames_available;
         }
-        if bypassed || wet_frames < frames as usize {
+        let worker_failed = runtime
+            .diagnostics()
+            .worker_failed
+            .load(std::sync::atomic::Ordering::Acquire);
+        let resyncing = runtime.is_resyncing();
+        let dry_frames = frames as usize - wet_frames_output;
+        runtime.diagnostics().wet_frames_output.fetch_add(
+            wet_frames_output as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        runtime
+            .diagnostics()
+            .dry_frames_output
+            .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
+        if bypassed || wet_frames_output < frames as usize {
             runtime
                 .diagnostics()
                 .dry_fallback_blocks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.host_bypass {
+                runtime
+                    .diagnostics()
+                    .dry_host_disabled_blocks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if bypassed {
+                runtime
+                    .diagnostics()
+                    .dry_bypass_blocks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if worker_failed {
+                runtime
+                    .diagnostics()
+                    .dry_worker_failure_blocks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if resyncing {
+                runtime
+                    .diagnostics()
+                    .dry_resync_blocks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if self.input_frame_position
+                < (self.scheduling_frames + self.synthesis_delay_frames) as u64
+            {
+                runtime
+                    .diagnostics()
+                    .dry_startup_blocks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                runtime
+                    .diagnostics()
+                    .dry_underrun_blocks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if !bypassed
+                && !worker_failed
+                && !resyncing
                 && self.channel_mask != 0
                 && self.input_frame_position
                     >= (self.scheduling_frames + self.synthesis_delay_frames) as u64
@@ -593,6 +639,87 @@ mod tests {
     }
 
     #[test]
+    fn bypass_and_host_disable_are_aligned_dry_while_wet_stays_active() {
+        let spec = AudioSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            max_frames: 256,
+        };
+        let mut wet = HushNoiseSuppressor::default();
+        wet.set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
+            .unwrap();
+        wet.prepare(spec.clone()).unwrap();
+
+        let mut parameter_bypass = HushNoiseSuppressor::default();
+        parameter_bypass
+            .set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
+            .unwrap();
+        parameter_bypass.prepare(spec.clone()).unwrap();
+        parameter_bypass
+            .set_parameter(HUSH_NOISE_SUPPRESSOR_BYPASS, 1.0)
+            .unwrap();
+
+        let mut host_disabled = HushNoiseSuppressor::default();
+        host_disabled
+            .set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
+            .unwrap();
+        host_disabled.prepare(spec).unwrap();
+        assert!(host_disabled.set_host_bypass(true));
+
+        let mut dry = DryDelay::new(wet.scheduling_frames + wet.synthesis_delay_frames);
+        dry.set_delay(dry.samples.len());
+        let mut wet_changed = false;
+        for block_index in 0..70 {
+            let input: Vec<f32> = (0..256)
+                .map(|frame| {
+                    let sample = block_index * 256 + frame;
+                    0.18 * (sample as f32 * 0.071).sin() + 0.11 * (sample as f32 * 0.913).sin()
+                })
+                .collect();
+            let mut expected = vec![0.0; input.len()];
+            dry.process(&input, &mut expected);
+            let mut wet_block = input.clone();
+            let mut bypass_block = input.clone();
+            let mut disabled_block = input.clone();
+            wet.process(&mut wet_block, 256).unwrap();
+            parameter_bypass.process(&mut bypass_block, 256).unwrap();
+            host_disabled.process(&mut disabled_block, 256).unwrap();
+            wet.runtime.as_ref().unwrap().wait_idle();
+            parameter_bypass.runtime.as_ref().unwrap().wait_idle();
+            host_disabled.runtime.as_ref().unwrap().wait_idle();
+            assert_eq!(bypass_block, expected, "parameter bypass lost alignment");
+            assert_eq!(disabled_block, expected, "host disable lost alignment");
+            if block_index > 20 {
+                wet_changed |= wet_block
+                    .iter()
+                    .zip(&expected)
+                    .any(|(actual, dry)| (actual - dry).abs() > 0.01);
+            }
+        }
+        assert!(wet_changed, "bypass OFF never emitted wet Hush audio");
+
+        assert!(host_disabled.set_host_bypass(false));
+        let mut resumed_wet = false;
+        for block_index in 0..30 {
+            let mut block = vec![0.2; 256];
+            let mut expected = vec![0.0; 256];
+            dry.process(&vec![0.2; 256], &mut expected);
+            host_disabled.process(&mut block, 256).unwrap();
+            host_disabled.runtime.as_ref().unwrap().wait_idle();
+            if block_index > 8 {
+                resumed_wet |= block
+                    .iter()
+                    .zip(&expected)
+                    .any(|(actual, dry)| (actual - dry).abs() > 0.01);
+            }
+        }
+        assert!(
+            resumed_wet,
+            "wet output did not resume after host re-enable"
+        );
+    }
+
+    #[test]
     fn worker_adapter_matches_direct_hush_and_resampler_reference() {
         use nnnoiseless::{HushDenoiser, Resampler, HUSH_FRAME_SIZE};
         let rate = 44_100;
@@ -700,7 +827,7 @@ mod tests {
 
     #[test]
     fn backlog_and_queue_overflow_resynchronize_without_latency_drift() {
-        use std::sync::atomic::Ordering::{Relaxed, Release};
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
         let mut p = HushNoiseSuppressor::default();
         p.prepare(AudioSpec {
             sample_rate: 48_000,
@@ -715,6 +842,11 @@ mod tests {
         }
         assert!(d.input_overruns.load(Relaxed) > 0);
         d.paused.store(false, Release);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while d.resync_completed.load(Acquire) == 0 {
+            assert!(Instant::now() < deadline, "worker resync did not complete");
+            thread::yield_now();
+        }
         p.runtime.as_ref().unwrap().wait_idle();
         // First fresh input triggers the off-RT state reset after the gap.
         for _ in 0..50 {
@@ -722,8 +854,114 @@ mod tests {
             p.runtime.as_ref().unwrap().wait_idle();
         }
         assert!(d.wet_blocks_output.load(Relaxed) > 0);
-        assert!(d.generation_resets.load(Relaxed) > 0);
+        assert!(d.resync_completed.load(Relaxed) > 0);
+        assert!(d.stale_input_blocks_dropped.load(Relaxed) > 0);
+        assert_eq!(d.generation_resets.load(Relaxed), 0);
         assert!(d.max_input_queue_depth.load(Relaxed) <= 128);
+    }
+
+    #[test]
+    fn partial_enqueue_failure_requests_one_resync_and_recovers() {
+        use crate::hush_worker::HUSH_QUEUE_CAPACITY;
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let mut p = HushNoiseSuppressor::default();
+        p.prepare(AudioSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            max_frames: 2_048,
+        })
+        .unwrap();
+        let d = p.diagnostics.as_ref().unwrap().clone();
+        d.paused.store(true, Release);
+        for _ in 0..128 {
+            p.process(&mut vec![0.2; 480], 480).unwrap();
+        }
+        // A large host callback is split into bounded worker slots. With the
+        // queue full, a partial enqueue must invalidate the wet epoch rather
+        // than leave a silent hole in its timeline.
+        p.process(&mut vec![0.2; 2_048], 2_048).unwrap();
+        assert!(d.input_frames_rejected.load(Relaxed) > 0);
+        assert_eq!(d.resync_requests.load(Relaxed), 1);
+        d.paused.store(false, Release);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while d.resync_completed.load(Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "partial enqueue resync did not complete"
+            );
+            thread::yield_now();
+        }
+        for _ in 0..60 {
+            p.process(&mut [0.2; 480], 480).unwrap();
+            p.runtime.as_ref().unwrap().wait_idle();
+        }
+        assert!(d.wet_frames_output.load(Relaxed) > 0);
+        assert!(d.max_input_queue_depth.load(Relaxed) <= HUSH_QUEUE_CAPACITY as u64);
+    }
+
+    #[test]
+    fn repeated_overloads_resynchronize_without_restarting_worker() {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let mut p = HushNoiseSuppressor::default();
+        p.prepare(AudioSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            max_frames: 128,
+        })
+        .unwrap();
+        let d = p.diagnostics.as_ref().unwrap().clone();
+        for expected_resync in 1..=2 {
+            d.paused.store(true, Release);
+            for _ in 0..160 {
+                p.process(&mut [0.2; 128], 128).unwrap();
+            }
+            d.paused.store(false, Release);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while d.resync_completed.load(Acquire) < expected_resync {
+                assert!(Instant::now() < deadline, "worker resync did not complete");
+                thread::yield_now();
+            }
+            for _ in 0..45 {
+                p.process(&mut [0.2; 128], 128).unwrap();
+                p.runtime.as_ref().unwrap().wait_idle();
+            }
+        }
+        assert_eq!(d.resync_requests.load(Relaxed), 2);
+        assert_eq!(d.resync_completed.load(Relaxed), 2);
+        assert!(d.wet_frames_output.load(Relaxed) > 0);
+        assert!(!d.worker_failed.load(Acquire));
+    }
+
+    #[test]
+    fn permanently_slow_worker_stays_bounded_and_uses_dry_fallback() {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let mut p = HushNoiseSuppressor::default();
+        p.prepare(AudioSpec {
+            sample_rate: 48_000,
+            channels: 1,
+            max_frames: 128,
+        })
+        .unwrap();
+        let d = p.diagnostics.as_ref().unwrap().clone();
+        // This is intentionally slower than the realtime budget. The worker
+        // must shed stale work and keep the producer bounded instead of
+        // accumulating seconds of latency.
+        d.frame_delay_ms.store(100, Release);
+        for _ in 0..240 {
+            p.process(&mut [0.2; 128], 128).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.resync_requests.load(Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "slow worker never requested resync"
+            );
+            thread::yield_now();
+        }
+        assert!(d.input_blocks_rejected.load(Relaxed) > 0);
+        assert!(d.dry_frames_output.load(Relaxed) > 0);
+        assert!(d.max_input_queue_depth.load(Relaxed) <= 128);
+        assert!(!d.worker_failed.load(Acquire));
     }
 
     #[test]
@@ -779,6 +1017,11 @@ mod tests {
             p.process(&mut [0.2; 128], 128).unwrap();
         }
         d.reset_paused.store(false, Release);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while d.resync_completed.load(Acquire) == 0 {
+            assert!(Instant::now() < deadline, "worker resync did not complete");
+            thread::yield_now();
+        }
         p.runtime.as_ref().unwrap().wait_idle();
         for _ in 0..40 {
             p.process(&mut [0.2; 128], 128).unwrap();
@@ -970,6 +1213,62 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "30-second release real-time throughput measurement"]
+    fn sustained_48k_stereo_256_keeps_wet_audio_dominant() {
+        if cfg!(debug_assertions) {
+            eprintln!("run this sustained throughput check in release mode");
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut processor = HushNoiseSuppressor::default();
+        processor
+            .set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
+            .unwrap();
+        processor
+            .prepare(AudioSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                max_frames: 256,
+            })
+            .unwrap();
+        let callbacks = 30 * 48_000 / 256;
+        let period = Duration::from_secs_f64(256.0 / 48_000.0);
+        let started = Instant::now();
+        for index in 0..callbacks {
+            let mut block = vec![0.0; 512];
+            for frame in 0..256 {
+                let sample = ((index * 256 + frame) as f32 * 0.071).sin() * 0.18
+                    + ((index * 256 + frame) as f32 * 0.913).sin() * 0.11;
+                block[frame * 2] = sample;
+                block[frame * 2 + 1] = sample;
+            }
+            processor.process(&mut block, 256).unwrap();
+            let next = started + period * (index as u32 + 1);
+            if let Some(remaining) = next.checked_duration_since(Instant::now()) {
+                thread::sleep(remaining);
+            }
+        }
+        processor.runtime.as_ref().unwrap().wait_idle();
+        let diagnostics = processor.diagnostics.as_ref().unwrap();
+        let wet = diagnostics.wet_frames_output.load(Relaxed);
+        let dry = diagnostics.dry_frames_output.load(Relaxed);
+        let ratio = wet as f64 / (wet + dry).max(1) as f64;
+        println!(
+            "sustained 48k/stereo/256: wet_frames={wet} dry_frames={dry} wet_ratio={:.3} input_overruns={} output_overruns={} underruns={} queue_peak={} resync={}/{}",
+            ratio,
+            diagnostics.input_overruns.load(Relaxed),
+            diagnostics.output_overruns.load(Relaxed),
+            diagnostics.underruns.load(Relaxed),
+            diagnostics.max_input_queue_depth.load(Relaxed),
+            diagnostics.resync_requests.load(Relaxed),
+            diagnostics.resync_completed.load(Relaxed),
+        );
+        assert!(ratio > 0.99);
+        assert_eq!(diagnostics.input_overruns.load(Relaxed), 0);
+        assert_eq!(diagnostics.output_overruns.load(Relaxed), 0);
+    }
+
+    #[test]
     #[ignore = "manual Hush performance measurement"]
     fn benchmark_hush_rates() {
         let cases = [
@@ -984,6 +1283,17 @@ mod tests {
             (48_000, 1, 256),
             (48_000, 1, 512),
             (48_000, 1, 1024),
+            (48_000, 2, 64),
+            (48_000, 2, 128),
+            (48_000, 2, 256),
+            (48_000, 2, 512),
+            (48_000, 2, 1024),
+            (96_000, 1, 256),
+            (96_000, 1, 480),
+            (96_000, 1, 1024),
+            (96_000, 2, 256),
+            (96_000, 2, 480),
+            (96_000, 2, 1024),
         ];
         for (sample_rate, channels, frames) in cases {
             let mut processor = HushNoiseSuppressor::default();
@@ -1028,7 +1338,17 @@ mod tests {
                 callback_us.push(started.elapsed().as_micros());
                 thread::sleep(Duration::from_secs_f64(frames as f64 / sample_rate as f64));
             }
-            thread::sleep(Duration::from_millis(100));
+            // Keep consuming the delayed output while the worker drains the
+            // final input. Ending the producer immediately would make the
+            // output queue look full even though a real host callback keeps
+            // reading it at the configured cadence.
+            let tail_callbacks = (sample_rate / frames * 100 / 1000).max(1);
+            for _ in 0..tail_callbacks {
+                let mut tail = vec![0.0; frames as usize * channels as usize];
+                processor.process(&mut tail, frames).unwrap();
+                thread::sleep(Duration::from_secs_f64(frames as f64 / sample_rate as f64));
+            }
+            processor.runtime.as_ref().unwrap().wait_idle();
             callback_us.sort_unstable();
             let processed = diagnostics
                 .processed_blocks
@@ -1048,18 +1368,36 @@ mod tests {
                 .max_inference_ns
                 .load(std::sync::atomic::Ordering::Relaxed)
                 / 1_000;
-            let mut timings = diagnostics.timings.lock().unwrap().clone();
+            let mut timings: Vec<u64> = diagnostics
+                .timings
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
             timings.sort_unstable();
             let percentile =
                 |pct: usize| timings.get(timings.len() * pct / 100).copied().unwrap_or(0) / 1000;
-            println!("frames={frames} duration_ms={:.3} latency_ms=50 worker_p95_us={} worker_p99_us={} wet_blocks_output={} dry_fallback_blocks={}", frames as f64 * 1000.0 / sample_rate as f64, percentile(95), percentile(99), diagnostics.wet_blocks_output.load(std::sync::atomic::Ordering::Relaxed), diagnostics.dry_fallback_blocks.load(std::sync::atomic::Ordering::Relaxed));
+            let wet_frames = diagnostics
+                .wet_frames_output
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dry_frames = diagnostics
+                .dry_frames_output
+                .load(std::sync::atomic::Ordering::Relaxed);
+            println!("frames={frames} duration_ms={:.3} latency_ms=50 worker_p95_us={} worker_p99_us={} wet_blocks_output={} dry_fallback_blocks={} wet_frames_output={} dry_frames_output={} wet_ratio={:.3} resync={}/{} stale_input/wet={}/{}", frames as f64 * 1000.0 / sample_rate as f64, percentile(95), percentile(99), diagnostics.wet_blocks_output.load(std::sync::atomic::Ordering::Relaxed), diagnostics.dry_fallback_blocks.load(std::sync::atomic::Ordering::Relaxed), wet_frames, dry_frames, wet_frames as f64 / (wet_frames + dry_frames).max(1) as f64, diagnostics.resync_requests.load(std::sync::atomic::Ordering::Relaxed), diagnostics.resync_completed.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_input_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_output_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed));
             println!(
-                "rate={sample_rate} channels={channels} callback_avg_us={average:.2} callback_p95_us={p95} callback_p99_us={p99} worker_blocks={processed} worker_avg_us={inference_average:.2} worker_max_us={inference_max} max_input_queue_depth={} max_output_queue_depth={} underruns={} input_overruns={} output_overruns={}",
+                "rate={sample_rate} channels={channels} callback_avg_us={average:.2} callback_p95_us={p95} callback_p99_us={p99} input_blocks={processed} hush_frames={} worker_avg_us={inference_average:.2} worker_max_us={inference_max} max_input_queue_depth={} max_output_queue_depth={} max_backlog_frames={} underruns={} input_overruns={} output_overruns={} input_blocks_pushed={} input_blocks_rejected={} input_frames_rejected={}",
+                diagnostics
+                    .hush_frames_processed
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 diagnostics
                     .max_input_queue_depth
                     .load(std::sync::atomic::Ordering::Relaxed),
                 diagnostics
                     .max_output_queue_depth
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .max_worker_backlog_frames
                     .load(std::sync::atomic::Ordering::Relaxed),
                 diagnostics
                     .underruns
@@ -1069,6 +1407,15 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Relaxed),
                 diagnostics
                     .output_overruns
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .input_blocks_pushed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .input_blocks_rejected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                diagnostics
+                    .input_frames_rejected
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
         }

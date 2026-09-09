@@ -31,6 +31,9 @@ by that crate on a control/worker thread and never by `process()`.
 The September 2026 qpwgraph adapter fix changes no vendor DSP or neural weights.
 It replaces callback-sequence scheduling with host-frame timelines, preserves
 native frame assembly/resampler continuity, and synchronously acknowledges
-worker initialization. The resampler's centered sinc lookahead delays sample
-availability without shifting sample positions. Direct model tests and a
-separate qpwgraph-to-direct-Hush reference test cover the two layers independently.
+worker initialization. The worker uses a bounded useful backlog and a separate
+wet epoch for hard overload resynchronization, so stale input is discarded and
+the aligned dry timeline remains continuous while Hush warms again. The
+resampler's centered sinc lookahead delays sample availability without shifting
+sample positions. Direct model tests and a separate qpwgraph-to-direct-Hush
+reference test cover the two layers independently.

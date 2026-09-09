@@ -189,7 +189,11 @@ Hush's asynchronous scheduling is implemented in `pw-graph-effects`, shared by
 PipeWire, the Windows router, and tests. It schedules continuous host-frame
 ranges, independent of the router cycle size, with 50 ms total wet/dry latency.
 Host bypass uses `set_host_bypass`: Hush continues advancing its delayed dry
-stream; legacy effects retain their existing bypass behavior.
+stream; legacy effects retain their existing bypass behavior. The worker keeps
+its backlog below an 80 ms useful window and performs a wet-only epoch reset if
+that limit or a partial enqueue is exceeded. The dry timeline continues while
+the worker warms, so temporary CPU pressure cannot strand the effect on stale
+audio or make latency grow without bound.
 
 Router setup exposes a shared `HushDiagnostics` handle. Windows effect snapshots
 read this control-thread handle to show worker state and failure details without
