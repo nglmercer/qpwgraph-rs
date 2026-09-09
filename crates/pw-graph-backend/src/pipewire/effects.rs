@@ -178,7 +178,18 @@ impl CallbackState {
         // A stateful effect must learn about route changes before it queues
         // this block. The default implementation is a no-op; Hush uses the
         // atomic/generation-only hook to reset disconnected denoiser state.
-        let channel_mask = (!dangling_inputs) as u16 & ((1u16 << self.channels) - 1);
+        // A channel is useful to a stateful processor only when both sides of
+        // the effect have a live DSP buffer. In particular, an input-only
+        // buffer must not make Hush spend inference time on audio that has no
+        // output path; an output-only buffer remains a diagnosed dangling
+        // channel and is forced to silence below.
+        let channel_mask = (0..self.channels).fold(0_u16, |mask, channel| {
+            if !inputs[channel].is_null() && !outputs[channel].is_null() {
+                mask | (1_u16 << channel)
+            } else {
+                mask
+            }
+        });
         if let Ok(mut state) = self.processor.try_lock() {
             state.processor.set_channel_mask(channel_mask);
         }
@@ -352,18 +363,23 @@ impl NativeEffect {
         // published to PipeWire. Legacy effects always retain their planar
         // FL/FR pair. Hush can use one MONO pair when the caller selected a
         // mono route, which avoids constructing/running a second denoiser.
-        let channels = if request.effect_id == pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID {
-            match request.channels.unwrap_or(DSP_CHANNELS as u16) {
-                1 | 2 => request.channels.unwrap_or(DSP_CHANNELS as u16) as usize,
-                count => {
-                    return Err(BackendError::native(format!(
-                        "Hush supports one or two channels, requested {count}"
-                    )))
-                }
-            }
+        let is_hush = request.effect_id == pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID;
+        let channels = if is_hush {
+            super::resolve_hush_channels(request.channels, None)? as usize
         } else {
             DSP_CHANNELS
         };
+        if is_hush {
+            eprintln!(
+                "INFO hush: channel mode={} resolved_channels={} standalone=true",
+                if request.channels.is_some() {
+                    "Explicit"
+                } else {
+                    "Auto"
+                },
+                channels
+            );
+        }
         let mut processor = host
             .create(&request.effect_id)
             .map_err(BackendError::effect_create_failed)?;
@@ -444,7 +460,14 @@ impl NativeEffect {
                 module_path: request.module_path,
                 enabled: request.enabled,
                 parameters: request.parameters,
-                channels: request.channels,
+                // Persist the effective Hush layout.  Writing `None` here
+                // would make a restored standalone mono node silently become
+                // stereo again.  Non-Hush effects retain their legacy config.
+                channels: if is_hush {
+                    Some(channels as u16)
+                } else {
+                    request.channels
+                },
             },
             node_id: NodeId(UNRESOLVED_ID),
             input_port: PortId(UNRESOLVED_ID),
@@ -590,7 +613,8 @@ mod tests {
     use pw_graph_effects::{AudioSpec, EffectDescriptor, EffectError, EffectProcessor};
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::Arc;
 
     #[derive(Clone, Copy)]
     enum ProcessBehavior {
@@ -605,10 +629,18 @@ mod tests {
         descriptor: EffectDescriptor,
         factor: f32,
         behavior: ProcessBehavior,
+        observed_channel_mask: Option<Arc<AtomicU16>>,
     }
 
     impl TestProcessor {
         fn new(behavior: ProcessBehavior) -> Self {
+            Self::with_observed_channel_mask(behavior, None)
+        }
+
+        fn with_observed_channel_mask(
+            behavior: ProcessBehavior,
+            observed_channel_mask: Option<Arc<AtomicU16>>,
+        ) -> Self {
             Self {
                 descriptor: EffectDescriptor {
                     id: "test.pipewire-effect".into(),
@@ -619,6 +651,7 @@ mod tests {
                 },
                 factor: 2.0,
                 behavior,
+                observed_channel_mask,
             }
         }
     }
@@ -660,6 +693,12 @@ mod tests {
         }
 
         fn reset(&mut self) {}
+
+        fn set_channel_mask(&mut self, mask: u16) {
+            if let Some(observed_channel_mask) = &self.observed_channel_mask {
+                observed_channel_mask.store(mask, Ordering::Release);
+            }
+        }
     }
 
     fn run_buffers(
@@ -820,6 +859,32 @@ mod tests {
         assert_eq!(output, [0.5, -1.0, 1.5, -2.0]);
         assert_eq!(state.channels, 1);
         assert_eq!(state.dangling_inputs.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn input_only_channel_is_not_reported_as_active() {
+        let observed_mask = Arc::new(AtomicU16::new(u16::MAX));
+        let state = CallbackState::new_with_channels(
+            Box::new(TestProcessor::with_observed_channel_mask(
+                ProcessBehavior::Gain,
+                Some(observed_mask.clone()),
+            )),
+            true,
+            2,
+        );
+        let mut left_input = [0.25; 4];
+        let mut right_input = [0.75; 4];
+        let mut left_output = [9.0; 4];
+
+        run_buffers(
+            &state,
+            [Some(&mut left_input), Some(&mut right_input)],
+            [Some(&mut left_output), None],
+            4,
+        );
+
+        assert_eq!(observed_mask.load(Ordering::Acquire), 1);
+        assert_eq!(left_output, [0.5; 4]);
     }
 
     #[test]

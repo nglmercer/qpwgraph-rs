@@ -13,6 +13,7 @@ use nnnoiseless::{HushModel, HUSH_SYNTHESIS_DELAY_SAMPLES};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 pub const HUSH_NOISE_SUPPRESSOR_ID: &str = "builtin.hush-noise-suppressor";
 pub const DEFAULT_EFFECT_ID: &str = HUSH_NOISE_SUPPRESSOR_ID;
@@ -22,6 +23,28 @@ pub const HUSH_NOISE_SUPPRESSOR_BYPASS: &str = "bypass";
 const HUSH_MODEL_SHA256: &str = "45632ccaa82b71bb743d6caa7c78e983fe2f2790a3af7f6ec48e6ed7ba085df6";
 const EMBEDDED_HUSH_MODEL: &[u8] =
     include_bytes!("../resources/hush/advanced_dfnet16k_model_best_onnx.tar.gz");
+
+const EMBEDDED_HUSH_MODEL_NAME: &str = "advanced_dfnet16k_model_best_onnx.tar.gz";
+
+/// Immutable metadata for the process-wide Hush model load.  The byte
+/// contents are intentionally not retained here; the parsed model owns what
+/// inference needs and diagnostics only need provenance and timings.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HushModelLoadInfo {
+    pub(crate) source: String,
+    pub(crate) name: String,
+    pub(crate) path: Option<String>,
+    pub(crate) embedded: bool,
+    pub(crate) compressed_bytes: u64,
+    pub(crate) decompressed_bytes: Option<u64>,
+    pub(crate) checksum: String,
+    pub(crate) load_started: bool,
+    pub(crate) load_completed: bool,
+    pub(crate) load_duration_ms: u64,
+    pub(crate) parse_started: bool,
+    pub(crate) parse_completed: bool,
+    pub(crate) error: Option<String>,
+}
 
 #[inline]
 fn channel_is_connected(mask: u16, channel: usize) -> bool {
@@ -164,6 +187,12 @@ impl EffectProcessor for HushNoiseSuppressor {
 
     fn prepare(&mut self, spec: AudioSpec) -> Result<(), EffectError> {
         spec.validate()?;
+        if !matches!(spec.channels, 1 | 2) {
+            return Err(EffectError::WorkerUnavailable(format!(
+                "Hush supports one or two channels, got {}",
+                spec.channels
+            )));
+        }
         if let Some(diagnostics) = &self.diagnostics {
             self.reduction_db = f32::from_bits(
                 diagnostics
@@ -238,6 +267,10 @@ impl EffectProcessor for HushNoiseSuppressor {
             .diagnostics()
             .bypass
             .store(self.bypass, std::sync::atomic::Ordering::Release);
+        runtime
+            .diagnostics()
+            .host_disabled
+            .store(self.host_bypass, std::sync::atomic::Ordering::Release);
         self.diagnostics = Some(runtime.diagnostics().clone());
         self.spec = Some(spec);
         self.runtime = Some(runtime);
@@ -459,6 +492,11 @@ impl EffectProcessor for HushNoiseSuppressor {
     fn set_host_bypass(&mut self, bypassed: bool) -> bool {
         let changed = self.host_bypass != bypassed;
         self.host_bypass = bypassed;
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics
+                .host_disabled
+                .store(bypassed, std::sync::atomic::Ordering::Release);
+        }
         if changed && !bypassed {
             if let Some(runtime) = &self.runtime {
                 runtime.request_retry();
@@ -494,28 +532,162 @@ impl EffectProcessor for HushNoiseSuppressor {
 /// Load the model once, on the caller's setup/control thread.  The audio
 /// callback never reads the filesystem or initializes Tract.
 pub(crate) fn shared_hush_model() -> Result<Arc<HushModel>, String> {
-    static MODEL: OnceLock<Result<Arc<HushModel>, String>> = OnceLock::new();
-    MODEL
-        .get_or_init(|| {
-            if let Some(path) = std::env::var_os("QPWGRAPH_HUSH_MODEL")
-                .or_else(|| std::env::var_os("HUSH_MODEL"))
-                .map(PathBuf::from)
-            {
-                let bytes = std::fs::read(&path).map_err(|error| {
-                    format!("could not read Hush model {}: {error}", path.display())
-                })?;
-                validate_model_checksum(&bytes, &path.display().to_string())?;
-                return HushModel::from_bytes(&bytes)
-                    .map(Arc::new)
-                    .map_err(|error| format!("could not parse Hush model: {error}"));
-            }
+    shared_hush_model_load().model.clone()
+}
 
-            validate_model_checksum(EMBEDDED_HUSH_MODEL, "embedded Hush model")?;
-            HushModel::from_static_bytes(EMBEDDED_HUSH_MODEL)
-                .map(Arc::new)
-                .map_err(|error| format!("could not parse embedded Hush model: {error}"))
-        })
-        .clone()
+/// Return the model provenance captured by the one-time load attempt. Calling
+/// this also performs the load if no effect has prepared yet, so callers must
+/// keep it off the realtime path.
+pub(crate) fn hush_model_load_info() -> HushModelLoadInfo {
+    shared_hush_model_load().info.clone()
+}
+
+struct SharedHushModelLoad {
+    model: Result<Arc<HushModel>, String>,
+    info: HushModelLoadInfo,
+}
+
+fn shared_hush_model_load() -> &'static SharedHushModelLoad {
+    static MODEL: OnceLock<SharedHushModelLoad> = OnceLock::new();
+    MODEL.get_or_init(load_hush_model)
+}
+
+fn load_hush_model() -> SharedHushModelLoad {
+    let override_path = non_empty_env_path("QPWGRAPH_HUSH_MODEL")
+        .map(|path| ("QPWGRAPH_HUSH_MODEL", path))
+        .or_else(|| non_empty_env_path("HUSH_MODEL").map(|path| ("HUSH_MODEL", path)));
+    load_hush_model_with_override(override_path)
+}
+
+fn load_hush_model_with_override(override_path: Option<(&str, PathBuf)>) -> SharedHushModelLoad {
+    let started = Instant::now();
+    let (source, name, path, embedded) = match override_path.as_ref() {
+        Some((variable, path)) => (
+            format!("environment override ({variable})"),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("external Hush model")
+                .to_owned(),
+            Some(path.display().to_string()),
+            false,
+        ),
+        None => (
+            "embedded".to_owned(),
+            EMBEDDED_HUSH_MODEL_NAME.to_owned(),
+            None,
+            true,
+        ),
+    };
+    let mut info = HushModelLoadInfo {
+        source,
+        name,
+        path,
+        embedded,
+        load_started: true,
+        ..HushModelLoadInfo::default()
+    };
+    eprintln!(
+        "INFO hush: loading model source={} name={}{}",
+        info.source,
+        info.name,
+        info.path
+            .as_deref()
+            .map(|path| format!(" path={path}"))
+            .unwrap_or_default()
+    );
+
+    let bytes = if let Some((_, path)) = override_path {
+        match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let message = format!("could not read Hush model {}: {error}", path.display());
+                return failed_model_load(info, started, message);
+            }
+        }
+    } else {
+        EMBEDDED_HUSH_MODEL.to_vec()
+    };
+    info.compressed_bytes = bytes.len() as u64;
+    info.decompressed_bytes = gzip_uncompressed_size(&bytes);
+    info.load_completed = true;
+    let checksum = Sha256::digest(&bytes);
+    info.checksum = format!("{checksum:x}");
+    // The embedded artifact is pinned and can therefore be verified against a
+    // known digest. An external override is intentionally allowed to have a
+    // different digest: its checksum is still reported, while parsing and
+    // denoiser initialization validate that it is actually a compatible Hush
+    // bundle. Never silently fall back to the embedded artifact after an
+    // override fails.
+    if info.embedded {
+        if let Err(error) = validate_model_checksum(&bytes, &info.source) {
+            return failed_model_load(info, started, error);
+        }
+    }
+
+    info.parse_started = true;
+    let parsed = if info.embedded {
+        HushModel::from_static_bytes(EMBEDDED_HUSH_MODEL)
+    } else {
+        HushModel::from_bytes(&bytes)
+    };
+    let model = match parsed {
+        Ok(model) => {
+            info.parse_completed = true;
+            Ok(Arc::new(model))
+        }
+        Err(error) => Err(format!("could not parse Hush model: {error}")),
+    };
+    info.load_duration_ms = elapsed_ms(started);
+    if let Err(error) = &model {
+        info.error = Some(error.clone());
+        eprintln!("ERROR hush: {error}");
+    } else {
+        eprintln!(
+            "INFO hush: model parsed source={} checksum={} compressed_bytes={} decompressed_bytes={} load_ms={}",
+            info.source,
+            info.checksum,
+            info.compressed_bytes,
+            info.decompressed_bytes
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+            info.load_duration_ms
+        );
+    }
+    SharedHushModelLoad { model, info }
+}
+
+fn failed_model_load(
+    mut info: HushModelLoadInfo,
+    started: Instant,
+    error: String,
+) -> SharedHushModelLoad {
+    info.load_duration_ms = elapsed_ms(started);
+    info.error = Some(error.clone());
+    eprintln!("ERROR hush: {error}");
+    SharedHushModelLoad {
+        model: Err(error),
+        info,
+    }
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn gzip_uncompressed_size(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 18 || bytes.get(..2) != Some(&[0x1f, 0x8b]) {
+        return None;
+    }
+    // The gzip ISIZE footer is the input size modulo 2^32. Hush bundles are
+    // far below that limit; reporting None for a future larger archive is
+    // safer than presenting a wrapped size as exact.
+    let size = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().ok()?);
+    Some(u64::from(size))
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 fn validate_model_checksum(bytes: &[u8], source: &str) -> Result<(), String> {
@@ -622,6 +794,44 @@ mod tests {
     }
 
     #[test]
+    fn invalid_hush_model_override_reports_path_without_falling_back() {
+        let path = PathBuf::from("/nonexistent/qpwgraph-hush-model.tar.gz");
+        let loaded = load_hush_model_with_override(Some(("QPWGRAPH_HUSH_MODEL", path.clone())));
+        assert!(loaded.model.is_err());
+        assert!(!loaded.info.embedded);
+        assert_eq!(
+            loaded.info.source,
+            "environment override (QPWGRAPH_HUSH_MODEL)"
+        );
+        assert_eq!(
+            loaded.info.path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        let error = loaded
+            .info
+            .error
+            .expect("override error should be retained");
+        assert!(error.contains(&path.display().to_string()));
+        assert!(!error.contains("embedded"));
+        assert!(!loaded.info.parse_started);
+    }
+
+    #[test]
+    fn embedded_hush_model_provenance_is_complete() {
+        let loaded = load_hush_model_with_override(None);
+        assert!(loaded.model.is_ok());
+        let info = loaded.info;
+        assert!(info.embedded);
+        assert!(info.load_started);
+        assert!(info.load_completed);
+        assert!(info.parse_started);
+        assert!(info.parse_completed);
+        assert_eq!(info.checksum, HUSH_MODEL_SHA256);
+        assert!(info.compressed_bytes > 0);
+        assert!(info.decompressed_bytes.is_some());
+    }
+
+    #[test]
     fn callback_allocates_nothing_through_wet_bypass_and_reset() {
         let mut p = HushNoiseSuppressor::default();
         p.prepare(AudioSpec {
@@ -703,6 +913,76 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_prove_mono_inference_wet_delivery_and_live_attenuation_updates() {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+
+        let mut processor = HushNoiseSuppressor::default();
+        processor
+            .prepare(AudioSpec {
+                sample_rate: 48_000,
+                channels: 1,
+                max_frames: 256,
+            })
+            .unwrap();
+        let diagnostics = processor.diagnostics.as_ref().unwrap().clone();
+        let runtime_identity = std::sync::Arc::as_ptr(&diagnostics);
+
+        for block_index in 0..80 {
+            let mut block = (0..256)
+                .map(|sample| {
+                    let position = block_index * 256 + sample;
+                    0.2 * (position as f32 * 0.071).sin() + 0.12 * (position as f32 * 0.913).sin()
+                })
+                .collect::<Vec<_>>();
+            processor.process(&mut block, 256).unwrap();
+            processor.runtime.as_ref().unwrap().wait_idle();
+        }
+
+        assert!(diagnostics.model_init_started.load(Acquire));
+        assert!(diagnostics.model_init_completed.load(Acquire));
+        assert!(diagnostics.model_initialized.load(Acquire));
+        assert_eq!(diagnostics.channels.load(Relaxed), 1);
+        assert_eq!(diagnostics.active_hush_channels.load(Relaxed), 1);
+        assert!(diagnostics.hush_frames_processed.load(Relaxed) > 0);
+        assert!(diagnostics.hush_channel_frames_processed.load(Relaxed) > 0);
+        assert!(diagnostics.wet_frames_output.load(Relaxed) > 0);
+        assert!(diagnostics.last_successful_inference_ms.load(Relaxed) > 0);
+        let delta_db = f64::from_bits(diagnostics.wet_dry_delta_rms_db_bits.load(Relaxed));
+        assert!(delta_db.is_finite() && delta_db > -119.0);
+        assert!(diagnostics.status_text().contains("active_channels=1"));
+
+        processor
+            .set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
+            .unwrap();
+        let mut block = vec![0.2; 256];
+        processor.process(&mut block, 256).unwrap();
+        processor.runtime.as_ref().unwrap().wait_idle();
+        assert_eq!(
+            f32::from_bits(diagnostics.effective_attenuation_bits.load(Acquire)),
+            40.0
+        );
+        assert_eq!(
+            runtime_identity,
+            std::sync::Arc::as_ptr(processor.runtime.as_ref().unwrap().diagnostics())
+        );
+    }
+
+    #[test]
+    fn unsupported_hush_channel_layout_fails_during_setup() {
+        let mut processor = HushNoiseSuppressor::default();
+        let error = processor
+            .prepare(AudioSpec {
+                sample_rate: 48_000,
+                channels: 3,
+                max_frames: 256,
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Hush supports one or two channels"));
+    }
+
+    #[test]
     fn bypass_and_host_disable_are_aligned_dry_while_wet_stays_active() {
         let spec = AudioSpec {
             sample_rate: 48_000,
@@ -761,6 +1041,16 @@ mod tests {
             }
         }
         assert!(wet_changed, "bypass OFF never emitted wet Hush audio");
+        assert_ne!(
+            parameter_bypass.diagnostics.as_ref().unwrap().health(),
+            crate::hush_worker::HushHealth::Overloaded,
+            "manual bypass must not be reported as CPU overload"
+        );
+        assert_ne!(
+            host_disabled.diagnostics.as_ref().unwrap().health(),
+            crate::hush_worker::HushHealth::Overloaded,
+            "host disable must not be reported as CPU overload"
+        );
 
         assert!(host_disabled.set_host_bypass(false));
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1031,7 +1321,10 @@ mod tests {
             p.process(&mut [0.2; 128], 128).unwrap();
             p.runtime.as_ref().unwrap().wait_idle();
         }
-        d.frame_delay_ms.store(6, Release);
+        // A 160-sample native frame represents 10 ms of 16 kHz audio. Add
+        // enough artificial work to make the sustained service rate clearly
+        // slower than realtime even on a fast release-build host.
+        d.frame_delay_ms.store(14, Release);
         let overload_deadline = Instant::now() + Duration::from_secs(30);
         while d.worker_state.load(Acquire)
             != crate::hush_worker::HushWorkerState::Overloaded.as_u32()
@@ -1052,7 +1345,11 @@ mod tests {
             d.overload_reason.load(Acquire),
             crate::hush_worker::HushOverloadReason::CpuTooSlow as u32
         );
-        assert!(d.resync_requests.load(Relaxed) <= 1);
+        assert!(
+            d.resync_requests.load(Relaxed)
+                <= 1 + crate::hush_worker::HUSH_MAX_AUTOMATIC_RETRIES as u64,
+            "automatic overload retries must remain bounded"
+        );
         assert_eq!(
             d.resync_completed.load(Relaxed),
             d.resync_requests.load(Relaxed)
@@ -1694,7 +1991,7 @@ mod tests {
             return;
         }
         let model = shared_hush_model().expect("embedded Hush model should prepare");
-        let input_frames: Vec<[f32; HUSH_FRAME_SIZE]> = (0..160)
+        let input_frames: Vec<[f32; HUSH_FRAME_SIZE]> = (0..320)
             .map(|frame_index| {
                 std::array::from_fn(|sample_index| {
                     let sample = frame_index * HUSH_FRAME_SIZE + sample_index;
@@ -1703,42 +2000,70 @@ mod tests {
             })
             .collect();
         for channels in [1_usize, 2] {
-            let mut denoisers: Vec<HushDenoiser> = (0..channels)
-                .map(|_| {
-                    model
-                        .denoiser_with_attenuation_db(40.0)
-                        .expect("native Hush denoiser should initialize")
-                })
-                .collect();
-            let mut timings = Vec::with_capacity(input_frames.len());
-            for input in &input_frames {
-                let started = Instant::now();
-                for denoiser in &mut denoisers {
-                    let mut output = [0.0; HUSH_FRAME_SIZE];
-                    denoiser
-                        .process_frame(&mut output, input)
-                        .expect("native Hush inference should succeed");
+            for attenuation_db in [6.0_f32, 25.0, 40.0] {
+                for native_frames_per_block in [1_usize, 2, 4, 8] {
+                    let mut denoisers: Vec<HushDenoiser> = (0..channels)
+                        .map(|_| {
+                            model
+                                .denoiser_with_attenuation_db(attenuation_db)
+                                .expect("native Hush denoiser should initialize")
+                        })
+                        .collect();
+                    let mut outputs = vec![[0.0; HUSH_FRAME_SIZE]; channels];
+                    let mut inference_timings = Vec::with_capacity(input_frames.len() * channels);
+                    let mut block_timings =
+                        Vec::with_capacity(input_frames.len().div_ceil(native_frames_per_block));
+                    let started = Instant::now();
+                    for block in input_frames.chunks(native_frames_per_block) {
+                        let block_started = Instant::now();
+                        for input in block {
+                            for (channel, denoiser) in denoisers.iter_mut().enumerate() {
+                                let inference_started = Instant::now();
+                                denoiser
+                                    .process_frame(&mut outputs[channel], input)
+                                    .expect("native Hush inference should succeed");
+                                inference_timings.push(
+                                    inference_started
+                                        .elapsed()
+                                        .as_nanos()
+                                        .min(u128::from(u64::MAX))
+                                        as u64,
+                                );
+                            }
+                        }
+                        block_timings.push(
+                            block_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        );
+                    }
+                    // The direct baseline measures the sustained processing
+                    // loop only; denoiser/model initialization is reported by
+                    // the qpwgraph diagnostics and is not realtime audio.
+                    let wall_ns = started.elapsed().as_nanos() as u64;
+                    inference_timings.sort_unstable();
+                    block_timings.sort_unstable();
+                    let percentile = |timings: &[u64], pct: usize| {
+                        timings
+                            .get(timings.len() * pct / 100)
+                            .copied()
+                            .unwrap_or_default()
+                    };
+                    let audio_seconds = (input_frames.len() * HUSH_FRAME_SIZE) as f64 / 16_000.0;
+                    let factor = wall_ns as f64 / (audio_seconds * 1e9);
+                    let inference_total: u64 = inference_timings.iter().sum();
+                    let mean_inference_ms =
+                        inference_total as f64 / inference_timings.len().max(1) as f64 / 1e6;
+                    println!(
+                        "direct sample_rate=16000 block_size={} channels={channels} attenuation_db={attenuation_db:.1} audio_duration_s={audio_seconds:.2} wall_clock_ms={:.2} rt_factor={factor:.3} mean_inference_ms={mean_inference_ms:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} block_p95_ms={:.3}",
+                        native_frames_per_block * HUSH_FRAME_SIZE,
+                        wall_ns as f64 / 1e6,
+                        percentile(&inference_timings, 50) as f64 / 1e6,
+                        percentile(&inference_timings, 95) as f64 / 1e6,
+                        percentile(&inference_timings, 99) as f64 / 1e6,
+                        inference_timings.last().copied().unwrap_or_default() as f64 / 1e6,
+                        percentile(&block_timings, 95) as f64 / 1e6,
+                    );
                 }
-                timings.push(started.elapsed().as_nanos() as u64);
             }
-            timings.sort_unstable();
-            let total_ns: u64 = timings.iter().sum();
-            let percentile = |pct: usize| {
-                timings
-                    .get(timings.len() * pct / 100)
-                    .copied()
-                    .unwrap_or_default()
-            };
-            let factor =
-                total_ns as f64 * 16_000.0 / ((input_frames.len() * HUSH_FRAME_SIZE) as f64 * 1e9);
-            println!(
-                "direct rate=16000 channels={channels} frames={} avg_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} rt_factor={factor:.3}",
-                input_frames.len() * HUSH_FRAME_SIZE,
-                total_ns as f64 / timings.len() as f64 / 1e6,
-                percentile(95) as f64 / 1e6,
-                percentile(99) as f64 / 1e6,
-                timings.last().copied().unwrap_or_default() as f64 / 1e6,
-            );
         }
     }
 }

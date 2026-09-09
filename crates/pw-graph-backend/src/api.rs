@@ -116,10 +116,10 @@ pub struct EffectNodeRequest {
     pub module_path: Option<String>,
     pub enabled: bool,
     pub parameters: BTreeMap<String, f32>,
-    /// Requested audio channel count for layout-aware effects. `None` keeps
-    /// the backend's legacy default; Hush uses this to select a mono or
-    /// independent stereo path. Other effects retain their established
-    /// stereo layout.
+    /// Requested audio channel count for layout-aware effects. `None` means
+    /// automatic layout: Hush resolves connected topology when available and
+    /// uses a safe mono layout while standalone topology is unresolved. Other
+    /// effects retain their established stereo layout.
     pub channels: Option<u16>,
     /// Initial canvas position in logical scene coordinates. Backends that do
     /// not persist layouts may still use it for their in-memory graph model.

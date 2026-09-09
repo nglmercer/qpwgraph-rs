@@ -4,13 +4,14 @@
 //! already-produced blocks from this module.  DeepFilterNet/Tract, model
 //! state, resampling, and frame assembly all live on the worker thread.
 
+use crate::hush_noise::HushModelLoadInfo;
 use nnnoiseless::{HushDenoiser, HushModel, Resampler, HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The queue is deliberately small and fixed.  A late worker loses a block
 /// and the processor uses its aligned dry path; latency cannot grow without
@@ -228,7 +229,7 @@ impl HushPerformanceState {
 }
 
 #[repr(u32)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HushWorkerState {
     Starting = 0,
     Running = 1,
@@ -245,13 +246,78 @@ impl HushWorkerState {
     }
 }
 
+/// User-facing health classification derived from delivery and worker
+/// telemetry.  It deliberately does not call an overloaded effect healthy
+/// merely because its worker thread is still alive.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HushHealth {
+    Starting = 0,
+    Healthy = 1,
+    Degraded = 2,
+    Overloaded = 3,
+    Failed = 4,
+}
+
+impl HushHealth {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "STARTING",
+            Self::Healthy => "HEALTHY",
+            Self::Degraded => "DEGRADED",
+            Self::Overloaded => "OVERLOADED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
 #[inline]
 fn channel_is_connected(mask: u16, channel: usize) -> bool {
     channel < u16::BITS as usize && mask & (1u16 << channel) != 0
 }
 
+#[inline]
+fn channel_mask_for_count(channels: usize) -> u16 {
+    if channels >= u16::BITS as usize {
+        u16::MAX
+    } else {
+        (1u16 << channels) - 1
+    }
+}
+
+#[inline]
+fn signal_db_from_energy(energy: f64, samples: u64) -> f64 {
+    if samples == 0 {
+        return -120.0;
+    }
+    let rms = (energy / samples as f64).sqrt().max(1.0e-12);
+    (20.0 * rms.log10()).clamp(-120.0, 12.0)
+}
+
+#[inline]
+fn signal_db_from_peak(peak: f64) -> f64 {
+    (20.0 * peak.max(1.0e-12).log10()).clamp(-120.0, 12.0)
+}
+
+#[inline]
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Default)]
 pub struct HushDiagnostics {
+    /// Provenance and one-time load status for the immutable model shared by
+    /// this worker. The contents are control-plane metadata, never audio data.
+    pub(crate) model: HushModelLoadInfo,
+    pub model_init_started: AtomicBool,
+    pub model_init_completed: AtomicBool,
+    pub model_initialized: AtomicBool,
+    pub model_init_duration_us: AtomicU64,
+    pub(crate) model_error: Mutex<Option<String>>,
     pub sample_rate: AtomicU32,
     pub channels: AtomicU16,
     pub host_quantum: AtomicU32,
@@ -263,7 +329,9 @@ pub struct HushDiagnostics {
     pub max_backlog_frames: AtomicU64,
     pub recovery_lead_frames: AtomicU64,
     pub(crate) attenuation_bits: Arc<AtomicU32>,
+    pub effective_attenuation_bits: AtomicU32,
     pub(crate) bypass: AtomicBool,
+    pub host_disabled: AtomicBool,
     pub wet_blocks_output: AtomicU64,
     pub dry_fallback_blocks: AtomicU64,
     pub wet_frames_output: AtomicU64,
@@ -296,6 +364,18 @@ pub struct HushDiagnostics {
     pub resync_requests: AtomicU64,
     pub resync_completed: AtomicU64,
     pub hush_frames_processed: AtomicU64,
+    pub inference_errors_total: AtomicU64,
+    pub last_inference_duration_us: AtomicU64,
+    pub inference_duration_us: AtomicU64,
+    pub last_successful_inference_ms: AtomicU64,
+    pub last_wet_output_ms: AtomicU64,
+    pub input_rms_db_bits: AtomicU64,
+    pub input_peak_db_bits: AtomicU64,
+    pub output_rms_db_bits: AtomicU64,
+    pub output_peak_db_bits: AtomicU64,
+    pub wet_dry_delta_rms_db_bits: AtomicU64,
+    pub no_audio_input_blocks: AtomicU64,
+    pub channel_config_errors: AtomicU64,
     pub max_input_queue_depth: AtomicU64,
     pub max_output_queue_depth: AtomicU64,
     pub max_worker_backlog_frames: AtomicU64,
@@ -334,6 +414,13 @@ pub struct HushDiagnostics {
     pub stale_wet_frames_dropped: AtomicU64,
     pub wet_frames_dropped_queue_full: AtomicU64,
     pub wet_frames_dropped_epoch: AtomicU64,
+    pub wet_drop_too_old: AtomicU64,
+    pub wet_drop_wrong_generation: AtomicU64,
+    pub wet_drop_wrong_sequence: AtomicU64,
+    pub wet_drop_wrong_channel_count: AtomicU64,
+    pub wet_drop_wrong_frame_count: AtomicU64,
+    pub wet_drop_other: AtomicU64,
+    pub wet_drop_queue_full: AtomicU64,
     pub overload_reason: AtomicU32,
     pub worker_ready: AtomicBool,
     pub worker_failed: AtomicBool,
@@ -377,21 +464,76 @@ impl HushDiagnostics {
         Ok(())
     }
 
+    /// Derive a user-facing health state from the current worker and delivery
+    /// telemetry. This is a control/UI-thread operation; it only reads
+    /// atomics and never touches the worker queues.
+    pub fn health(&self) -> HushHealth {
+        let worker_state = self.worker_state.load(Ordering::Acquire);
+        if self.worker_failed.load(Ordering::Acquire)
+            || worker_state == HushWorkerState::Failed.as_u32()
+        {
+            return HushHealth::Failed;
+        }
+        if !self.worker_ready.load(Ordering::Acquire)
+            || worker_state == HushWorkerState::Starting.as_u32()
+        {
+            return HushHealth::Starting;
+        }
+        // Intentional dry operation is not an overload signal. Keep it out of
+        // the wet-ratio classifier so a user who enables bypass or the host
+        // disables the effect does not get a false CPU failure diagnosis.
+        if self.bypass.load(Ordering::Acquire) || self.host_disabled.load(Ordering::Acquire) {
+            return HushHealth::Degraded;
+        }
+        // A live effect with no usable input is a routing/connection
+        // condition, not an inference deadline miss. Keep it out of the wet
+        // ratio classifier so the diagnostic state says “degraded/no input”
+        // instead of falsely claiming CPU overload.
+        if self.active_hush_channels.load(Ordering::Acquire) == 0
+            && self.no_audio_input_blocks.load(Ordering::Relaxed) > 0
+        {
+            return HushHealth::Degraded;
+        }
+        let wet = self.wet_frames_output.load(Ordering::Relaxed);
+        let dry = self.dry_frames_output.load(Ordering::Relaxed);
+        let delivered = wet.saturating_add(dry);
+        let wet_ratio = if delivered == 0 {
+            0.0
+        } else {
+            wet as f64 / delivered as f64
+        };
+        let ewma = f64::from_bits(self.ewma_realtime_factor_bits.load(Ordering::Relaxed));
+        if worker_state == HushWorkerState::Overloaded.as_u32()
+            || (delivered > 0 && (wet_ratio < 0.90 || ewma >= 1.0))
+        {
+            return HushHealth::Overloaded;
+        }
+        if matches!(
+            worker_state,
+            state if state == HushWorkerState::ResyncRequested.as_u32()
+                || state == HushWorkerState::Recovering.as_u32()
+                || state == HushWorkerState::Warming.as_u32()
+        ) {
+            return HushHealth::Degraded;
+        }
+        if worker_state == HushWorkerState::Running.as_u32()
+            && delivered > 0
+            && wet_ratio >= 0.98
+            && ewma < 0.90
+        {
+            HushHealth::Healthy
+        } else {
+            HushHealth::Degraded
+        }
+    }
+
     /// Control/UI thread only: locks the worker's bounded timing/error side
     /// channels and allocates display text. Never call from an audio callback.
     pub fn status_text(&self) -> String {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let processed = load(&self.processed_blocks);
         let pushed = load(&self.input_blocks_pushed);
-        let state = match self.worker_state.load(Ordering::Acquire) {
-            1 => "ready",
-            2 | 3 | 5 => "recovering",
-            6 => "CPU too slow",
-            4 => "failed",
-            _ if self.worker_failed.load(Ordering::Acquire) => "failed",
-            _ if self.worker_ready.load(Ordering::Acquire) => "ready",
-            _ => "starting",
-        };
+        let health = self.health();
         let error = self
             .error
             .lock()
@@ -413,6 +555,7 @@ impl HushDiagnostics {
         };
         let p95 = times.get(times.len() * 95 / 100).copied().unwrap_or(0) as f64 / 1e6;
         let p99 = times.get(times.len() * 99 / 100).copied().unwrap_or(0) as f64 / 1e6;
+        let p50 = times.get(times.len() * 50 / 100).copied().unwrap_or(0) as f64 / 1e6;
         let total_frames = load(&self.wet_frames_output) + load(&self.dry_frames_output);
         let wet_ratio = if total_frames == 0 {
             0.0
@@ -438,62 +581,117 @@ impl HushDiagnostics {
             3 => HushOverloadReason::InputQueueFull,
             _ => HushOverloadReason::None,
         };
-        format!(
-            "Hush: {state} | Wet: {wet_ratio:.1}% | RT factor: {ewma_factor:.2}x (last {last_factor:.2}x, lifetime {realtime_factor:.2}x) | cause: {} | error: {} | {} Hz / {} ch / quantum {} (max {}) | latency: {:.1} ms (schedule {} frames, synthesis {} frames, measured headroom {} frames) | wet: {} blocks / {} frames dry: {} blocks / {} frames [startup:{} bypass:{} host-off:{} underrun:{} resync:{} failure:{}] | underruns: {} | queue overruns: input {} / output {} | input pushed: {pushed} queue-rejected: {} ({} frames), skipped recovery: {} ({} frames), skipped overloaded: {} ({} frames) | wet dropped: {} (stale {} epoch {} queue {}) | resync: {}/{} | stale input/wet blocks: {}/{} | queue peaks: {}/{} | backlog: {:.1}/{:.1} ms (limit {:.1} ms) | processed blocks: {processed} native Hush channel-frames: {} active channels: {} resets: {} | worker avg/p95/p99/max: {average:.2}/{p95:.2}/{p99:.2}/{:.2} ms | components input/Hush/output: {:.2}/{:.2}/{:.2} ms | recovery: {}/{} (confidence overload/healthy: {}/{})",
-            overload_reason.label(),
-            error,
+        let model_error = self
+            .model_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .or_else(|| self.model.error.clone())
+            .unwrap_or_default();
+        let effective_attenuation =
+            f32::from_bits(self.effective_attenuation_bits.load(Ordering::Acquire));
+        let requested_attenuation = f32::from_bits(self.attenuation_bits.load(Ordering::Acquire));
+        let inference_calls = load(&self.hush_frames_processed);
+        let mean_inference_us = if inference_calls == 0 {
+            0.0
+        } else {
+            load(&self.inference_duration_us) as f64 / inference_calls as f64
+        };
+        let f64_metric = |bits: &AtomicU64| f64::from_bits(bits.load(Ordering::Relaxed));
+        let backlog_ms = backlog_frames as f64 * 1000.0 / sample_rate as f64;
+        let current_wet_percent = wet_ratio;
+        let decompressed_bytes = self
+            .model
+            .decompressed_bytes
+            .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string());
+        let init_us = load(&self.model_init_duration_us);
+        let dry_percent = 100.0 - current_wet_percent;
+        let backlog_limit_ms = load(&self.max_backlog_frames) as f64 * 1000.0 / sample_rate as f64;
+        let last_inference_ms = load(&self.last_successful_inference_ms);
+        let last_wet_ms = load(&self.last_wet_output_ms);
+        let overload_cause = if self.active_hush_channels.load(Ordering::Acquire) == 0
+            && load(&self.no_audio_input_blocks) > 0
+        {
+            "no audio input"
+        } else {
+            overload_reason.label()
+        };
+        let wet_blocks = load(&self.wet_blocks_output);
+        let fallback_blocks = load(&self.dry_fallback_blocks);
+        let manual_bypass_blocks = load(&self.dry_bypass_blocks);
+        let host_disabled_blocks = load(&self.dry_host_disabled_blocks);
+        let wet_drop_other = load(&self.wet_drop_other);
+        let wet_drop_queue_full = load(&self.wet_drop_queue_full);
+        let model_path = self.model.path.as_deref().unwrap_or("-");
+        let manual_bypass_now = self.bypass.load(Ordering::Acquire);
+        let host_disabled_now = self.host_disabled.load(Ordering::Acquire);
+        let mut status = format!(
+            "Hush: {}\nModel: source={} name={} path={model_path} embedded={} load_started={} load_completed={} load_ms={} parse_started={} parse_completed={} initialized={} init_ms={} checksum={} compressed_bytes={} decompressed_bytes={}{}\nAudio: rate={} Hz configured_channels={} active_channels={} quantum={} max_quantum={} callback_budget_ms={:.3} latency_ms={:.1} schedule_frames={} measured_headroom_frames={}\nInference: calls={} native_samples={} mean_us={mean_inference_us:.1} last_us={} errors={} last_success_ms={last_inference_ms} worker_avg_ms={average:.2} p50_ms={:.2} p95_ms={p95:.2} p99_ms={p99:.2} worker_max_ms={:.2} rt_factor={ewma_factor:.2}x last_rt={last_factor:.2}x lifetime_rt={realtime_factor:.2}x input_rms_db={:.1} input_peak_db={:.1} output_rms_db={:.1} output_peak_db={:.1} wet_dry_delta_db={:.1} worker_blocks={} queued={}\nDelivery: wet={current_wet_percent:.1}% dry_fallback={dry_percent:.1}% wet_blocks={wet_blocks} fallback_blocks={fallback_blocks} manual_bypass_blocks={manual_bypass_blocks} manual_now={} host_disabled_blocks={host_disabled_blocks} host_now={} last_wet_ms={last_wet_ms} underruns={} no_input_blocks={}\nQueue: backlog_ms={backlog_ms:.1} max_backlog_ms={max_backlog_ms:.1} limit_ms={:.1} input_queue_peak={} output_queue_peak={} resync={}/{} dropped={} queue_full={wet_drop_queue_full} old={} generation={} sequence={} channels={} frames={} other={wet_drop_other}\nReduction: requested_db={requested_attenuation:.2} effective_db={effective_attenuation:.2}\nCause: {overload_cause}\nError: {error}",
+            health.label(),
+            self.model.source,
+            self.model.name,
+            self.model.embedded,
+            self.model.load_started,
+            self.model.load_completed,
+            self.model.load_duration_ms,
+            self.model.parse_started,
+            self.model.parse_completed,
+            self.model_initialized.load(Ordering::Acquire),
+            init_us as f64 / 1000.0,
+            self.model.checksum,
+            self.model.compressed_bytes,
+            decompressed_bytes,
+            if model_error.is_empty() {
+                String::new()
+            } else {
+                format!(" model_error={model_error}")
+            },
             sample_rate,
             self.channels.load(Ordering::Relaxed),
+            self.active_hush_channels.load(Ordering::Relaxed),
             self.host_quantum.load(Ordering::Relaxed),
             self.max_host_quantum.load(Ordering::Relaxed),
+            self.host_quantum.load(Ordering::Relaxed) as f64 * 1000.0 / sample_rate as f64,
             total_latency_frames as f64 * 1000.0 / sample_rate as f64,
             scheduling_frames,
-            load(&self.synthesis_delay_frames),
             measured_headroom_frames,
-            load(&self.wet_blocks_output),
-            load(&self.wet_frames_output),
-            load(&self.dry_fallback_blocks),
-            load(&self.dry_frames_output),
-            load(&self.dry_startup_blocks),
-            load(&self.dry_bypass_blocks),
-            load(&self.dry_host_disabled_blocks),
-            load(&self.dry_underrun_blocks),
-            load(&self.dry_resync_blocks),
-            load(&self.dry_worker_failure_blocks),
+            inference_calls,
+            load(&self.hush_channel_frames_processed),
+            load(&self.last_inference_duration_us),
+            load(&self.inference_errors_total),
+            p50,
+            load(&self.max_inference_ns) as f64 / 1e6,
+            f64_metric(&self.input_rms_db_bits),
+            f64_metric(&self.input_peak_db_bits),
+            f64_metric(&self.output_rms_db_bits),
+            f64_metric(&self.output_peak_db_bits),
+            f64_metric(&self.wet_dry_delta_rms_db_bits),
+            processed,
+            pushed,
+            manual_bypass_now,
+            host_disabled_now,
             load(&self.underruns),
-            load(&self.input_queue_overruns),
-            load(&self.output_overruns),
-            load(&self.input_blocks_rejected),
-            load(&self.input_frames_rejected),
-            load(&self.input_blocks_skipped_recovery),
-            load(&self.input_frames_skipped_recovery),
-            load(&self.input_blocks_skipped_overloaded),
-            load(&self.input_frames_skipped_overloaded),
-            load(&self.wet_frames_dropped),
-            load(&self.stale_wet_frames_dropped),
-            load(&self.wet_frames_dropped_epoch),
-            load(&self.wet_frames_dropped_queue_full),
-            load(&self.resync_requests),
-            load(&self.resync_completed),
-            load(&self.stale_input_blocks_dropped),
-            load(&self.stale_output_blocks_dropped),
+            load(&self.no_audio_input_blocks),
+            backlog_limit_ms,
             load(&self.max_input_queue_depth),
             load(&self.max_output_queue_depth),
-            backlog_frames as f64 * 1000.0 / sample_rate as f64,
-            max_backlog_ms,
-            load(&self.max_backlog_frames) as f64 * 1000.0 / sample_rate as f64,
-            load(&self.hush_channel_frames_processed),
-            self.active_hush_channels.load(Ordering::Relaxed),
-            load(&self.generation_resets),
-            load(&self.max_inference_ns) as f64 / 1e6,
-            load(&self.input_resample_ns) as f64 / 1e6,
-            load(&self.hush_inference_ns) as f64 / 1e6,
-            load(&self.output_resample_ns) as f64 / 1e6,
-            load(&self.recovery_successes),
-            load(&self.recovery_attempts),
-            self.overload_windows.load(Ordering::Relaxed),
-            self.healthy_windows.load(Ordering::Relaxed),
-        )
+            load(&self.resync_requests),
+            load(&self.resync_completed),
+            load(&self.wet_frames_dropped),
+            load(&self.wet_drop_too_old),
+            load(&self.wet_drop_wrong_generation),
+            load(&self.wet_drop_wrong_sequence),
+            load(&self.wet_drop_wrong_channel_count),
+            load(&self.wet_drop_wrong_frame_count),
+        );
+        status.push_str(&format!(
+            "\nRouting: channel_errors={} input_rejected={} input_overruns={} output_overruns={}",
+            load(&self.channel_config_errors),
+            load(&self.input_blocks_rejected),
+            load(&self.input_overruns),
+            load(&self.output_overruns),
+        ));
+        status
     }
     pub fn failure_reason(&self) -> Option<String> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -644,7 +842,13 @@ fn read_timeline(
     diagnostics: Option<&HushDiagnostics>,
     destination: &mut [f32],
 ) -> usize {
-    let end = start + frames as u64;
+    if channels == 0 || destination.len() < frames as usize * channels as usize {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.wet_drop_other.fetch_add(1, Ordering::Relaxed);
+        }
+        return 0;
+    }
+    let end = start.saturating_add(frames as u64);
     let mut copied = 0;
     for _ in 0..HUSH_QUEUE_CAPACITY {
         let Some((epoch, pipeline_epoch, first, last)) = queue.peek_with(|b| {
@@ -652,12 +856,35 @@ fn read_timeline(
                 b.generation,
                 b.wet_epoch,
                 b.start_frame,
-                b.start_frame + b.frames as u64,
+                b.start_frame.saturating_add(b.frames as u64),
             )
         }) else {
             break;
         };
-        if epoch != generation || pipeline_epoch != wet_epoch || last <= start {
+        let metadata = queue.peek_with(|b| {
+            (
+                b.channels,
+                b.frames,
+                b.frames as usize * b.channels as usize <= b.samples.len(),
+            )
+        });
+        let Some((block_channels, block_frames, block_fits)) = metadata else {
+            break;
+        };
+        let drop_reason = if epoch != generation {
+            Some(0_u8)
+        } else if pipeline_epoch != wet_epoch {
+            Some(1_u8)
+        } else if block_frames == 0 || !block_fits {
+            Some(2_u8)
+        } else if block_channels != channels {
+            Some(3_u8)
+        } else if last <= start {
+            Some(4_u8)
+        } else {
+            None
+        };
+        if let Some(drop_reason) = drop_reason {
             if let Some(diagnostics) = diagnostics {
                 diagnostics
                     .stale_output_blocks_dropped
@@ -665,14 +892,42 @@ fn read_timeline(
                 diagnostics
                     .wet_frames_dropped
                     .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
-                if epoch != generation || last <= start {
-                    diagnostics
-                        .stale_wet_frames_dropped
-                        .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
-                } else {
-                    diagnostics
-                        .wet_frames_dropped_epoch
-                        .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+                match drop_reason {
+                    0 => {
+                        diagnostics
+                            .wet_drop_wrong_generation
+                            .fetch_add(1, Ordering::Relaxed);
+                        diagnostics
+                            .stale_wet_frames_dropped
+                            .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+                    }
+                    1 => {
+                        diagnostics
+                            .wet_drop_wrong_sequence
+                            .fetch_add(1, Ordering::Relaxed);
+                        diagnostics
+                            .wet_frames_dropped_epoch
+                            .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+                    }
+                    2 => {
+                        diagnostics
+                            .wet_drop_wrong_frame_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    3 => {
+                        diagnostics
+                            .wet_drop_wrong_channel_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    4 => {
+                        diagnostics.wet_drop_too_old.fetch_add(1, Ordering::Relaxed);
+                        diagnostics
+                            .stale_wet_frames_dropped
+                            .fetch_add(last.saturating_sub(first), Ordering::Relaxed);
+                    }
+                    _ => {
+                        diagnostics.wet_drop_other.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             queue.pop_with(|_| ());
@@ -682,9 +937,6 @@ fn read_timeline(
             break;
         }
         queue.peek_with(|b| {
-            if b.channels != channels {
-                return;
-            }
             let from = first.max(start);
             let to = last.min(end);
             let ch = channels as usize;
@@ -773,8 +1025,11 @@ impl HushRuntime {
         let retry_generation = Arc::new(AtomicBool::new(false));
         let accept_input = Arc::new(AtomicBool::new(true));
         let attenuation_bits = Arc::new(AtomicU32::new(attenuation_db.to_bits()));
+        let model_info = crate::hush_noise::hush_model_load_info();
         let diagnostics = Arc::new(HushDiagnostics {
+            model: model_info,
             attenuation_bits: attenuation_bits.clone(),
+            effective_attenuation_bits: AtomicU32::new(attenuation_db.max(0.01).to_bits()),
             ..HushDiagnostics::default()
         });
         diagnostics
@@ -790,6 +1045,15 @@ impl HushRuntime {
         diagnostics
             .last_realtime_factor_bits
             .store(1.0_f64.to_bits(), Ordering::Relaxed);
+        for metric in [
+            &diagnostics.input_rms_db_bits,
+            &diagnostics.input_peak_db_bits,
+            &diagnostics.output_rms_db_bits,
+            &diagnostics.output_peak_db_bits,
+            &diagnostics.wet_dry_delta_rms_db_bits,
+        ] {
+            metric.store((-120.0_f64).to_bits(), Ordering::Relaxed);
+        }
         let base_schedule_frames =
             (sample_rate as usize * HUSH_SCHEDULING_MS as usize).div_ceil(1000);
         let synthesis_delay_frames =
@@ -830,6 +1094,10 @@ impl HushRuntime {
         let worker = thread::Builder::new()
             .name("qpwgraph-hush".into())
             .spawn(move || {
+                worker_diagnostics
+                    .model_init_started
+                    .store(true, Ordering::Release);
+                let model_init_started = Instant::now();
                 let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     HushWorker::new(model, sample_rate, channels, max_frames, attenuation_db)
                 }))
@@ -837,13 +1105,52 @@ impl HushRuntime {
                     format!("Hush initialization panicked: {}", panic_reason(&*payload))
                 })
                 .and_then(|result| result);
+                worker_diagnostics.model_init_duration_us.store(
+                    model_init_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64,
+                    Ordering::Release,
+                );
                 let mut worker = match initialized {
                     Ok(mut worker) => {
+                        worker_diagnostics
+                            .model_init_completed
+                            .store(true, Ordering::Release);
+                        worker_diagnostics
+                            .model_initialized
+                            .store(true, Ordering::Release);
+                        worker_diagnostics
+                            .effective_attenuation_bits
+                            .store(worker.attenuation_db.to_bits(), Ordering::Release);
+                        eprintln!(
+                            "INFO hush: model initialized channels={} rate={} init_us={}",
+                            channels,
+                            sample_rate,
+                            worker_diagnostics
+                                .model_init_duration_us
+                                .load(Ordering::Acquire)
+                        );
                         worker.generation = initial_generation;
                         let _ = ready_tx.send(Ok(()));
                         worker
                     }
                     Err(error) => {
+                        *worker_diagnostics
+                            .model_error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
+                        *worker_diagnostics
+                            .error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
+                        worker_diagnostics
+                            .worker_failed
+                            .store(true, Ordering::Release);
+                        worker_diagnostics
+                            .worker_state
+                            .store(HushWorkerState::Failed.as_u32(), Ordering::Release);
+                        eprintln!("ERROR hush: model initialization failed: {error}");
                         let _ = ready_tx.send(Err(error));
                         return;
                     }
@@ -954,7 +1261,22 @@ impl HushRuntime {
             }
             return true;
         }
-        if channels == 0 || samples.len() != frames as usize * channels as usize {
+        let expected_channels = self.diagnostics.channels.load(Ordering::Acquire);
+        let valid_mask = channel_mask_for_count(channels as usize);
+        if channels == 0
+            || channels != expected_channels
+            || channel_mask & !valid_mask != 0
+            || samples.len() != frames as usize * channels as usize
+        {
+            self.diagnostics
+                .channel_config_errors
+                .fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .input_blocks_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .input_frames_rejected
+                .fetch_add(frames as u64, Ordering::Relaxed);
             return false;
         }
         let slot_frames = self.input.max_samples() / channels as usize;
@@ -1277,6 +1599,11 @@ impl HushWorker {
         max_frames: u32,
         attenuation_db: f32,
     ) -> Result<Self, String> {
+        let attenuation_db = if attenuation_db.is_finite() {
+            attenuation_db.max(0.01)
+        } else {
+            return Err(format!("Hush attenuation is not finite: {attenuation_db}"));
+        };
         let channels = channels as usize;
         let max_frames = max_frames as usize;
         let mut denoisers = Vec::with_capacity(channels);
@@ -1295,7 +1622,7 @@ impl HushWorker {
         for _ in 0..channels {
             denoisers.push(
                 model
-                    .denoiser_with_attenuation_db(attenuation_db.max(0.01))
+                    .denoiser_with_attenuation_db(attenuation_db)
                     .map_err(|error| error.to_string())?,
             );
             let mut input_resampler =
@@ -1395,6 +1722,9 @@ impl HushWorker {
     ) -> Result<(), String> {
         #[cfg(test)]
         if diagnostics.inject_error.swap(false, Ordering::AcqRel) {
+            diagnostics
+                .inference_errors_total
+                .fetch_add(1, Ordering::Relaxed);
             return Err("injected inference failure".into());
         }
         if block.generation != generation.load(Ordering::Acquire)
@@ -1422,20 +1752,52 @@ impl HushWorker {
             self.pristine = false;
         }
         let frames = block.frames as usize;
-        if frames > self.max_frames || block.channels as usize != self.channels {
-            return Err("Hush worker received an invalid audio block".into());
+        if frames == 0
+            || frames > self.max_frames
+            || block.channels as usize != self.channels
+            || frames.saturating_mul(block.channels as usize) > block.samples.len()
+        {
+            diagnostics
+                .channel_config_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(format!(
+                "Hush worker received invalid audio block: frames={} channels={} expected_channels={} sample_capacity={}",
+                block.frames, block.channels, self.channels, block.samples.len()
+            ));
+        }
+        let valid_mask = channel_mask_for_count(self.channels);
+        if block.channel_mask & !valid_mask != 0 {
+            diagnostics
+                .channel_config_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(format!(
+                "Hush worker received invalid channel mask 0x{:x} for {} channels",
+                block.channel_mask, self.channels
+            ));
         }
         self.input_position = block.start_frame + block.frames as u64;
         let worker_start = Instant::now();
         let mut input_resample_ns = 0_u64;
         let mut hush_inference_ns = 0_u64;
         let mut output_resample_ns = 0_u64;
+        let mut inference_calls = 0_u64;
+        let mut input_energy = 0.0_f64;
+        let mut output_energy = 0.0_f64;
+        let mut delta_energy = 0.0_f64;
+        let mut input_peak = 0.0_f64;
+        let mut output_peak = 0.0_f64;
+        let mut metric_samples = 0_u64;
         let connected_channels = (0..self.channels)
             .filter(|&channel| channel_is_connected(block.channel_mask, channel))
             .count();
         diagnostics
             .active_hush_channels
             .store(connected_channels as u16, Ordering::Release);
+        if connected_channels == 0 {
+            diagnostics
+                .no_audio_input_blocks
+                .fetch_add(1, Ordering::Relaxed);
+        }
         for channel in 0..self.channels {
             if !channel_is_connected(block.channel_mask, channel) {
                 self.input_pending[channel].clear();
@@ -1468,11 +1830,22 @@ impl HushWorker {
                 thread::sleep(Duration::from_millis(
                     diagnostics.frame_delay_ms.load(Ordering::Relaxed),
                 ));
-                self.denoisers[channel]
-                    .process_frame(&mut self.frame_output, &self.frame_input)
-                    .map_err(|error| error.to_string())?;
-                hush_inference_ns = hush_inference_ns
-                    .saturating_add(hush_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                if let Err(error) =
+                    self.denoisers[channel].process_frame(&mut self.frame_output, &self.frame_input)
+                {
+                    diagnostics
+                        .inference_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(error.to_string());
+                }
+                let inference_ns = hush_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                hush_inference_ns = hush_inference_ns.saturating_add(inference_ns);
+                diagnostics
+                    .last_inference_duration_us
+                    .store(inference_ns / 1_000, Ordering::Relaxed);
+                diagnostics
+                    .inference_duration_us
+                    .fetch_add(inference_ns / 1_000, Ordering::Relaxed);
                 diagnostics
                     .hush_frames_processed
                     .fetch_add(1, Ordering::Relaxed);
@@ -1480,8 +1853,23 @@ impl HushWorker {
                     .hush_channel_frames_processed
                     .fetch_add(HUSH_FRAME_SIZE as u64, Ordering::Relaxed);
                 if self.frame_output.iter().any(|sample| !sample.is_finite()) {
+                    diagnostics
+                        .inference_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err("Hush produced a non-finite frame".into());
                 }
+                for (&input, &output) in self.frame_input.iter().zip(&self.frame_output) {
+                    let input = f64::from(input);
+                    let output = f64::from(output);
+                    input_energy += input * input;
+                    output_energy += output * output;
+                    let delta = input - output;
+                    delta_energy += delta * delta;
+                    input_peak = input_peak.max(input.abs());
+                    output_peak = output_peak.max(output.abs());
+                }
+                inference_calls = inference_calls.saturating_add(1);
+                metric_samples = metric_samples.saturating_add(HUSH_FRAME_SIZE as u64);
                 let output_started = Instant::now();
                 self.at_host_rate.clear();
                 self.output_resamplers[channel].process(&self.frame_output, &mut self.at_host_rate);
@@ -1504,6 +1892,30 @@ impl HushWorker {
         diagnostics
             .output_resample_ns
             .fetch_add(output_resample_ns, Ordering::Relaxed);
+        if inference_calls > 0 {
+            diagnostics.input_rms_db_bits.store(
+                signal_db_from_energy(input_energy, metric_samples).to_bits(),
+                Ordering::Relaxed,
+            );
+            diagnostics
+                .input_peak_db_bits
+                .store(signal_db_from_peak(input_peak).to_bits(), Ordering::Relaxed);
+            diagnostics.output_rms_db_bits.store(
+                signal_db_from_energy(output_energy, metric_samples).to_bits(),
+                Ordering::Relaxed,
+            );
+            diagnostics.output_peak_db_bits.store(
+                signal_db_from_peak(output_peak).to_bits(),
+                Ordering::Relaxed,
+            );
+            diagnostics.wet_dry_delta_rms_db_bits.store(
+                signal_db_from_energy(delta_energy, metric_samples).to_bits(),
+                Ordering::Relaxed,
+            );
+            diagnostics
+                .last_successful_inference_ms
+                .store(unix_time_millis(), Ordering::Relaxed);
+        }
         if connected_channels != 0 {
             diagnostics
                 .worker_audio_frames_processed
@@ -1629,6 +2041,9 @@ impl HushWorker {
                     .wet_frames_dropped_queue_full
                     .fetch_add(count as u64, Ordering::Relaxed);
                 diagnostics
+                    .wet_drop_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
+                diagnostics
                     .wet_frames_dropped
                     .fetch_add(count as u64, Ordering::Relaxed);
             } else {
@@ -1636,6 +2051,9 @@ impl HushWorker {
                 diagnostics
                     .latest_wet_frame
                     .store(self.output_position, Ordering::Release);
+                diagnostics
+                    .last_wet_output_ms
+                    .store(unix_time_millis(), Ordering::Relaxed);
             }
         }
         Ok(())
@@ -1669,9 +2087,39 @@ fn worker_loop(
         .store(state.as_u32(), Ordering::Release);
 
     let set_state = |state: HushWorkerState, diagnostics: &HushDiagnostics| {
-        diagnostics
+        let previous = diagnostics
             .worker_state
-            .store(state.as_u32(), Ordering::Release);
+            .swap(state.as_u32(), Ordering::AcqRel);
+        if previous == state.as_u32() {
+            return;
+        }
+        if state == HushWorkerState::Overloaded {
+            let wet = diagnostics.wet_frames_output.load(Ordering::Relaxed);
+            let dry = diagnostics.dry_frames_output.load(Ordering::Relaxed);
+            let wet_percent = if wet.saturating_add(dry) == 0 {
+                0.0
+            } else {
+                wet as f64 * 100.0 / wet.saturating_add(dry) as f64
+            };
+            let factor = f64::from_bits(
+                diagnostics
+                    .ewma_realtime_factor_bits
+                    .load(Ordering::Relaxed),
+            );
+            eprintln!(
+                "WARN hush: entering overloaded state reason={} wet_delivery={wet_percent:.1}% rt_factor={factor:.2}x",
+                match diagnostics.overload_reason.load(Ordering::Relaxed) {
+                    1 => HushOverloadReason::CpuTooSlow.label(),
+                    2 => HushOverloadReason::BacklogExceeded.label(),
+                    3 => HushOverloadReason::InputQueueFull.label(),
+                    _ => HushOverloadReason::None.label(),
+                }
+            );
+        } else if previous == HushWorkerState::Overloaded.as_u32()
+            && state == HushWorkerState::Running
+        {
+            eprintln!("INFO hush: recovered from overload");
+        }
     };
     let wait_briefly = |signal: &WorkerSignal, stop: &AtomicBool| -> bool {
         let guard = match signal.mutex.lock() {
@@ -1952,17 +2400,32 @@ fn worker_loop(
                     return;
                 }
                 let requested = f32::from_bits(attenuation.load(Ordering::Acquire));
-                if requested.is_finite() && (requested - worker.attenuation_db).abs() > f32::EPSILON
-                {
+                if !requested.is_finite() {
+                    let error = format!("Hush attenuation became non-finite: {requested}");
+                    *diagnostics.error.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(error.clone());
+                    diagnostics.worker_failed.store(true, Ordering::Release);
+                    set_state(HushWorkerState::Failed, &diagnostics);
+                    return;
+                }
+                let effective = requested.max(0.01);
+                if (effective - worker.attenuation_db).abs() > f32::EPSILON {
                     for denoiser in &mut worker.denoisers {
-                        if let Err(error) = denoiser.set_attenuation_limit_db(requested.max(0.01)) {
+                        if let Err(error) = denoiser.set_attenuation_limit_db(effective) {
                             *diagnostics.error.lock().unwrap_or_else(|e| e.into_inner()) =
                                 Some(error.to_string());
+                            diagnostics
+                                .inference_errors_total
+                                .fetch_add(1, Ordering::Relaxed);
                             diagnostics.worker_failed.store(true, Ordering::Release);
+                            set_state(HushWorkerState::Failed, &diagnostics);
                             return;
                         }
                     }
-                    worker.attenuation_db = requested;
+                    worker.attenuation_db = effective;
+                    diagnostics
+                        .effective_attenuation_bits
+                        .store(effective.to_bits(), Ordering::Release);
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker.process_block(block, &output, &generation, &wet_epoch, &diagnostics)
@@ -2128,6 +2591,21 @@ mod tests {
     }
 
     #[test]
+    fn no_audio_input_is_not_classified_as_cpu_overload() {
+        let diagnostics = HushDiagnostics::default();
+        diagnostics.worker_ready.store(true, Ordering::Release);
+        diagnostics
+            .worker_state
+            .store(HushWorkerState::Running.as_u32(), Ordering::Release);
+        diagnostics
+            .no_audio_input_blocks
+            .store(1, Ordering::Release);
+        diagnostics.dry_frames_output.store(512, Ordering::Release);
+
+        assert_eq!(diagnostics.health(), HushHealth::Degraded);
+    }
+
+    #[test]
     fn overload_cooldown_is_exponential_and_bounded() {
         assert_eq!(overload_cooldown_for_attempt(0), Duration::from_millis(500));
         assert_eq!(
@@ -2193,6 +2671,27 @@ mod tests {
         assert_eq!(read_timeline(&q, 3, 0, 14, 4, 1, None, &mut out), 4);
         assert_eq!(out, [14.0, 15.0, 16.0, 17.0]);
         assert_eq!(q.depth(), 0);
+    }
+
+    #[test]
+    fn timeline_discards_wrong_channel_count_and_keeps_reading() {
+        let q = BlockQueue::new(4, 8);
+        assert!(q.try_push_with(3, 0, 0, 4, 2, 3, |samples: &mut [f32]| {
+            samples.fill(0.5);
+        }));
+        let diagnostics = HushDiagnostics::default();
+        let mut output = [0.0; 4];
+        assert_eq!(
+            read_timeline(&q, 3, 0, 0, 4, 1, Some(&diagnostics), &mut output,),
+            0
+        );
+        assert_eq!(q.depth(), 0, "a mismatched result must not stall the queue");
+        assert_eq!(
+            diagnostics
+                .wet_drop_wrong_channel_count
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

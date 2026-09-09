@@ -21,11 +21,13 @@ they are **not additive**. qpwgraph schedules the raw streaming output 40 ms
 later and aligns the dry path by another 10 ms of synthesis delay: **50 ms total**
 (800 / 2,205 / 2,400 / 4,800 frames at 16 / 44.1 / 48 / 96 kHz). The 40 ms
 scheduling allowance is a conservative margin over the measured release worker
-maximum (4.68 ms in the expanded benchmark and 6.13 ms in the live 48 kHz
+maximum (5.68 ms in the final expanded benchmark and 6.13 ms in the live 48 kHz
 stereo probe), rather than a callback-count assumption.
 
 The immutable model is embedded and checksum verified. Development and CI may
-override it with `QPWGRAPH_HUSH_MODEL` or `HUSH_MODEL`. Preparation waits for the
+override it with `QPWGRAPH_HUSH_MODEL` (preferred) or `HUSH_MODEL`; the winning
+source, path, byte counts, and checksum are reported, and an invalid override
+does not silently fall back to the embedded model. Preparation waits for the
 worker's initialization acknowledgement and returns the real setup error.
 Tract state is not `Send`, so construction and ownership stay on the worker;
 no unsafe cross-thread transfer is used.
@@ -90,11 +92,16 @@ window. Wet and dry block counters can both increment for a callback containing
 a partial wet range. Underruns exclude startup, intentional bypass, worker
 failure/recovery, and fully disconnected input.
 
-The original `builtin.adaptive-noise-suppressor` remains the compatibility
+For Hush, an explicit 1/2-channel request is honored. `channels = None` is
+automatic: insertion derives the source layout, while an unresolved standalone
+node safely starts mono. The effective layout is persisted so restoration does
+not turn a resolved mono node back into stereo. The original
+`builtin.adaptive-noise-suppressor` remains the compatibility
 implementation for saved configurations. Its persisted reduction, adaptation,
 voice-preserve, and bypass parameters are not migrated to Hush. If an override
-bundle is unavailable or fails checksum validation, creating a Hush effect
-reports a setup error and does not create a fake working node.
+bundle is unavailable, cannot be parsed, or cannot initialize a compatible
+runtime, creating a Hush effect reports a setup error and does not create a
+fake working node.
 
 Windows currently supports the built-in effect registry in the user-mode
 realtime router. A persisted `module_path` is rejected explicitly because no

@@ -1124,6 +1124,33 @@ mod tests {
     }
 
     #[test]
+    fn hush_resolved_channels_round_trip_and_legacy_auto_is_preserved() {
+        let mut config = AppConfig::default();
+        config.effects.push(PersistedEffect {
+            instance: EffectInstanceConfig {
+                instance_id: "hush-mono".into(),
+                effect_id: "builtin.hush-noise-suppressor".into(),
+                module_path: None,
+                enabled: true,
+                parameters: BTreeMap::new(),
+                channels: Some(1),
+            },
+            source: None,
+            destination: None,
+            position: [10.0, 20.0],
+        });
+        let text = toml::to_string(&config).unwrap();
+        let restored: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(restored.effects[0].instance.channels, Some(1));
+
+        let legacy: AppConfig = toml::from_str(
+            "effects = [{ instance = { instance_id = 'legacy-hush', effect_id = 'builtin.hush-noise-suppressor' } }]",
+        )
+        .unwrap();
+        assert_eq!(legacy.effects[0].instance.channels, None);
+    }
+
+    #[test]
     fn legacy_effect_without_routing_or_position_loads_as_a_standalone_node() {
         let config: AppConfig = toml::from_str(
             r#"

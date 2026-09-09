@@ -119,7 +119,8 @@ flight. Generation tags discard output queued before reset, disconnect,
 reprepare, or bypass.
 
 The pinned Hush bundle is embedded in `pw-graph-effects`; development builds
-may point `QPWGRAPH_HUSH_MODEL` at a checksum-verified replacement. Neither
+may point `QPWGRAPH_HUSH_MODEL` at an explicitly reported replacement model.
+Neither
 the PipeWire callback nor the Windows router downloads or parses model files.
 
 On Windows, `router::wasapi` opens render, capture, and render-loopback

@@ -62,6 +62,27 @@ const PROP_MEDIA_CATEGORY: &str = "media.category";
 const PROP_MEDIA_ROLE: &str = "media.role";
 const PROP_FORMAT_DSP_VALUE: &str = "32 bit float mono audio";
 
+/// Resolve the layout used by a Hush filter.
+///
+/// `None` is the persisted/API representation of the old automatic layout.
+/// A free-standing filter has no topology to inspect yet, so its safe
+/// unresolved layout is mono.  Link insertion supplies the source topology as
+/// `inferred`; explicit requests always win over inference.  Keeping this in
+/// one helper is important because a Hush node can be created through the
+/// standalone, insertion, or restore paths.
+pub(super) fn resolve_hush_channels(
+    requested: Option<u16>,
+    inferred: Option<u16>,
+) -> BackendResult<u16> {
+    let channels = requested.or(inferred).unwrap_or(1);
+    match channels {
+        1 | 2 => Ok(channels),
+        count => Err(BackendError::native(format!(
+            "Hush supports one or two channels, requested {count}"
+        ))),
+    }
+}
+
 /// Media classes and roles shared by the virtual nodes the backend creates.
 const MEDIA_CLASS_AUDIO_FILTER: &str = "Audio/Filter";
 const MEDIA_ROLE_DSP: &str = "DSP";
@@ -871,6 +892,12 @@ impl PipewireDriver {
             position,
             ..
         } = request;
+        let is_hush = effect_id == pw_graph_effects::HUSH_NOISE_SUPPRESSOR_ID;
+        let inferred_hush_channels = if is_hush {
+            self.inferred_hush_channels(&source)
+        } else {
+            None
+        };
         // Verify the selected link before publishing a new node. It can still
         // disappear while the effect initializes, so we resolve it once more
         // immediately before disconnecting it below.
@@ -881,9 +908,21 @@ impl PipewireDriver {
             module_path,
             enabled,
             parameters,
-            channels: channels.or_else(|| self.inferred_hush_channels(&source)),
+            channels: if is_hush {
+                Some(resolve_hush_channels(channels, inferred_hush_channels)?)
+            } else {
+                channels
+            },
             position,
         };
+        if is_hush {
+            eprintln!(
+                "INFO hush: channel mode={} resolved_channels={} inferred_channels={:?} insertion=true",
+                if channels.is_some() { "Explicit" } else { "Auto" },
+                instance_request.channels.unwrap_or(1),
+                inferred_hush_channels
+            );
+        }
         let instance = self.create_effect_node_locked(instance_request)?;
 
         let result = (|| {
@@ -2479,7 +2518,9 @@ fn ui_volume_to_spa_volume(volume: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_port_type, ui_volume_to_spa_volume, PipewireDriver};
+    use super::{
+        classify_port_type, resolve_hush_channels, ui_volume_to_spa_volume, PipewireDriver,
+    };
     use crate::{EffectDriver, EffectNodeRequest, GraphDriver};
     use pw_graph_core::{Direction, NodeType, PortType};
     use std::collections::BTreeMap;
@@ -2515,6 +2556,26 @@ mod tests {
         assert!((ui_volume_to_spa_volume(1.0) - 1.0).abs() < f32::EPSILON);
         assert!((ui_volume_to_spa_volume(0.5) - 0.125).abs() < f32::EPSILON);
         assert!((ui_volume_to_spa_volume(1.5) - 3.375).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn unresolved_hush_layout_is_safe_mono_and_shared_by_all_creation_paths() {
+        assert_eq!(resolve_hush_channels(None, None).unwrap(), 1);
+        assert_eq!(resolve_hush_channels(None, Some(1)).unwrap(), 1);
+        assert_eq!(resolve_hush_channels(None, Some(2)).unwrap(), 2);
+        // An explicit saved/API layout wins over topology inference.
+        assert_eq!(resolve_hush_channels(Some(1), Some(2)).unwrap(), 1);
+        assert_eq!(resolve_hush_channels(Some(2), Some(1)).unwrap(), 2);
+    }
+
+    #[test]
+    fn hush_layout_rejects_invalid_channel_counts_instead_of_defaulting() {
+        for requested in [Some(0), Some(3), Some(u16::MAX)] {
+            let error = resolve_hush_channels(requested, None).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("Hush supports one or two channels"));
+        }
     }
 
     /// Opt-in because it creates a real PipeWire node in the user's session.
@@ -2606,6 +2667,18 @@ mod tests {
                 position: [56.0, 78.0],
             })
             .expect("the Hush PipeWire filter should publish a node and ports");
+        assert_eq!(instance.config.channels, Some(1));
+        let node = driver
+            .graph()
+            .node(instance.node_id)
+            .expect("Hush node should be present in the rebuilt graph");
+        let port_names: Vec<_> = node
+            .ports
+            .iter()
+            .filter_map(|port_id| driver.graph().port(*port_id))
+            .map(|port| port.name.as_str())
+            .collect();
+        assert_eq!(port_names, ["input_MONO", "output_MONO"]);
         assert_eq!(
             driver
                 .graph()
