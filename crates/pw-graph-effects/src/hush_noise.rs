@@ -5,7 +5,7 @@
 //! only sanitizes samples, advances a preallocated dry delay, and performs
 //! bounded SPSC queue operations.
 
-use crate::hush_worker::{HushDiagnostics, HushRuntime, HUSH_SCHEDULING_MS};
+use crate::hush_worker::{HushDiagnostics, HushRuntime, HUSH_MAX_BACKLOG_MS, HUSH_SCHEDULING_MS};
 use crate::{
     AudioSpec, EffectDescriptor, EffectError, EffectFactory, EffectParameter, EffectProcessor,
 };
@@ -178,14 +178,19 @@ impl EffectProcessor for HushNoiseSuppressor {
         self.generation = generation;
         // Resamplers center sample zero on source sample zero; their
         // lookahead delays availability, not sample position. Streaming Hush
-        // contains 160 native samples of synthesis delay. Reserve 40 ms for
-        // assembly/lookahead/scheduling, then align dry by another 10 ms.
-        // The 320-sample algorithmic metadata is NOT added again.
+        // contains 160 native samples of synthesis delay. The scheduling
+        // allowance starts at 40 ms and grows from the observed host quantum;
+        // worker cost is measured independently for overload/recovery. Reserve
+        // enough capacity for any callback up to max_frames without making
+        // that capacity the logical latency.
         let synthesis_delay_frames =
             (spec.sample_rate as usize * HUSH_SYNTHESIS_DELAY_SAMPLES).div_ceil(16_000);
         self.scheduling_frames =
             (spec.sample_rate as usize * HUSH_SCHEDULING_MS as usize).div_ceil(1000);
-        let delay_capacity_frames = synthesis_delay_frames + self.scheduling_frames;
+        let logical_delay_frames = synthesis_delay_frames + self.scheduling_frames;
+        let delay_capacity_frames = logical_delay_frames
+            + self.scheduling_frames.max(spec.max_frames as usize)
+            + (spec.sample_rate as usize * HUSH_MAX_BACKLOG_MS as usize).div_ceil(1000);
         self.fallback = vec![0.0; spec.max_frames as usize * channels];
         self.wet = vec![0.0; spec.max_frames as usize * channels];
         self.dry_delay = Some(DryDelay::new(
@@ -194,9 +199,21 @@ impl EffectProcessor for HushNoiseSuppressor {
         self.dry_delay
             .as_mut()
             .unwrap()
-            .set_delay(delay_capacity_frames * channels);
+            .set_delay(logical_delay_frames * channels);
         self.input_frame_position = 0;
         self.synthesis_delay_frames = synthesis_delay_frames;
+        runtime.diagnostics().scheduling_frames.store(
+            self.scheduling_frames as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        runtime.diagnostics().synthesis_delay_frames.store(
+            synthesis_delay_frames as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        runtime.diagnostics().total_latency_frames.store(
+            (self.scheduling_frames + synthesis_delay_frames) as u64,
+            std::sync::atomic::Ordering::Release,
+        );
         runtime.set_generation(self.generation);
         runtime
             .diagnostics()
@@ -228,6 +245,18 @@ impl EffectProcessor for HushNoiseSuppressor {
                 expected,
             });
         }
+        let Some(runtime) = &self.runtime else {
+            return Err(EffectError::NotPrepared);
+        };
+        // The first callback establishes the active host quantum. Later
+        // callbacks may vary, but scheduling only grows so the wet timeline
+        // never moves earlier and never asks the worker for the callback it
+        // has just received.
+        self.scheduling_frames = runtime.observe_quantum(frames);
+        if let Some(delay) = &mut self.dry_delay {
+            let delay_frames = self.scheduling_frames + self.synthesis_delay_frames;
+            delay.set_delay_preserve(delay_frames * spec.channels as usize);
+        }
         for sample in buffer.iter_mut() {
             if !sample.is_finite() {
                 *sample = 0.0;
@@ -251,9 +280,6 @@ impl EffectProcessor for HushNoiseSuppressor {
         }
         buffer.copy_from_slice(&self.fallback[..expected]);
 
-        let Some(runtime) = &self.runtime else {
-            return Err(EffectError::NotPrepared);
-        };
         runtime.push(
             self.generation,
             self.input_frame_position,
@@ -508,15 +534,30 @@ impl DryDelay {
         }
     }
 
+    /// Change the logical delay without clearing the history. The ring is
+    /// preallocated during prepare(), so quantum-aware latency growth remains
+    /// realtime safe and the dry timeline stays continuous during worker-only
+    /// recovery.
+    fn set_delay_preserve(&mut self, delay: usize) {
+        self.delay = delay.min(self.samples.len());
+        if self.delay > 0 {
+            self.position %= self.samples.len();
+        } else {
+            self.position = 0;
+        }
+    }
+
     fn process(&mut self, input: &[f32], output: &mut [f32]) {
         if self.delay == 0 {
             output.copy_from_slice(input);
             return;
         }
+        let capacity = self.samples.len();
         for (sample, delayed) in input.iter().zip(output.iter_mut()) {
-            *delayed = self.samples[self.position];
+            let read = (self.position + capacity - self.delay % capacity) % capacity;
+            *delayed = self.samples[read];
             self.samples[self.position] = *sample;
-            self.position = (self.position + 1) % self.delay;
+            self.position = (self.position + 1) % capacity;
         }
     }
 }
@@ -1213,6 +1254,66 @@ mod tests {
     }
 
     #[test]
+    fn large_quantum_grows_scheduling_before_wet_read() {
+        let mut processor = HushNoiseSuppressor::default();
+        processor
+            .set_parameter(HUSH_NOISE_SUPPRESSOR_REDUCTION, 40.0)
+            .unwrap();
+        processor
+            .prepare(AudioSpec {
+                sample_rate: 48_000,
+                channels: 2,
+                max_frames: 16_384,
+            })
+            .unwrap();
+        let mut block = vec![0.1; 2_048 * 2];
+        processor.process(&mut block, 2_048).unwrap();
+        assert!(processor.scheduling_frames >= 2_048);
+        let diagnostics = processor.diagnostics.as_ref().unwrap();
+        assert!(
+            diagnostics
+                .scheduling_frames
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= 2_048
+        );
+        assert!(
+            diagnostics
+                .max_host_quantum
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= 2_048
+        );
+        assert!(
+            diagnostics
+                .total_latency_frames
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= processor.scheduling_frames as u64 + processor.synthesis_delay_frames as u64
+        );
+    }
+
+    #[test]
+    fn quantum_latency_only_grows_during_variable_callbacks() {
+        let mut processor = HushNoiseSuppressor::default();
+        processor
+            .prepare(AudioSpec {
+                sample_rate: 48_000,
+                channels: 1,
+                max_frames: 2_048,
+            })
+            .unwrap();
+        let mut block = vec![0.1; 256];
+        processor.process(&mut block, 256).unwrap();
+        let initial = processor.scheduling_frames;
+        let mut large = vec![0.1; 2_048];
+        processor.process(&mut large, 2_048).unwrap();
+        let grown = processor.scheduling_frames;
+        assert!(grown >= 2_048);
+        let mut small = vec![0.1; 128];
+        processor.process(&mut small, 128).unwrap();
+        assert!(processor.scheduling_frames >= grown);
+        assert!(grown >= initial);
+    }
+
+    #[test]
     #[ignore = "30-second release real-time throughput measurement"]
     fn sustained_48k_stereo_256_keeps_wet_audio_dominant() {
         if cfg!(debug_assertions) {
@@ -1288,6 +1389,8 @@ mod tests {
             (48_000, 2, 256),
             (48_000, 2, 512),
             (48_000, 2, 1024),
+            (48_000, 1, 2048),
+            (48_000, 2, 2048),
             (96_000, 1, 256),
             (96_000, 1, 480),
             (96_000, 1, 1024),
@@ -1384,7 +1487,15 @@ mod tests {
             let dry_frames = diagnostics
                 .dry_frames_output
                 .load(std::sync::atomic::Ordering::Relaxed);
-            println!("frames={frames} duration_ms={:.3} latency_ms=50 worker_p95_us={} worker_p99_us={} wet_blocks_output={} dry_fallback_blocks={} wet_frames_output={} dry_frames_output={} wet_ratio={:.3} resync={}/{} stale_input/wet={}/{}", frames as f64 * 1000.0 / sample_rate as f64, percentile(95), percentile(99), diagnostics.wet_blocks_output.load(std::sync::atomic::Ordering::Relaxed), diagnostics.dry_fallback_blocks.load(std::sync::atomic::Ordering::Relaxed), wet_frames, dry_frames, wet_frames as f64 / (wet_frames + dry_frames).max(1) as f64, diagnostics.resync_requests.load(std::sync::atomic::Ordering::Relaxed), diagnostics.resync_completed.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_input_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_output_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed));
+            let latency_frames = diagnostics
+                .total_latency_frames
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let realtime_factor = f64::from_bits(
+                diagnostics
+                    .realtime_factor_bits
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            println!("frames={frames} duration_ms={:.3} latency_ms={:.3} worker_p95_us={} worker_p99_us={} wet_blocks_output={} dry_fallback_blocks={} wet_frames_output={} dry_frames_output={} wet_ratio={:.3} resync={}/{} stale_input/wet={}/{} realtime_factor={:.3} input_frames_rejected={} output_overruns={}", frames as f64 * 1000.0 / sample_rate as f64, latency_frames as f64 * 1000.0 / sample_rate as f64, percentile(95), percentile(99), diagnostics.wet_blocks_output.load(std::sync::atomic::Ordering::Relaxed), diagnostics.dry_fallback_blocks.load(std::sync::atomic::Ordering::Relaxed), wet_frames, dry_frames, wet_frames as f64 / (wet_frames + dry_frames).max(1) as f64, diagnostics.resync_requests.load(std::sync::atomic::Ordering::Relaxed), diagnostics.resync_completed.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_input_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), diagnostics.stale_output_blocks_dropped.load(std::sync::atomic::Ordering::Relaxed), realtime_factor, diagnostics.input_frames_rejected.load(std::sync::atomic::Ordering::Relaxed), diagnostics.output_overruns.load(std::sync::atomic::Ordering::Relaxed));
             println!(
                 "rate={sample_rate} channels={channels} callback_avg_us={average:.2} callback_p95_us={p95} callback_p99_us={p99} input_blocks={processed} hush_frames={} worker_avg_us={inference_average:.2} worker_max_us={inference_max} max_input_queue_depth={} max_output_queue_depth={} max_backlog_frames={} underruns={} input_overruns={} output_overruns={} input_blocks_pushed={} input_blocks_rejected={} input_frames_rejected={}",
                 diagnostics
