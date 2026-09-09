@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod effect_topology;
 mod effects;
 mod filter_runtime;
 mod links;
@@ -34,6 +35,7 @@ mod registry;
 #[cfg(all(target_os = "linux", feature = "relay"))]
 mod relay;
 
+use effect_topology::active_channel_mask;
 use effects::NativeEffect;
 use metering::{process_meter_buffer, MeterCallbackState, MeterHandle, MeterReadingState};
 use registry::{
@@ -477,6 +479,7 @@ impl PipewireDriver {
             if suppressed.is_empty() || pass == 2 {
                 // Volume and mute are read back here so a change made in
                 // pavucontrol or with a media key reaches the cards.
+                self.refresh_effect_channel_masks_locked();
                 self.read_node_controls_locked();
                 self.ensure_meters_locked();
                 return Ok(());
@@ -490,6 +493,37 @@ impl PipewireDriver {
             self.roundtrip_locked()?;
         }
         Ok(())
+    }
+
+    /// Publish graph topology to each live effect through its atomic
+    /// realtime control.  This is deliberately derived from stable registry
+    /// links, not from the presence of a DSP buffer in the most recent
+    /// callback.  An Auto effect may expose two physical ports while only the
+    /// linked input channels are active, so the mask also controls expensive
+    /// per-channel work such as Hush inference.
+    fn refresh_effect_channel_masks_locked(&self) {
+        let updates: Vec<(String, u16)> = self
+            .effects
+            .iter()
+            .map(|(instance_id, effect)| {
+                let mask = if effect.resolved() {
+                    active_channel_mask(
+                        &self.graph,
+                        effect.instance.node_id,
+                        effect.physical_channels(),
+                    )
+                } else {
+                    0
+                };
+                (instance_id.clone(), mask)
+            })
+            .collect();
+
+        for (instance_id, mask) in updates {
+            if let Some(effect) = self.effects.get(&instance_id) {
+                effect.set_active_channel_mask(mask);
+            }
+        }
     }
 
     fn port_keys_equal(left: &PortKey, right: &PortKey) -> bool {
@@ -928,8 +962,9 @@ impl PipewireDriver {
         };
         let resolved_channels = self
             .effect_host
-            .negotiate_channels(
+            .physical_channels_for_request(
                 &instance_request.effect_id,
+                instance_request.module_path.as_deref(),
                 channel_policy,
                 inferred_channels,
             )
@@ -1039,11 +1074,6 @@ impl PipewireDriver {
         if request.effect_id.trim().is_empty() {
             return Err(BackendError::native("effect id cannot be empty"));
         }
-        if request.module_path.is_some() {
-            return Err(BackendError::unsupported(
-                "WASM/native effect modules are not yet hosted by the PipeWire filter runtime",
-            ));
-        }
         if self.effects.contains_key(&request.instance_id)
             || self
                 .pending_effects
@@ -1068,8 +1098,9 @@ impl PipewireDriver {
         };
         let channels = self
             .effect_host
-            .negotiate_channels(
+            .physical_channels_for_request(
                 &request.effect_id,
+                request.module_path.as_deref(),
                 request.channel_policy,
                 topology_channels,
             )

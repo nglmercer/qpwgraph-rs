@@ -5,14 +5,15 @@
 //! only sanitizes samples, advances a preallocated dry delay, and performs
 //! bounded SPSC queue operations.
 
+pub(crate) use crate::hush_model::{hush_model_load_info, shared_hush_model, HushModelLoadInfo};
+#[cfg(test)]
+pub(crate) use crate::hush_model::{load_hush_model_with_override, HUSH_MODEL_SHA256};
 use crate::hush_worker::{HushDiagnostics, HushRuntime, HUSH_MAX_BACKLOG_MS, HUSH_SCHEDULING_MS};
 use crate::{
     apply_parameters, AudioSpec, EffectDescriptor, EffectError, EffectIoCapabilities,
     EffectParameter, EffectPrepareRequest, EffectProcessor, EffectProvider, PreparedEffect,
 };
-use nnnoiseless::{HushModel, HUSH_SYNTHESIS_DELAY_SAMPLES};
-use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use nnnoiseless::HUSH_SYNTHESIS_DELAY_SAMPLES;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,32 +22,6 @@ pub const HUSH_NOISE_SUPPRESSOR_ID: &str = "builtin.hush-noise-suppressor";
 pub const DEFAULT_EFFECT_ID: &str = HUSH_NOISE_SUPPRESSOR_ID;
 pub const HUSH_NOISE_SUPPRESSOR_REDUCTION: &str = "reduction-db";
 pub const HUSH_NOISE_SUPPRESSOR_BYPASS: &str = "bypass";
-
-const HUSH_MODEL_SHA256: &str = "45632ccaa82b71bb743d6caa7c78e983fe2f2790a3af7f6ec48e6ed7ba085df6";
-const EMBEDDED_HUSH_MODEL: &[u8] =
-    include_bytes!("../resources/hush/advanced_dfnet16k_model_best_onnx.tar.gz");
-
-const EMBEDDED_HUSH_MODEL_NAME: &str = "advanced_dfnet16k_model_best_onnx.tar.gz";
-
-/// Immutable metadata for the process-wide Hush model load.  The byte
-/// contents are intentionally not retained here; the parsed model owns what
-/// inference needs and diagnostics only need provenance and timings.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct HushModelLoadInfo {
-    pub(crate) source: String,
-    pub(crate) name: String,
-    pub(crate) path: Option<String>,
-    pub(crate) embedded: bool,
-    pub(crate) compressed_bytes: u64,
-    pub(crate) decompressed_bytes: Option<u64>,
-    pub(crate) checksum: String,
-    pub(crate) load_started: bool,
-    pub(crate) load_completed: bool,
-    pub(crate) load_duration_ms: u64,
-    pub(crate) parse_started: bool,
-    pub(crate) parse_completed: bool,
-    pub(crate) error: Option<String>,
-}
 
 #[inline]
 fn channel_is_connected(mask: u16, channel: usize) -> bool {
@@ -569,6 +544,26 @@ impl EffectProcessor for HushNoiseSuppressor {
     }
 
     fn set_channel_mask(&mut self, mask: u16) {
+        let physical_mask = self
+            .spec
+            .map(|spec| {
+                if spec.channels >= 16 {
+                    u16::MAX
+                } else {
+                    (1u16 << spec.channels) - 1
+                }
+            })
+            .unwrap_or(u16::MAX);
+        let mask = mask & physical_mask;
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics
+                .active_channel_mask
+                .store(mask, std::sync::atomic::Ordering::Release);
+            diagnostics.active_hush_channels.store(
+                mask.count_ones() as u16,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         if self.channel_mask != mask {
             self.channel_mask = mask;
             self.next_generation(true);
@@ -590,178 +585,6 @@ impl EffectProcessor for HushNoiseSuppressor {
     fn reset(&mut self) {
         self.next_generation(true);
     }
-}
-
-/// Load the model once, on the caller's setup/control thread.  The audio
-/// callback never reads the filesystem or initializes Tract.
-pub(crate) fn shared_hush_model() -> Result<Arc<HushModel>, String> {
-    shared_hush_model_load().model.clone()
-}
-
-/// Return the model provenance captured by the one-time load attempt. Calling
-/// this also performs the load if no effect has prepared yet, so callers must
-/// keep it off the realtime path.
-pub(crate) fn hush_model_load_info() -> HushModelLoadInfo {
-    shared_hush_model_load().info.clone()
-}
-
-struct SharedHushModelLoad {
-    model: Result<Arc<HushModel>, String>,
-    info: HushModelLoadInfo,
-}
-
-fn shared_hush_model_load() -> &'static SharedHushModelLoad {
-    static MODEL: OnceLock<SharedHushModelLoad> = OnceLock::new();
-    MODEL.get_or_init(load_hush_model)
-}
-
-fn load_hush_model() -> SharedHushModelLoad {
-    let override_path = non_empty_env_path("QPWGRAPH_HUSH_MODEL")
-        .map(|path| ("QPWGRAPH_HUSH_MODEL", path))
-        .or_else(|| non_empty_env_path("HUSH_MODEL").map(|path| ("HUSH_MODEL", path)));
-    load_hush_model_with_override(override_path)
-}
-
-fn load_hush_model_with_override(override_path: Option<(&str, PathBuf)>) -> SharedHushModelLoad {
-    let started = Instant::now();
-    let (source, name, path, embedded) = match override_path.as_ref() {
-        Some((variable, path)) => (
-            format!("environment override ({variable})"),
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("external Hush model")
-                .to_owned(),
-            Some(path.display().to_string()),
-            false,
-        ),
-        None => (
-            "embedded".to_owned(),
-            EMBEDDED_HUSH_MODEL_NAME.to_owned(),
-            None,
-            true,
-        ),
-    };
-    let mut info = HushModelLoadInfo {
-        source,
-        name,
-        path,
-        embedded,
-        load_started: true,
-        ..HushModelLoadInfo::default()
-    };
-    eprintln!(
-        "INFO hush: loading model source={} name={}{}",
-        info.source,
-        info.name,
-        info.path
-            .as_deref()
-            .map(|path| format!(" path={path}"))
-            .unwrap_or_default()
-    );
-
-    let bytes = if let Some((_, path)) = override_path {
-        match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let message = format!("could not read Hush model {}: {error}", path.display());
-                return failed_model_load(info, started, message);
-            }
-        }
-    } else {
-        EMBEDDED_HUSH_MODEL.to_vec()
-    };
-    info.compressed_bytes = bytes.len() as u64;
-    info.decompressed_bytes = gzip_uncompressed_size(&bytes);
-    info.load_completed = true;
-    let checksum = Sha256::digest(&bytes);
-    info.checksum = format!("{checksum:x}");
-    // The embedded artifact is pinned and can therefore be verified against a
-    // known digest. An external override is intentionally allowed to have a
-    // different digest: its checksum is still reported, while parsing and
-    // denoiser initialization validate that it is actually a compatible Hush
-    // bundle. Never silently fall back to the embedded artifact after an
-    // override fails.
-    if info.embedded {
-        if let Err(error) = validate_model_checksum(&bytes, &info.source) {
-            return failed_model_load(info, started, error);
-        }
-    }
-
-    info.parse_started = true;
-    let parsed = if info.embedded {
-        HushModel::from_static_bytes(EMBEDDED_HUSH_MODEL)
-    } else {
-        HushModel::from_bytes(&bytes)
-    };
-    let model = match parsed {
-        Ok(model) => {
-            info.parse_completed = true;
-            Ok(Arc::new(model))
-        }
-        Err(error) => Err(format!("could not parse Hush model: {error}")),
-    };
-    info.load_duration_ms = elapsed_ms(started);
-    if let Err(error) = &model {
-        info.error = Some(error.clone());
-        eprintln!("ERROR hush: {error}");
-    } else {
-        eprintln!(
-            "INFO hush: model parsed source={} checksum={} compressed_bytes={} decompressed_bytes={} load_ms={}",
-            info.source,
-            info.checksum,
-            info.compressed_bytes,
-            info.decompressed_bytes
-                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
-            info.load_duration_ms
-        );
-    }
-    SharedHushModelLoad { model, info }
-}
-
-fn failed_model_load(
-    mut info: HushModelLoadInfo,
-    started: Instant,
-    error: String,
-) -> SharedHushModelLoad {
-    info.load_duration_ms = elapsed_ms(started);
-    info.error = Some(error.clone());
-    eprintln!("ERROR hush: {error}");
-    SharedHushModelLoad {
-        model: Err(error),
-        info,
-    }
-}
-
-fn non_empty_env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn gzip_uncompressed_size(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() < 18 || bytes.get(..2) != Some(&[0x1f, 0x8b]) {
-        return None;
-    }
-    // The gzip ISIZE footer is the input size modulo 2^32. Hush bundles are
-    // far below that limit; reporting None for a future larger archive is
-    // safer than presenting a wrapped size as exact.
-    let size = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().ok()?);
-    Some(u64::from(size))
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u64::MAX as u128) as u64
-}
-
-fn validate_model_checksum(bytes: &[u8], source: &str) -> Result<(), String> {
-    let checksum = Sha256::digest(bytes);
-    let checksum = format!("{checksum:x}");
-    if checksum != HUSH_MODEL_SHA256 {
-        return Err(format!(
-            "Hush model checksum mismatch for {source} (expected {HUSH_MODEL_SHA256}, got {checksum})"
-        ));
-    }
-    Ok(())
 }
 
 struct DryDelay {
@@ -824,6 +647,7 @@ impl DryDelay {
 mod tests {
     use super::*;
     use crate::{AudioSpec, EffectProcessor};
+    use std::path::PathBuf;
     use std::thread;
     use std::time::{Duration, Instant};
 

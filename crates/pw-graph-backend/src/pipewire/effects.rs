@@ -6,7 +6,6 @@
 //! driver's `ThreadLoop` lock is held.  That is the lifetime boundary PipeWire
 //! requires before a callback data pointer may be released.
 //!
-//! The current effect SDK has one builtin processor and no native WASM host.
 //! Built-in effects retain their established stereo FL/FR ports. Hush is
 //! layout-aware and may instead expose one MONO pair; the callback still uses
 //! a fixed two-pointer storage envelope so changing the selected layout never
@@ -48,6 +47,11 @@ struct CallbackState {
     input_ports: [AtomicPtr<c_void>; DSP_CHANNELS],
     output_ports: [AtomicPtr<c_void>; DSP_CHANNELS],
     channels: usize,
+    /// Stable control-plane topology.  This is intentionally separate from
+    /// the presence of a DSP buffer in one callback: PipeWire can temporarily
+    /// return a null buffer while a graph is renegotiating, and that must not
+    /// reset a stateful denoiser on every quantum.
+    active_channel_mask: AtomicU32,
     enabled: AtomicBool,
     processor_failed: AtomicBool,
     hush_diagnostics: Option<std::sync::Arc<pw_graph_effects::HushDiagnostics>>,
@@ -68,19 +72,32 @@ struct CallbackState {
 impl CallbackState {
     #[cfg(test)]
     fn new(processor: Box<dyn EffectProcessor>, enabled: bool) -> Self {
-        Self::new_with_channels(processor, enabled, DSP_CHANNELS)
+        Self::new_with_channels_and_mask(processor, enabled, DSP_CHANNELS, u16::MAX)
     }
 
+    #[cfg(test)]
     fn new_with_channels(
         processor: Box<dyn EffectProcessor>,
         enabled: bool,
         channels: usize,
+    ) -> Self {
+        Self::new_with_channels_and_mask(processor, enabled, channels, u16::MAX)
+    }
+
+    fn new_with_channels_and_mask(
+        processor: Box<dyn EffectProcessor>,
+        enabled: bool,
+        channels: usize,
+        active_channel_mask: u16,
     ) -> Self {
         let channels = channels.clamp(1, DSP_CHANNELS);
         Self {
             input_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             output_ports: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             channels,
+            active_channel_mask: AtomicU32::new(u32::from(
+                active_channel_mask & channel_mask_for_count(channels),
+            )),
             enabled: AtomicBool::new(enabled),
             processor_failed: AtomicBool::new(false),
             hush_diagnostics: processor.hush_diagnostics(),
@@ -176,21 +193,11 @@ impl CallbackState {
         self.dangling_inputs
             .store(dangling_inputs, Ordering::Release);
 
-        // A stateful effect must learn about route changes before it queues
-        // this block. The default implementation is a no-op; Hush uses the
-        // atomic/generation-only hook to reset disconnected denoiser state.
-        // A channel is useful to a stateful processor only when both sides of
-        // the effect have a live DSP buffer. In particular, an input-only
-        // buffer must not make Hush spend inference time on audio that has no
-        // output path; an output-only buffer remains a diagnosed dangling
-        // channel and is forced to silence below.
-        let channel_mask = (0..self.channels).fold(0_u16, |mask, channel| {
-            if !inputs[channel].is_null() && !outputs[channel].is_null() {
-                mask | (1_u16 << channel)
-            } else {
-                mask
-            }
-        });
+        // The graph-derived mask is the persistent connection state.  Buffer
+        // pointers below are only a per-quantum safety check; they must not
+        // become the authority for a stateful processor's generation.
+        let channel_mask = self.active_channel_mask.load(Ordering::Acquire) as u16
+            & channel_mask_for_count(self.channels);
         if let Ok(mut state) = self.processor.try_lock() {
             state.processor.set_channel_mask(channel_mask);
         }
@@ -247,6 +254,7 @@ impl CallbackState {
                 samples,
                 outputs,
                 dangling_inputs,
+                channel_mask,
                 frame_count,
                 self.channels,
             );
@@ -262,6 +270,21 @@ impl CallbackState {
             // processor output. Keep the diagnostic state separate from audio.
             self.processor_failed.store(true, Ordering::Relaxed);
         }
+    }
+
+    fn set_active_channel_mask(&self, mask: u16) {
+        self.active_channel_mask.store(
+            u32::from(mask & channel_mask_for_count(self.channels)),
+            Ordering::Release,
+        );
+    }
+}
+
+fn channel_mask_for_count(channels: usize) -> u16 {
+    if channels >= u16::BITS as usize {
+        u16::MAX
+    } else {
+        (1u16 << channels) - 1
     }
 }
 
@@ -305,13 +328,16 @@ unsafe fn copy_processed_to_outputs(
     samples: &[f32],
     outputs: [*mut c_void; DSP_CHANNELS],
     dangling_inputs: u32,
+    active_channel_mask: u16,
     frames: usize,
     channels: usize,
 ) {
     for frame in 0..frames {
         for channel in 0..channels {
             if !outputs[channel].is_null() {
-                let sample = if dangling_inputs & (1 << channel) != 0 {
+                let sample = if active_channel_mask & (1 << channel) == 0
+                    || dangling_inputs & (1 << channel) != 0
+                {
                     // A stateful processor may still have a queued tail after
                     // its input is disconnected. Do not let that tail turn a
                     // passive meter into an audio source.
@@ -355,19 +381,15 @@ impl NativeEffect {
         topology_channels: Option<u16>,
     ) -> BackendResult<Self> {
         validate_request(&request)?;
-        if request.module_path.is_some() {
-            return Err(BackendError::unsupported(
-                "WASM/native effect modules are not yet hosted by the PipeWire filter runtime",
-            ));
-        }
 
         // Compatibility callers still get a synchronous API, but all setup
         // is routed through the provider hook. The asynchronous backend path
         // uses EffectComponentManager and reaches activate() directly, so it
         // never performs this heavyweight work before publishing a node.
         let channels = host
-            .negotiate_channels(
+            .physical_channels_for_request(
                 &request.effect_id,
+                request.module_path.as_deref(),
                 request.channel_policy,
                 topology_channels,
             )
@@ -402,11 +424,6 @@ impl NativeEffect {
         prepared: PreparedEffect,
     ) -> BackendResult<Self> {
         validate_request(&request)?;
-        if request.module_path.is_some() {
-            return Err(BackendError::unsupported(
-                "WASM/native effect modules are not yet hosted by the PipeWire filter runtime",
-            ));
-        }
         prepared.spec.validate().map_err(BackendError::native)?;
         let channels = prepared.spec.channels as usize;
         if channels == 0 || channels > DSP_CHANNELS {
@@ -423,10 +440,15 @@ impl NativeEffect {
         // same persistence/undo endpoint after a registry refresh.
         let node_name = format!("{effect_name} ({})", request.instance_id);
 
-        let callback = Box::new(CallbackState::new_with_channels(
+        // The graph-derived topology refresh is authoritative for both
+        // policies. Until it observes an actual input link, no channel is
+        // active and a stateful effect such as Hush performs no inference.
+        let initial_mask = 0;
+        let callback = Box::new(CallbackState::new_with_channels_and_mask(
             processor,
             request.enabled,
             channels,
+            initial_mask,
         ));
         let filter_properties = pw::properties::properties! {
             NODE_NAME => node_name.as_str(),
@@ -538,6 +560,14 @@ impl NativeEffect {
             && self.instance.output_port.0 != UNRESOLVED_ID
     }
 
+    pub(super) fn physical_channels(&self) -> usize {
+        self.runtime.callback().channels
+    }
+
+    pub(super) fn set_active_channel_mask(&self, mask: u16) {
+        self.runtime.callback().set_active_channel_mask(mask);
+    }
+
     pub(super) fn snapshot(&self) -> EffectInstance {
         let mut instance = self.instance.clone();
         let callback = self.runtime.callback();
@@ -615,6 +645,9 @@ fn validate_request(request: &EffectNodeRequest) -> BackendResult<()> {
     }
     validate_pipewire_text("effect instance id", &request.instance_id)?;
     validate_pipewire_text("effect id", &request.effect_id)?;
+    if let Some(path) = &request.module_path {
+        validate_pipewire_text("effect module path", path)?;
+    }
     Ok(())
 }
 
@@ -884,13 +917,14 @@ mod tests {
     #[test]
     fn input_only_channel_is_not_reported_as_active() {
         let observed_mask = Arc::new(AtomicU16::new(u16::MAX));
-        let state = CallbackState::new_with_channels(
+        let state = CallbackState::new_with_channels_and_mask(
             Box::new(TestProcessor::with_observed_channel_mask(
                 ProcessBehavior::Gain,
                 Some(observed_mask.clone()),
             )),
             true,
             2,
+            1,
         );
         let mut left_input = [0.25; 4];
         let mut right_input = [0.75; 4];

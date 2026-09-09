@@ -51,6 +51,7 @@ windows = "0.62.2"
 windows-core = "0.62.2"
 hmac = "0.12"
 sha2 = "0.10"
+wasmi = { version = "2.0", default-features = false, features = ["std", "validate"] }
 hkdf = "0.12"
 spake2 = "0.4"
 chacha20poly1305 = "0.10"

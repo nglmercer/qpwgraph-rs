@@ -406,6 +406,10 @@ pub struct HushDiagnostics {
     pub warmup_frames: AtomicU64,
     /// One count is one native 160-sample Hush inference for one channel.
     pub hush_channel_frames_processed: AtomicU64,
+    /// Stable graph-derived channel state. `channels` remains the prepared
+    /// physical capacity; this mask is the subset that may consume inference
+    /// work for the current route.
+    pub active_channel_mask: AtomicU16,
     pub active_hush_channels: AtomicU16,
     pub input_blocks_skipped_recovery: AtomicU64,
     pub input_frames_skipped_recovery: AtomicU64,
@@ -685,6 +689,12 @@ impl HushDiagnostics {
             load(&self.wet_drop_wrong_channel_count),
             load(&self.wet_drop_wrong_frame_count),
         );
+        status.push_str(&format!(
+            "\nTopology: physical_channels={} active_channels={} active_mask=0x{:02x}",
+            self.channels.load(Ordering::Relaxed),
+            self.active_hush_channels.load(Ordering::Relaxed),
+            self.active_channel_mask.load(Ordering::Relaxed),
+        ));
         status.push_str(&format!(
             "\nRouting: channel_errors={} input_rejected={} input_overruns={} output_overruns={}",
             load(&self.channel_config_errors),
@@ -1220,6 +1230,13 @@ impl HushRuntime {
         samples: &[f32],
     ) -> bool {
         self.diagnostics
+            .active_channel_mask
+            .store(channel_mask, Ordering::Release);
+        self.diagnostics.active_hush_channels.store(
+            channel_mask.count_ones().min(u32::from(channels)) as u16,
+            Ordering::Release,
+        );
+        self.diagnostics
             .host_quantum
             .store(frames, Ordering::Relaxed);
         self.latest_frame
@@ -1231,6 +1248,12 @@ impl HushRuntime {
             .latest_submitted_frame
             .store(start_frame + frames as u64, Ordering::Release);
         if self.diagnostics.worker_failed.load(Ordering::Acquire) {
+            return true;
+        }
+        if channel_mask == 0 {
+            self.diagnostics
+                .no_audio_input_blocks
+                .fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if !self.accept_input.load(Ordering::Acquire) {

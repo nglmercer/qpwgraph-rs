@@ -13,9 +13,11 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod adaptive_noise;
+mod hush_model;
 mod hush_noise;
 mod hush_worker;
 pub mod lifecycle;
+pub mod resources;
 pub mod wasm;
 pub use adaptive_noise::AdaptiveNoiseSuppressor;
 pub use hush_noise::HushNoiseSuppressor;
@@ -24,6 +26,12 @@ pub use lifecycle::{
     EffectCancellation, EffectComponentManager, EffectLifecycle, EffectLoadStage,
     EffectPreparationEvent, EffectPrepareRequest, EffectTicket, PreparedEffect,
 };
+pub use resources::{
+    global_effect_resources, EffectResourceManager, LoadedResource, ResourceError, ResourceId,
+    ResourceProvenance, ResourceSource,
+};
+#[cfg(feature = "wasm")]
+pub use wasm::WasmEffectProvider;
 
 pub const NOISE_GATE_ID: &str = "builtin.noise-gate";
 pub const NOISE_SUPPRESSOR_ID: &str = "builtin.adaptive-noise-suppressor";
@@ -171,6 +179,37 @@ pub fn negotiate_channels(
     Ok(channels)
 }
 
+/// Resolve the physical channel capacity an instance must prepare and expose.
+///
+/// A fixed policy has no adaptation room, so its physical capacity is the
+/// requested count.  An independent-channel Auto effect can expose its full
+/// provider capacity while the host separately communicates which channels
+/// are currently live.  This is what lets a two-port Hush node adapt from a
+/// mono route to a stereo route without recreating its processor, while the
+/// worker still skips inactive neural channels.  Effects whose channels are
+/// coupled use their negotiated count instead.
+pub fn physical_channels(
+    policy: ChannelPolicy,
+    capabilities: EffectIoCapabilities,
+    topology_channels: Option<u16>,
+) -> Result<u16, EffectError> {
+    capabilities.validate()?;
+    let negotiated = negotiate_channels(policy, capabilities, topology_channels)?;
+    let physical = match policy {
+        ChannelPolicy::Fixed(_) => negotiated,
+        ChannelPolicy::Auto if capabilities.independent_channels => capabilities.max_channels,
+        ChannelPolicy::Auto => negotiated,
+    };
+    if physical < capabilities.min_channels || physical > capabilities.max_channels {
+        return Err(EffectError::UnsupportedChannelCount {
+            channels: physical,
+            min_channels: capabilities.min_channels,
+            max_channels: capabilities.max_channels,
+        });
+    }
+    Ok(physical)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AudioSpec {
     pub sample_rate: u32,
@@ -242,6 +281,10 @@ pub enum EffectError {
     MissingWasmExport(String),
     #[error("invalid effect module manifest: {0}")]
     InvalidWasmManifest(String),
+    #[error("invalid effect module: {0}")]
+    InvalidWasmModule(String),
+    #[error("WASM effect hosting is unavailable: {0}")]
+    WasmUnavailable(String),
     #[error("Hush model unavailable: {0}")]
     ModelUnavailable(String),
     #[error("Hush worker unavailable: {0}")]
@@ -355,6 +398,20 @@ impl EffectHost {
         self.providers.insert(id, Arc::from(provider));
     }
 
+    /// Discover and register a WASM provider whose sidecar manifest is next
+    /// to its module. The compiled module remains lazy and is shared through
+    /// the resource manager when an instance is prepared.
+    #[cfg(feature = "wasm")]
+    pub fn register_wasm_module(
+        &mut self,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<EffectDescriptor, EffectError> {
+        let provider = wasm::WasmEffectProvider::discover(path)?;
+        let descriptor = provider.descriptor().clone();
+        self.register(Box::new(provider));
+        Ok(descriptor)
+    }
+
     pub fn descriptors(&self) -> Vec<EffectDescriptor> {
         self.providers
             .values()
@@ -381,6 +438,17 @@ impl EffectHost {
         negotiate_channels(policy, self.io_capabilities(id)?, topology_channels)
     }
 
+    /// Resolve the physical prepared/published capacity while preserving the
+    /// distinction from the live topology-derived active mask.
+    pub fn physical_channels(
+        &self,
+        id: &str,
+        policy: ChannelPolicy,
+        topology_channels: Option<u16>,
+    ) -> Result<u16, EffectError> {
+        physical_channels(policy, self.io_capabilities(id)?, topology_channels)
+    }
+
     pub fn create(&self, id: &str) -> Result<Box<dyn EffectProcessor>, EffectError> {
         self.providers
             .get(id)
@@ -396,9 +464,7 @@ impl EffectHost {
         &self,
         request: EffectPrepareRequest,
     ) -> Result<PreparedEffect, EffectError> {
-        self.providers
-            .get(&request.effect_id)
-            .ok_or_else(|| EffectError::UnknownEffect(request.effect_id.clone()))?
+        self.provider_for_request(&request.effect_id, request.module_path.as_deref())?
             .prepare_instance(request)
     }
 
@@ -407,6 +473,55 @@ impl EffectHost {
             .get(id)
             .cloned()
             .ok_or_else(|| EffectError::UnknownEffect(id.into()))
+    }
+
+    /// Resolve either a registered builtin provider or a provider backed by a
+    /// dynamically supplied WASM module.  Dynamic providers are deliberately
+    /// created for one request; their compiled component is shared through
+    /// the resource manager rather than through this registry.
+    pub(crate) fn provider_for_request(
+        &self,
+        id: &str,
+        module_path: Option<&str>,
+    ) -> Result<Arc<dyn EffectProvider>, EffectError> {
+        if let Some(path) = module_path {
+            #[cfg(feature = "wasm")]
+            {
+                return Ok(Arc::new(wasm::WasmEffectProvider::new(path, id)));
+            }
+            #[cfg(not(feature = "wasm"))]
+            {
+                let _ = path;
+                return Err(EffectError::WasmUnavailable(
+                    "rebuild pw-graph-effects with the `wasm` feature".into(),
+                ));
+            }
+        }
+        self.provider(id)
+    }
+
+    pub(crate) fn io_capabilities_for_request(
+        &self,
+        id: &str,
+        module_path: Option<&str>,
+    ) -> Result<EffectIoCapabilities, EffectError> {
+        Ok(self
+            .provider_for_request(id, module_path)?
+            .io_capabilities())
+    }
+
+    pub fn physical_channels_for_request(
+        &self,
+        id: &str,
+        module_path: Option<&str>,
+        policy: ChannelPolicy,
+        topology_channels: Option<u16>,
+    ) -> Result<u16, EffectError> {
+        physical_channels(
+            policy,
+            self.io_capabilities_for_request(id, module_path)?,
+            topology_channels,
+        )
     }
 }
 
@@ -823,5 +938,26 @@ mod tests {
             .parameters
             .iter()
             .any(|parameter| parameter.id == "bypass" && parameter.unit == "boolean"));
+    }
+
+    #[test]
+    fn independent_auto_effect_keeps_physical_capacity_separate_from_topology() {
+        let capabilities = EffectIoCapabilities::independent(1, 2);
+        assert_eq!(
+            physical_channels(ChannelPolicy::Auto, capabilities, None).unwrap(),
+            2
+        );
+        assert_eq!(
+            physical_channels(ChannelPolicy::Auto, capabilities, Some(1)).unwrap(),
+            2
+        );
+        assert_eq!(
+            negotiate_channels(ChannelPolicy::Auto, capabilities, Some(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            physical_channels(ChannelPolicy::Fixed(1), capabilities, Some(2)).unwrap(),
+            1
+        );
     }
 }

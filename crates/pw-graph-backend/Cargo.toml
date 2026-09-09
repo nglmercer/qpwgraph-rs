@@ -12,6 +12,7 @@ default = ["in-memory"]
 in-memory = []
 pipewire = ["dep:pipewire"]
 relay = ["dep:pw-graph-relay"]
+wasm = ["pw-graph-effects/wasm"]
 
 [dependencies]
 pw-graph-core = { path = "../pw-graph-core" }

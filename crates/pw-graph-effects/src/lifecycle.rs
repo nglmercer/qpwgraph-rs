@@ -218,7 +218,8 @@ impl EffectComponentManager {
         mut request: EffectPrepareRequest,
     ) -> Result<EffectTicket, EffectError> {
         request.spec.validate()?;
-        let provider = host.provider(&request.effect_id)?;
+        let provider =
+            host.provider_for_request(&request.effect_id, request.module_path.as_deref())?;
         let ticket = EffectTicket(self.next_ticket);
         self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
         let cancelled = EffectCancellation::new();

@@ -8,9 +8,17 @@ authors.workspace = true
 # published to crates.io.
 publish = false
 
+[features]
+default = []
+wasm = ["dep:wasmi"]
+
 [dependencies]
 nnnoiseless = { path = "../../vendor/nnnoiseless", default-features = false, features = ["hush"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+wasmi = { workspace = true, optional = true }
+
+[dev-dependencies]
+wat = "1"
