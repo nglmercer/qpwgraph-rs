@@ -21,6 +21,7 @@ mod connections;
 mod effects;
 mod effects_restore;
 mod events;
+mod icons;
 #[cfg(test)]
 mod keyboard;
 mod meters;

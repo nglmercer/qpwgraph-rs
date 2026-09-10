@@ -59,6 +59,18 @@ fn snapshot_filters_and_keeps_link_endpoints() {
 }
 
 #[test]
+fn snapshot_preserves_an_optional_node_icon_name() {
+    let mut graph = graph();
+    graph.nodes.get_mut(&NodeId(1)).unwrap().icon_name = Some("firefox".into());
+    let config = AppConfig::default();
+    let mut state = UiGraphState::from_config(&config);
+
+    let snapshot = state.snapshot(&graph, &config);
+
+    assert_eq!(snapshot.nodes[0].icon_name.as_deref(), Some("firefox"));
+}
+
+#[test]
 fn box_selection_includes_links_by_endpoint() {
     let graph = graph();
     let config = AppConfig::default();

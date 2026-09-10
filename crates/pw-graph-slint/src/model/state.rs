@@ -131,6 +131,7 @@ impl UiGraphState {
                     .clone()
                     .unwrap_or_else(|| node.name.clone()),
                 node_type: node.node_type,
+                icon_name: node.icon_name.clone(),
                 position: positions.get(&node.id).copied().unwrap_or(node.position),
                 width: NODE_WIDTH,
                 height,

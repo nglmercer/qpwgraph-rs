@@ -19,6 +19,7 @@ use super::effects::{
     effect_operation_rows, effect_options, effect_setup_rows, sync_effect_rows,
     sync_effect_setup_rows,
 };
+use super::icons::load_node_icon;
 use super::meters::meter_fallback;
 #[cfg(feature = "relay")]
 use super::relay::relay_qr_payload;
@@ -561,10 +562,14 @@ fn read_backend_profiles(source: &ApplicationDriver) -> BTreeMap<NodeId, NodeBac
 }
 
 fn node_row(node: &NodeView, i18n: &I18n) -> NodeRow {
+    let icon = load_node_icon(node.icon_name.as_deref());
+    let has_icon = icon.is_some();
     NodeRow {
         id: node.id,
         node_title: SharedString::from(compact_label(&display_node_name(&node.title, i18n), 22)),
         node_subtitle: SharedString::from(localized_node_type(i18n, node.node_type)),
+        icon: icon.unwrap_or_default(),
+        has_icon,
         x: node.position[0],
         y: node.position[1],
         width: node.width,

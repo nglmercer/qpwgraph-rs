@@ -61,7 +61,11 @@ const CLIENT_NAME: &str = "client.name";
 const CLIENT_API: &str = "client.api";
 const APPLICATION_ID: &str = "application.id";
 const APPLICATION_NAME: &str = "application.name";
+const APPLICATION_ICON_NAME: &str = "application.icon-name";
 const APPLICATION_PROCESS_BINARY: &str = "application.process.binary";
+const DEVICE_ID: &str = "device.id";
+const DEVICE_ICON_NAME: &str = "device.icon-name";
+const MEDIA_ICON_NAME: &str = "media.icon-name";
 const PORT_NAME: &str = "port.name";
 const AUDIO_CHANNEL: &str = "audio.channel";
 const PORT_DIRECTION: &str = "port.direction";
@@ -392,6 +396,7 @@ impl PipewireDriver {
         let mut graph = Graph::default();
         let mut node_media_classes = HashMap::new();
         let clients = &state.clients;
+        let devices = &state.devices;
         let effect_nodes: HashMap<NodeId, String> = self
             .effects
             .values()
@@ -414,6 +419,29 @@ impl PipewireDriver {
             let client = record
                 .client_id
                 .and_then(|client_id| clients.get(&client_id));
+            let icon_name = record
+                .icon_name
+                .clone()
+                .or_else(|| {
+                    record.device_id.and_then(|device_id| {
+                        devices
+                            .get(&device_id)
+                            .and_then(|device| device.icon_name.clone())
+                    })
+                })
+                .or_else(|| client.and_then(|client| client.icon_name.clone()))
+                // Some clients publish the icon only as process metadata.
+                // It uses the same XDG naming convention in practice and is
+                // a useful fallback for applications such as Firefox.
+                .or_else(|| record.process_binary.clone())
+                .or_else(|| client.and_then(|client| client.process_binary.clone()))
+                .or_else(|| {
+                    record
+                        .application_id
+                        .as_deref()
+                        .and_then(|application_id| application_id.rsplit(['.', '/']).next())
+                        .map(str::to_owned)
+                });
             let mut node = Node::new(
                 node_id,
                 &record.name,
@@ -454,6 +482,9 @@ impl PipewireDriver {
                 effect_instance_id: effect_instance_id.cloned(),
             };
             node = node.with_identity(identity);
+            if let Some(icon_name) = icon_name {
+                node = node.with_icon_name(icon_name);
+            }
             if let Some(serial) = record.serial {
                 node = node.with_serial(serial);
             }

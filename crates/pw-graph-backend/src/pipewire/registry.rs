@@ -34,11 +34,20 @@ pub(super) fn install_registry_listener(
                         ClientRecord {
                             application_id: props.get(APPLICATION_ID).map(str::to_owned),
                             application_name: props.get(APPLICATION_NAME).map(str::to_owned),
+                            icon_name: non_empty_property(props.get(APPLICATION_ICON_NAME)),
                             process_binary: props
                                 .get(APPLICATION_PROCESS_BINARY)
                                 .map(str::to_owned),
                             client_name: props.get(CLIENT_NAME).map(str::to_owned),
                             client_api: props.get(CLIENT_API).map(str::to_owned),
+                        },
+                    );
+                }
+                pw::types::ObjectType::Device => {
+                    state.devices.insert(
+                        global.id,
+                        DeviceRecord {
+                            icon_name: non_empty_property(props.get(DEVICE_ICON_NAME)),
                         },
                     );
                 }
@@ -61,12 +70,16 @@ pub(super) fn install_registry_listener(
                             description: props.get(NODE_DESCRIPTION).map(str::to_owned),
                             application_id: props.get(APPLICATION_ID).map(str::to_owned),
                             application_name: props.get(APPLICATION_NAME).map(str::to_owned),
+                            icon_name: non_empty_property(props.get(APPLICATION_ICON_NAME))
+                                .or_else(|| non_empty_property(props.get(DEVICE_ICON_NAME)))
+                                .or_else(|| non_empty_property(props.get(MEDIA_ICON_NAME))),
                             process_binary: props
                                 .get(APPLICATION_PROCESS_BINARY)
                                 .map(str::to_owned),
                             media_role: props.get(PROP_MEDIA_ROLE).map(str::to_owned),
                             media_name: props.get(MEDIA_NAME).map(str::to_owned),
                             client_id: props.get(CLIENT_ID).and_then(|value| value.parse().ok()),
+                            device_id: props.get(DEVICE_ID).and_then(|value| value.parse().ok()),
                             client_name: props.get(CLIENT_NAME).map(str::to_owned),
                             client_api: props.get(CLIENT_API).map(str::to_owned),
                             object_path: props.get(OBJECT_PATH).map(str::to_owned),
@@ -123,6 +136,7 @@ pub(super) fn install_registry_listener(
         .global_remove(move |id| {
             let mut state = state_for_removals.lock().unwrap();
             state.nodes.remove(&id);
+            state.devices.remove(&id);
             state.clients.remove(&id);
             state.ports.remove(&id);
             state.links.remove(&id);
@@ -245,10 +259,12 @@ pub(super) struct NodeRecord {
     pub(super) serial: Option<u64>,
     pub(super) application_id: Option<String>,
     pub(super) application_name: Option<String>,
+    pub(super) icon_name: Option<String>,
     pub(super) process_binary: Option<String>,
     pub(super) media_role: Option<String>,
     pub(super) media_name: Option<String>,
     pub(super) client_id: Option<u32>,
+    pub(super) device_id: Option<u32>,
     pub(super) client_name: Option<String>,
     pub(super) client_api: Option<String>,
     pub(super) object_path: Option<String>,
@@ -258,9 +274,15 @@ pub(super) struct NodeRecord {
 pub(super) struct ClientRecord {
     pub(super) application_id: Option<String>,
     pub(super) application_name: Option<String>,
+    pub(super) icon_name: Option<String>,
     pub(super) process_binary: Option<String>,
     pub(super) client_name: Option<String>,
     pub(super) client_api: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct DeviceRecord {
+    pub(super) icon_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -287,6 +309,7 @@ pub(super) struct DefaultDevice {
 #[derive(Clone, Debug, Default)]
 pub(super) struct RegistryState {
     pub(super) clients: BTreeMap<u32, ClientRecord>,
+    pub(super) devices: BTreeMap<u32, DeviceRecord>,
     pub(super) nodes: BTreeMap<u32, NodeRecord>,
     pub(super) ports: BTreeMap<u32, PortRecord>,
     pub(super) links: BTreeMap<u32, LinkRecord>,
@@ -349,4 +372,11 @@ pub(super) fn classify_port_type(media_type: &str, node_media_class: Option<&str
     } else {
         PortType::Unknown
     }
+}
+
+fn non_empty_property(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }

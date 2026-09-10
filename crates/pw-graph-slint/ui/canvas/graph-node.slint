@@ -37,14 +37,20 @@ export component GraphNode inherits Rectangle {
             x: 0px; y: 0px; width: 4px; height: parent.height;
             background: data.accent; border-radius: 4px;
         }
+        if data.has-icon: Image {
+            x: 9px; y: 9px; width: 20px; height: 20px;
+            source: data.icon;
+        }
         Text {
-            x: 12px; y: 3px; width: parent.width - 52px; height: 20px;
+            x: data.has-icon ? 34px : 12px;
+            y: 3px; width: parent.width - (data.has-icon ? 74px : 52px); height: 20px;
             text: data.node-title; color: #f5f8fa;
             font-size: 12px * data.font-scale * UiTheme.node-scale;
             vertical-alignment: center; overflow: elide;
         }
         Text {
-            x: 12px; y: 21px; width: parent.width - 52px; height: 21px;
+            x: data.has-icon ? 34px : 12px;
+            y: 21px; width: parent.width - (data.has-icon ? 74px : 52px); height: 21px;
             text: data.node-subtitle; color: #d4dde5;
             font-size: 8px * data.font-scale * UiTheme.node-scale;
             vertical-alignment: center; overflow: elide;

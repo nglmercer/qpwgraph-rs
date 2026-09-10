@@ -19,6 +19,7 @@ pub(crate) struct NodeView {
     pub(crate) node_id: NodeId,
     pub(crate) title: String,
     pub(crate) node_type: NodeType,
+    pub(crate) icon_name: Option<String>,
     pub(crate) position: [f32; 2],
     pub(crate) width: f32,
     pub(crate) height: f32,

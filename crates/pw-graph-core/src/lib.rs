@@ -419,6 +419,12 @@ pub struct Node {
     /// value by matching helpers.
     #[serde(default, skip_serializing_if = "NodeIdentity::is_empty")]
     pub identity: NodeIdentity,
+    /// Optional XDG icon name supplied by the backend. This is presentation
+    /// metadata rather than part of a node's durable routing identity, so the
+    /// UI may resolve it against the user's current icon theme without
+    /// changing selectors or patchbay files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_name: Option<String>,
     pub ports: Vec<PortId>,
     /// Canvas position in logical scene coordinates.
     pub position: [f32; 2],
@@ -434,6 +440,7 @@ impl Node {
             serial: None,
             effect_instance_id: None,
             identity: NodeIdentity::with_node_name(name),
+            icon_name: None,
             ports: Vec::new(),
             position: [0.0, 0.0],
         }
@@ -459,6 +466,13 @@ impl Node {
         if self.identity.node_name.is_empty() {
             self.identity.node_name = self.name.clone();
         }
+        self
+    }
+
+    /// Attach an optional backend-provided XDG icon name.
+    pub fn with_icon_name(mut self, icon_name: impl Into<String>) -> Self {
+        let icon_name = icon_name.into().trim().to_owned();
+        self.icon_name = (!icon_name.is_empty()).then_some(icon_name);
         self
     }
 
