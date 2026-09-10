@@ -6,7 +6,7 @@ use crate::source::ApplicationDriver;
 use pw_graph_config::{config_path, AppConfig};
 use pw_graph_core::{Direction, NodeId};
 use pw_graph_i18n::I18n;
-use pw_graph_patchbay::Patchbay;
+use pw_graph_patchbay::{Patchbay, ReconcileReport};
 #[cfg(not(feature = "relay"))]
 use slint::Image;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::app::{toast_visible, Application};
-use super::effects::{effect_options, effect_setup_rows, sync_effect_rows, sync_effect_setup_rows};
+use super::effects::{
+    effect_operation_rows, effect_options, effect_setup_rows, sync_effect_rows,
+    sync_effect_setup_rows,
+};
 use super::meters::meter_fallback;
 #[cfg(feature = "relay")]
 use super::relay::relay_qr_payload;
@@ -282,6 +285,20 @@ pub(crate) fn sync_models(
         window.set_effects(model);
     }
     if let Some(model) = set_window_model_if_changed(
+        window.get_pending_effects(),
+        effect_operation_rows(application),
+    ) {
+        window.set_pending_effects(model);
+    }
+    window.set_effect_debug_name(SharedString::from(application.effect_debug_name.clone()));
+    window.set_effect_debug_health(SharedString::from(application.effect_debug_health.clone()));
+    window.set_effect_debug_report(SharedString::from(application.effect_debug_report.clone()));
+    window.set_patchbay_debug_report(SharedString::from(
+        application.patchbay_debug_report.clone(),
+    ));
+    window.set_node_debug_name(SharedString::from(application.node_debug_name.clone()));
+    window.set_node_debug_report(SharedString::from(application.node_debug_report.clone()));
+    if let Some(model) = set_window_model_if_changed(
         window.get_effect_options(),
         effect_options(&application.source),
     ) {
@@ -321,9 +338,13 @@ pub(crate) fn sync_models(
     ) {
         window.set_effect_setup_parameters(model);
     }
-    if let Some(model) =
-        set_window_model_if_changed(window.get_rules(), rule_rows(&application.patchbay))
-    {
+    if let Some(model) = set_window_model_if_changed(
+        window.get_rules(),
+        rule_rows(
+            &application.patchbay,
+            application.patchbay_reconciler.last_report(),
+        ),
+    ) {
         window.set_rules(model);
     }
     let (undo_history, redo_history) = application.history();
@@ -714,7 +735,7 @@ fn link_row(link: &LinkView) -> LinkRow {
     }
 }
 
-pub(crate) fn rule_rows(patchbay: &Patchbay) -> Vec<RuleRow> {
+pub(crate) fn rule_rows(patchbay: &Patchbay, report: &ReconcileReport) -> Vec<RuleRow> {
     patchbay
         .connections
         .iter()
@@ -728,6 +749,14 @@ pub(crate) fn rule_rows(patchbay: &Patchbay) -> Vec<RuleRow> {
             input_node: SharedString::from(rule.input_node.clone()),
             input_port: SharedString::from(rule.input_name.clone()),
             pinned: rule.pinned,
+            status: SharedString::from(
+                report
+                    .rules
+                    .iter()
+                    .find(|status| status.rule_index == index)
+                    .map(|status| status.status.label())
+                    .unwrap_or("Saved"),
+            ),
         })
         .collect()
 }

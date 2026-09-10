@@ -325,6 +325,10 @@ impl ApplicationDriver {
         EffectDriver::effect_instances(self)
     }
 
+    pub(crate) fn effect_diagnostics(&self, instance_id: &str) -> Result<Option<String>, String> {
+        EffectDriver::effect_diagnostics(self, instance_id).map_err(|error| error.to_string())
+    }
+
     pub(crate) fn supports_effect_nodes(&self) -> bool {
         EffectDriver::supports_effect_nodes(self)
     }
@@ -832,6 +836,16 @@ impl EffectDriver for ApplicationDriver {
         match &self.backend {
             BackendKind::Demo(driver) => driver.effect_instances(),
             BackendKind::Live(driver) => driver.effect_instances(),
+        }
+    }
+
+    fn effect_diagnostics(
+        &self,
+        instance_id: &str,
+    ) -> pw_graph_backend::BackendResult<Option<String>> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.effect_diagnostics(instance_id),
+            BackendKind::Live(driver) => driver.effect_diagnostics(instance_id),
         }
     }
 

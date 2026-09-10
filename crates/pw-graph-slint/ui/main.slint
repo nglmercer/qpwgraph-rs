@@ -16,18 +16,22 @@ import {
     UiI18n,
 } from "parity-components.slint";
 import { RailActionButton } from "components/navigation-rail.slint";
-import { RailTooltip, ConnectionToast } from "components/toast.slint";
+import { RailTooltip, AppToast } from "components/toast.slint";
+import { BackgroundOperations } from "components/background-operations.slint";
 import { ActionButton } from "components/button.slint";
 import { HistoryDialog } from "dialogs/history-dialog.slint";
 import { EffectsDialog } from "dialogs/effects-dialog.slint";
+import { EffectDiagnosticsDialog } from "dialogs/effect-diagnostics-dialog.slint";
+import { PatchbayDiagnosticsDialog } from "dialogs/patchbay-diagnostics-dialog.slint";
+import { NodeDiagnosticsDialog } from "dialogs/node-diagnostics-dialog.slint";
 import { QrDialog } from "dialogs/qr-dialog.slint";
 import { RelayPanel } from "panels/relay-panel.slint";
 import { NodeAppearancePanel } from "panels/node-appearance-panel.slint";
 import { DialogShell } from "components/dialog-shell.slint";
 import { ActionButton } from "components/button.slint";
-import { EffectParameterRow, EffectRow, RelayRow, HistoryRow } from "foundation/structs.slint";
+import { EffectParameterRow, EffectOperationRow, EffectRow, RelayRow, HistoryRow } from "foundation/structs.slint";
 
-export { HitResult, LinkRow, MinimapNode, NodeRow, PortRow, UiI18n, UiTheme, EffectParameterRow, EffectRow, RelayRow, HistoryRow }
+export { HitResult, LinkRow, MinimapNode, NodeRow, PortRow, UiI18n, UiTheme, EffectParameterRow, EffectOperationRow, EffectRow, RelayRow, HistoryRow }
 
 export component MainWindow inherits Window {
     title: UiI18n.localized("app.title");
@@ -46,6 +50,7 @@ export component MainWindow inherits Window {
     in property <[HistoryRow]> undo-history: [];
     in property <[HistoryRow]> redo-history: [];
     in property <[EffectRow]> effects: [];
+    in property <[EffectOperationRow]> pending-effects: [];
     in property <[string]> effect-options: [];
     in property <bool> effects-available: false;
     in property <[RelayRow]> relay-rows: [];
@@ -89,7 +94,16 @@ export component MainWindow inherits Window {
     in-out property <bool> show-history: false;
     in-out property <bool> show-shortcuts: false;
     in-out property <bool> show-effects: false;
+    in-out property <bool> show-effect-diagnostics: false;
+    in property <string> effect-debug-name: "";
+    in property <string> effect-debug-health: "";
+    in property <string> effect-debug-report: "";
+    in property <string> patchbay-debug-report: "";
     in-out property <bool> show-node-editor: false;
+    in-out property <bool> show-node-diagnostics: false;
+    in-out property <bool> show-patchbay-diagnostics: false;
+    in property <string> node-debug-name: "";
+    in property <string> node-debug-report: "";
     in-out property <bool> show-relay: false;
     in-out property <bool> show-qr: false;
     // --- Keyboard policy -------------------------------------------------
@@ -102,7 +116,8 @@ export component MainWindow inherits Window {
     // not a modal, so the canvas keymap survives it and only its own text
     // fields suppress typing shortcuts.
     out property <bool> modal-open: root.show-preferences || root.show-history
-        || root.show-shortcuts || root.show-effects || root.show-node-editor
+        || root.show-shortcuts || root.show-effects || root.show-effect-diagnostics || root.show-node-editor
+        || root.show-node-diagnostics || root.show-patchbay-diagnostics
         || root.show-qr || root.relay-pending-active;
     // Text editing always wins: a typed 'r', 'a' or digit belongs to the field.
     out property <bool> text-editing: TextInputInterface.text-input-focused;
@@ -132,6 +147,10 @@ export component MainWindow inherits Window {
     callback effect-toggle(string);
     callback effect-remove(string);
     callback effect-inspect(string);
+    callback effect-debug(string);
+    callback effect-debug-close();
+    callback effect-debug-copy();
+    callback effect-cancel(int);
     callback effect-parameter-changed(string, string, float);
     callback effect-draft-parameter-changed(string, float);
     callback effect-draft-enabled-changed(bool);
@@ -597,10 +616,41 @@ export component MainWindow inherits Window {
                 effect-toggle(instance-id) => { root.effect-toggle(instance-id); }
                 effect-remove(instance-id) => { root.effect-remove(instance-id); }
                 effect-inspect(instance-id) => { root.effect-inspect(instance-id); }
+                effect-debug(instance-id) => { root.effect-debug(instance-id); }
                 effect-parameter-changed(instance-id, parameter-id, value) => { root.effect-parameter-changed(instance-id, parameter-id, value); }
                 effect-draft-parameter-changed(parameter-id, value) => { root.effect-draft-parameter-changed(parameter-id, value); }
                 effect-draft-enabled-changed(enabled) => { root.effect-draft-enabled-changed(enabled); }
                 close => { root.action("effects"); }
+            }
+
+            if root.show-effect-diagnostics: EffectDiagnosticsDialog {
+                z: 200;
+                x: max(24px, (parent.width - 760px) / 2); y: max(28px, (parent.height - 560px) / 2);
+                width: min(760px, parent.width - 48px); height: min(560px, parent.height - 56px);
+                effect-name: root.effect-debug-name;
+                health: root.effect-debug-health;
+                report: root.effect-debug-report;
+                close => { root.effect-debug-close(); }
+                copy-diagnostics => { root.effect-debug-copy(); }
+            }
+
+            if root.show-patchbay-diagnostics: PatchbayDiagnosticsDialog {
+                z: 220;
+                x: max(24px, (parent.width - 760px) / 2); y: max(28px, (parent.height - 560px) / 2);
+                width: min(760px, parent.width - 48px); height: min(560px, parent.height - 56px);
+                report: root.patchbay-debug-report;
+                close => { root.action("patchbay-debug-close"); }
+                copy-diagnostics => { root.action("patchbay-debug-copy"); }
+            }
+
+            if root.show-node-diagnostics: NodeDiagnosticsDialog {
+                z: 210;
+                x: max(24px, (parent.width - 760px) / 2); y: max(28px, (parent.height - 560px) / 2);
+                width: min(760px, parent.width - 48px); height: min(560px, parent.height - 56px);
+                node-name: root.node-debug-name;
+                report: root.node-debug-report;
+                close => { root.action("node-identity-debug-close"); }
+                copy-diagnostics => { root.action("node-identity-debug-copy"); }
             }
 
             if root.show-qr: QrDialog {
@@ -658,7 +708,14 @@ export component MainWindow inherits Window {
             }
         }
 
-        ConnectionToast {
+        BackgroundOperations {
+            x: root.width - 378px;
+            y: 16px;
+            operations: root.pending-effects;
+            cancel(ticket) => { root.effect-cancel(ticket); }
+        }
+
+        AppToast {
             x: root.rail-width + 18px;
             y: max(16px, root.height - 68px);
             width: min(520px, root.width - root.rail-width - 36px);

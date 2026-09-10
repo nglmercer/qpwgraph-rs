@@ -5,7 +5,7 @@ import { Tooltip } from "tooltip.slint";
 // Single visual implementation lives in tooltip.slint; keep rail name as alias.
 export component RailTooltip inherits Tooltip { }
 
-export component ConnectionToast inherits Rectangle {
+export component AppToast inherits Rectangle {
     in property <string> message;
     in property <bool> shown: false;
     in property <bool> error: false;
@@ -29,3 +29,6 @@ export component ConnectionToast inherits Rectangle {
         overflow: elide;
     }
 }
+
+// Compatibility name retained for older UI imports and downstream skins.
+export component ConnectionToast inherits AppToast { }

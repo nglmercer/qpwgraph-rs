@@ -1,5 +1,5 @@
 use super::*;
-use pw_graph_core::{LinkId, Node, Port};
+use pw_graph_core::{LinkId, Node, NodeIdentity, Port};
 
 fn graph() -> Graph {
     let mut graph = Graph::default();
@@ -216,6 +216,85 @@ fn local_positions_are_explicitly_written_to_config() {
     assert_eq!(
         config.node_positions_by_name.get("PipeWire:Source"),
         Some(&[99.0, 101.0])
+    );
+}
+
+#[test]
+fn recreated_application_node_restores_v2_layout_after_a_rename() {
+    let old =
+        Node::new(NodeId(10), "Browser playback", NodeType::PipeWire).with_identity(NodeIdentity {
+            application_id: Some("org.example.browser".into()),
+            node_name: "Browser playback".into(),
+            media_role: Some("music".into()),
+            ..NodeIdentity::default()
+        });
+    let mut config = AppConfig::default();
+    config
+        .node_positions_by_name
+        .insert(node_layout_key(&old), [321.0, 123.0]);
+
+    let current =
+        Node::new(NodeId(300), "Browser stream", NodeType::PipeWire).with_identity(NodeIdentity {
+            application_id: Some("org.example.browser".into()),
+            node_name: "Browser stream".into(),
+            media_role: Some("music".into()),
+            ..NodeIdentity::default()
+        });
+    let mut graph = Graph::default();
+    graph.add_node(current).unwrap();
+    let mut state = UiGraphState::from_config(&config);
+    assert_eq!(
+        state.snapshot(&graph, &config).nodes[0].position,
+        [321.0, 123.0]
+    );
+}
+
+#[test]
+fn indistinguishable_application_layout_keys_do_not_exchange_positions() {
+    let identity = NodeIdentity {
+        application_id: Some("org.example.browser".into()),
+        media_role: Some("music".into()),
+        ..NodeIdentity::default()
+    };
+    let first =
+        Node::new(NodeId(1), "Browser stream", NodeType::PipeWire).with_identity(NodeIdentity {
+            node_name: "Browser stream".into(),
+            ..identity.clone()
+        });
+    let second =
+        Node::new(NodeId(2), "Browser stream", NodeType::PipeWire).with_identity(NodeIdentity {
+            node_name: "Browser stream".into(),
+            ..identity
+        });
+    let key = node_layout_key(&first);
+    let mut config = AppConfig::default();
+    config.node_positions_by_name.insert(key, [321.0, 123.0]);
+    let mut graph = Graph::default();
+    graph.add_node(first).unwrap();
+    graph.add_node(second).unwrap();
+    let mut state = UiGraphState::from_config(&config);
+    let positions: Vec<_> = state
+        .snapshot(&graph, &config)
+        .nodes
+        .iter()
+        .map(|node| node.position)
+        .collect();
+    assert!(positions.iter().all(|position| *position != [321.0, 123.0]));
+}
+
+#[test]
+fn legacy_layout_key_is_used_as_a_unique_migration_fallback() {
+    let current = Node::new(NodeId(300), "Legacy application", NodeType::PipeWire);
+    let mut config = AppConfig::default();
+    config
+        .node_positions_by_name
+        .insert(node_layout_legacy_key(&current), [77.0, 88.0]);
+    let mut graph = Graph::default();
+    graph.add_node(current).unwrap();
+    let mut state = UiGraphState::from_config(&config);
+    assert_eq!(
+        state.snapshot(&graph, &config).nodes[0].position,
+        [77.0, 88.0]
     );
 }
 

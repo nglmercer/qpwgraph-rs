@@ -25,22 +25,12 @@ impl Patchbay {
             .map_err(PatchbayError::XmlWrite)?;
         for connection in &self.connections {
             let output_node_type = connection.effective_output_node_type();
-            let input_node_type = connection.effective_input_node_type();
             let mut item = BytesStart::new("item");
-            // `node-type` is the native qpwgraph field and can only describe
-            // its broad PipeWire/ALSA family. Preserve it for interoperability
-            // and add our optional endpoint fields only when that shared type
-            // would lose information about an Effect endpoint.
+            // Keep the native qpwgraph fields only. Rich endpoint identity and
+            // endpoint-specific node types live in the deterministic sidecar;
+            // unknown XML attributes would make interoperability depend on the
+            // particular qpwgraph version reading this file.
             item.push_attribute(("node-type", node_type_text(output_node_type)));
-            if !matches!(output_node_type, NodeType::PipeWire | NodeType::AlsaMidi) {
-                item.push_attribute((
-                    "output-node-type",
-                    endpoint_node_type_text(output_node_type),
-                ));
-            }
-            if input_node_type != output_node_type {
-                item.push_attribute(("input-node-type", endpoint_node_type_text(input_node_type)));
-            }
             item.push_attribute((
                 "port-type",
                 port_type_text(output_node_type, connection.port_type),
@@ -196,18 +186,6 @@ fn node_type_from_text(value: Option<&String>) -> NodeType {
         Some("windows-midi") => NodeType::WindowsMidi,
         Some("unknown") => NodeType::Unknown,
         _ => NodeType::Unknown,
-    }
-}
-
-fn endpoint_node_type_text(node_type: NodeType) -> &'static str {
-    match node_type {
-        NodeType::PipeWire => "pipewire",
-        NodeType::Effect => "effect",
-        NodeType::AlsaMidi => "alsa",
-        NodeType::WindowsAudioEndpoint => "windows-audio-endpoint",
-        NodeType::WindowsAudioSession => "windows-audio-session",
-        NodeType::WindowsMidi => "windows-midi",
-        NodeType::Unknown => "unknown",
     }
 }
 

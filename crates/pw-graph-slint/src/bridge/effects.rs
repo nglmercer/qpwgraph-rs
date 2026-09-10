@@ -1,6 +1,6 @@
 use crate::source::ApplicationDriver;
 use pw_graph_backend::{
-    EffectCreateRequest, EffectEvent, EffectInstance, EffectTarget, GraphDriver,
+    EffectCreateRequest, EffectEvent, EffectInstance, EffectLoadStage, EffectTarget, GraphDriver,
 };
 use pw_graph_config::PersistedEffect;
 use pw_graph_effects::{ChannelPolicy, EffectDescriptor, EffectParameter};
@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use super::app::Application;
-use super::{EffectParameterRow, EffectRow, MainWindow};
+use super::app::{set_app_feedback, Application, PendingEffectUi};
+use super::{EffectOperationRow, EffectParameterRow, EffectRow, MainWindow};
 
 pub(crate) use super::effects_restore::{restore_inserted_effects, restore_standalone_effects};
 
@@ -98,7 +98,17 @@ pub(crate) fn create_effect(window: &MainWindow, application: &mut Application) 
     match result {
         Ok(ticket) => {
             let name = descriptor.name.clone();
-            application.pending_effect_tickets.insert(ticket);
+            application.pending_effect_tickets.insert(
+                ticket,
+                PendingEffectUi {
+                    ticket,
+                    effect_id: descriptor.id.clone(),
+                    effect_name: name.clone(),
+                    stage: EffectLoadStage::Queued,
+                    started_at: Instant::now(),
+                    cancellable: true,
+                },
+            );
             finish_effect_setup(window, application);
             application.status = format!("{name}: loading (ticket {})", ticket.0);
         }
@@ -116,7 +126,11 @@ pub(crate) fn poll_effect_events(application: &mut Application) -> bool {
     let events = match application.source.poll_effect_events() {
         Ok(events) => events,
         Err(error) => {
-            application.status = application.tf("status.effect_create_failed", &[("error", error)]);
+            set_app_feedback(
+                application,
+                application.tf("status.effect_create_failed", &[("error", error)]),
+                true,
+            );
             return true;
         }
     };
@@ -134,6 +148,9 @@ pub(crate) fn poll_effect_events(application: &mut Application) -> bool {
         }
         match event {
             EffectEvent::Loading { ticket, stage } => {
+                if let Some(operation) = application.pending_effect_tickets.get_mut(&ticket) {
+                    operation.stage = stage;
+                }
                 application.status = format!("Effect ticket {}: {stage:?}", ticket.0);
             }
             EffectEvent::Ready { ticket, instance } => {
@@ -147,22 +164,38 @@ pub(crate) fn poll_effect_events(application: &mut Application) -> bool {
                 match application.source.refresh() {
                     Ok(()) => application.last_refresh = Instant::now(),
                     Err(error) => {
-                        application.status = application.tf(
-                            "status.effect_refresh_failed",
-                            &[("error", error.to_string())],
+                        set_app_feedback(
+                            application,
+                            application.tf(
+                                "status.effect_refresh_failed",
+                                &[("error", error.to_string())],
+                            ),
+                            true,
                         );
                         continue;
                     }
                 }
                 application.sync_patchbay_connections();
                 application.autosave_patchbay();
-                application.status = format!("{name}: ready (ticket {})", ticket.0);
+                set_app_feedback(
+                    application,
+                    format!("✓ {name} is ready (ticket {})", ticket.0),
+                    false,
+                );
             }
             EffectEvent::Failed { ticket, error } => {
-                application.status = format!("Effect ticket {} failed: {error}", ticket.0);
+                set_app_feedback(
+                    application,
+                    format!("✕ Effect ticket {} failed: {error}", ticket.0),
+                    true,
+                );
             }
             EffectEvent::Cancelled { ticket } => {
-                application.status = format!("Effect ticket {} cancelled", ticket.0);
+                set_app_feedback(
+                    application,
+                    format!("Effect ticket {} cancelled", ticket.0),
+                    false,
+                );
             }
         }
     }
@@ -304,6 +337,52 @@ pub(crate) fn remove_effect(application: &mut Application, instance_id: &str) {
     }
 }
 
+pub(crate) fn open_effect_diagnostics(
+    window: &MainWindow,
+    application: &mut Application,
+    instance_id: Option<&str>,
+) {
+    let instance = match instance_id {
+        Some(instance_id) => application
+            .source
+            .effect_instances()
+            .into_iter()
+            .find(|instance| instance.config.instance_id == instance_id),
+        None => application.source.effect_instances().into_iter().next(),
+    };
+    let Some(instance) = instance else {
+        application.status = application.t("status.no_effect_instance");
+        return;
+    };
+    let descriptor = application
+        .source
+        .effect_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.id == instance.config.effect_id);
+    let name = descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.name.as_str())
+        .unwrap_or(instance.config.effect_id.as_str());
+    match application
+        .source
+        .effect_diagnostics(&instance.config.instance_id)
+    {
+        Ok(Some(report)) => {
+            application.effect_debug_name = name.to_owned();
+            application.effect_debug_health = instance.health.label().to_owned();
+            application.effect_debug_report = report;
+            window.set_show_effect_diagnostics(true);
+        }
+        Ok(None) => {
+            application.status = application.t("status.effect_details_unavailable");
+        }
+        Err(error) => {
+            application.status =
+                application.tf("status.effect_details_failed", &[("error", error)]);
+        }
+    }
+}
+
 pub(crate) fn inspect_effect(application: &mut Application, instance_id: Option<&str>) {
     let instance = match instance_id {
         Some(instance_id) => application
@@ -345,6 +424,40 @@ pub(crate) fn inspect_effect(application: &mut Application, instance_id: Option<
             ("parameters", parameters),
         ],
     );
+}
+
+pub(crate) fn close_effect_diagnostics(window: &MainWindow, application: &mut Application) {
+    window.set_show_effect_diagnostics(false);
+    application.effect_debug_report.clear();
+}
+
+pub(crate) fn copy_effect_diagnostics(application: &mut Application) {
+    if application.effect_debug_report.is_empty() {
+        application.status = application.t("status.effect_details_unavailable");
+    } else {
+        application.status = application.t("status.effect_diagnostics_copied");
+    }
+}
+
+pub(crate) fn effect_operation_rows(application: &Application) -> Vec<EffectOperationRow> {
+    application
+        .pending_effect_tickets
+        .values()
+        .map(|operation| EffectOperationRow {
+            ticket: operation.ticket.0.min(i32::MAX as u64) as i32,
+            name: SharedString::from(if operation.effect_name.is_empty() {
+                operation.effect_id.clone()
+            } else {
+                operation.effect_name.clone()
+            }),
+            stage: SharedString::from(format!(
+                "{:?} · {}s",
+                operation.stage,
+                operation.started_at.elapsed().as_secs()
+            )),
+            cancellable: operation.cancellable,
+        })
+        .collect()
 }
 
 fn persist_effect(application: &mut Application, instance: EffectInstance) {
@@ -691,9 +804,15 @@ pub(crate) fn prepare_effect_draft(window: &MainWindow, application: &mut Applic
     window.set_effect_configuring(true);
 }
 
-pub(crate) fn cancel_effect_setup(window: &MainWindow, application: &mut Application) {
-    cancel_pending_effects(application);
+pub(crate) fn discard_effect_draft(window: &MainWindow, application: &mut Application) {
     finish_effect_setup(window, application);
+}
+
+/// Compatibility name for callers that used the old setup-only operation.
+/// It now discards only the unsubmitted draft; submitted tickets are owned by
+/// the background lifecycle until explicit cancellation or shutdown.
+pub(crate) fn cancel_effect_setup(window: &MainWindow, application: &mut Application) {
+    discard_effect_draft(window, application);
 }
 
 /// Close the setup form after a successful queue operation. This must not
@@ -711,12 +830,39 @@ fn finish_effect_setup(window: &MainWindow, application: &mut Application) {
 /// background. A race with a terminal event is harmless; the backend reports
 /// that ticket as completed and the next pump removes it from this set.
 pub(crate) fn cancel_pending_effects(application: &mut Application) {
-    let tickets = std::mem::take(&mut application.pending_effect_tickets);
+    let tickets: Vec<_> = application
+        .pending_effect_tickets
+        .values()
+        .filter(|operation| operation.cancellable)
+        .map(|operation| operation.ticket)
+        .collect();
     for ticket in tickets {
+        if let Some(operation) = application.pending_effect_tickets.get_mut(&ticket) {
+            operation.cancellable = false;
+        }
         if let Err(error) = application.source.cancel_effect(ticket) {
             application.status =
                 format!("Effect ticket {} could not be cancelled: {error}", ticket.0);
         }
+    }
+}
+
+pub(crate) fn cancel_effect_ticket(application: &mut Application, ticket: u64) {
+    let ticket = pw_graph_backend::EffectTicket(ticket);
+    let Some(operation) = application.pending_effect_tickets.get(&ticket) else {
+        return;
+    };
+    if !operation.cancellable {
+        return;
+    }
+    let effect_name = operation.effect_name.clone();
+    if let Err(error) = application.source.cancel_effect(ticket) {
+        application.status = format!("Effect ticket {} could not be cancelled: {error}", ticket.0);
+    } else {
+        if let Some(operation) = application.pending_effect_tickets.get_mut(&ticket) {
+            operation.cancellable = false;
+        }
+        application.status = format!("{effect_name}: cancelling");
     }
 }
 

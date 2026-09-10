@@ -273,6 +273,120 @@ pub enum PortType {
     Unknown,
 }
 
+/// Durable and session-scoped metadata used to identify a node without
+/// treating a PipeWire global object id as an application identity.
+///
+/// application_id is the preferred cross-restart identity. The remaining
+/// application/process fields are useful fallbacks and diagnostics. serial
+/// is deliberately only a current-session hint: PipeWire assigns it when the
+/// object is created, so it must never be the only durable selector.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_binary: Option<String>,
+    #[serde(default)]
+    pub node_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_api: Option<String>,
+    /// Current PipeWire client global id. It is intentionally diagnostic-only
+    /// and is never serialized into a durable selector.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub client_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_serial: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_instance_id: Option<String>,
+}
+
+impl NodeIdentity {
+    pub fn with_node_name(node_name: impl Into<String>) -> Self {
+        Self {
+            node_name: node_name.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn has_application_identity(&self) -> bool {
+        self.application_id.is_some()
+            || self.process_binary.is_some()
+            || self.application_name.is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.application_id.is_none()
+            && self.application_name.is_none()
+            && self.process_binary.is_none()
+            && self.node_name.is_empty()
+            && self.description.is_none()
+            && self.media_role.is_none()
+            && self.media_name.is_none()
+            && self.client_name.is_none()
+            && self.client_api.is_none()
+            && self.client_id.is_none()
+            && self.object_path.is_none()
+            && self.object_serial.is_none()
+            && self.effect_instance_id.is_none()
+    }
+}
+
+/// Persistence semantics for a selector. Instance matching is specific to a
+/// stream when the graph exposes enough metadata; application matching is
+/// intentionally broader and may be used for deterministic fan-out.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointMatchMode {
+    #[default]
+    Instance,
+    Application,
+    NamePattern,
+}
+
+/// A typed endpoint selector suitable for patchbay/config persistence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EndpointSelector {
+    pub node_type: NodeType,
+    pub identity: NodeIdentity,
+    pub port_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub direction: Direction,
+    pub port_type: PortType,
+    #[serde(default)]
+    pub match_mode: EndpointMatchMode,
+}
+
+/// A resolver result that fails closed when equally good candidates exist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EndpointResolution {
+    Exact(PortId),
+    UniqueFallback(PortId),
+    Ambiguous(Vec<PortId>),
+    Missing,
+}
+
+impl EndpointResolution {
+    pub fn port_id(&self) -> Option<PortId> {
+        match self {
+            Self::Exact(id) | Self::UniqueFallback(id) => Some(*id),
+            Self::Ambiguous(_) | Self::Missing => None,
+        }
+    }
+}
+
 impl PortType {
     pub fn color_hex(self) -> &'static str {
         match self {
@@ -300,6 +414,11 @@ pub struct Node {
     /// intentionally not used for effect persistence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_instance_id: Option<String>,
+    /// Rich endpoint identity. The legacy serial/effect fields above remain
+    /// readable for older graph/config snapshots and are mirrored into this
+    /// value by matching helpers.
+    #[serde(default, skip_serializing_if = "NodeIdentity::is_empty")]
+    pub identity: NodeIdentity,
     pub ports: Vec<PortId>,
     /// Canvas position in logical scene coordinates.
     pub position: [f32; 2],
@@ -307,12 +426,14 @@ pub struct Node {
 
 impl Node {
     pub fn new(id: NodeId, name: impl Into<String>, node_type: NodeType) -> Self {
+        let name = name.into();
         Self {
             id,
-            name: name.into(),
+            name: name.clone(),
             node_type,
             serial: None,
             effect_instance_id: None,
+            identity: NodeIdentity::with_node_name(name),
             ports: Vec::new(),
             position: [0.0, 0.0],
         }
@@ -320,12 +441,41 @@ impl Node {
 
     pub fn with_serial(mut self, serial: u64) -> Self {
         self.serial = Some(serial);
+        self.identity.object_serial = Some(serial);
         self
     }
 
     pub fn with_effect_instance(mut self, instance_id: impl Into<String>) -> Self {
-        self.effect_instance_id = Some(instance_id.into());
+        let instance_id = instance_id.into();
+        self.effect_instance_id = Some(instance_id.clone());
+        self.identity.effect_instance_id = Some(instance_id);
         self
+    }
+
+    pub fn with_identity(mut self, identity: NodeIdentity) -> Self {
+        self.serial = identity.object_serial;
+        self.effect_instance_id = identity.effect_instance_id.clone();
+        self.identity = identity;
+        if self.identity.node_name.is_empty() {
+            self.identity.node_name = self.name.clone();
+        }
+        self
+    }
+
+    /// Return the current node identity while preserving compatibility with
+    /// graph values deserialized before the identity field was introduced.
+    pub fn matching_identity(&self) -> NodeIdentity {
+        let mut identity = self.identity.clone();
+        if identity.node_name.is_empty() {
+            identity.node_name = self.name.clone();
+        }
+        if identity.object_serial.is_none() {
+            identity.object_serial = self.serial;
+        }
+        if identity.effect_instance_id.is_none() {
+            identity.effect_instance_id = self.effect_instance_id.clone();
+        }
+        identity
     }
 }
 
@@ -358,6 +508,29 @@ pub struct PortKey {
     pub channel: Option<String>,
     pub direction: Direction,
     pub port_type: PortType,
+    /// Rich selector metadata. None means this is a legacy name/serial key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<NodeIdentity>,
+    #[serde(default)]
+    pub match_mode: EndpointMatchMode,
+}
+
+impl PortKey {
+    pub fn selector(&self) -> EndpointSelector {
+        EndpointSelector {
+            node_type: self.node_type,
+            identity: self.identity.clone().unwrap_or_else(|| NodeIdentity {
+                node_name: self.node_name.clone(),
+                object_serial: self.node_serial,
+                ..NodeIdentity::default()
+            }),
+            port_name: self.port_name.clone(),
+            channel: self.channel.clone(),
+            direction: self.direction,
+            port_type: self.port_type,
+            match_mode: self.match_mode,
+        }
+    }
 }
 
 impl Port {
@@ -478,6 +651,8 @@ impl Graph {
             channel: port.channel.clone(),
             direction: port.direction,
             port_type: port.port_type,
+            identity: Some(node.matching_identity()),
+            match_mode: EndpointMatchMode::Instance,
         })
     }
 
@@ -488,58 +663,124 @@ impl Graph {
         // A patchbay saved before the relay ports were role-prefixed names
         // them `FL`/`FR`; accept that one rewrite so those files keep
         // reconnecting. See [`legacy_relay_port_name`] for its scope.
-        let legacy_relay_port =
-            legacy_relay_port_name(&key.node_name, &key.port_name, key.direction);
-        self.ports
+        self.resolve_endpoint(&key.selector()).port_id()
+    }
+
+    /// Resolve a stable key while retaining an ambiguity explanation for
+    /// patchbay and diagnostic callers.
+    pub fn resolve_port_key_result(&self, key: &PortKey) -> EndpointResolution {
+        self.resolve_endpoint(&key.selector())
+    }
+
+    /// Explain the current selector result for a support/debug report. The
+    /// resolver itself stays typed and compact; this control-plane helper
+    /// turns the selected identity tier into a human-readable reason without
+    /// exposing a numeric PipeWire id as if it were durable identity.
+    pub fn endpoint_resolution_explanation(&self, selector: &EndpointSelector) -> String {
+        let basis = endpoint_identity_basis(selector);
+        match self.resolve_endpoint(selector) {
+            EndpointResolution::Exact(id) => format!("matched port {id} via {basis}"),
+            EndpointResolution::UniqueFallback(id) => {
+                format!("matched port {id} via fallback {basis}")
+            }
+            EndpointResolution::Ambiguous(ids) => {
+                format!("ambiguous ({}) via {basis}: {ids:?}", ids.len())
+            }
+            EndpointResolution::Missing => format!("missing via {basis}"),
+        }
+    }
+
+    /// Resolve a typed selector against the current registry snapshot.
+    ///
+    /// Scores express identity confidence, not a preference for a numeric
+    /// object id. Equal best scores are returned as Ambiguous so a recreated
+    /// application stream cannot be connected to the wrong same-named node.
+    pub fn resolve_endpoint(&self, selector: &EndpointSelector) -> EndpointResolution {
+        let mut candidates: Vec<(u16, PortId)> = self
+            .ports
             .values()
             .filter(|port| {
-                port.name == key.port_name
-                    || legacy_relay_port.is_some_and(|name| port.name == name)
+                let exact_name = port.name == selector.port_name
+                    || legacy_relay_port_name(
+                        &selector.identity.node_name,
+                        &selector.port_name,
+                        selector.direction,
+                    )
+                    .is_some_and(|name| port.name == name);
+                // A selector with application identity can describe a stream
+                // channel rather than a particular PipeWire port spelling.
+                // This lets a recreated browser/Electron stream resolve when
+                // its port name changes, while the channel and direction
+                // filters below still prevent a left/right swap. A
+                // name-pattern selector remains port-name specific.
+                let has_application_identity = selector.identity.application_id.is_some()
+                    || selector.identity.process_binary.is_some()
+                    || selector.identity.application_name.is_some();
+                let application_channel =
+                    !matches!(selector.match_mode, EndpointMatchMode::NamePattern)
+                        && has_application_identity
+                        && selector.channel.is_some()
+                        && selector.channel.as_ref() == port.channel.as_ref();
+                exact_name || application_channel
             })
-            .filter(|port| port.direction == key.direction)
+            .filter(|port| port.direction == selector.direction)
             .filter(|port| {
-                port.port_type == key.port_type
+                port.port_type == selector.port_type
                     || port.port_type == PortType::Unknown
-                    || key.port_type == PortType::Unknown
+                    || selector.port_type == PortType::Unknown
             })
             .filter_map(|port| {
                 let node = self.node(port.node_id)?;
-                if node.node_type != key.node_type {
+                if selector.node_type != NodeType::Unknown && node.node_type != selector.node_type {
                     return None;
                 }
-                // The legacy relay rewrite is accepted only on the relay node
-                // the key actually names, never on some other node that
-                // happens to carry a matching serial.
-                if port.name != key.port_name && node.name != key.node_name {
-                    return None;
-                }
-                let serial_matches = matches!((key.node_serial, node.serial),
-                    (Some(expected), Some(actual)) if expected == actual);
-                // A stable backend identity is authoritative when both sides
-                // provide it. Display names are still required for legacy or
-                // name-only keys, but a renamed Windows endpoint/session must
-                // remain resolvable by its native identity.
-                if !serial_matches && node.name != key.node_name {
+                let has_application_identity = selector.identity.application_id.is_some()
+                    || selector.identity.process_binary.is_some()
+                    || selector.identity.application_name.is_some();
+                let application_channel =
+                    !matches!(selector.match_mode, EndpointMatchMode::NamePattern)
+                        && has_application_identity
+                        && selector.channel.is_some()
+                        && selector.channel.as_ref() == port.channel.as_ref();
+                // The compatibility relay rewrite must remain tied to the
+                // relay node named by the saved selector.
+                if port.name != selector.port_name
+                    && node.name != selector.identity.node_name
+                    && node.matching_identity().node_name != selector.identity.node_name
+                    && !application_channel
+                {
                     return None;
                 }
                 if let (Some(expected), Some(actual)) =
-                    (key.channel.as_ref(), port.channel.as_ref())
+                    (selector.channel.as_ref(), port.channel.as_ref())
                 {
                     if expected != actual {
                         return None;
                     }
                 }
-                let serial_score = match (key.node_serial, node.serial) {
-                    (Some(expected), Some(actual)) if expected == actual => 200,
-                    (Some(_), Some(_)) => 0,
-                    (None, None) => 20,
-                    (None, Some(_)) => 10,
-                    (Some(_), None) => 5,
-                };
-                Some((serial_score, port.id))
+                let score = endpoint_match_score(node, selector)?;
+                Some((score, port.id))
             })
-            .max_by_key(|(score, id)| (*score, *id))
-            .map(|(_, id)| id)
+            .collect();
+
+        if candidates.is_empty() {
+            return EndpointResolution::Missing;
+        }
+        candidates.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        let best_score = candidates[0].0;
+        let best: Vec<_> = candidates
+            .iter()
+            .take_while(|(score, _)| *score == best_score)
+            .map(|(_, id)| *id)
+            .collect();
+        if best.len() > 1 {
+            return EndpointResolution::Ambiguous(best);
+        }
+        if best_score >= 800 {
+            EndpointResolution::Exact(best[0])
+        } else {
+            EndpointResolution::UniqueFallback(best[0])
+        }
     }
 
     pub fn find_link_by_keys(&self, output: &PortKey, input: &PortKey) -> Option<Link> {
@@ -792,6 +1033,111 @@ impl Graph {
     }
 }
 
+fn endpoint_match_score(node: &Node, selector: &EndpointSelector) -> Option<u16> {
+    let actual = node.matching_identity();
+    let expected = &selector.identity;
+
+    if let Some(effect_instance_id) = expected.effect_instance_id.as_ref() {
+        return (actual.effect_instance_id.as_ref() == Some(effect_instance_id)).then_some(1_000);
+    }
+
+    if let Some(application_id) = expected.application_id.as_ref() {
+        if actual.application_id.as_ref() != Some(application_id) {
+            return None;
+        }
+        let mut score = 800;
+        if matches!(selector.match_mode, EndpointMatchMode::Instance) {
+            if !expected.node_name.is_empty() && actual.node_name == expected.node_name {
+                score += 70;
+            }
+            if expected.media_role.is_some() && expected.media_role == actual.media_role {
+                score += 20;
+            }
+            // object.serial is only a same-session refinement after a
+            // durable application identity matched; it is never sufficient
+            // on its own.
+            if expected.object_serial.is_some() && expected.object_serial == actual.object_serial {
+                score += 10;
+            }
+        }
+        return Some(score);
+    }
+
+    let has_process_fallback =
+        expected.process_binary.is_some() || expected.application_name.is_some();
+    if has_process_fallback {
+        if expected.process_binary.is_some() && expected.process_binary != actual.process_binary {
+            return None;
+        }
+        if expected.application_name.is_some()
+            && expected.application_name != actual.application_name
+        {
+            return None;
+        }
+        let mut score = 620;
+        if expected.media_role.is_some() && expected.media_role == actual.media_role {
+            score += 30;
+        }
+        if matches!(selector.match_mode, EndpointMatchMode::Instance)
+            && !expected.node_name.is_empty()
+            && actual.node_name == expected.node_name
+        {
+            score += 30;
+        }
+        return Some(score);
+    }
+
+    // A PipeWire object.serial is intentionally not accepted as a
+    // cross-restart application identity. It remains a useful current-session
+    // hint for legacy Windows/native endpoint keys, and only after the node
+    // type/name still agrees for PipeWire.
+    if expected.object_serial.is_some()
+        && expected.object_serial == actual.object_serial
+        && (selector.node_type != NodeType::PipeWire
+            || expected.node_name.is_empty()
+            || expected.node_name == actual.node_name
+            || expected.node_name == node.name)
+    {
+        return Some(600);
+    }
+
+    if expected.node_name.is_empty() {
+        return Some(100);
+    }
+    let name_matches = match selector.match_mode {
+        EndpointMatchMode::NamePattern => {
+            let pattern = expected
+                .node_name
+                .strip_suffix('*')
+                .unwrap_or(&expected.node_name);
+            node.name.starts_with(pattern) || actual.node_name.starts_with(pattern)
+        }
+        EndpointMatchMode::Instance | EndpointMatchMode::Application => {
+            node.name == expected.node_name || actual.node_name == expected.node_name
+        }
+    };
+    name_matches.then_some(450)
+}
+
+fn endpoint_identity_basis(selector: &EndpointSelector) -> &'static str {
+    let identity = &selector.identity;
+    if identity.effect_instance_id.is_some() {
+        "effect instance id"
+    } else if identity.application_id.is_some() {
+        "application.id"
+    } else if identity.process_binary.is_some() || identity.application_name.is_some() {
+        "process binary/application name"
+    } else if identity.object_serial.is_some() {
+        "object.serial session hint"
+    } else if matches!(selector.match_mode, EndpointMatchMode::NamePattern) {
+        "name pattern"
+    } else if identity.node_name.is_empty() {
+        "unqualified selector"
+    } else {
+        "legacy node name + port name"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1249,295 @@ mod tests {
         assert_eq!(graph.resolve_port_key(&key), Some(port_id));
     }
 
+    fn application_graph(
+        node_id: u64,
+        port_id: u64,
+        node_name: &str,
+        application_id: &str,
+        serial: u64,
+        port_name: &str,
+        channel: Option<&str>,
+    ) -> Graph {
+        let mut graph = Graph::default();
+        graph
+            .add_node(
+                Node::new(NodeId(node_id), node_name, NodeType::PipeWire).with_identity(
+                    NodeIdentity {
+                        application_id: Some(application_id.into()),
+                        application_name: Some("Test application".into()),
+                        process_binary: Some("test-app".into()),
+                        node_name: node_name.into(),
+                        media_role: Some("music".into()),
+                        object_serial: Some(serial),
+                        ..NodeIdentity::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let port = Port::new(
+            PortId(port_id),
+            NodeId(node_id),
+            port_name,
+            Direction::Source,
+            PortType::Audio,
+        );
+        graph
+            .add_port(channel.map_or(port.clone(), |channel| port.with_channel(channel)))
+            .unwrap();
+        graph
+    }
+
+    #[test]
+    fn application_selector_survives_global_id_churn() {
+        let old = application_graph(
+            10,
+            20,
+            "Discord",
+            "com.example.discord",
+            100,
+            "output",
+            None,
+        );
+        let key = old.port_key(PortId(20)).unwrap();
+        let current = application_graph(
+            145,
+            227,
+            "Discord",
+            "com.example.discord",
+            800,
+            "output",
+            None,
+        );
+
+        assert_eq!(
+            current.resolve_port_key_result(&key),
+            EndpointResolution::Exact(PortId(227))
+        );
+    }
+
+    #[test]
+    fn application_identity_survives_serial_churn_and_node_rename() {
+        let old = application_graph(
+            10,
+            20,
+            "Discord playback",
+            "com.example.discord",
+            100,
+            "output",
+            None,
+        );
+        let key = old.port_key(PortId(20)).unwrap();
+        let current = application_graph(
+            300,
+            455,
+            "Discord stream",
+            "com.example.discord",
+            801,
+            "output",
+            None,
+        );
+
+        assert_eq!(
+            current.resolve_port_key_result(&key),
+            EndpointResolution::Exact(PortId(455))
+        );
+    }
+
+    #[test]
+    fn process_identity_can_follow_a_renamed_port_when_application_id_is_absent() {
+        let mut old = application_graph(
+            10,
+            20,
+            "Discord playback",
+            "org.example.discord",
+            100,
+            "old-output",
+            Some("FL"),
+        );
+        old.nodes
+            .get_mut(&NodeId(10))
+            .expect("old node exists")
+            .identity
+            .application_id = None;
+        let key = old.port_key(PortId(20)).unwrap();
+
+        let mut current = application_graph(
+            300,
+            455,
+            "Discord recreated",
+            "org.example.discord",
+            801,
+            "new-output",
+            Some("FL"),
+        );
+        current
+            .nodes
+            .get_mut(&NodeId(300))
+            .expect("current node exists")
+            .identity
+            .application_id = None;
+
+        assert_eq!(
+            current.resolve_port_key_result(&key),
+            EndpointResolution::UniqueFallback(PortId(455))
+        );
+    }
+
+    #[test]
+    fn same_named_applications_do_not_cross_match() {
+        let mut graph = Graph::default();
+        for (node_id, port_id, application_id) in [(1, 10, "app.one"), (2, 20, "app.two")] {
+            let node = Node::new(NodeId(node_id), "Same name", NodeType::PipeWire).with_identity(
+                NodeIdentity {
+                    application_id: Some(application_id.into()),
+                    node_name: "Same name".into(),
+                    ..NodeIdentity::default()
+                },
+            );
+            graph.add_node(node).unwrap();
+            graph
+                .add_port(Port::new(
+                    PortId(port_id),
+                    NodeId(node_id),
+                    "output",
+                    Direction::Source,
+                    PortType::Audio,
+                ))
+                .unwrap();
+        }
+        let key = graph.port_key(PortId(10)).unwrap();
+
+        assert_eq!(graph.resolve_port_key(&key), Some(PortId(10)));
+    }
+
+    #[test]
+    fn duplicate_same_application_streams_are_ambiguous() {
+        let mut graph = Graph::default();
+        for (node_id, port_id, serial) in [(1, 10, 1), (2, 20, 2)] {
+            let node = Node::new(NodeId(node_id), "Browser stream", NodeType::PipeWire)
+                .with_identity(NodeIdentity {
+                    application_id: Some("org.example.browser".into()),
+                    node_name: "Browser stream".into(),
+                    media_role: Some("music".into()),
+                    object_serial: Some(serial),
+                    ..NodeIdentity::default()
+                });
+            graph.add_node(node).unwrap();
+            graph
+                .add_port(Port::new(
+                    PortId(port_id),
+                    NodeId(node_id),
+                    "output",
+                    Direction::Source,
+                    PortType::Audio,
+                ))
+                .unwrap();
+        }
+        let mut selector = EndpointSelector {
+            node_type: NodeType::PipeWire,
+            identity: NodeIdentity {
+                application_id: Some("org.example.browser".into()),
+                node_name: "Browser stream".into(),
+                media_role: Some("music".into()),
+                ..NodeIdentity::default()
+            },
+            port_name: "output".into(),
+            channel: None,
+            direction: Direction::Source,
+            port_type: PortType::Audio,
+            match_mode: EndpointMatchMode::Instance,
+        };
+
+        assert_eq!(
+            graph.resolve_endpoint(&selector),
+            EndpointResolution::Ambiguous(vec![PortId(10), PortId(20)])
+        );
+
+        selector.match_mode = EndpointMatchMode::Application;
+        assert_eq!(
+            graph.resolve_endpoint(&selector),
+            EndpointResolution::Ambiguous(vec![PortId(10), PortId(20)])
+        );
+    }
+
+    #[test]
+    fn stereo_channel_selector_cannot_reverse_left_and_right() {
+        let mut graph = application_graph(
+            1,
+            10,
+            "Stereo app",
+            "org.example.stereo",
+            1,
+            "output",
+            Some("FL"),
+        );
+        graph
+            .add_port(
+                Port::new(
+                    PortId(11),
+                    NodeId(1),
+                    "output",
+                    Direction::Source,
+                    PortType::Audio,
+                )
+                .with_channel("FR"),
+            )
+            .unwrap();
+        let left = graph.port_key(PortId(10)).unwrap();
+        assert_eq!(graph.resolve_port_key(&left), Some(PortId(10)));
+    }
+
+    #[test]
+    fn application_mode_can_follow_a_changed_port_name_by_channel() {
+        let old = application_graph(
+            10,
+            20,
+            "Browser",
+            "org.example.browser",
+            100,
+            "old-output",
+            Some("FL"),
+        );
+        let old_key = old.port_key(PortId(20)).unwrap();
+        let mut selector = old_key.selector();
+        selector.match_mode = EndpointMatchMode::Application;
+        let current = application_graph(
+            300,
+            455,
+            "Browser recreated",
+            "org.example.browser",
+            800,
+            "new-output",
+            Some("FL"),
+        );
+
+        assert_eq!(
+            current.resolve_endpoint(&selector),
+            EndpointResolution::Exact(PortId(455))
+        );
+    }
+
+    #[test]
+    fn legacy_name_key_still_resolves_without_numeric_identity() {
+        let graph = application_graph(10, 20, "Legacy source", "", 0, "output", None);
+        let key = PortKey {
+            node_name: "Legacy source".into(),
+            node_serial: None,
+            node_type: NodeType::PipeWire,
+            port_name: "output".into(),
+            channel: None,
+            direction: Direction::Source,
+            port_type: PortType::Audio,
+            identity: None,
+            match_mode: EndpointMatchMode::Instance,
+        };
+
+        assert_eq!(
+            graph.resolve_port_key_result(&key),
+            EndpointResolution::UniqueFallback(PortId(20))
+        );
+    }
+
     /// Build a graph holding both relay virtual nodes with their current
     /// role-prefixed ports, plus an unrelated device that also has `FL`/`FR`.
     fn relay_graph() -> (Graph, Vec<(PortId, &'static str)>) {
@@ -961,6 +1596,8 @@ mod tests {
             channel: Some(port_name.into()),
             direction,
             port_type: PortType::Audio,
+            identity: None,
+            match_mode: EndpointMatchMode::Instance,
         }
     }
 

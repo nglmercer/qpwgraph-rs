@@ -123,6 +123,7 @@ export component PreferencesDialog inherits Rectangle {
                 SwitchSettingRow { x: 0px; y: 55px; width: parent.width; icon: @image-url("../../../../assets/icons/auto_disconnect.svg"); title: UiI18n.localized("inspector.auto_disconnect"); help: UiI18n.localized("help.auto_disconnect"); checked <=> root.patchbay-auto-disconnect; }
                 SwitchSettingRow { x: 0px; y: 110px; width: parent.width; icon: @image-url("../../../../assets/icons/pin.svg"); title: UiI18n.localized("inspector.auto_pin"); help: UiI18n.localized("help.auto_pin"); checked <=> root.patchbay-auto-pin; }
                 SwitchSettingRow { x: 0px; y: 165px; width: parent.width; icon: @image-url("../../../../assets/icons/timer.svg"); title: UiI18n.localized("inspector.patchbay_activated"); help: UiI18n.localized("help.patchbay_activated"); checked <=> root.patchbay-activated; }
+                DialogButton { x: parent.width - 171px; y: 220px; width: 167px; text: UiI18n.localized("inspector.patchbay_debug"); clicked => { root.action("patchbay-debug"); } }
             }
             SettingsSection {
                 title: UiI18n.localized("patchbay.file_options"); section-height: max(230px, 223px + root.recent-patchbay-paths.length * 28px);

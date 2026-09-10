@@ -33,12 +33,13 @@ pub use denoise::{denoise_offline, DenoiseState};
 pub use features::DenoiseFeatures;
 #[cfg(feature = "hush")]
 pub use hush::{
-    denoise_hush_buffer, HushDenoiser, HushError, HushModel, HUSH_ALGORITHMIC_LATENCY_SAMPLES,
-    HUSH_FRAME_SIZE, HUSH_LATENCY_SAMPLES, HUSH_SAMPLE_RATE, HUSH_SYNTHESIS_DELAY_SAMPLES,
+    denoise_hush_buffer, HushDenoiser, HushError, HushMaskMode, HushModel, HushMultiDenoiser,
+    HUSH_ALGORITHMIC_LATENCY_SAMPLES, HUSH_FRAME_SIZE, HUSH_LATENCY_SAMPLES, HUSH_SAMPLE_RATE,
+    HUSH_SYNTHESIS_DELAY_SAMPLES,
 };
 pub use multi::{ChannelLink, MultiDenoiser};
 pub use params::DenoiseParams;
-pub use resample::Resampler;
+pub use resample::{FixedPolyphaseResampler, Resampler};
 pub use rnn::{Activation, DenseLayer, GruLayer, RnnModel};
 pub use simd::Isa;
 

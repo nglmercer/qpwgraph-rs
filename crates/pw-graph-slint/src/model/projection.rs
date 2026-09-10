@@ -107,17 +107,32 @@ pub(super) fn configured_positions(
 ) -> BTreeMap<NodeId, [f32; 2]> {
     let defaults = graph.default_node_positions();
     let mut key_counts = BTreeMap::<String, usize>::new();
+    let mut legacy_key_counts = BTreeMap::<String, usize>::new();
     for node in graph.nodes.values() {
         *key_counts.entry(node_layout_key(node)).or_default() += 1;
+        *legacy_key_counts
+            .entry(node_layout_legacy_key(node))
+            .or_default() += 1;
     }
     graph
         .nodes
         .values()
         .map(|node| {
             let key = node_layout_key(node);
+            let legacy_key = node_layout_legacy_key(node);
             let by_id = config.node_positions.get(&node.id.0.to_string()).copied();
             let by_name = (key_counts.get(&key) == Some(&1))
-                .then(|| config.node_positions_by_name.get(&key).copied())
+                .then(|| {
+                    config
+                        .node_positions_by_name
+                        .get(&key)
+                        .copied()
+                        .or_else(|| {
+                            (legacy_key_counts.get(&legacy_key) == Some(&1))
+                                .then(|| config.node_positions_by_name.get(&legacy_key).copied())
+                                .flatten()
+                        })
+                })
                 .flatten();
             (
                 node.id,
@@ -135,14 +150,19 @@ pub(super) fn configured_appearances(
     config: &AppConfig,
 ) -> BTreeMap<NodeId, NodeAppearance> {
     let mut key_counts = BTreeMap::<String, usize>::new();
+    let mut legacy_key_counts = BTreeMap::<String, usize>::new();
     for node in graph.nodes.values() {
         *key_counts.entry(node_layout_key(node)).or_default() += 1;
+        *legacy_key_counts
+            .entry(node_layout_legacy_key(node))
+            .or_default() += 1;
     }
     graph
         .nodes
         .values()
         .filter_map(|node| {
             let key = node_layout_key(node);
+            let legacy_key = node_layout_legacy_key(node);
             (key_counts.get(&key) == Some(&1)).then(|| {
                 (
                     node.id,
@@ -150,6 +170,11 @@ pub(super) fn configured_appearances(
                         .node_view_by_name
                         .get(&key)
                         .cloned()
+                        .or_else(|| {
+                            (legacy_key_counts.get(&legacy_key) == Some(&1))
+                                .then(|| config.node_view_by_name.get(&legacy_key).cloned())
+                                .flatten()
+                        })
                         .unwrap_or_default(),
                 )
             })

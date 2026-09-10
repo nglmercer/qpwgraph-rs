@@ -5,6 +5,7 @@
 //! which is why it does not sit in the constructor with the window wiring.
 
 use super::*;
+use pw_graph_patchbay::PatchbayReconciler;
 #[cfg(feature = "relay")]
 use std::collections::BTreeSet;
 
@@ -26,6 +27,7 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
     source.configure_windows_app_routing(config.windows.experimental_app_routing);
     restore_node_positions(&mut source, &config);
     let patchbay_file = selected_patchbay_path(&config);
+    let patchbay_activated = config.patchbay_activated;
     let patchbay = Patchbay::load_from(&patchbay_file)
         .unwrap_or_else(|_| Patchbay::new(patchbay_file.display().to_string()));
     restore_standalone_effects(&mut source, &config, &mut status, &i18n);
@@ -77,6 +79,9 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         source,
         commands: pw_graph_command::CommandStack::new(),
         patchbay,
+        patchbay_reconciler: PatchbayReconciler::new(),
+        patchbay_graph_generation: 0,
+        manually_suppressed_patchbay: Vec::new(),
         patchbay_file,
         config: config.clone(),
         config_file,
@@ -94,7 +99,13 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         effect_selection_id: None,
         effect_draft_enabled: true,
         effect_draft_parameters: BTreeMap::new(),
-        pending_effect_tickets: BTreeSet::new(),
+        pending_effect_tickets: BTreeMap::new(),
+        effect_debug_name: String::new(),
+        effect_debug_health: String::new(),
+        effect_debug_report: String::new(),
+        patchbay_debug_report: String::new(),
+        node_debug_name: String::new(),
+        node_debug_report: String::new(),
         debug: args.debug,
         last_refresh: Instant::now(),
         last_full_sync: Instant::now(),
@@ -131,5 +142,10 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         relay_route_preferences_applied: false,
     }));
 
+    if patchbay_activated {
+        app.borrow_mut()
+            .patchbay_reconciler
+            .schedule_now(Instant::now());
+    }
     (app, meter_policy)
 }

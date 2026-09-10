@@ -113,6 +113,7 @@ pub type BackendResult<T> = Result<T, BackendError>;
 /// mutate the graph, which keeps insertion transactional until the processor
 /// is ready.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum EffectTarget {
     Standalone {
         position: [f32; 2],
@@ -242,6 +243,12 @@ pub trait EffectDriver {
 
     fn effect_instances(&self) -> Vec<EffectInstance> {
         Vec::new()
+    }
+
+    /// Build a full provider report on demand. Normal effect snapshots must
+    /// remain cheap enough for routine UI synchronization.
+    fn effect_diagnostics(&self, _instance_id: &str) -> BackendResult<Option<String>> {
+        Ok(None)
     }
 
     /// Whether the backend can create a processing node. Exposing an effect

@@ -82,6 +82,15 @@ impl DemoDriver {
         }
     }
 
+    /// Replace the deterministic graph used by integration tests. A real
+    /// backend gets this event from its registry; tests use it to model a
+    /// destroy/recreate cycle without exposing the driver's private state.
+    pub fn replace_graph(&mut self, graph: Graph) {
+        self.next_link_id = graph.links.keys().map(|id| id.0).max().unwrap_or(0) + 1;
+        self.graph = graph;
+        self.observed_links.clear();
+    }
+
     pub fn demo() -> Self {
         let mut graph = Graph::default();
         let nodes = [

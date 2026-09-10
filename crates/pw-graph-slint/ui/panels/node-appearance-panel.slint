@@ -32,6 +32,7 @@ export component NodeAppearancePanel inherits DialogShell {
     }
     ActionButton { x: 20px; y: 176px; width: 135px; text: UiI18n.localized("inspector.reset_name"); clicked => { root.action("node-appearance-reset-name"); } }
     ActionButton { x: 164px; y: 176px; width: 135px; text: UiI18n.localized("inspector.reset_color"); clicked => { root.action("node-appearance-reset-color"); } }
+    ActionButton { x: 20px; y: 208px; width: 135px; text: UiI18n.localized("inspector.debug_identity"); clicked => { root.action("node-identity-debug"); } }
     ActionButton { x: parent.width - 190px; y: 236px; width: 78px; text: UiI18n.localized("shortcuts.close"); clicked => { root.action("node-appearance-close"); } }
     ActionButton { x: parent.width - 104px; y: 236px; width: 84px; text: UiI18n.localized("inspector.save"); clicked => { root.action("node-appearance-save"); } }
 }

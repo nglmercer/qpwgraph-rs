@@ -14,7 +14,10 @@ pub(crate) use crate::hush_overload::{
     HUSH_REALTIME_FACTOR_LIMIT, HUSH_RECOVERY_LEAD_MS, HUSH_SCHEDULING_MS,
 };
 pub(crate) use crate::hush_queue::{read_timeline, AudioBlock, BlockQueue, HUSH_QUEUE_CAPACITY};
-use nnnoiseless::{HushDenoiser, HushModel, Resampler, HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE};
+use nnnoiseless::{
+    FixedPolyphaseResampler, HushDenoiser, HushMaskMode, HushModel, HushMultiDenoiser, Resampler,
+    HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE,
+};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -711,18 +714,117 @@ fn hush_worker_reaper() -> Option<&'static SyncSender<JoinHandle<()>>> {
         .as_ref()
 }
 
+enum HushEngine {
+    Mono(Vec<HushDenoiser>),
+    Multi(Box<HushMultiDenoiser>),
+}
+
+/// Host/Hush conversion selected once during worker preparation. Exact 48 ↔
+/// 16 kHz streams use the fixed polyphase converter; all other rates retain
+/// the generic streaming Kaiser converter.
+enum HushResampler {
+    Generic(Resampler),
+    Fixed(FixedPolyphaseResampler),
+}
+
+impl HushResampler {
+    fn new(in_rate: f64, out_rate: f64, channels: usize) -> Self {
+        if let Some(resampler) = FixedPolyphaseResampler::new(in_rate, out_rate, channels) {
+            Self::Fixed(resampler)
+        } else {
+            Self::Generic(Resampler::new(in_rate, out_rate, channels))
+        }
+    }
+
+    fn reserve(&mut self, additional_frames: usize) {
+        match self {
+            Self::Generic(resampler) => resampler.reserve(additional_frames),
+            Self::Fixed(resampler) => resampler.reserve(additional_frames),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Generic(resampler) => resampler.reset(),
+            Self::Fixed(resampler) => resampler.reset(),
+        }
+    }
+
+    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        match self {
+            Self::Generic(resampler) => resampler.process(input, output),
+            Self::Fixed(resampler) => resampler.process(input, output),
+        }
+    }
+}
+
+impl HushEngine {
+    fn mono(model: &HushModel, channels: usize, attenuation_db: f32) -> Result<Self, String> {
+        let denoisers = (0..channels)
+            .map(|_| {
+                model
+                    .denoiser_with_attenuation_db(attenuation_db)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::Mono(denoisers))
+    }
+
+    fn multi(model: &HushModel, attenuation_db: f32) -> Result<Self, String> {
+        model
+            .multi_denoiser_with_attenuation_db(2, attenuation_db, HushMaskMode::Independent)
+            .map(|denoiser| Self::Multi(Box::new(denoiser)))
+            .map_err(|error| error.to_string())
+    }
+
+    fn reset_for_mask(
+        &mut self,
+        model: &HushModel,
+        channels: usize,
+        attenuation_db: f32,
+        mask: u16,
+    ) -> Result<(), String> {
+        let wants_multi = channels == 2 && mask == channel_mask_for_count(channels);
+        if wants_multi {
+            if !matches!(self, Self::Multi(_)) {
+                *self = Self::multi(model, attenuation_db)?;
+            }
+            if let Self::Multi(denoiser) = self {
+                denoiser.reset().map_err(|error| error.to_string())?;
+            }
+        } else {
+            if !matches!(self, Self::Mono(_)) {
+                *self = Self::mono(model, channels, attenuation_db)?;
+            }
+            if let Self::Mono(denoisers) = self {
+                for denoiser in denoisers {
+                    denoiser.reset().map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct HushWorker {
-    denoisers: Vec<HushDenoiser>,
-    input_resamplers: Vec<Resampler>,
-    output_resamplers: Vec<Resampler>,
+    model: Arc<HushModel>,
+    engine: HushEngine,
+    input_resamplers: Vec<HushResampler>,
+    output_resamplers: Vec<HushResampler>,
+    input_multichannel_resampler: Option<HushResampler>,
+    output_multichannel_resampler: Option<HushResampler>,
     input_pending: Vec<Vec<f32>>,
     output_pending: Vec<Vec<f32>>,
     output_offsets: Vec<usize>,
     input_mono: Vec<f32>,
     at_model_rate: Vec<f32>,
+    at_model_rate_interleaved: Vec<f32>,
     frame_input: Vec<f32>,
     frame_output: Vec<f32>,
+    multi_frame_input: Vec<f32>,
+    multi_frame_output: Vec<f32>,
     at_host_rate: Vec<f32>,
+    at_host_rate_interleaved: Vec<f32>,
 
     channels: usize,
     sample_rate: u32,
@@ -754,12 +856,20 @@ impl HushWorker {
         };
         let channels = channels as usize;
         let max_frames = max_frames as usize;
-        let mut denoisers = Vec::with_capacity(channels);
         let mut input_resamplers = Vec::with_capacity(channels);
         let mut output_resamplers = Vec::with_capacity(channels);
         let mut input_pending = Vec::with_capacity(channels);
         let mut output_pending = Vec::with_capacity(channels);
         let mut output_offsets = Vec::with_capacity(channels);
+
+        // A full stereo stream can use one DfTract runtime with independent
+        // channel masks. Partial routing still uses independent mono sessions
+        // so disconnected channels do not consume inference time.
+        let engine = if channels == 2 {
+            HushEngine::multi(&model, attenuation_db)?
+        } else {
+            HushEngine::mono(&model, channels, attenuation_db)?
+        };
 
         let converted_capacity = (max_frames as f64 * HUSH_SAMPLE_RATE as f64 / sample_rate as f64)
             .ceil() as usize
@@ -767,17 +877,28 @@ impl HushWorker {
         let output_capacity = (max_frames as f64 * sample_rate as f64 / HUSH_SAMPLE_RATE as f64)
             .ceil() as usize
             + HUSH_FRAME_SIZE * 2;
+        let input_multichannel_resampler = if channels == 2 {
+            let mut resampler =
+                HushResampler::new(sample_rate as f64, HUSH_SAMPLE_RATE as f64, channels);
+            resampler.reserve(max_frames + HUSH_FRAME_SIZE);
+            Some(resampler)
+        } else {
+            None
+        };
+        let output_multichannel_resampler = if channels == 2 {
+            let mut resampler =
+                HushResampler::new(HUSH_SAMPLE_RATE as f64, sample_rate as f64, channels);
+            resampler.reserve(output_capacity + HUSH_FRAME_SIZE);
+            Some(resampler)
+        } else {
+            None
+        };
         for _ in 0..channels {
-            denoisers.push(
-                model
-                    .denoiser_with_attenuation_db(attenuation_db)
-                    .map_err(|error| error.to_string())?,
-            );
             let mut input_resampler =
-                Resampler::new(sample_rate as f64, HUSH_SAMPLE_RATE as f64, 1);
+                HushResampler::new(sample_rate as f64, HUSH_SAMPLE_RATE as f64, 1);
             input_resampler.reserve(max_frames + HUSH_FRAME_SIZE);
             let mut output_resampler =
-                Resampler::new(HUSH_SAMPLE_RATE as f64, sample_rate as f64, 1);
+                HushResampler::new(HUSH_SAMPLE_RATE as f64, sample_rate as f64, 1);
             output_resampler.reserve(converted_capacity + HUSH_FRAME_SIZE);
             input_resamplers.push(input_resampler);
             output_resamplers.push(output_resampler);
@@ -788,17 +909,28 @@ impl HushWorker {
             output_offsets.push(0);
         }
         Ok(Self {
-            denoisers,
+            model,
+            engine,
             input_resamplers,
             output_resamplers,
+            input_multichannel_resampler,
+            output_multichannel_resampler,
             input_pending,
             output_pending,
             output_offsets,
             input_mono: vec![0.0; max_frames],
             at_model_rate: Vec::with_capacity(converted_capacity + HUSH_FRAME_SIZE),
+            at_model_rate_interleaved: Vec::with_capacity(
+                (converted_capacity + HUSH_FRAME_SIZE) * channels,
+            ),
             frame_input: vec![0.0; HUSH_FRAME_SIZE],
             frame_output: vec![0.0; HUSH_FRAME_SIZE],
+            multi_frame_input: vec![0.0; HUSH_FRAME_SIZE * channels],
+            multi_frame_output: vec![0.0; HUSH_FRAME_SIZE * channels],
             at_host_rate: Vec::with_capacity(output_capacity + HUSH_FRAME_SIZE),
+            at_host_rate_interleaved: Vec::with_capacity(
+                (output_capacity + HUSH_FRAME_SIZE) * channels,
+            ),
 
             channels,
             sample_rate,
@@ -846,15 +978,20 @@ impl HushWorker {
                 thread::yield_now();
             }
         }
+        self.engine
+            .reset_for_mask(&self.model, self.channels, self.attenuation_db, mask)?;
         for channel in 0..self.channels {
-            self.denoisers[channel]
-                .reset()
-                .map_err(|error| error.to_string())?;
             self.input_resamplers[channel].reset();
             self.output_resamplers[channel].reset();
             self.input_pending[channel].clear();
             self.output_pending[channel].clear();
             self.output_offsets[channel] = 0;
+        }
+        if let Some(resampler) = self.input_multichannel_resampler.as_mut() {
+            resampler.reset();
+        }
+        if let Some(resampler) = self.output_multichannel_resampler.as_mut() {
+            resampler.reset();
         }
         Ok(())
     }
@@ -946,40 +1083,84 @@ impl HushWorker {
                 .no_audio_input_blocks
                 .fetch_add(1, Ordering::Relaxed);
         }
-        for channel in 0..self.channels {
-            if !channel_is_connected(block.channel_mask, channel) {
-                self.input_pending[channel].clear();
-                self.output_pending[channel].clear();
-                self.output_offsets[channel] = 0;
-                self.input_resamplers[channel].reset();
-                self.output_resamplers[channel].reset();
-
-                continue;
-            }
+        let use_multichannel = self.channels == 2 && block.channel_mask == valid_mask;
+        if use_multichannel {
             let input_started = Instant::now();
-            for frame in 0..frames {
-                self.input_mono[frame] = block.samples[frame * self.channels + channel];
-            }
-            self.at_model_rate.clear();
-            self.input_resamplers[channel]
-                .process(&self.input_mono[..frames], &mut self.at_model_rate);
-            self.input_pending[channel].extend_from_slice(&self.at_model_rate);
+            self.at_model_rate_interleaved.clear();
+            let Some(resampler) = self.input_multichannel_resampler.as_mut() else {
+                return Err(
+                    "Hush stereo resampler was not configured for multichannel input".into(),
+                );
+            };
+            resampler.process(
+                &block.samples[..frames * self.channels],
+                &mut self.at_model_rate_interleaved,
+            );
             input_resample_ns = input_resample_ns
                 .saturating_add(input_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-            while self.input_pending[channel].len() >= HUSH_FRAME_SIZE {
-                self.frame_input
-                    .copy_from_slice(&self.input_pending[channel][..HUSH_FRAME_SIZE]);
-                let pending_len = self.input_pending[channel].len();
-                self.input_pending[channel].copy_within(HUSH_FRAME_SIZE.., 0);
-                self.input_pending[channel].truncate(pending_len - HUSH_FRAME_SIZE);
-                self.frame_output.fill(0.0);
+            for frame in self.at_model_rate_interleaved.chunks_exact(self.channels) {
+                for (channel, sample) in frame.iter().enumerate() {
+                    self.input_pending[channel].push(*sample);
+                }
+            }
+        } else {
+            for channel in 0..self.channels {
+                if !channel_is_connected(block.channel_mask, channel) {
+                    self.input_pending[channel].clear();
+                    self.output_pending[channel].clear();
+                    self.output_offsets[channel] = 0;
+                    self.input_resamplers[channel].reset();
+                    self.output_resamplers[channel].reset();
+
+                    continue;
+                }
+                let input_started = Instant::now();
+                for frame in 0..frames {
+                    self.input_mono[frame] = block.samples[frame * self.channels + channel];
+                }
+                self.at_model_rate.clear();
+                self.input_resamplers[channel]
+                    .process(&self.input_mono[..frames], &mut self.at_model_rate);
+                self.input_pending[channel].extend_from_slice(&self.at_model_rate);
+                input_resample_ns =
+                    input_resample_ns.saturating_add(
+                        input_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+            }
+        }
+
+        if use_multichannel {
+            while self
+                .input_pending
+                .iter()
+                .take(self.channels)
+                .map(Vec::len)
+                .min()
+                .unwrap_or(0)
+                >= HUSH_FRAME_SIZE
+            {
+                for channel in 0..self.channels {
+                    let start = channel * HUSH_FRAME_SIZE;
+                    let end = start + HUSH_FRAME_SIZE;
+                    self.multi_frame_input[start..end]
+                        .copy_from_slice(&self.input_pending[channel][..HUSH_FRAME_SIZE]);
+                    let pending_len = self.input_pending[channel].len();
+                    self.input_pending[channel].copy_within(HUSH_FRAME_SIZE.., 0);
+                    self.input_pending[channel].truncate(pending_len - HUSH_FRAME_SIZE);
+                }
+                self.multi_frame_output.fill(0.0);
                 let hush_started = Instant::now();
                 #[cfg(test)]
                 thread::sleep(Duration::from_millis(
                     diagnostics.frame_delay_ms.load(Ordering::Relaxed),
                 ));
+                let HushEngine::Multi(denoiser) = &mut self.engine else {
+                    return Err(
+                        "Hush stereo engine was not configured for multichannel input".into(),
+                    );
+                };
                 if let Err(error) =
-                    self.denoisers[channel].process_frame(&mut self.frame_output, &self.frame_input)
+                    denoiser.process_frame(&mut self.multi_frame_output, &self.multi_frame_input)
                 {
                     diagnostics
                         .inference_errors_total
@@ -999,14 +1180,19 @@ impl HushWorker {
                     .fetch_add(1, Ordering::Relaxed);
                 diagnostics
                     .hush_channel_frames_processed
-                    .fetch_add(HUSH_FRAME_SIZE as u64, Ordering::Relaxed);
-                if self.frame_output.iter().any(|sample| !sample.is_finite()) {
+                    .fetch_add((HUSH_FRAME_SIZE * self.channels) as u64, Ordering::Relaxed);
+                if self
+                    .multi_frame_output
+                    .iter()
+                    .any(|sample| !sample.is_finite())
+                {
                     diagnostics
                         .inference_errors_total
                         .fetch_add(1, Ordering::Relaxed);
                     return Err("Hush produced a non-finite frame".into());
                 }
-                for (&input, &output) in self.frame_input.iter().zip(&self.frame_output) {
+                for (&input, &output) in self.multi_frame_input.iter().zip(&self.multi_frame_output)
+                {
                     let input = f64::from(input);
                     let output = f64::from(output);
                     input_energy += input * input;
@@ -1017,17 +1203,105 @@ impl HushWorker {
                     output_peak = output_peak.max(output.abs());
                 }
                 inference_calls = inference_calls.saturating_add(1);
-                metric_samples = metric_samples.saturating_add(HUSH_FRAME_SIZE as u64);
+                metric_samples =
+                    metric_samples.saturating_add((HUSH_FRAME_SIZE * self.channels) as u64);
                 let output_started = Instant::now();
-                self.at_host_rate.clear();
-                self.output_resamplers[channel].process(&self.frame_output, &mut self.at_host_rate);
+                self.at_host_rate_interleaved.clear();
+                let Some(resampler) = self.output_multichannel_resampler.as_mut() else {
+                    return Err(
+                        "Hush stereo resampler was not configured for multichannel output".into(),
+                    );
+                };
+                resampler.process(&self.multi_frame_output, &mut self.at_host_rate_interleaved);
                 output_resample_ns = output_resample_ns.saturating_add(
                     output_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
-                if self.at_host_rate.iter().any(|sample| !sample.is_finite()) {
+                if self
+                    .at_host_rate_interleaved
+                    .iter()
+                    .any(|sample| !sample.is_finite())
+                {
                     return Err("Hush output resampler produced non-finite audio".into());
                 }
-                self.output_pending[channel].extend_from_slice(&self.at_host_rate);
+                for frame in self.at_host_rate_interleaved.chunks_exact(self.channels) {
+                    for (channel, sample) in frame.iter().enumerate() {
+                        self.output_pending[channel].push(*sample);
+                    }
+                }
+            }
+        } else {
+            for channel in 0..self.channels {
+                if !channel_is_connected(block.channel_mask, channel) {
+                    continue;
+                }
+                while self.input_pending[channel].len() >= HUSH_FRAME_SIZE {
+                    self.frame_input
+                        .copy_from_slice(&self.input_pending[channel][..HUSH_FRAME_SIZE]);
+                    let pending_len = self.input_pending[channel].len();
+                    self.input_pending[channel].copy_within(HUSH_FRAME_SIZE.., 0);
+                    self.input_pending[channel].truncate(pending_len - HUSH_FRAME_SIZE);
+                    self.frame_output.fill(0.0);
+                    let hush_started = Instant::now();
+                    #[cfg(test)]
+                    thread::sleep(Duration::from_millis(
+                        diagnostics.frame_delay_ms.load(Ordering::Relaxed),
+                    ));
+                    let HushEngine::Mono(denoisers) = &mut self.engine else {
+                        return Err("Hush mono engine was not configured for partial input".into());
+                    };
+                    if let Err(error) =
+                        denoisers[channel].process_frame(&mut self.frame_output, &self.frame_input)
+                    {
+                        diagnostics
+                            .inference_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(error.to_string());
+                    }
+                    let inference_ns =
+                        hush_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    hush_inference_ns = hush_inference_ns.saturating_add(inference_ns);
+                    diagnostics
+                        .last_inference_duration_us
+                        .store(inference_ns / 1_000, Ordering::Relaxed);
+                    diagnostics
+                        .inference_duration_us
+                        .fetch_add(inference_ns / 1_000, Ordering::Relaxed);
+                    diagnostics
+                        .hush_frames_processed
+                        .fetch_add(1, Ordering::Relaxed);
+                    diagnostics
+                        .hush_channel_frames_processed
+                        .fetch_add(HUSH_FRAME_SIZE as u64, Ordering::Relaxed);
+                    if self.frame_output.iter().any(|sample| !sample.is_finite()) {
+                        diagnostics
+                            .inference_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err("Hush produced a non-finite frame".into());
+                    }
+                    for (&input, &output) in self.frame_input.iter().zip(&self.frame_output) {
+                        let input = f64::from(input);
+                        let output = f64::from(output);
+                        input_energy += input * input;
+                        output_energy += output * output;
+                        let delta = input - output;
+                        delta_energy += delta * delta;
+                        input_peak = input_peak.max(input.abs());
+                        output_peak = output_peak.max(output.abs());
+                    }
+                    inference_calls = inference_calls.saturating_add(1);
+                    metric_samples = metric_samples.saturating_add(HUSH_FRAME_SIZE as u64);
+                    let output_started = Instant::now();
+                    self.at_host_rate.clear();
+                    self.output_resamplers[channel]
+                        .process(&self.frame_output, &mut self.at_host_rate);
+                    output_resample_ns = output_resample_ns.saturating_add(
+                        output_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                    if self.at_host_rate.iter().any(|sample| !sample.is_finite()) {
+                        return Err("Hush output resampler produced non-finite audio".into());
+                    }
+                    self.output_pending[channel].extend_from_slice(&self.at_host_rate);
+                }
             }
         }
         let worker_total_ns = worker_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -1558,17 +1832,23 @@ fn worker_loop(
                 }
                 let effective = requested.max(0.01);
                 if (effective - worker.attenuation_db).abs() > f32::EPSILON {
-                    for denoiser in &mut worker.denoisers {
-                        if let Err(error) = denoiser.set_attenuation_limit_db(effective) {
-                            *diagnostics.error.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(error.to_string());
-                            diagnostics
-                                .inference_errors_total
-                                .fetch_add(1, Ordering::Relaxed);
-                            diagnostics.worker_failed.store(true, Ordering::Release);
-                            set_state(HushWorkerState::Failed, &diagnostics);
-                            return;
+                    let result = match &mut worker.engine {
+                        HushEngine::Mono(denoisers) => denoisers
+                            .iter_mut()
+                            .try_for_each(|denoiser| denoiser.set_attenuation_limit_db(effective)),
+                        HushEngine::Multi(denoiser) => {
+                            denoiser.set_attenuation_limit_db(effective).map(|_| ())
                         }
+                    };
+                    if let Err(error) = result {
+                        *diagnostics.error.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(error.to_string());
+                        diagnostics
+                            .inference_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        diagnostics.worker_failed.store(true, Ordering::Release);
+                        set_state(HushWorkerState::Failed, &diagnostics);
+                        return;
                     }
                     worker.attenuation_db = effective;
                     diagnostics

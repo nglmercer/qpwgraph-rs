@@ -357,8 +357,12 @@ impl UiGraphState {
         let configured_appearances = configured_appearances(graph, config);
         let effective_positions = self.effective_positions(graph, config);
         let mut key_counts = BTreeMap::<String, usize>::new();
+        let mut legacy_key_counts = BTreeMap::<String, usize>::new();
         for node in graph.nodes.values() {
             *key_counts.entry(node_layout_key(node)).or_default() += 1;
+            *legacy_key_counts
+                .entry(node_layout_legacy_key(node))
+                .or_default() += 1;
         }
 
         config.node_positions = graph
@@ -435,17 +439,34 @@ impl UiGraphState {
         }
         let defaults = &self.layout_cache;
         let mut key_counts = BTreeMap::<String, usize>::new();
+        let mut legacy_key_counts = BTreeMap::<String, usize>::new();
         for node in graph.nodes.values() {
             *key_counts.entry(node_layout_key(node)).or_default() += 1;
+            *legacy_key_counts
+                .entry(node_layout_legacy_key(node))
+                .or_default() += 1;
         }
         graph
             .nodes
             .values()
             .map(|node| {
                 let key = node_layout_key(node);
+                let legacy_key = node_layout_legacy_key(node);
                 let by_id = config.node_positions.get(&node.id.0.to_string()).copied();
                 let by_name = (key_counts.get(&key) == Some(&1))
-                    .then(|| config.node_positions_by_name.get(&key).copied())
+                    .then(|| {
+                        config
+                            .node_positions_by_name
+                            .get(&key)
+                            .copied()
+                            .or_else(|| {
+                                (legacy_key_counts.get(&legacy_key) == Some(&1))
+                                    .then(|| {
+                                        config.node_positions_by_name.get(&legacy_key).copied()
+                                    })
+                                    .flatten()
+                            })
+                    })
                     .flatten();
                 (
                     node.id,
@@ -710,9 +731,9 @@ fn search_matches_port_query(node: &Node, port: &Port, query: &str) -> bool {
 }
 
 /// Fingerprint of every input `write_to_config` reads: the topology, the
-/// node names its stable keys derive from, and the local position and
-/// appearance overrides. The config autosave consults this before rebuilding
-/// all layout maps just to discover nothing changed.
+/// stable identity keys derive from, and the local position and appearance
+/// overrides. The config autosave consults this before rebuilding all layout
+/// maps just to discover nothing changed.
 pub(crate) fn layout_inputs_fingerprint(view: &UiGraphState, graph: &Graph) -> u64 {
     const PRIME: u64 = 0x100000001b3;
     let mut hash = topology_fingerprint(graph);
@@ -723,7 +744,11 @@ pub(crate) fn layout_inputs_fingerprint(view: &UiGraphState, graph: &Graph) -> u
         }
     };
     for node in graph.nodes.values() {
-        mix_bytes(node.name.as_bytes());
+        // The v2 key includes application identity/process fallback and the
+        // legacy name fallback. This invalidates the cache when a recreated
+        // PipeWire node gains richer metadata, without making raw global IDs
+        // part of persistence.
+        mix_bytes(node_layout_key(node).as_bytes());
     }
     for (id, position) in &view.local_positions {
         mix_bytes(&id.0.to_le_bytes());

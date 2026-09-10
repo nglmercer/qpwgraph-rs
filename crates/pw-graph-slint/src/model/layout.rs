@@ -161,6 +161,44 @@ pub(super) fn drag_distance_squared(candidate: [f32; 2], desired: [f32; 2]) -> f
 }
 
 pub(crate) fn node_layout_key(node: &Node) -> String {
+    let identity = node.matching_identity();
+    let kind = match node.node_type {
+        NodeType::PipeWire => "PipeWire",
+        NodeType::Effect => "Effect",
+        NodeType::AlsaMidi => "AlsaMidi",
+        NodeType::WindowsAudioEndpoint => "WindowsAudioEndpoint",
+        NodeType::WindowsAudioSession => "WindowsAudioSession",
+        NodeType::WindowsMidi => "WindowsMidi",
+        NodeType::Unknown => "Unknown",
+    };
+    if let Some(effect_instance_id) = identity.effect_instance_id {
+        return format!("v2:effect:{effect_instance_id}");
+    }
+    if let Some(application_id) = identity.application_id {
+        return format!(
+            "v2:application:{kind}:{application_id}:{}",
+            identity.media_role.unwrap_or_default()
+        );
+    }
+    if identity.process_binary.is_some() || identity.application_name.is_some() {
+        return format!(
+            "v2:process:{kind}:{}:{}:{}",
+            identity.process_binary.unwrap_or_default(),
+            identity.application_name.unwrap_or_default(),
+            identity.media_role.unwrap_or_default()
+        );
+    }
+    // PipeWire object.path is useful for durable hardware/backend objects,
+    // but client-owned application paths can contain a recreated stream
+    // identifier. It is therefore only a fallback after application/process
+    // identity, so a browser restart does not silently move the card.
+    if let Some(object_path) = identity.object_path {
+        return format!("v2:path:{kind}:{object_path}");
+    }
+    node_layout_legacy_key(node)
+}
+
+pub(crate) fn node_layout_legacy_key(node: &Node) -> String {
     let kind = match node.node_type {
         NodeType::PipeWire => "PipeWire",
         NodeType::Effect => "Effect",

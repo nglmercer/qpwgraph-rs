@@ -185,6 +185,10 @@ pub(crate) fn connect_pin_pair(application: &mut Application, start_id: i32, end
     ) {
         Ok(()) => match refresh_connection_graph(application) {
             Ok(()) => {
+                application.allow_patchbay_connections(std::slice::from_ref(&(
+                    output.clone(),
+                    input.clone(),
+                )));
                 application.sync_patchbay_connections();
                 application.autosave_patchbay();
                 let message = if !existed {
@@ -459,7 +463,7 @@ fn apply_easy_pairs(application: &mut Application, port_keys: Vec<(PortKey, Port
         .count();
     let requested = port_keys.len();
     let result = application.commands.execute(
-        Box::new(ConnectManyCommand::with_keys(Vec::new(), port_keys)),
+        Box::new(ConnectManyCommand::with_keys(Vec::new(), port_keys.clone())),
         &mut application.source,
     );
     let connected = requested.saturating_sub(already_connected);
@@ -477,6 +481,7 @@ fn apply_easy_pairs(application: &mut Application, port_keys: Vec<(PortKey, Port
     }
     match refresh_connection_graph(application) {
         Ok(()) => {
+            application.allow_patchbay_connections(&port_keys);
             application.sync_patchbay_connections();
             application.autosave_patchbay();
             let message = if connected == 0 {

@@ -47,8 +47,8 @@ export component RuleCard inherits Rectangle {
         y: 48px;
         width: 90px;
         height: 14px;
-        text: root.rule.pinned ? UiI18n.localized("inspector.pinned") : UiI18n.localized("patchbay.rule");
-        color: root.rule.pinned ? AppTokens.accent-green : #9fadb8;
+        text: (root.rule.pinned ? UiI18n.localized("inspector.pinned") : UiI18n.localized("patchbay.rule")) + " · " + root.rule.status;
+        color: root.rule.status == "Ambiguous" || root.rule.status == "Failed" ? #ff9b9b : (root.rule.pinned ? AppTokens.accent-green : #9fadb8);
         font-size: 8px * UiTheme.panel-scale;
         vertical-alignment: center;
     }

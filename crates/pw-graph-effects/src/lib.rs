@@ -24,9 +24,11 @@ pub mod lifecycle;
 pub mod resources;
 pub mod wasm;
 pub use adaptive_noise::AdaptiveNoiseSuppressor;
+pub use hush_diagnostics::{
+    classify_health, HushDiagnostics, HushDiagnosticsSnapshot, HushHealthInput, HushHealthWindow,
+};
 pub use hush_noise::HushNoiseSuppressor;
 pub use hush_overload::{HushHealth, HushOverloadReason};
-pub use hush_worker::HushDiagnostics;
 pub use lifecycle::{
     EffectCancellation, EffectComponentManager, EffectLifecycle, EffectLoadStage,
     EffectPreparationEvent, EffectPrepareRequest, EffectTicket, PreparedEffect,
@@ -84,6 +86,13 @@ pub struct EffectDiagnosticsSnapshot {
 /// Generic diagnostics boundary for effect hosts and UI consumers.
 pub trait EffectDiagnostics: Send + Sync {
     fn snapshot(&self) -> EffectDiagnosticsSnapshot;
+
+    /// Build the full, display-oriented report only when explicitly requested.
+    /// Providers with expensive timing history can keep that work out of
+    /// normal effect-row synchronization.
+    fn report(&self) -> String {
+        self.snapshot().message.unwrap_or_default()
+    }
 }
 
 impl From<HushHealth> for EffectHealth {

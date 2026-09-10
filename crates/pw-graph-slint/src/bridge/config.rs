@@ -156,6 +156,8 @@ pub(crate) fn read_window_state(window: &MainWindow, application: &mut Applicati
 
     if !patchbay_was_activated && application.config.patchbay_activated {
         activate_patchbay(application);
+    } else if patchbay_was_activated && !application.config.patchbay_activated {
+        application.patchbay_reconciler.deactivate();
     }
 }
 

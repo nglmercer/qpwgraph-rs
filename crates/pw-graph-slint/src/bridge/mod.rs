@@ -77,9 +77,13 @@ impl UiBridge {
         window.set_links(ModelRc::from(links.clone()));
         window.set_minimap_nodes(ModelRc::from(minimap_nodes.clone()));
         window.set_shortcuts(ModelRc::from(shortcuts.clone()));
-        window.set_rules(ModelRc::from(Rc::new(VecModel::from(rule_rows(
-            &app.borrow().patchbay,
-        )))));
+        {
+            let application = app.borrow();
+            window.set_rules(ModelRc::from(Rc::new(VecModel::from(rule_rows(
+                &application.patchbay,
+                application.patchbay_reconciler.last_report(),
+            )))));
+        }
         {
             let application = app.borrow();
             window.set_effects(ModelRc::from(Rc::new(VecModel::from(effect_rows(
@@ -147,6 +151,24 @@ impl UiBridge {
         self.window.on_effect_inspect(move |instance_id| {
             events.borrow_mut().push(UiEvent::EffectInspect {
                 instance_id: instance_id.to_string(),
+            })
+        });
+        let events = self.events.clone();
+        self.window.on_effect_debug(move |instance_id| {
+            events.borrow_mut().push(UiEvent::EffectDebug {
+                instance_id: instance_id.to_string(),
+            })
+        });
+        let events = self.events.clone();
+        self.window
+            .on_effect_debug_close(move || events.borrow_mut().push(UiEvent::EffectDebugClose));
+        let events = self.events.clone();
+        self.window
+            .on_effect_debug_copy(move || events.borrow_mut().push(UiEvent::EffectDebugCopy));
+        let events = self.events.clone();
+        self.window.on_effect_cancel(move |ticket| {
+            events.borrow_mut().push(UiEvent::EffectCancel {
+                ticket: ticket.max(0) as u64,
             })
         });
         let events = self.events.clone();
@@ -226,6 +248,7 @@ impl UiBridge {
         let result = self.window.run();
         {
             let mut application = self.app.borrow_mut();
+            cancel_pending_effects(&mut application);
             read_window_state(&self.window, &mut application);
             application.sync_patchbay_connections();
             application.autosave_patchbay();

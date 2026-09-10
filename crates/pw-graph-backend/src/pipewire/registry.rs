@@ -28,6 +28,20 @@ pub(super) fn install_registry_listener(
             };
             let mut state = state_for_globals.lock().unwrap();
             match &global.type_ {
+                pw::types::ObjectType::Client => {
+                    state.clients.insert(
+                        global.id,
+                        ClientRecord {
+                            application_id: props.get(APPLICATION_ID).map(str::to_owned),
+                            application_name: props.get(APPLICATION_NAME).map(str::to_owned),
+                            process_binary: props
+                                .get(APPLICATION_PROCESS_BINARY)
+                                .map(str::to_owned),
+                            client_name: props.get(CLIENT_NAME).map(str::to_owned),
+                            client_api: props.get(CLIENT_API).map(str::to_owned),
+                        },
+                    );
+                }
                 pw::types::ObjectType::Node => {
                     let name = props
                         .get(NODE_NAME)
@@ -44,6 +58,18 @@ pub(super) fn install_registry_listener(
                             name,
                             media_class,
                             serial,
+                            description: props.get(NODE_DESCRIPTION).map(str::to_owned),
+                            application_id: props.get(APPLICATION_ID).map(str::to_owned),
+                            application_name: props.get(APPLICATION_NAME).map(str::to_owned),
+                            process_binary: props
+                                .get(APPLICATION_PROCESS_BINARY)
+                                .map(str::to_owned),
+                            media_role: props.get(PROP_MEDIA_ROLE).map(str::to_owned),
+                            media_name: props.get(MEDIA_NAME).map(str::to_owned),
+                            client_id: props.get(CLIENT_ID).and_then(|value| value.parse().ok()),
+                            client_name: props.get(CLIENT_NAME).map(str::to_owned),
+                            client_api: props.get(CLIENT_API).map(str::to_owned),
+                            object_path: props.get(OBJECT_PATH).map(str::to_owned),
                         },
                     );
                 }
@@ -97,6 +123,7 @@ pub(super) fn install_registry_listener(
         .global_remove(move |id| {
             let mut state = state_for_removals.lock().unwrap();
             state.nodes.remove(&id);
+            state.clients.remove(&id);
             state.ports.remove(&id);
             state.links.remove(&id);
             dirty_for_removals.store(true, Ordering::Relaxed);
@@ -214,10 +241,26 @@ pub(super) fn install_default_metadata_listener(
 pub(super) struct NodeRecord {
     pub(super) name: String,
     pub(super) media_class: String,
-    /// `object.serial` is unique for the lifetime of the daemon, while node
-    /// names are not. Targeting by serial keeps a meter pinned to the node the
-    /// user actually asked about when several share a name.
+    pub(super) description: Option<String>,
     pub(super) serial: Option<u64>,
+    pub(super) application_id: Option<String>,
+    pub(super) application_name: Option<String>,
+    pub(super) process_binary: Option<String>,
+    pub(super) media_role: Option<String>,
+    pub(super) media_name: Option<String>,
+    pub(super) client_id: Option<u32>,
+    pub(super) client_name: Option<String>,
+    pub(super) client_api: Option<String>,
+    pub(super) object_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ClientRecord {
+    pub(super) application_id: Option<String>,
+    pub(super) application_name: Option<String>,
+    pub(super) process_binary: Option<String>,
+    pub(super) client_name: Option<String>,
+    pub(super) client_api: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -243,6 +286,7 @@ pub(super) struct DefaultDevice {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RegistryState {
+    pub(super) clients: BTreeMap<u32, ClientRecord>,
     pub(super) nodes: BTreeMap<u32, NodeRecord>,
     pub(super) ports: BTreeMap<u32, PortRecord>,
     pub(super) links: BTreeMap<u32, LinkRecord>,

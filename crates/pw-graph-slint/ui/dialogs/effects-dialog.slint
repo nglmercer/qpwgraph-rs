@@ -20,6 +20,7 @@ export component EffectsDialog inherits DialogShell {
     callback effect-toggle(string);
     callback effect-remove(string);
     callback effect-inspect(string);
+    callback effect-debug(string);
     callback effect-parameter-changed(string, string, float);
     callback effect-draft-parameter-changed(string, float);
     callback effect-draft-enabled-changed(bool);
@@ -34,8 +35,7 @@ export component EffectsDialog inherits DialogShell {
                 spacing: 8px;
                 if root.effects.length == 0: Text { text: UiI18n.localized("effects.no_available"); color: #9eafbc; font-size: 11px * UiTheme.panel-scale; }
                 for effect in root.effects: Rectangle {
-                    property <length> diagnostics-height: effect.diagnostics == "" ? 0px : diagnostic.height + 8px;
-                    height: 76px + effect.parameters.length * 30px + self.diagnostics-height; background: #2a333d; border-color: #40505f; border-width: 1px; border-radius: 5px;
+                    height: 76px + effect.parameters.length * 30px; background: #2a333d; border-color: #40505f; border-width: 1px; border-radius: 5px;
                     Text { x: 11px; y: 8px; width: parent.width - 180px; height: 17px; text: effect.name; color: #edf3f7; font-size: 12px * UiTheme.panel-scale; overflow: elide; }
                     Text { x: 11px; y: 27px; width: parent.width - 180px; height: 15px; text: effect.vendor; color: #96a8b6; font-size: 9px * UiTheme.panel-scale; overflow: elide; }
                     Text {
@@ -44,13 +44,8 @@ export component EffectsDialog inherits DialogShell {
                         color: effect.health == "FAILED" ? #ff7b7b : (effect.health == "OVERLOADED" ? #ffc46b : (effect.health == "BYPASSED" ? #c6a0f6 : (effect.health == "HEALTHY" ? #8bd5ca : #b9c7d1)));
                         font-size: 10px * UiTheme.panel-scale; overflow: elide;
                     }
-                    diagnostic := Text {
-                        x: 11px; y: 70px; width: parent.width - 22px;
-                        text: effect.diagnostics; visible: effect.diagnostics != "";
-                        color: #b9c7d1; font-size: 10px * UiTheme.panel-scale; wrap: word-wrap;
-                    }
                     for parameter[index] in effect.parameters: Rectangle {
-                        y: 72px + parent.diagnostics-height + (index * 30px);
+                        y: 72px + (index * 30px);
                         height: 26px;
                         Text { x: 11px; width: 102px; height: parent.height; text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : ""); color: #aebdca; font-size: 9px * UiTheme.panel-scale; vertical-alignment: center; overflow: elide; }
                         if parameter.boolean: CheckBox {
@@ -66,7 +61,8 @@ export component EffectsDialog inherits DialogShell {
                         }
                     }
                     ActionButton { x: parent.width - 168px; y: 10px; width: 76px; text: effect.enabled ? UiI18n.localized("effects.disable") : UiI18n.localized("effects.enable"); clicked => { root.effect-toggle(effect.instance-id); } }
-                    ActionButton { x: parent.width - 86px; y: 10px; width: 76px; text: UiI18n.localized("effects.setup"); clicked => { root.effect-inspect(effect.instance-id); } }
+                    ActionButton { x: parent.width - 250px; y: 10px; width: 76px; text: "Debug"; clicked => { root.effect-debug(effect.instance-id); } }
+                    ActionButton { x: parent.width - 168px; y: 43px; width: 76px; text: UiI18n.localized("effects.setup"); clicked => { root.effect-inspect(effect.instance-id); } }
                     ActionButton { x: parent.width - 86px; y: 43px; width: 76px; text: UiI18n.localized("effects.remove"); clicked => { root.effect-remove(effect.instance-id); } }
                 }
             }

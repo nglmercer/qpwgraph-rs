@@ -13,7 +13,8 @@ use super::connections::{
     easy_connect_from_pin, easy_connect_nodes, handle_link_requested, handle_link_rerouted,
 };
 use super::effects::{
-    cancel_effect_setup, create_effect, inspect_effect, poll_effect_events, remove_effect,
+    cancel_effect_setup, cancel_effect_ticket, close_effect_diagnostics, copy_effect_diagnostics,
+    create_effect, inspect_effect, open_effect_diagnostics, poll_effect_events, remove_effect,
     select_effect_draft, set_effect_draft_enabled, set_effect_draft_parameter_typed,
     set_effect_parameter_typed, toggle_effect,
 };
@@ -67,8 +68,12 @@ pub(crate) fn pump(
             application.status = application.tf("status.refresh_failed", &[("error", error)]);
         } else {
             application.last_refresh = Instant::now();
+            application.mark_patchbay_graph_dirty();
             graph_changed = true;
         }
+    }
+    if application.reconcile_patchbay() {
+        graph_changed = true;
     }
     refresh_meters(window, &mut application);
     // A toast expiring only flips a boolean; without this the message would
@@ -197,6 +202,12 @@ pub(crate) fn process_event(window: &MainWindow, application: &mut Application, 
         UiEvent::EffectToggle { instance_id } => toggle_effect(application, &instance_id),
         UiEvent::EffectRemove { instance_id } => remove_effect(application, &instance_id),
         UiEvent::EffectInspect { instance_id } => inspect_effect(application, Some(&instance_id)),
+        UiEvent::EffectDebug { instance_id } => {
+            open_effect_diagnostics(window, application, Some(&instance_id))
+        }
+        UiEvent::EffectDebugClose => close_effect_diagnostics(window, application),
+        UiEvent::EffectDebugCopy => copy_effect_diagnostics(application),
+        UiEvent::EffectCancel { ticket } => cancel_effect_ticket(application, ticket),
         UiEvent::EffectParameterChanged {
             instance_id,
             parameter_id,

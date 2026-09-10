@@ -15,7 +15,9 @@ it can be reinserted, so patchbay activation has to run in between.
 
 New noise-suppression effects use the separate `builtin.hush-noise-suppressor`
 descriptor. Hush runs the pinned DeepFilterNet-SE model at 16 kHz in 160-sample
-mono frames. Its 320-sample algorithmic latency metadata and 160-sample
+frames. Full stereo uses one independent-mask multi-channel runtime; partial
+stereo and mono routes use only the connected mono runtimes. Its 320-sample
+algorithmic latency metadata and 160-sample
 streaming overlap-add synthesis delay describe different aspects of the model;
 they are **not additive**. qpwgraph schedules the raw streaming output 40 ms
 later and aligns the dry path by another 10 ms of synthesis delay: **50 ms total**
@@ -68,12 +70,15 @@ synthesis and changes the signal delay. Reconnection warms a
 clean recurrent/resampler state. Disconnected channels are zeroed immediately,
 even if old wet audio remains queued.
 
-The sinc filters center their first output on source position zero and need
-roughly 2.2 ms of combined lookahead at the tested rates. Impulse tests verify
-that they add no extra signal-position shift. That lookahead and native-frame
-assembly consume part of the 40 ms scheduling allowance; neither is added again
-to the dry alignment. See [runtime validation](hush-runtime-validation.md) for
-measurements and the limits of the live tests.
+The generic sinc filters center their first output on source position zero and
+remain the fallback for nonstandard rates. Exact 48 kHz ↔ 16 kHz Hush streams
+use a precomputed 3:1/1:3 polyphase converter with circular history; its
+streaming latency and alignment are covered by the same impulse and length
+tests. Both paths need roughly 2.2 ms of combined lookahead at the tested
+rates. That lookahead and native-frame assembly consume part of the 40 ms
+scheduling allowance; neither is added again to the dry alignment. See
+[runtime validation](hush-runtime-validation.md) for measurements and the
+limits of the live tests.
 
 `process()` only sanitizes/copies samples, advances preallocated delay storage,
 uses bounded SPSC operations, and updates atomics. It neither allocates nor
@@ -88,15 +93,26 @@ PipeWire Hush parameter updates use shared atomics rather than the generic
 processor mutex, so slider and bypass changes do not introduce an instantaneous
 host fallback. The existing typed events and stable parameter models are retained.
 
-The Effects status exposes rate, channels, quantum, fixed latency, wet/dry
-counts and frames, fallback reasons, wet ratio, underruns, queue peaks/overruns,
-rejected/stale frames, resync state, backlog, Hush frame count, resets, worker
-average/p95/p99/max timing, and the actual persistent failure reason. Timing is
-**worker input-chunk time**, including conversion and any inference; small
-chunks do not all run inference. Percentiles use a bounded 4,096-observation
-window. Wet and dry block counters can both increment for a callback containing
-a partial wet range. Underruns exclude startup, intentional bypass, worker
-failure/recovery, and fully disconnected input.
+The normal Effects card uses a cheap typed summary: health, rate, channel
+layout, realtime factor, recent wet percentage, and the most useful worker
+timing. It does not rebuild the large diagnostics report on every UI tick.
+Health is computed from a bounded recent control-plane window (currently about
+three seconds), with dry frames tracked by reason. Historical startup,
+intentional bypass, and host-disabled frames therefore do not permanently make
+a later healthy stream appear degraded; underruns, no-input periods, overload,
+and worker failure remain visible and distinct. Timing is **worker input-chunk
+time**, including conversion and any inference; small chunks do not all run
+inference. Percentiles use a bounded 4,096-observation window. Wet and dry
+block counters can both increment for a callback containing a partial wet
+range.
+
+Open **Debug** on an effect to request the full report on demand. The
+diagnostics dialog includes the raw selectable report and a cross-platform
+native copy action. Effect creation is also a background operation: closing
+Effects discards only the unsubmitted draft, while an already-ticketed model
+load continues in the background. Its operation card exposes explicit Cancel;
+completion becomes a toast and failure remains inspectable without requiring
+the modal to stay open.
 
 For all effects, `ChannelPolicy::Auto` and `ChannelPolicy::Fixed(n)` are kept
 separate from the negotiated runtime width. Legacy `channels = 1/2` values

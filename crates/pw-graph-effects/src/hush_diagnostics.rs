@@ -9,6 +9,126 @@ use crate::hush_overload::{HushHealth, HushOverloadReason, HushWorkerState};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const RECENT_HEALTH_WINDOW: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HushHealthWindow {
+    pub wet_frames: u64,
+    pub dry_frames: u64,
+    pub intentional_dry_frames: u64,
+    pub unexpected_dry_frames: u64,
+    pub startup_dry_frames: u64,
+    pub no_input_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HushHealthInput {
+    pub worker_failed: bool,
+    pub worker_ready: bool,
+    pub worker_state: u32,
+    pub bypass: bool,
+    pub host_disabled: bool,
+    pub active_channels: u16,
+    pub no_audio_input_blocks: u64,
+    pub ewma_realtime_factor: f64,
+    pub recent: HushHealthWindow,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HealthSample {
+    at: Option<Instant>,
+    wet_frames: u64,
+    dry_frames: u64,
+    manual_bypass_frames: u64,
+    host_disabled_frames: u64,
+    underrun_frames: u64,
+    worker_failure_frames: u64,
+    resync_frames: u64,
+    startup_frames: u64,
+    no_input_frames: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HushDiagnosticsSnapshot {
+    pub health: HushHealth,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub active_channels: u16,
+    pub quantum: u32,
+    pub rt_factor: f64,
+    pub ewma_rt_factor: f64,
+    pub wet_percent_recent: f64,
+    pub unexpected_dry_percent_recent: f64,
+    pub worker_avg_ms: f64,
+    pub worker_p95_ms: f64,
+    pub worker_p99_ms: f64,
+    pub backlog_ms: f64,
+    pub input_rms_db: f64,
+    pub output_rms_db: f64,
+    pub input_peak_db: f64,
+    pub output_peak_db: f64,
+    pub lifecycle: crate::EffectLifecycle,
+}
+
+/// Pure health decision used by the control thread and deterministic tests.
+/// Lifetime intentional dry delivery is deliberately absent from this
+/// decision; only the bounded recent window is considered.
+pub fn classify_health(input: HushHealthInput) -> HushHealth {
+    let HushHealthInput {
+        worker_failed,
+        worker_ready,
+        worker_state,
+        bypass,
+        host_disabled,
+        active_channels,
+        no_audio_input_blocks,
+        ewma_realtime_factor,
+        recent,
+    } = input;
+    if worker_failed || worker_state == HushWorkerState::Failed.as_u32() {
+        return HushHealth::Failed;
+    }
+    if !worker_ready || worker_state == HushWorkerState::Starting.as_u32() {
+        return HushHealth::Starting;
+    }
+    if bypass || host_disabled {
+        return HushHealth::Degraded;
+    }
+    if active_channels == 0 && (recent.no_input_frames > 0 || no_audio_input_blocks > 0) {
+        return HushHealth::Degraded;
+    }
+    if worker_state == HushWorkerState::Overloaded.as_u32() || ewma_realtime_factor >= 1.0 {
+        return HushHealth::Overloaded;
+    }
+    if matches!(
+        worker_state,
+        state if state == HushWorkerState::ResyncRequested.as_u32()
+            || state == HushWorkerState::Recovering.as_u32()
+            || state == HushWorkerState::Warming.as_u32()
+    ) {
+        return HushHealth::Degraded;
+    }
+    let intentional_or_transitional = recent
+        .intentional_dry_frames
+        .saturating_add(recent.startup_dry_frames);
+    let delivered = recent
+        .wet_frames
+        .saturating_add(recent.dry_frames)
+        .saturating_sub(intentional_or_transitional);
+    if recent.unexpected_dry_frames > 0 {
+        return HushHealth::Degraded;
+    }
+    if delivered > 0
+        && recent.wet_frames as f64 / delivered as f64 >= 0.98
+        && ewma_realtime_factor < 0.90
+    {
+        HushHealth::Healthy
+    } else {
+        HushHealth::Degraded
+    }
+}
 
 #[derive(Default)]
 pub struct HushDiagnostics {
@@ -38,6 +158,15 @@ pub struct HushDiagnostics {
     pub dry_fallback_blocks: AtomicU64,
     pub wet_frames_output: AtomicU64,
     pub dry_frames_output: AtomicU64,
+    /// Dry delivery counters are frame-granular because one callback may
+    /// contain both wet and fallback ranges.
+    pub dry_startup_frames: AtomicU64,
+    pub dry_manual_bypass_frames: AtomicU64,
+    pub dry_host_disabled_frames: AtomicU64,
+    pub dry_underrun_frames: AtomicU64,
+    pub dry_worker_failure_frames: AtomicU64,
+    pub dry_resync_frames: AtomicU64,
+    pub dry_no_input_frames: AtomicU64,
     pub dry_startup_blocks: AtomicU64,
     pub dry_bypass_blocks: AtomicU64,
     pub dry_underrun_blocks: AtomicU64,
@@ -139,6 +268,9 @@ pub struct HushDiagnostics {
     pub playout_frame: AtomicU64,
     pub latest_submitted_frame: AtomicU64,
     pub latest_completed_input_frame: AtomicU64,
+    /// Control-plane samples of cumulative counters. The realtime callback
+    /// only updates atomics and never touches this mutex.
+    pub(crate) health_history: Mutex<VecDeque<HealthSample>>,
 }
 
 impl HushDiagnostics {
@@ -166,63 +298,163 @@ impl HushDiagnostics {
     /// telemetry. This is a control/UI-thread operation; it only reads
     /// atomics and never touches the worker queues.
     pub fn health(&self) -> HushHealth {
-        let worker_state = self.worker_state.load(Ordering::Acquire);
-        if self.worker_failed.load(Ordering::Acquire)
-            || worker_state == HushWorkerState::Failed.as_u32()
+        let recent = self.recent_health_window(Instant::now());
+        classify_health(self.health_input(recent))
+    }
+
+    fn health_input(&self, recent: HushHealthWindow) -> HushHealthInput {
+        HushHealthInput {
+            worker_failed: self.worker_failed.load(Ordering::Acquire),
+            worker_ready: self.worker_ready.load(Ordering::Acquire),
+            worker_state: self.worker_state.load(Ordering::Acquire),
+            bypass: self.bypass.load(Ordering::Acquire),
+            host_disabled: self.host_disabled.load(Ordering::Acquire),
+            active_channels: self.active_hush_channels.load(Ordering::Acquire),
+            no_audio_input_blocks: self.no_audio_input_blocks.load(Ordering::Relaxed),
+            ewma_realtime_factor: f64::from_bits(
+                self.ewma_realtime_factor_bits.load(Ordering::Relaxed),
+            ),
+            recent,
+        }
+    }
+
+    fn recent_health_window(&self, now: Instant) -> HushHealthWindow {
+        let sample = HealthSample {
+            at: Some(now),
+            wet_frames: self.wet_frames_output.load(Ordering::Relaxed),
+            dry_frames: self.dry_frames_output.load(Ordering::Relaxed),
+            manual_bypass_frames: self.dry_manual_bypass_frames.load(Ordering::Relaxed),
+            host_disabled_frames: self.dry_host_disabled_frames.load(Ordering::Relaxed),
+            underrun_frames: self.dry_underrun_frames.load(Ordering::Relaxed),
+            worker_failure_frames: self.dry_worker_failure_frames.load(Ordering::Relaxed),
+            resync_frames: self.dry_resync_frames.load(Ordering::Relaxed),
+            startup_frames: self.dry_startup_frames.load(Ordering::Relaxed),
+            no_input_frames: self.dry_no_input_frames.load(Ordering::Relaxed),
+        };
+        let mut history = self
+            .health_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        history.push_back(sample);
+        while history.len() > 1
+            && history
+                .front()
+                .and_then(|oldest| oldest.at)
+                .is_some_and(|oldest| now.duration_since(oldest) > RECENT_HEALTH_WINDOW)
         {
-            return HushHealth::Failed;
+            history.pop_front();
         }
-        if !self.worker_ready.load(Ordering::Acquire)
-            || worker_state == HushWorkerState::Starting.as_u32()
-        {
-            return HushHealth::Starting;
+        // The first control-plane sample establishes a baseline. If the
+        // caller asks for health after a long unobserved interval, it cannot
+        // honestly reconstruct a recent ratio from lifetime counters.
+        let baseline = if history.len() > 1 {
+            history.front().copied().unwrap_or_default()
+        } else {
+            HealthSample::default()
+        };
+        HushHealthWindow {
+            wet_frames: sample.wet_frames.saturating_sub(baseline.wet_frames),
+            dry_frames: sample.dry_frames.saturating_sub(baseline.dry_frames),
+            intentional_dry_frames: sample
+                .manual_bypass_frames
+                .saturating_sub(baseline.manual_bypass_frames)
+                .saturating_add(
+                    sample
+                        .host_disabled_frames
+                        .saturating_sub(baseline.host_disabled_frames),
+                ),
+            unexpected_dry_frames: sample
+                .underrun_frames
+                .saturating_sub(baseline.underrun_frames)
+                .saturating_add(
+                    sample
+                        .worker_failure_frames
+                        .saturating_sub(baseline.worker_failure_frames),
+                )
+                .saturating_add(sample.resync_frames.saturating_sub(baseline.resync_frames)),
+            startup_dry_frames: sample
+                .startup_frames
+                .saturating_sub(baseline.startup_frames),
+            no_input_frames: sample
+                .no_input_frames
+                .saturating_sub(baseline.no_input_frames),
         }
-        // Intentional dry operation is not an overload signal. Keep it out of
-        // the wet-ratio classifier so a user who enables bypass or the host
-        // disables the effect does not get a false CPU failure diagnosis.
-        if self.bypass.load(Ordering::Acquire) || self.host_disabled.load(Ordering::Acquire) {
-            return HushHealth::Degraded;
-        }
-        // A live effect with no usable input is a routing/connection
-        // condition, not an inference deadline miss. Keep it out of the wet
-        // ratio classifier so the diagnostic state says “degraded/no input”
-        // instead of falsely claiming CPU overload.
-        if self.active_hush_channels.load(Ordering::Acquire) == 0
-            && self.no_audio_input_blocks.load(Ordering::Relaxed) > 0
-        {
-            return HushHealth::Degraded;
-        }
-        let wet = self.wet_frames_output.load(Ordering::Relaxed);
-        let dry = self.dry_frames_output.load(Ordering::Relaxed);
-        let delivered = wet.saturating_add(dry);
-        let wet_ratio = if delivered == 0 {
+    }
+
+    pub fn summary_snapshot(&self) -> HushDiagnosticsSnapshot {
+        let recent = self.recent_health_window(Instant::now());
+        let ewma = f64::from_bits(self.ewma_realtime_factor_bits.load(Ordering::Relaxed));
+        let health = classify_health(self.health_input(recent));
+        let intentional_or_transitional = recent
+            .intentional_dry_frames
+            .saturating_add(recent.startup_dry_frames);
+        let effective_dry = recent
+            .dry_frames
+            .saturating_sub(intentional_or_transitional);
+        let delivered = recent.wet_frames.saturating_add(effective_dry);
+        let wet_percent_recent = if delivered == 0 {
             0.0
         } else {
-            wet as f64 / delivered as f64
+            recent.wet_frames as f64 * 100.0 / delivered as f64
         };
-        let ewma = f64::from_bits(self.ewma_realtime_factor_bits.load(Ordering::Relaxed));
-        if worker_state == HushWorkerState::Overloaded.as_u32()
-            || (delivered > 0 && (wet_ratio < 0.90 || ewma >= 1.0))
-        {
-            return HushHealth::Overloaded;
-        }
-        if matches!(
-            worker_state,
-            state if state == HushWorkerState::ResyncRequested.as_u32()
-                || state == HushWorkerState::Recovering.as_u32()
-                || state == HushWorkerState::Warming.as_u32()
-        ) {
-            return HushHealth::Degraded;
-        }
-        if worker_state == HushWorkerState::Running.as_u32()
-            && delivered > 0
-            && wet_ratio >= 0.98
-            && ewma < 0.90
-        {
-            HushHealth::Healthy
+        let unexpected_dry_percent_recent = if delivered == 0 {
+            0.0
         } else {
-            HushHealth::Degraded
+            recent.unexpected_dry_frames as f64 * 100.0 / delivered as f64
+        };
+        let processed = self.processed_blocks.load(Ordering::Relaxed);
+        let worker_avg_ms = if processed == 0 {
+            0.0
+        } else {
+            self.inference_ns.load(Ordering::Relaxed) as f64 / processed as f64 / 1e6
+        };
+        let sample_rate = self.sample_rate.load(Ordering::Relaxed).max(1);
+        let backlog_frames = self
+            .latest_submitted_frame
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.latest_completed_input_frame.load(Ordering::Relaxed));
+        HushDiagnosticsSnapshot {
+            health,
+            sample_rate,
+            channels: self.channels.load(Ordering::Relaxed),
+            active_channels: self.active_hush_channels.load(Ordering::Relaxed),
+            quantum: self.host_quantum.load(Ordering::Relaxed),
+            rt_factor: f64::from_bits(self.realtime_factor_bits.load(Ordering::Relaxed)),
+            ewma_rt_factor: ewma,
+            wet_percent_recent,
+            unexpected_dry_percent_recent,
+            worker_avg_ms,
+            worker_p95_ms: self.stable_worker_p95_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            worker_p99_ms: self.stable_worker_p99_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            backlog_ms: backlog_frames as f64 * 1000.0 / sample_rate as f64,
+            input_rms_db: f64::from_bits(self.input_rms_db_bits.load(Ordering::Relaxed)),
+            output_rms_db: f64::from_bits(self.output_rms_db_bits.load(Ordering::Relaxed)),
+            input_peak_db: f64::from_bits(self.input_peak_db_bits.load(Ordering::Relaxed)),
+            output_peak_db: f64::from_bits(self.output_peak_db_bits.load(Ordering::Relaxed)),
+            lifecycle: if matches!(health, HushHealth::Failed) {
+                crate::EffectLifecycle::Failed
+            } else if !self.worker_ready.load(Ordering::Acquire) {
+                crate::EffectLifecycle::Preparing
+            } else {
+                crate::EffectLifecycle::Active
+            },
         }
+    }
+
+    fn short_summary_text(summary: &HushDiagnosticsSnapshot) -> String {
+        format!(
+            "{} · {} kHz · {} ch · RT {:.2}x · Wet {:.1}% · Worker p99 {:.2} ms",
+            summary.health.label(),
+            summary.sample_rate / 1_000,
+            summary.active_channels,
+            summary.ewma_rt_factor,
+            summary.wet_percent_recent,
+            summary.worker_p99_ms,
+        )
+    }
+
+    pub fn summary_text(&self) -> String {
+        Self::short_summary_text(&self.summary_snapshot())
     }
 
     /// Control/UI thread only: locks the worker's bounded timing/error side
@@ -318,13 +550,20 @@ impl HushDiagnostics {
         let fallback_blocks = load(&self.dry_fallback_blocks);
         let manual_bypass_blocks = load(&self.dry_bypass_blocks);
         let host_disabled_blocks = load(&self.dry_host_disabled_blocks);
+        let dry_startup_frames = load(&self.dry_startup_frames);
+        let dry_manual_bypass_frames = load(&self.dry_manual_bypass_frames);
+        let dry_host_disabled_frames = load(&self.dry_host_disabled_frames);
+        let dry_underrun_frames = load(&self.dry_underrun_frames);
+        let dry_worker_failure_frames = load(&self.dry_worker_failure_frames);
+        let dry_resync_frames = load(&self.dry_resync_frames);
+        let dry_no_input_frames = load(&self.dry_no_input_frames);
         let wet_drop_other = load(&self.wet_drop_other);
         let wet_drop_queue_full = load(&self.wet_drop_queue_full);
         let model_path = self.model.path.as_deref().unwrap_or("-");
         let manual_bypass_now = self.bypass.load(Ordering::Acquire);
         let host_disabled_now = self.host_disabled.load(Ordering::Acquire);
         let mut status = format!(
-            "Hush: {}\nModel: source={} name={} path={model_path} embedded={} load_started={} load_completed={} load_ms={} parse_started={} parse_completed={} initialized={} init_ms={} checksum={} compressed_bytes={} decompressed_bytes={}{}\nAudio: rate={} Hz configured_channels={} active_channels={} quantum={} max_quantum={} callback_budget_ms={:.3} latency_ms={:.1} schedule_frames={} measured_headroom_frames={}\nInference: calls={} native_samples={} mean_us={mean_inference_us:.1} last_us={} errors={} last_success_ms={last_inference_ms} worker_avg_ms={average:.2} p50_ms={:.2} p95_ms={p95:.2} p99_ms={p99:.2} worker_max_ms={:.2} rt_factor={ewma_factor:.2}x last_rt={last_factor:.2}x lifetime_rt={realtime_factor:.2}x input_rms_db={:.1} input_peak_db={:.1} output_rms_db={:.1} output_peak_db={:.1} wet_dry_delta_db={:.1} worker_blocks={} queued={}\nDelivery: wet={current_wet_percent:.1}% dry_fallback={dry_percent:.1}% wet_blocks={wet_blocks} fallback_blocks={fallback_blocks} manual_bypass_blocks={manual_bypass_blocks} manual_now={} host_disabled_blocks={host_disabled_blocks} host_now={} last_wet_ms={last_wet_ms} underruns={} no_input_blocks={}\nQueue: backlog_ms={backlog_ms:.1} max_backlog_ms={max_backlog_ms:.1} limit_ms={:.1} input_queue_peak={} output_queue_peak={} resync={}/{} dropped={} queue_full={wet_drop_queue_full} old={} generation={} sequence={} channels={} frames={} other={wet_drop_other}\nReduction: requested_db={requested_attenuation:.2} effective_db={effective_attenuation:.2}\nCause: {overload_cause}\nError: {error}",
+            "Hush: {}\nModel: source={} name={} path={model_path} embedded={} load_started={} load_completed={} load_ms={} parse_started={} parse_completed={} initialized={} init_ms={} checksum={} compressed_bytes={} decompressed_bytes={}{}\nAudio: rate={} Hz configured_channels={} active_channels={} quantum={} max_quantum={} callback_budget_ms={:.3} latency_ms={:.1} schedule_frames={} measured_headroom_frames={}\nInference: calls={} native_samples={} mean_us={mean_inference_us:.1} last_us={} errors={} last_success_ms={last_inference_ms} worker_avg_ms={average:.2} p50_ms={:.2} p95_ms={p95:.2} p99_ms={p99:.2} worker_max_ms={:.2} rt_factor={ewma_factor:.2}x last_rt={last_factor:.2}x lifetime_rt={realtime_factor:.2}x input_rms_db={:.1} input_peak_db={:.1} output_rms_db={:.1} output_peak_db={:.1} wet_dry_delta_db={:.1} worker_blocks={} queued={}\nDelivery: wet={current_wet_percent:.1}% dry_fallback={dry_percent:.1}% wet_blocks={wet_blocks} fallback_blocks={fallback_blocks} manual_bypass_blocks={manual_bypass_blocks} manual_now={} host_disabled_blocks={host_disabled_blocks} host_now={} last_wet_ms={last_wet_ms} underruns={} no_input_blocks={}\nDry frames: startup={dry_startup_frames} manual_bypass={dry_manual_bypass_frames} host_disabled={dry_host_disabled_frames} underrun={dry_underrun_frames} worker_failure={dry_worker_failure_frames} resync={dry_resync_frames} no_input={dry_no_input_frames}\nQueue: backlog_ms={backlog_ms:.1} max_backlog_ms={max_backlog_ms:.1} limit_ms={:.1} input_queue_peak={} output_queue_peak={} resync={}/{} dropped={} queue_full={wet_drop_queue_full} old={} generation={} sequence={} channels={} frames={} other={wet_drop_other}\nReduction: requested_db={requested_attenuation:.2} effective_db={effective_attenuation:.2}\nCause: {overload_cause}\nError: {error}",
             health.label(),
             self.model.source,
             self.model.name,
@@ -411,21 +650,7 @@ impl HushDiagnostics {
 
 impl crate::EffectDiagnostics for HushDiagnostics {
     fn snapshot(&self) -> crate::EffectDiagnosticsSnapshot {
-        let health = self.health();
-        let lifecycle = if matches!(health, HushHealth::Failed) {
-            crate::EffectLifecycle::Failed
-        } else if !self.worker_ready.load(Ordering::Acquire) {
-            crate::EffectLifecycle::Preparing
-        } else {
-            crate::EffectLifecycle::Active
-        };
-        let total = self.wet_frames_output.load(Ordering::Relaxed)
-            + self.dry_frames_output.load(Ordering::Relaxed);
-        let wet_percent = if total == 0 {
-            0.0
-        } else {
-            self.wet_frames_output.load(Ordering::Relaxed) as f64 * 100.0 / total as f64
-        };
+        let summary = self.summary_snapshot();
         let mut metrics = std::collections::BTreeMap::new();
         metrics.insert(
             "physical_channels".into(),
@@ -441,26 +666,31 @@ impl crate::EffectDiagnostics for HushDiagnostics {
             "active_mask".into(),
             format!("0x{:02x}", self.active_channel_mask.load(Ordering::Relaxed)),
         );
-        metrics.insert("wet_percent".into(), format!("{wet_percent:.1}"));
         metrics.insert(
-            "rt_factor".into(),
-            format!(
-                "{:.2}",
-                f64::from_bits(self.ewma_realtime_factor_bits.load(Ordering::Relaxed))
-            ),
+            "wet_percent_recent".into(),
+            format!("{:.1}", summary.wet_percent_recent),
         );
+        metrics.insert(
+            "unexpected_dry_percent_recent".into(),
+            format!("{:.1}", summary.unexpected_dry_percent_recent),
+        );
+        metrics.insert("rt_factor".into(), format!("{:.2}", summary.ewma_rt_factor));
         crate::EffectDiagnosticsSnapshot {
-            lifecycle,
+            lifecycle: summary.lifecycle,
             health: if self.bypass.load(Ordering::Acquire)
                 || self.host_disabled.load(Ordering::Acquire)
             {
                 crate::EffectHealth::Bypassed
             } else {
-                health.into()
+                summary.health.into()
             },
-            message: Some(self.status_text()),
+            message: Some(Self::short_summary_text(&summary)),
             metrics,
         }
+    }
+
+    fn report(&self) -> String {
+        self.status_text()
     }
 }
 
@@ -473,5 +703,119 @@ pub(crate) fn record_maximum(counter: &AtomicU64, value: usize) {
             Ok(_) => break,
             Err(observed) => maximum = observed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn healthy_window() -> HushHealthWindow {
+        HushHealthWindow {
+            wet_frames: 1_000,
+            ..HushHealthWindow::default()
+        }
+    }
+
+    fn classify(recent: HushHealthWindow) -> HushHealth {
+        classify_health(HushHealthInput {
+            worker_ready: true,
+            worker_state: HushWorkerState::Running.as_u32(),
+            active_channels: 2,
+            ewma_realtime_factor: 0.32,
+            recent,
+            ..HushHealthInput::default()
+        })
+    }
+
+    #[test]
+    fn startup_dry_does_not_poison_later_wet_health() {
+        let mut recent = healthy_window();
+        recent.startup_dry_frames = 512;
+        assert_eq!(classify(recent), HushHealth::Healthy);
+    }
+
+    #[test]
+    fn intentional_bypass_history_is_excluded_from_future_health() {
+        let mut recent = healthy_window();
+        recent.dry_frames = 1_000;
+        recent.intentional_dry_frames = 1_000;
+        assert_eq!(classify(recent), HushHealth::Healthy);
+        assert_eq!(
+            classify_health(HushHealthInput {
+                worker_ready: true,
+                worker_state: HushWorkerState::Running.as_u32(),
+                bypass: true,
+                active_channels: 2,
+                ewma_realtime_factor: 0.32,
+                recent,
+                ..HushHealthInput::default()
+            }),
+            HushHealth::Degraded
+        );
+    }
+
+    #[test]
+    fn host_disabled_history_is_excluded_from_future_health() {
+        let mut recent = healthy_window();
+        recent.dry_frames = 2_000;
+        recent.intentional_dry_frames = 2_000;
+        assert_eq!(classify(recent), HushHealth::Healthy);
+    }
+
+    #[test]
+    fn underrun_is_degraded_but_not_overloaded() {
+        let mut recent = healthy_window();
+        recent.dry_frames = 10;
+        recent.unexpected_dry_frames = 10;
+        assert_eq!(classify(recent), HushHealth::Degraded);
+    }
+
+    #[test]
+    fn persistent_realtime_overload_is_overloaded() {
+        assert_eq!(
+            classify_health(HushHealthInput {
+                worker_ready: true,
+                worker_state: HushWorkerState::Running.as_u32(),
+                active_channels: 2,
+                ewma_realtime_factor: 1.05,
+                recent: healthy_window(),
+                ..HushHealthInput::default()
+            }),
+            HushHealth::Overloaded
+        );
+    }
+
+    #[test]
+    fn worker_failure_wins_over_delivery_health() {
+        assert_eq!(
+            classify_health(HushHealthInput {
+                worker_failed: true,
+                worker_ready: true,
+                worker_state: HushWorkerState::Running.as_u32(),
+                active_channels: 2,
+                ewma_realtime_factor: 0.32,
+                recent: healthy_window(),
+                ..HushHealthInput::default()
+            }),
+            HushHealth::Failed
+        );
+    }
+
+    #[test]
+    fn no_input_is_degraded_without_cpu_overload() {
+        assert_eq!(
+            classify_health(HushHealthInput {
+                worker_ready: true,
+                worker_state: HushWorkerState::Running.as_u32(),
+                ewma_realtime_factor: 0.32,
+                recent: HushHealthWindow {
+                    no_input_frames: 512,
+                    ..HushHealthWindow::default()
+                },
+                ..HushHealthInput::default()
+            }),
+            HushHealth::Degraded
+        );
     }
 }

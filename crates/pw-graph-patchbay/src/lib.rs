@@ -6,10 +6,14 @@
 
 use pw_graph_backend::{BackendError, GraphDriver};
 use pw_graph_core::{
-    legacy_relay_port_name, Direction, Graph, NodeType, PortId, PortKey, PortType,
+    Direction, EndpointResolution, EndpointSelector, Graph, NodeIdentity, NodeType, PortId,
+    PortKey, PortType,
 };
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::fmt::Write as FmtWrite;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 mod xml;
@@ -142,6 +146,27 @@ pub struct PatchConnection {
     pub input_node: String,
     #[serde(default)]
     pub input_name: String,
+    /// Rich selectors are optional so files written by older qpwgraph-rs
+    /// versions and native qpwgraph XML remain readable without a rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_selector: Option<EndpointSelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_selector: Option<EndpointSelector>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct XmlSelectorSidecarEntry {
+    #[serde(default)]
+    index: Option<usize>,
+    fingerprint: String,
+    output_selector: Option<EndpointSelector>,
+    input_selector: Option<EndpointSelector>,
+    #[serde(default)]
+    output_node_type: Option<NodeType>,
+    #[serde(default)]
+    input_node_type: Option<NodeType>,
+    #[serde(default)]
+    port_type: Option<PortType>,
 }
 
 impl PatchConnection {
@@ -152,6 +177,30 @@ impl PatchConnection {
     fn effective_input_node_type(&self) -> NodeType {
         self.input_node_type.unwrap_or(self.node_type)
     }
+
+    fn matches_stable_pair(&self, output: &PortKey, input: &PortKey) -> bool {
+        let legacy_match = self.output_node == output.node_name
+            && self.output_name == output.port_name
+            && self.input_node == input.node_name
+            && self.input_name == input.port_name;
+        let selector_match = self
+            .output_selector
+            .as_ref()
+            .zip(self.input_selector.as_ref())
+            .is_some_and(|(saved_output, saved_input)| {
+                selectors_equivalent(saved_output, &output.selector())
+                    && selectors_equivalent(saved_input, &input.selector())
+            });
+        // Once a rule has rich selectors, its display names are only a
+        // compatibility/cache view. Using `legacy_match || selector_match`
+        // here would delete two same-named applications together when one of
+        // them is explicitly disconnected.
+        if self.output_selector.is_some() && self.input_selector.is_some() {
+            selector_match
+        } else {
+            legacy_match
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -160,12 +209,383 @@ pub struct ActivationReport {
     pub already_present: usize,
     pub disconnected: usize,
     pub failed: Vec<String>,
+    pub waiting: Vec<String>,
+    pub ambiguous: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PatchbayResolution {
+    Resolved { output: PortId, input: PortId },
+    WaitingForEndpoint { detail: String },
+    Ambiguous { detail: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconcileStatus {
+    Satisfied,
+    WaitingForEndpoint,
+    Ambiguous,
+    Retrying,
+    Failed,
+}
+
+impl ReconcileStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Satisfied => "Satisfied",
+            Self::WaitingForEndpoint => "Waiting for endpoint",
+            Self::Ambiguous => "Ambiguous",
+            Self::Retrying => "Retrying",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconcileRuleStatus {
+    pub rule_index: usize,
+    pub status: ReconcileStatus,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReconcileReport {
+    pub connected: usize,
+    pub already_present: usize,
+    pub disconnected: usize,
+    pub rules: Vec<ReconcileRuleStatus>,
+    /// Control-plane warnings which are not attributable to one saved rule,
+    /// such as a transient failure while enforcing exclusive cleanup.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RetryState {
+    attempts: u8,
+    next_retry: Instant,
+}
+
+/// Debounced desired-state reconciliation for an activated patchbay.
+///
+/// The reconciler is deliberately independent from the UI timer. A backend
+/// marks it dirty when its registry changes, and the application invokes
+/// `reconcile_if_due` after the graph snapshot is refreshed. That coalesces a
+/// node/port/link burst into one idempotent pass and leaves missing rules
+/// pending instead of deleting them.
+#[derive(Debug)]
+pub struct PatchbayReconciler {
+    pending: bool,
+    next_run: Option<Instant>,
+    last_graph_generation: u64,
+    retry_state: BTreeMap<usize, RetryState>,
+    last_report: ReconcileReport,
+    debounce: Duration,
+}
+
+impl Default for PatchbayReconciler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PatchbayReconciler {
+    pub fn new() -> Self {
+        Self {
+            pending: false,
+            next_run: None,
+            last_graph_generation: 0,
+            retry_state: BTreeMap::new(),
+            last_report: ReconcileReport::default(),
+            debounce: Duration::from_millis(100),
+        }
+    }
+
+    pub fn mark_dirty(&mut self, now: Instant) {
+        self.pending = true;
+        // A new graph generation is a fresh opportunity after a transient
+        // backend failure. Retrying is still bounded for that generation,
+        // while a destroy/recreate event does not leave a route permanently
+        // stuck at its old failure count.
+        self.retry_state.clear();
+        self.next_run = Some(now + self.debounce);
+    }
+
+    pub fn schedule_now(&mut self, now: Instant) {
+        self.pending = true;
+        self.retry_state.clear();
+        self.next_run = Some(now);
+    }
+
+    pub fn deactivate(&mut self) {
+        self.pending = false;
+        self.next_run = None;
+        self.retry_state.clear();
+    }
+
+    pub fn last_report(&self) -> &ReconcileReport {
+        &self.last_report
+    }
+
+    pub fn last_graph_generation(&self) -> u64 {
+        self.last_graph_generation
+    }
+
+    fn retry_status(
+        &mut self,
+        rule_index: usize,
+        now: Instant,
+        error: impl Into<String>,
+    ) -> ReconcileRuleStatus {
+        let state = self.retry_state.entry(rule_index).or_insert(RetryState {
+            attempts: 0,
+            next_retry: now,
+        });
+        state.attempts = state.attempts.saturating_add(1).min(6);
+        let delay = Duration::from_millis(100_u64 << state.attempts.min(5));
+        state.next_retry = now + delay;
+        if state.attempts < 6 {
+            self.pending = true;
+            self.next_run = Some(
+                self.next_run
+                    .map_or(state.next_retry, |current| current.min(state.next_retry)),
+            );
+        }
+        ReconcileRuleStatus {
+            rule_index,
+            status: if state.attempts >= 6 {
+                ReconcileStatus::Failed
+            } else {
+                ReconcileStatus::Retrying
+            },
+            detail: error.into(),
+        }
+    }
+
+    pub fn reconcile_if_due(
+        &mut self,
+        patchbay: &Patchbay,
+        driver: &mut dyn GraphDriver,
+        exclusive: bool,
+        auto_disconnect: bool,
+        now: Instant,
+        graph_generation: u64,
+    ) -> Result<Option<ReconcileReport>, PatchbayError> {
+        if !self.pending || self.next_run.is_some_and(|next| now < next) {
+            return Ok(None);
+        }
+        self.pending = false;
+        self.next_run = None;
+        self.last_graph_generation = graph_generation;
+        if let Err(error) = driver.refresh() {
+            let retry = self.retry_status(usize::MAX, now, error.to_string());
+            let mut report = ReconcileReport::default();
+            report.warnings.push(format!(
+                "graph refresh: {} ({})",
+                retry.detail,
+                retry.status.label()
+            ));
+            self.last_report = report.clone();
+            return Ok(Some(report));
+        }
+
+        let mut report = ReconcileReport::default();
+        let mut resolved = Vec::new();
+        let mut all_rules_resolved = true;
+        for (rule_index, _connection) in patchbay.connections.iter().enumerate() {
+            match patchbay.resolve_rule(driver.graph(), rule_index) {
+                PatchbayResolution::Resolved { output, input } => {
+                    resolved.push((rule_index, output, input));
+                }
+                PatchbayResolution::WaitingForEndpoint { detail } => {
+                    all_rules_resolved = false;
+                    report.rules.push(ReconcileRuleStatus {
+                        rule_index,
+                        status: ReconcileStatus::WaitingForEndpoint,
+                        detail,
+                    });
+                }
+                PatchbayResolution::Ambiguous { detail } => {
+                    all_rules_resolved = false;
+                    report.rules.push(ReconcileRuleStatus {
+                        rule_index,
+                        status: ReconcileStatus::Ambiguous,
+                        detail,
+                    });
+                }
+            }
+        }
+
+        // Exclusive removal is only safe when the complete desired set is
+        // known. A disappearing app must never make us tear down unrelated
+        // session-manager links while its rule is merely waiting.
+        if exclusive && all_rules_resolved {
+            let desired: Vec<_> = resolved
+                .iter()
+                .filter_map(|(_, output, input)| {
+                    Some((
+                        driver.graph().port_key(*output)?,
+                        driver.graph().port_key(*input)?,
+                    ))
+                })
+                .collect();
+            // A link can disappear between selector resolution and this
+            // snapshot. Never interpret an incomplete desired set as an
+            // instruction to remove every mutable session-manager link.
+            if desired.len() == resolved.len() {
+                let live: Vec<_> = driver
+                    .graph()
+                    .links
+                    .values()
+                    .filter(|link| driver.is_link_mutable(link.id))
+                    .filter_map(|link| {
+                        Some((
+                            driver.graph().port_key(link.output_port)?,
+                            driver.graph().port_key(link.input_port)?,
+                        ))
+                    })
+                    .collect();
+                let mut cleanup_failed = false;
+                for (live_output, live_input) in live {
+                    if desired
+                        .iter()
+                        .any(|(output, input)| output == &live_output && input == &live_input)
+                    {
+                        continue;
+                    }
+                    match driver
+                        .disconnect_by_key_if_present_without_suppression(&live_output, &live_input)
+                    {
+                        Ok(Some(_)) => report.disconnected += 1,
+                        Ok(None) => {}
+                        Err(error) => {
+                            let retry = self.retry_status(usize::MAX, now, error.to_string());
+                            report.warnings.push(format!(
+                                "exclusive cleanup: {} ({})",
+                                retry.detail,
+                                retry.status.label()
+                            ));
+                            cleanup_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if !cleanup_failed {
+                    self.retry_state.remove(&usize::MAX);
+                }
+            }
+        }
+
+        'desired_rules: for (rule_index, output, input) in resolved {
+            if self
+                .retry_state
+                .get(&rule_index)
+                .is_some_and(|state| state.next_retry > now)
+            {
+                report.rules.push(ReconcileRuleStatus {
+                    rule_index,
+                    status: ReconcileStatus::Retrying,
+                    detail: "waiting for the next bounded retry".into(),
+                });
+                continue;
+            }
+            let Some(output_key) = driver.graph().port_key(output) else {
+                report.rules.push(self.retry_status(
+                    rule_index,
+                    now,
+                    "source port disappeared during reconciliation",
+                ));
+                continue;
+            };
+            let Some(input_key) = driver.graph().port_key(input) else {
+                report.rules.push(self.retry_status(
+                    rule_index,
+                    now,
+                    "destination port disappeared during reconciliation",
+                ));
+                continue;
+            };
+            if driver
+                .graph()
+                .find_link_by_keys(&output_key, &input_key)
+                .is_some()
+            {
+                report.already_present += 1;
+                report.rules.push(ReconcileRuleStatus {
+                    rule_index,
+                    status: ReconcileStatus::Satisfied,
+                    detail: "route already present".into(),
+                });
+                self.retry_state.remove(&rule_index);
+                continue;
+            }
+            if auto_disconnect {
+                let Some(input_id) = driver.graph().resolve_port_key(&input_key) else {
+                    report.rules.push(self.retry_status(
+                        rule_index,
+                        now,
+                        "destination port disappeared before auto-disconnect",
+                    ));
+                    continue;
+                };
+                let stale: Vec<_> = driver
+                    .graph()
+                    .links_for_port(input_id)
+                    .filter(|link| link.input_port == input_id && driver.is_link_mutable(link.id))
+                    .filter_map(|link| {
+                        Some((
+                            driver.graph().port_key(link.output_port)?,
+                            driver.graph().port_key(link.input_port)?,
+                        ))
+                    })
+                    .collect();
+                for (stale_output, stale_input) in stale {
+                    if let Err(error) = driver.disconnect_by_key_if_present_without_suppression(
+                        &stale_output,
+                        &stale_input,
+                    ) {
+                        report
+                            .rules
+                            .push(self.retry_status(rule_index, now, error.to_string()));
+                        continue 'desired_rules;
+                    }
+                    report.disconnected += 1;
+                }
+            }
+            match driver.connect_by_key_if_missing(&output_key, &input_key) {
+                Ok(Some(_)) => {
+                    report.connected += 1;
+                    report.rules.push(ReconcileRuleStatus {
+                        rule_index,
+                        status: ReconcileStatus::Satisfied,
+                        detail: "route connected".into(),
+                    });
+                    self.retry_state.remove(&rule_index);
+                }
+                Ok(None) => {
+                    report.already_present += 1;
+                    self.retry_state.remove(&rule_index);
+                    report.rules.push(ReconcileRuleStatus {
+                        rule_index,
+                        status: ReconcileStatus::Satisfied,
+                        detail: "route appeared during reconciliation".into(),
+                    });
+                }
+                Err(error) => {
+                    report
+                        .rules
+                        .push(self.retry_status(rule_index, now, error.to_string()));
+                }
+            }
+        }
+        self.last_report = report.clone();
+        Ok(Some(report))
+    }
 }
 
 impl Patchbay {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            version: 1,
+            version: 2,
             name: name.into(),
             connections: Vec::new(),
         }
@@ -209,12 +629,29 @@ impl Patchbay {
             self.add_connection(output_port, input_port, pinned);
             return;
         };
+        let output_selector = graph.port_key(output_port).map(|key| key.selector());
+        let input_selector = graph.port_key(input_port).map(|key| key.selector());
         if let Some(connection) = self.connections.iter_mut().find(|connection| {
+            let selector_match = connection
+                .output_selector
+                .as_ref()
+                .zip(connection.input_selector.as_ref())
+                .zip(output_selector.as_ref().zip(input_selector.as_ref()))
+                .is_some_and(
+                    |((saved_output, saved_input), (current_output, current_input))| {
+                        selectors_equivalent(saved_output, current_output)
+                            && selectors_equivalent(saved_input, current_input)
+                    },
+                );
+            let legacy_match = connection.output_selector.is_none()
+                && connection.input_selector.is_none()
+                && connection.output_node == output_node.name
+                && connection.output_name == output.name
+                && connection.input_node == input_node.name
+                && connection.input_name == input.name;
             (connection.output_port == output_port && connection.input_port == input_port)
-                || (connection.output_node == output_node.name
-                    && connection.output_name == output.name
-                    && connection.input_node == input_node.name
-                    && connection.input_name == input.name)
+                || selector_match
+                || legacy_match
         }) {
             connection.pinned |= pinned;
             connection.output_port = output_port;
@@ -227,6 +664,8 @@ impl Patchbay {
             connection.output_name = output.name.clone();
             connection.input_node = input_node.name.clone();
             connection.input_name = input.name.clone();
+            connection.output_selector = output_selector;
+            connection.input_selector = input_selector;
             return;
         }
         self.connections.push(PatchConnection {
@@ -241,6 +680,8 @@ impl Patchbay {
             output_name: output.name.clone(),
             input_node: input_node.name.clone(),
             input_name: input.name.clone(),
+            output_selector,
+            input_selector,
         });
     }
 
@@ -257,12 +698,8 @@ impl Patchbay {
     /// recreated link must also remove the older saved rule.
     pub fn remove_stable_connection(&mut self, output: &PortKey, input: &PortKey) -> bool {
         let original_len = self.connections.len();
-        self.connections.retain(|connection| {
-            !(connection.output_node == output.node_name
-                && connection.output_name == output.port_name
-                && connection.input_node == input.node_name
-                && connection.input_name == input.port_name)
-        });
+        self.connections
+            .retain(|connection| !connection.matches_stable_pair(output, input));
         original_len != self.connections.len()
     }
 
@@ -322,6 +759,140 @@ impl Patchbay {
         }
     }
 
+    /// Resolve one persisted rule without mutating the graph. This is also
+    /// used by the continuous reconciler so missing and ambiguous endpoints
+    /// remain observable rather than being silently dropped.
+    pub fn resolve_rule(&self, graph: &Graph, rule_index: usize) -> PatchbayResolution {
+        let Some(connection) = self.connections.get(rule_index) else {
+            return PatchbayResolution::WaitingForEndpoint {
+                detail: format!("rule {rule_index} is no longer present"),
+            };
+        };
+        let has_names = !connection.output_node.is_empty()
+            && !connection.output_name.is_empty()
+            && !connection.input_node.is_empty()
+            && !connection.input_name.is_empty();
+        if !has_names && connection.output_selector.is_none() && connection.input_selector.is_none()
+        {
+            let Some(output) = graph.port(connection.output_port) else {
+                return PatchbayResolution::WaitingForEndpoint {
+                    detail: "legacy output port is missing".into(),
+                };
+            };
+            let Some(input) = graph.port(connection.input_port) else {
+                return PatchbayResolution::WaitingForEndpoint {
+                    detail: "legacy input port is missing".into(),
+                };
+            };
+            return if output.direction == Direction::Source && input.direction == Direction::Sink {
+                PatchbayResolution::Resolved {
+                    output: output.id,
+                    input: input.id,
+                }
+            } else {
+                PatchbayResolution::WaitingForEndpoint {
+                    detail: "legacy numeric endpoints have incompatible directions".into(),
+                }
+            };
+        }
+        let output = resolve_selector(graph, connection.output_selector.as_ref(), || {
+            legacy_selector(
+                connection.output_node.clone(),
+                connection.output_name.clone(),
+                Direction::Source,
+                connection.port_type,
+                connection.effective_output_node_type(),
+            )
+        });
+        let input = resolve_selector(graph, connection.input_selector.as_ref(), || {
+            legacy_selector(
+                connection.input_node.clone(),
+                connection.input_name.clone(),
+                Direction::Sink,
+                connection.port_type,
+                connection.effective_input_node_type(),
+            )
+        });
+        match (output, input) {
+            (
+                EndpointResolution::Exact(output) | EndpointResolution::UniqueFallback(output),
+                EndpointResolution::Exact(input) | EndpointResolution::UniqueFallback(input),
+            ) => PatchbayResolution::Resolved { output, input },
+            (EndpointResolution::Ambiguous(ids), _) => PatchbayResolution::Ambiguous {
+                detail: format!("output endpoint is ambiguous: {} candidates", ids.len()),
+            },
+            (_, EndpointResolution::Ambiguous(ids)) => PatchbayResolution::Ambiguous {
+                detail: format!("input endpoint is ambiguous: {} candidates", ids.len()),
+            },
+            (EndpointResolution::Missing, _) => PatchbayResolution::WaitingForEndpoint {
+                detail: "output endpoint is missing".into(),
+            },
+            (_, EndpointResolution::Missing) => PatchbayResolution::WaitingForEndpoint {
+                detail: "input endpoint is missing".into(),
+            },
+        }
+    }
+
+    /// Build a detailed, on-demand report for the patchbay diagnostics view.
+    ///
+    /// This is intentionally not part of the regular model synchronization
+    /// path: it formats every saved selector and current resolution, which is
+    /// useful when investigating a recreated stream but unnecessary for the
+    /// compact rule cards.
+    pub fn debug_report(&self, graph: &Graph, report: &ReconcileReport) -> String {
+        let mut text = String::new();
+        let _ = writeln!(text, "Patchbay diagnostics");
+        let _ = writeln!(text, "name={}", self.name);
+        let _ = writeln!(text, "schema_version={}", self.version);
+        let _ = writeln!(text, "saved_rules={}", self.connections.len());
+        let _ = writeln!(text, "reconcile_connected={}", report.connected);
+        let _ = writeln!(text, "reconcile_already_present={}", report.already_present);
+        let _ = writeln!(text, "reconcile_disconnected={}", report.disconnected);
+        if !report.warnings.is_empty() {
+            let _ = writeln!(text, "warnings={:?}", report.warnings);
+        }
+        let _ = writeln!(text, "\nRules:");
+        for (index, connection) in self.connections.iter().enumerate() {
+            let (output, input) = connection_selectors(connection);
+            let _ = writeln!(
+                text,
+                "rule[{index}] pinned={} display={}:{} -> {}:{}",
+                connection.pinned,
+                connection.output_node,
+                connection.output_name,
+                connection.input_node,
+                connection.input_name,
+            );
+            let _ = writeln!(text, "  output_selector={output:?}");
+            let _ = writeln!(
+                text,
+                "  output_resolution={}",
+                graph.endpoint_resolution_explanation(&output)
+            );
+            let _ = writeln!(text, "  input_selector={input:?}");
+            let _ = writeln!(
+                text,
+                "  input_resolution={}",
+                graph.endpoint_resolution_explanation(&input)
+            );
+            if let Some(status) = report
+                .rules
+                .iter()
+                .find(|status| status.rule_index == index)
+            {
+                let _ = writeln!(
+                    text,
+                    "  reconcile_status={} detail={}",
+                    status.status.label(),
+                    status.detail
+                );
+            } else {
+                let _ = writeln!(text, "  reconcile_status=not sampled in the last pass");
+            }
+        }
+        text
+    }
+
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), PatchbayError> {
         let path = path.as_ref();
         if let Some(parent) = path
@@ -340,15 +911,41 @@ impl Patchbay {
         } else {
             serde_json::to_string_pretty(self)?
         };
-        pw_graph_utils::atomic_write(path, text.as_bytes(), false).map_err(PatchbayError::Write)
+        pw_graph_utils::atomic_write(path, text.as_bytes(), false).map_err(PatchbayError::Write)?;
+        if is_xml {
+            let sidecar = selector_sidecar_path(path);
+            let entries = self
+                .connections
+                .iter()
+                .enumerate()
+                .map(|(index, connection)| XmlSelectorSidecarEntry {
+                    index: Some(index),
+                    fingerprint: connection_fingerprint(connection),
+                    output_selector: connection.output_selector.clone(),
+                    input_selector: connection.input_selector.clone(),
+                    output_node_type: connection.output_node_type,
+                    input_node_type: connection.input_node_type,
+                    port_type: Some(connection.port_type),
+                })
+                .collect::<Vec<_>>();
+            let sidecar_text = serde_json::to_string_pretty(&entries)?;
+            pw_graph_utils::atomic_write(&sidecar, sidecar_text.as_bytes(), false)
+                .map_err(PatchbayError::Write)?;
+        }
+        Ok(())
     }
 
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self, PatchbayError> {
+        let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(PatchbayError::Read)?;
         if text.trim_start().starts_with('<') {
-            Self::from_xml(&text)
+            let mut patchbay = Self::from_xml(&text)?;
+            load_xml_selector_sidecar(path, &mut patchbay);
+            Ok(patchbay)
         } else {
-            Ok(serde_json::from_str(&text)?)
+            let mut patchbay: Self = serde_json::from_str(&text)?;
+            patchbay.version = patchbay.version.max(2);
+            Ok(patchbay)
         }
     }
 
@@ -378,22 +975,37 @@ impl Patchbay {
                 .push("connection removal is not supported by this backend".into());
             return Ok(report);
         }
-        let resolved: Vec<(PortKey, PortKey)> = self
-            .connections
-            .iter()
-            .filter_map(|connection| {
-                let (output, input) = self.resolve_connection(driver.graph(), connection)?;
-                Some((
-                    driver.graph().port_key(output)?,
-                    driver.graph().port_key(input)?,
-                ))
-            })
-            .collect();
+        let mut resolved = Vec::new();
+        for (rule_index, _) in self.connections.iter().enumerate() {
+            match self.resolve_rule(driver.graph(), rule_index) {
+                PatchbayResolution::Resolved { output, input } => {
+                    let Some(output) = driver.graph().port_key(output) else {
+                        continue;
+                    };
+                    let Some(input) = driver.graph().port_key(input) else {
+                        continue;
+                    };
+                    resolved.push((output, input));
+                }
+                PatchbayResolution::WaitingForEndpoint { detail } => {
+                    report.waiting.push(format!("rule {rule_index}: {detail}"));
+                }
+                PatchbayResolution::Ambiguous { detail } => {
+                    report
+                        .ambiguous
+                        .push(format!("rule {rule_index}: {detail}"));
+                }
+            }
+        }
 
         let mut removed_by_activation: Vec<(PortKey, PortKey)> = Vec::new();
         let mut created_by_activation: Vec<(PortKey, PortKey)> = Vec::new();
 
-        if exclusive {
+        // Exclusive mode is only safe once every saved selector has resolved.
+        // A dynamic application can legitimately be between its node and port
+        // registry events; removing the currently-live links from that partial
+        // snapshot would make a transient disappearance destructive.
+        if exclusive && report.waiting.is_empty() && report.ambiguous.is_empty() {
             let live: Vec<_> = driver
                 .graph()
                 .links
@@ -509,106 +1121,174 @@ impl Patchbay {
         }
         Ok(report)
     }
-
-    fn resolve_connection(
-        &self,
-        graph: &Graph,
-        connection: &PatchConnection,
-    ) -> Option<(PortId, PortId)> {
-        let has_names = !connection.output_node.is_empty()
-            && !connection.output_name.is_empty()
-            && !connection.input_node.is_empty()
-            && !connection.input_name.is_empty();
-        if has_names {
-            let output = resolve_named_port(
-                graph,
-                &connection.output_node,
-                &connection.output_name,
-                Direction::Source,
-                connection.port_type,
-                connection.effective_output_node_type(),
-                connection.output_node_type.is_none(),
-            )?;
-            let input = resolve_named_port(
-                graph,
-                &connection.input_node,
-                &connection.input_name,
-                Direction::Sink,
-                connection.port_type,
-                connection.effective_input_node_type(),
-                connection.input_node_type.is_none(),
-            )?;
-            return Some((output, input));
-        }
-
-        // Legacy files may contain only numeric IDs. Keep that fallback, but
-        // never let an old numeric ID override a complete name-based rule.
-        let output = graph.port(connection.output_port)?;
-        let input = graph.port(connection.input_port)?;
-        (output.direction == Direction::Source && input.direction == Direction::Sink)
-            .then_some((output.id, input.id))
-    }
 }
 
-/// Resolve an endpoint by its durable node/port identity. Newer patchbay
-/// rules carry an explicit endpoint type and must match it exactly. For a
-/// legacy rule, first prefer the original shared type, then fall back to the
-/// saved name/port shape when that type is no longer sufficient (for example
-/// an old PipeWire-to-Effect rule saved before Effect had its own type).
-fn resolve_named_port(
-    graph: &Graph,
-    node_name: &str,
-    port_name: &str,
+fn legacy_selector(
+    node_name: String,
+    port_name: String,
     direction: Direction,
     port_type: PortType,
     node_type: NodeType,
-    allow_legacy_type_fallback: bool,
-) -> Option<PortId> {
-    let strict_type = (node_type != NodeType::Unknown).then_some(node_type);
-    if let Some(port) = find_named_port(
-        graph,
-        node_name,
+) -> EndpointSelector {
+    EndpointSelector {
+        node_type,
+        identity: NodeIdentity::with_node_name(node_name),
         port_name,
+        channel: None,
         direction,
         port_type,
-        strict_type,
-    ) {
-        return Some(port);
+        match_mode: pw_graph_core::EndpointMatchMode::Instance,
     }
-
-    allow_legacy_type_fallback
-        .then(|| find_named_port(graph, node_name, port_name, direction, port_type, None))
-        .flatten()
 }
 
-fn find_named_port(
+fn connection_selectors(connection: &PatchConnection) -> (EndpointSelector, EndpointSelector) {
+    let output = connection.output_selector.clone().unwrap_or_else(|| {
+        legacy_selector(
+            connection.output_node.clone(),
+            connection.output_name.clone(),
+            Direction::Source,
+            connection.port_type,
+            connection.effective_output_node_type(),
+        )
+    });
+    let input = connection.input_selector.clone().unwrap_or_else(|| {
+        legacy_selector(
+            connection.input_node.clone(),
+            connection.input_name.clone(),
+            Direction::Sink,
+            connection.port_type,
+            connection.effective_input_node_type(),
+        )
+    });
+    (output, input)
+}
+
+fn resolve_selector<F>(
     graph: &Graph,
-    node_name: &str,
-    port_name: &str,
-    direction: Direction,
-    port_type: PortType,
-    node_type: Option<NodeType>,
-) -> Option<PortId> {
-    graph
-        .nodes
-        .values()
-        .filter(|node| node.name == node_name)
-        .filter(|node| node_type.is_none_or(|expected| node.node_type == expected))
-        .find_map(|node| {
-            // A patchbay saved before the relay filter ports were
-            // role-prefixed stores them as bare `FL`/`FR`. `legacy_relay_port_name`
-            // accepts that one rewrite, and only on the two relay nodes, so
-            // an ordinary card's `FL` pin is untouched.
-            let legacy_relay_port = legacy_relay_port_name(&node.name, port_name, direction);
-            node.ports.iter().find_map(|id| {
-                let port = graph.port(*id)?;
-                ((port.name == port_name
-                    || legacy_relay_port.is_some_and(|name| port.name == name))
-                    && port.direction == direction
-                    && (port_type == PortType::Unknown || port.port_type == port_type))
-                    .then_some(port.id)
-            })
-        })
+    selector: Option<&EndpointSelector>,
+    legacy: F,
+) -> EndpointResolution
+where
+    F: FnOnce() -> EndpointSelector,
+{
+    let selector = selector.cloned().unwrap_or_else(legacy);
+    let result = graph.resolve_endpoint(&selector);
+    if !matches!(result, EndpointResolution::Missing) {
+        return result;
+    }
+    // A pre-v2 rule used one broad node type for both endpoints. Preserve the
+    // old compatibility fallback, but only after the precise typed selector
+    // had no candidate.
+    if selector.node_type != NodeType::Unknown && selector.identity.effect_instance_id.is_none() {
+        let mut fallback = selector;
+        fallback.node_type = NodeType::Unknown;
+        return graph.resolve_endpoint(&fallback);
+    }
+    result
+}
+
+fn selectors_equivalent(saved: &EndpointSelector, current: &EndpointSelector) -> bool {
+    let app_channel_matches = !matches!(
+        saved.match_mode,
+        pw_graph_core::EndpointMatchMode::NamePattern
+    ) && !matches!(
+        current.match_mode,
+        pw_graph_core::EndpointMatchMode::NamePattern
+    ) && saved.channel.is_some()
+        && saved.channel == current.channel
+        && (saved.identity.application_id.is_some()
+            || saved.identity.process_binary.is_some()
+            || saved.identity.application_name.is_some());
+    let port_name_matches = saved.port_name == current.port_name || app_channel_matches;
+    if saved.node_type != current.node_type
+        || !port_name_matches
+        || saved.channel != current.channel
+        || saved.direction != current.direction
+        || saved.port_type != current.port_type
+    {
+        return false;
+    }
+    let a = &saved.identity;
+    let b = &current.identity;
+    if a.effect_instance_id.is_some() || b.effect_instance_id.is_some() {
+        return a.effect_instance_id == b.effect_instance_id;
+    }
+    if a.application_id.is_some() || b.application_id.is_some() {
+        return a.application_id.is_some() && a.application_id == b.application_id;
+    }
+    ((a.process_binary.is_some() || b.process_binary.is_some())
+        && a.process_binary == b.process_binary
+        && (a.application_name.is_none()
+            || b.application_name.is_none()
+            || a.application_name == b.application_name))
+        || (a.application_id.is_none()
+            && b.application_id.is_none()
+            && a.process_binary.is_none()
+            && b.process_binary.is_none()
+            && a.node_name == b.node_name)
+}
+
+fn selector_sidecar_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("patchbay");
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{file_name}.qpwgraph-rs-selectors.json"))
+}
+
+fn connection_fingerprint(connection: &PatchConnection) -> String {
+    serde_json::to_string(&(
+        &connection.output_node,
+        &connection.output_name,
+        &connection.input_node,
+        &connection.input_name,
+        connection.node_type,
+        connection.output_node_type,
+        connection.input_node_type,
+        connection.port_type,
+    ))
+    .expect("patchbay selector fingerprint is serializable")
+}
+
+fn load_xml_selector_sidecar(path: &Path, patchbay: &mut Patchbay) {
+    let sidecar = selector_sidecar_path(path);
+    let Ok(text) = std::fs::read_to_string(sidecar) else {
+        return;
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<XmlSelectorSidecarEntry>>(&text) else {
+        return;
+    };
+    let mut used = vec![false; entries.len()];
+    for (connection_index, connection) in patchbay.connections.iter_mut().enumerate() {
+        let fingerprint = connection_fingerprint(connection);
+        let match_index = entries
+            .iter()
+            .enumerate()
+            .find(|(index, entry)| !used[*index] && entry.index == Some(connection_index))
+            .map(|(index, _)| index)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .find(|(index, entry)| !used[*index] && entry.fingerprint == fingerprint)
+                    .map(|(index, _)| index)
+            });
+        let Some(index) = match_index else {
+            continue;
+        };
+        let entry = &entries[index];
+        connection.output_selector = entry.output_selector.clone();
+        connection.input_selector = entry.input_selector.clone();
+        connection.output_node_type = entry.output_node_type;
+        connection.input_node_type = entry.input_node_type;
+        if let Some(port_type) = entry.port_type {
+            connection.port_type = port_type;
+        }
+        used[index] = true;
+    }
+    patchbay.version = patchbay.version.max(2);
 }
 
 #[cfg(test)]
@@ -943,7 +1623,11 @@ mod tests {
         assert_eq!(loaded.connections.len(), 1);
         assert_eq!(loaded.connections[0].output_node, "Audio Capture");
         assert_eq!(loaded.connections[0].output_name, "capture_FL");
+        assert!(loaded.connections[0].output_selector.is_some());
+        assert!(loaded.connections[0].input_selector.is_some());
+        let sidecar = selector_sidecar_path(&path);
         std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_file(sidecar);
     }
 
     #[test]
@@ -1118,10 +1802,15 @@ mod tests {
         patchbay.add_graph_connection(&original, PortId(21), PortId(22), true);
 
         let xml = patchbay.to_xml().unwrap();
-        assert!(xml.contains("output-node-type=\"effect\""));
-        assert!(xml.contains("input-node-type=\"pipewire\""));
+        assert!(!xml.contains("output-node-type"));
+        assert!(!xml.contains("input-node-type"));
 
-        let loaded = Patchbay::from_xml(&xml).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "qpwgraph-rs-effect-types-{}.qpwgraph",
+            std::process::id()
+        ));
+        patchbay.save_to(&path).unwrap();
+        let loaded = Patchbay::load_from(&path).unwrap();
         let connection = &loaded.connections[0];
         assert_eq!(connection.effective_output_node_type(), NodeType::Effect);
         assert_eq!(connection.effective_input_node_type(), NodeType::PipeWire);
@@ -1131,7 +1820,12 @@ mod tests {
         same_type_patchbay.add_graph_connection(&same_type, PortId(41), PortId(42), true);
         let same_type_xml = same_type_patchbay.to_xml().unwrap();
         assert!(!same_type_xml.contains("input-node-type"));
-        let same_type_loaded = Patchbay::from_xml(&same_type_xml).unwrap();
+        let same_type_path = std::env::temp_dir().join(format!(
+            "qpwgraph-rs-effect-types-same-{}.qpwgraph",
+            std::process::id()
+        ));
+        same_type_patchbay.save_to(&same_type_path).unwrap();
+        let same_type_loaded = Patchbay::load_from(&same_type_path).unwrap();
         assert_eq!(
             same_type_loaded.connections[0].output_node_type,
             Some(NodeType::Effect)
@@ -1140,6 +1834,10 @@ mod tests {
             same_type_loaded.connections[0].input_node_type,
             Some(NodeType::Effect)
         );
+        let _ = std::fs::remove_file(path.clone());
+        let _ = std::fs::remove_file(selector_sidecar_path(&path));
+        let _ = std::fs::remove_file(same_type_path.clone());
+        let _ = std::fs::remove_file(selector_sidecar_path(&same_type_path));
     }
 
     #[test]
@@ -1334,5 +2032,508 @@ mod tests {
         assert_eq!(patchbay.connections.len(), 1);
         assert_eq!(patchbay.connections[0].output_node, "Other");
         assert!(!patchbay.remove_connections_for_node("Noise Gate (gate-1)"));
+    }
+
+    fn dynamic_application_graph(
+        application_node_id: u64,
+        application_port_id: u64,
+        serial: u64,
+        application_name: &str,
+        sink_node_id: u64,
+        sink_port_id: u64,
+    ) -> Graph {
+        let mut graph = Graph::default();
+        graph
+            .add_node(
+                pw_graph_core::Node::new(
+                    pw_graph_core::NodeId(application_node_id),
+                    application_name,
+                    NodeType::PipeWire,
+                )
+                .with_identity(NodeIdentity {
+                    application_id: Some("org.example.browser".into()),
+                    application_name: Some("Browser".into()),
+                    process_binary: Some("browser".into()),
+                    node_name: application_name.into(),
+                    media_role: Some("music".into()),
+                    object_serial: Some(serial),
+                    ..NodeIdentity::default()
+                }),
+            )
+            .unwrap();
+        graph
+            .add_node(pw_graph_core::Node::new(
+                pw_graph_core::NodeId(sink_node_id),
+                "Built-in sink",
+                NodeType::PipeWire,
+            ))
+            .unwrap();
+        graph
+            .add_port(
+                pw_graph_core::Port::new(
+                    PortId(application_port_id),
+                    pw_graph_core::NodeId(application_node_id),
+                    "output",
+                    Direction::Source,
+                    PortType::Audio,
+                )
+                .with_channel("FL"),
+            )
+            .unwrap();
+        graph
+            .add_port(
+                pw_graph_core::Port::new(
+                    PortId(sink_port_id),
+                    pw_graph_core::NodeId(sink_node_id),
+                    "input",
+                    Direction::Sink,
+                    PortType::Audio,
+                )
+                .with_channel("FL"),
+            )
+            .unwrap();
+        graph
+    }
+
+    fn reconcile_now(
+        reconciler: &mut PatchbayReconciler,
+        patchbay: &Patchbay,
+        driver: &mut InMemoryDriver,
+        now: Instant,
+        exclusive: bool,
+        auto_disconnect: bool,
+    ) -> ReconcileReport {
+        reconciler.schedule_now(now);
+        reconciler
+            .reconcile_if_due(patchbay, driver, exclusive, auto_disconnect, now, 1)
+            .unwrap()
+            .expect("scheduled reconciliation should run")
+    }
+
+    #[test]
+    fn reconciler_restores_a_recreated_application_stream() {
+        let old = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&old, PortId(20), PortId(40), true);
+        let mut driver = InMemoryDriver::new(old);
+        driver.connect(PortId(20), PortId(40)).unwrap();
+
+        let recreated = dynamic_application_graph(300, 455, 800, "Browser stream", 600, 655);
+        driver.replace_graph(recreated);
+        let now = Instant::now();
+        let mut reconciler = PatchbayReconciler::new();
+        let report = reconcile_now(&mut reconciler, &patchbay, &mut driver, now, false, false);
+
+        assert_eq!(report.connected, 1);
+        assert_eq!(report.rules[0].status, ReconcileStatus::Satisfied);
+        assert!(driver
+            .graph()
+            .links
+            .values()
+            .any(|link| link.output_port == PortId(455) && link.input_port == PortId(655)));
+    }
+
+    #[test]
+    fn reconciler_coalesces_registry_bursts_and_never_duplicates_a_route() {
+        let graph = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&graph, PortId(20), PortId(40), true);
+        let mut driver = InMemoryDriver::new(graph);
+        let now = Instant::now();
+        let mut reconciler = PatchbayReconciler::new();
+        for offset in [0, 20, 40, 60] {
+            reconciler.mark_dirty(now + Duration::from_millis(offset));
+        }
+        assert!(reconciler
+            .reconcile_if_due(
+                &patchbay,
+                &mut driver,
+                false,
+                false,
+                now + Duration::from_millis(99),
+                4,
+            )
+            .unwrap()
+            .is_none());
+        let report = reconciler
+            .reconcile_if_due(
+                &patchbay,
+                &mut driver,
+                false,
+                false,
+                now + Duration::from_millis(161),
+                4,
+            )
+            .unwrap()
+            .expect("one debounced pass should run");
+        assert_eq!(report.connected, 1);
+        assert!(reconciler
+            .reconcile_if_due(
+                &patchbay,
+                &mut driver,
+                false,
+                false,
+                now + Duration::from_millis(161),
+                4,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(driver.graph().links.len(), 1);
+    }
+
+    #[test]
+    fn missing_endpoint_stays_pending_without_mutating_the_graph() {
+        let old = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&old, PortId(20), PortId(40), true);
+        let mut current = old.clone();
+        current.ports.remove(&PortId(20));
+        current
+            .nodes
+            .get_mut(&pw_graph_core::NodeId(10))
+            .unwrap()
+            .ports
+            .clear();
+        let mut driver = InMemoryDriver::new(current);
+        let mut reconciler = PatchbayReconciler::new();
+        let report = reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            false,
+            false,
+        );
+
+        assert_eq!(report.rules[0].status, ReconcileStatus::WaitingForEndpoint);
+        assert!(driver.graph().links.is_empty());
+        assert_eq!(patchbay.connections.len(), 1);
+    }
+
+    #[test]
+    fn node_then_ports_is_retried_after_the_next_graph_generation() {
+        let old = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&old, PortId(20), PortId(40), true);
+        let mut partial = old.clone();
+        partial.ports.remove(&PortId(20));
+        partial
+            .nodes
+            .get_mut(&pw_graph_core::NodeId(10))
+            .unwrap()
+            .ports
+            .clear();
+        let mut driver = InMemoryDriver::new(partial);
+        let mut reconciler = PatchbayReconciler::new();
+        let first = reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            false,
+            false,
+        );
+        assert_eq!(first.rules[0].status, ReconcileStatus::WaitingForEndpoint);
+
+        driver.replace_graph(dynamic_application_graph(
+            300,
+            455,
+            800,
+            "Browser stream",
+            600,
+            655,
+        ));
+        let second = reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            false,
+            false,
+        );
+        assert_eq!(second.connected, 1);
+    }
+
+    #[test]
+    fn equal_application_candidates_are_reported_ambiguous() {
+        let old = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&old, PortId(20), PortId(40), true);
+        let mut current = dynamic_application_graph(300, 455, 800, "Browser stream", 600, 655);
+        let second = dynamic_application_graph(301, 456, 801, "Browser stream", 600, 655);
+        current.nodes.insert(
+            pw_graph_core::NodeId(301),
+            second.nodes[&pw_graph_core::NodeId(301)].clone(),
+        );
+        current
+            .ports
+            .insert(PortId(456), second.ports[&PortId(456)].clone());
+        let mut driver = InMemoryDriver::new(current);
+        let mut reconciler = PatchbayReconciler::new();
+        let report = reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            false,
+            false,
+        );
+
+        assert_eq!(report.rules[0].status, ReconcileStatus::Ambiguous);
+        assert!(driver.graph().links.is_empty());
+    }
+
+    #[test]
+    fn transient_backend_failure_uses_bounded_exponential_retry() {
+        let graph = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&graph, PortId(20), PortId(40), true);
+        let mut driver = InMemoryDriver::new(graph);
+        driver.fail_connect_of(PortId(20), PortId(40));
+        let mut reconciler = PatchbayReconciler::new();
+        let mut now = Instant::now();
+        let mut final_status = None;
+        reconciler.schedule_now(now);
+        for attempt in 0..6 {
+            let report = reconciler
+                .reconcile_if_due(&patchbay, &mut driver, false, false, now, 1)
+                .unwrap()
+                .expect("the next retry should be due");
+            final_status = report.rules.first().map(|rule| rule.status);
+            if attempt < 5 {
+                now += Duration::from_millis(100_u64 << (attempt + 1));
+            }
+        }
+        assert_eq!(final_status, Some(ReconcileStatus::Failed));
+        assert!(reconciler
+            .reconcile_if_due(
+                &patchbay,
+                &mut driver,
+                false,
+                false,
+                now + Duration::from_secs(60),
+                1,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn deleting_a_saved_rule_prevents_reconciliation_from_recreating_it() {
+        let graph = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let output = graph.port_key(PortId(20)).unwrap();
+        let input = graph.port_key(PortId(40)).unwrap();
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&graph, PortId(20), PortId(40), true);
+        let mut driver = InMemoryDriver::new(graph);
+        let mut reconciler = PatchbayReconciler::new();
+        reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            false,
+            false,
+        );
+        let link = driver.graph().links.values().next().unwrap().id;
+        driver.disconnect(link).unwrap();
+        assert!(patchbay.remove_stable_connection(&output, &input));
+
+        let report = reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            false,
+            false,
+        );
+        assert!(report.rules.is_empty());
+        assert!(driver.graph().links.is_empty());
+    }
+
+    #[test]
+    fn same_named_application_rules_remain_distinct_and_delete_only_one() {
+        let first = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut second = dynamic_application_graph(11, 21, 101, "Browser stream", 30, 40);
+        second
+            .nodes
+            .get_mut(&pw_graph_core::NodeId(11))
+            .unwrap()
+            .identity
+            .application_id = Some("org.example.other-browser".into());
+        let mut graph = first.clone();
+        graph.nodes.insert(
+            pw_graph_core::NodeId(11),
+            second.nodes[&pw_graph_core::NodeId(11)].clone(),
+        );
+        graph
+            .ports
+            .insert(PortId(21), second.ports[&PortId(21)].clone());
+
+        let mut patchbay = Patchbay::new("same-name");
+        patchbay.add_graph_connection(&graph, PortId(20), PortId(40), true);
+        patchbay.add_graph_connection(&graph, PortId(21), PortId(40), true);
+        assert_eq!(patchbay.connections.len(), 2);
+
+        let first_output = graph.port_key(PortId(20)).unwrap();
+        let input = graph.port_key(PortId(40)).unwrap();
+        assert!(patchbay.remove_stable_connection(&first_output, &input));
+        assert_eq!(patchbay.connections.len(), 1);
+        assert_eq!(
+            patchbay.connections[0]
+                .output_selector
+                .as_ref()
+                .and_then(|selector| selector.identity.application_id.as_deref()),
+            Some("org.example.other-browser")
+        );
+        assert_eq!(patchbay.connections[0].output_port, PortId(21));
+    }
+
+    #[test]
+    fn exclusive_reconciliation_settles_without_oscillation() {
+        let graph = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut extra = graph.clone();
+        extra
+            .add_node(pw_graph_core::Node::new(
+                pw_graph_core::NodeId(50),
+                "Other source",
+                NodeType::PipeWire,
+            ))
+            .unwrap();
+        extra
+            .add_node(pw_graph_core::Node::new(
+                pw_graph_core::NodeId(51),
+                "Other sink",
+                NodeType::PipeWire,
+            ))
+            .unwrap();
+        extra
+            .add_port(pw_graph_core::Port::new(
+                PortId(60),
+                pw_graph_core::NodeId(50),
+                "output",
+                Direction::Source,
+                PortType::Audio,
+            ))
+            .unwrap();
+        extra
+            .add_port(pw_graph_core::Port::new(
+                PortId(61),
+                pw_graph_core::NodeId(51),
+                "input",
+                Direction::Sink,
+                PortType::Audio,
+            ))
+            .unwrap();
+        let mut patchbay = Patchbay::new("exclusive");
+        patchbay.add_graph_connection(&graph, PortId(20), PortId(40), true);
+        let mut driver = InMemoryDriver::new(extra);
+        driver.connect(PortId(20), PortId(40)).unwrap();
+        driver.connect(PortId(60), PortId(61)).unwrap();
+        let mut reconciler = PatchbayReconciler::new();
+        let first = reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            true,
+            false,
+        );
+        assert_eq!(first.disconnected, 1);
+        assert_eq!(driver.graph().links.len(), 1);
+        let second = reconcile_now(
+            &mut reconciler,
+            &patchbay,
+            &mut driver,
+            Instant::now(),
+            true,
+            false,
+        );
+        assert_eq!(second.disconnected, 0);
+        assert_eq!(driver.graph().links.len(), 1);
+    }
+
+    #[test]
+    fn one_shot_exclusive_activation_does_not_remove_links_for_waiting_rules() {
+        let old = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("exclusive-waiting");
+        patchbay.add_graph_connection(&old, PortId(20), PortId(40), true);
+
+        let mut current = old.clone();
+        current.nodes.remove(&pw_graph_core::NodeId(10));
+        current.ports.remove(&PortId(20));
+        current
+            .nodes
+            .get_mut(&pw_graph_core::NodeId(30))
+            .unwrap()
+            .ports
+            .clear();
+        current
+            .add_node(pw_graph_core::Node::new(
+                pw_graph_core::NodeId(50),
+                "Other source",
+                NodeType::PipeWire,
+            ))
+            .unwrap();
+        current
+            .add_node(pw_graph_core::Node::new(
+                pw_graph_core::NodeId(51),
+                "Other sink",
+                NodeType::PipeWire,
+            ))
+            .unwrap();
+        current
+            .add_port(pw_graph_core::Port::new(
+                PortId(60),
+                pw_graph_core::NodeId(50),
+                "output",
+                Direction::Source,
+                PortType::Audio,
+            ))
+            .unwrap();
+        current
+            .add_port(pw_graph_core::Port::new(
+                PortId(61),
+                pw_graph_core::NodeId(51),
+                "input",
+                Direction::Sink,
+                PortType::Audio,
+            ))
+            .unwrap();
+        let mut driver = InMemoryDriver::new(current);
+        driver.connect(PortId(60), PortId(61)).unwrap();
+
+        let report = patchbay.activate(&mut driver, true, false).unwrap();
+        assert_eq!(report.disconnected, 0);
+        assert_eq!(report.waiting.len(), 1);
+        assert!(driver
+            .graph()
+            .find_link_by_keys(&key(&driver, 60), &key(&driver, 61))
+            .is_some());
+    }
+
+    #[test]
+    fn repeated_application_recreation_does_not_accumulate_routes_or_stale_ids() {
+        let first = dynamic_application_graph(10, 20, 100, "Browser stream", 30, 40);
+        let mut patchbay = Patchbay::new("dynamic");
+        patchbay.add_graph_connection(&first, PortId(20), PortId(40), true);
+        let mut driver = InMemoryDriver::new(first);
+        let mut reconciler = PatchbayReconciler::new();
+        let mut now = Instant::now();
+        for generation in 0..100_u64 {
+            let base = 1000 + generation * 4;
+            driver.replace_graph(dynamic_application_graph(
+                base,
+                base + 1,
+                10_000 + generation,
+                "Browser stream",
+                base + 2,
+                base + 3,
+            ));
+            reconcile_now(&mut reconciler, &patchbay, &mut driver, now, false, false);
+            assert_eq!(driver.graph().links.len(), 1);
+            assert_eq!(patchbay.connections.len(), 1);
+            now += Duration::from_millis(1);
+        }
     }
 }

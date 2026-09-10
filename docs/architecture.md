@@ -7,7 +7,8 @@ before adding a crate or moving logic between layers.
 
 The code is split into focused crates:
 
-- `pw-graph-core`: graph models, stable endpoint keys, validation, and layout.
+- `pw-graph-core`: graph models, typed durable endpoint selectors, explicit
+  resolution outcomes, validation, and layout.
 - `pw-graph-effects`: realtime-safe effect processor API and built-in effects.
 - `pw-graph-backend`: driver abstraction, demo backend, native PipeWire graph,
   Windows Core Audio endpoint/session graph, WinMM MIDI, audio controls,
@@ -77,6 +78,33 @@ persisted application routes use process selectors rather than transient PIDs.
 ## Assets
 
 Shared SVG assets live in [`assets/icons`](../assets/icons).
+
+## Durable graph identity and reconciliation
+
+PipeWire registry records capture node properties and join parent Client
+metadata before building graph nodes. `NodeIdentity` deliberately separates
+durable application hints (`application.id`, process binary/name, effect
+instance) from current-session diagnostics (`object.serial`, client/global
+IDs). `EndpointSelector` and `EndpointResolution` live in `pw-graph-core`, so
+matching never depends on Slint or on a numeric-ID tie breaker. The resolver
+returns `Exact`, `UniqueFallback`, `Ambiguous`, or `Missing`; equal candidates
+are therefore safe to inspect rather than unsafe to guess.
+
+`pw-graph-patchbay` owns schema-v2 selectors, legacy migration, qpwgraph XML
+compatibility, and the control-plane `PatchbayReconciler`. An activated
+patchbay marks itself dirty on registry changes, waits for a short settle
+window, resolves all desired routes, and then performs only idempotent missing
+connects (or safe exclusive cleanup). Missing dynamic applications remain
+pending, ambiguous matches remain untouched, and backend failures retry with a
+bounded backoff. Manual deletion updates desired state so the reconciler does
+not fight the user.
+
+The Slint bridge requests compact Hush snapshots during ordinary synchronization
+and asks the effect driver for a full report only for the diagnostics dialog.
+The same copyable dialog pattern is used for PipeWire identity and patchbay
+reconciliation reports. None of these control-plane operations enter the Hush
+realtime callback; model loading, inference, filesystem I/O, locks, waits, and
+joins remain worker/control-plane work.
 
 ## Further reading
 

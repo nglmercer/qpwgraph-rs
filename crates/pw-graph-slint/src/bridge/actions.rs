@@ -1,17 +1,19 @@
 use crate::model::node_layout_key;
 use crate::model::{ConnectMode, MediaFilter};
 use pw_graph_command::{DisconnectAllCommand, MoveNodesCommand};
-use pw_graph_core::NodeAppearance;
+use pw_graph_core::{decode_backend_local_id, decode_backend_namespace, NodeAppearance};
+use std::fmt::Write as FmtWrite;
 use std::time::Instant;
 
 use super::app::Application;
 use super::config::save_config;
 use super::connections::{delete_selected_connections, disconnect_selected_node};
-use super::effects::{cancel_effect_setup, remove_effect};
+use super::effects::{cancel_effect_setup, close_effect_diagnostics, remove_effect};
 use super::patchbay::{
     activate_patchbay, add_rule_from_selection, begin_rule_edit, cancel_rule_edit,
-    choose_patchbay_directory, load_patchbay, load_recent_patchbay, remove_rule, save_patchbay,
-    save_profile, save_rule, select_profile, snapshot_patchbay, toggle_rule_pin,
+    choose_patchbay_directory, close_patchbay_diagnostics, load_patchbay, load_recent_patchbay,
+    open_patchbay_diagnostics, remove_rule, save_patchbay, save_profile, save_rule, select_profile,
+    snapshot_patchbay, toggle_rule_pin,
 };
 use super::relay::{
     accept_pending_enrollment, cancel_relay_connect, connect_relay, disconnect_relay,
@@ -167,6 +169,19 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
         }
         "node-appearance" => open_node_appearance(window, application),
         "node-appearance-close" => window.set_show_node_editor(false),
+        "node-identity-debug" => open_node_identity_diagnostics(window, application),
+        "node-identity-debug-close" => {
+            window.set_show_node_diagnostics(false);
+            application.node_debug_report.clear();
+        }
+        "node-identity-debug-copy" => {
+            application.status = application.t("status.node_diagnostics_copied");
+        }
+        "patchbay-debug" => open_patchbay_diagnostics(window, application),
+        "patchbay-debug-close" => close_patchbay_diagnostics(window, application),
+        "patchbay-debug-copy" => {
+            super::patchbay::copy_patchbay_diagnostics(application);
+        }
         "node-appearance-reset-name" => window.set_node_editor_custom_name("".into()),
         "node-appearance-reset-color" => window.set_node_editor_color("".into()),
         "node-appearance-save" => save_node_appearance(window, application),
@@ -394,6 +409,77 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
     }
 }
 
+fn open_node_identity_diagnostics(window: &MainWindow, application: &mut Application) {
+    let Some(node_id) = application.view.selected_nodes.iter().next().copied() else {
+        application.status = application.t("status.select_node_before_debug");
+        return;
+    };
+    let graph = application.source.graph();
+    let Some(node) = graph.node(node_id) else {
+        application.status = application.t("status.select_node_before_debug");
+        return;
+    };
+    let identity = node.matching_identity();
+    let namespace = decode_backend_namespace(node.id.0);
+    let mut report = String::new();
+    let _ = writeln!(report, "Node identity diagnostics");
+    let _ = writeln!(report, "graph_id={}", node.id.0);
+    let _ = writeln!(report, "backend={namespace:?}");
+    let _ = writeln!(
+        report,
+        "current_global_id={}",
+        decode_backend_local_id(node.id.0)
+    );
+    let _ = writeln!(report, "node_type={:?}", node.node_type);
+    let _ = writeln!(report, "node.name={}", node.name);
+    let _ = writeln!(report, "node.description={:?}", identity.description);
+    let _ = writeln!(report, "object.serial={:?}", identity.object_serial);
+    let _ = writeln!(report, "client.id={:?}", identity.client_id);
+    let _ = writeln!(report, "client.name={:?}", identity.client_name);
+    let _ = writeln!(report, "client.api={:?}", identity.client_api);
+    let _ = writeln!(report, "application.id={:?}", identity.application_id);
+    let _ = writeln!(report, "application.name={:?}", identity.application_name);
+    let _ = writeln!(
+        report,
+        "application.process.binary={:?}",
+        identity.process_binary
+    );
+    let _ = writeln!(report, "media.role={:?}", identity.media_role);
+    let _ = writeln!(report, "media.name={:?}", identity.media_name);
+    let _ = writeln!(report, "object.path={:?}", identity.object_path);
+    let _ = writeln!(
+        report,
+        "effect.instance_id={:?}",
+        identity.effect_instance_id
+    );
+    let _ = writeln!(report, "\nPorts:");
+    for port_id in &node.ports {
+        let Some(port) = graph.port(*port_id) else {
+            continue;
+        };
+        let _ = writeln!(
+            report,
+            "  graph_id={} current_global_id={} name={} channel={:?} direction={:?} type={:?}",
+            port.id.0,
+            decode_backend_local_id(port.id.0),
+            port.name,
+            port.channel,
+            port.direction,
+            port.port_type,
+        );
+        if let Some(key) = graph.port_key(port.id) {
+            let _ = writeln!(
+                report,
+                "    selector_resolution={}",
+                graph.endpoint_resolution_explanation(&key.selector())
+            );
+        }
+    }
+    application.node_debug_name = node.name.clone();
+    application.node_debug_report = report;
+    window.set_show_node_diagnostics(true);
+}
+
 fn delete_selection(application: &mut Application) {
     if !application.view.selected_links.is_empty() {
         delete_selected_connections(application);
@@ -454,8 +540,8 @@ fn toggle_overlay(window: &MainWindow, overlay: Overlay) {
 /// order below is the layering order on screen, innermost first:
 ///
 /// ```text
-/// QR dialog -> node appearance -> effect setup -> the four modals
-///           -> relay panel -> canvas gesture
+/// QR dialog -> patchbay/node diagnostics -> effect diagnostics -> node appearance
+/// -> effect setup -> the four modals -> relay panel -> canvas gesture
 /// ```
 ///
 /// The canvas gesture is cancelled in `ui/main.slint` before this runs, so an
@@ -467,6 +553,19 @@ fn escape_topmost_layer(window: &MainWindow, application: &mut Application) {
     }
     if window.get_show_qr() {
         window.set_show_qr(false);
+        return;
+    }
+    if window.get_show_patchbay_diagnostics() {
+        close_patchbay_diagnostics(window, application);
+        return;
+    }
+    if window.get_show_node_diagnostics() {
+        window.set_show_node_diagnostics(false);
+        application.node_debug_report.clear();
+        return;
+    }
+    if window.get_show_effect_diagnostics() {
+        close_effect_diagnostics(window, application);
         return;
     }
     if window.get_show_node_editor() {
@@ -481,9 +580,9 @@ fn escape_topmost_layer(window: &MainWindow, application: &mut Application) {
     }
     if window.get_show_effects() {
         // A completed Create action closes the setup subview while its ticket
-        // continues in the background. Closing the whole effects overlay is
-        // an explicit user cancellation for those still-pending interactive
-        // preparations.
+        // continues in the background. This call only discards an unsubmitted
+        // draft; a submitted ticket is cancelled through its own operation
+        // card or during shutdown.
         cancel_effect_setup(window, application);
         window.set_show_effects(false);
         return;
@@ -511,7 +610,10 @@ fn close_modals(window: &MainWindow) {
     window.set_show_history(false);
     window.set_show_shortcuts(false);
     window.set_show_effects(false);
+    window.set_show_effect_diagnostics(false);
+    window.set_show_patchbay_diagnostics(false);
     window.set_show_node_editor(false);
+    window.set_show_node_diagnostics(false);
 }
 
 fn open_node_appearance(window: &MainWindow, application: &mut Application) {

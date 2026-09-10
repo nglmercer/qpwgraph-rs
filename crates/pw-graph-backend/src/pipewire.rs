@@ -12,6 +12,7 @@ use pw::spa::param::ParamType;
 use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::{Pod, Value};
 use pw::spa::utils::Direction as SpaDirection;
+use pw_graph_core::NodeIdentity;
 use pw_graph_effects::{
     AudioSpec, EffectComponentManager, EffectHost, EffectPreparationEvent, EffectPrepareRequest,
     EffectTicket, PreparedEffect,
@@ -48,11 +49,19 @@ use registry::{
 
 const NODE_NAME: &str = "node.name";
 const NODE_DESCRIPTION: &str = "node.description";
+const OBJECT_PATH: &str = "object.path";
 const MEDIA_CLASS: &str = "media.class";
+const MEDIA_NAME: &str = "media.name";
 const MEDIA_TYPE: &str = "media.type";
 const FORMAT_DSP: &str = "format.dsp";
 const NODE_ID: &str = "node.id";
 const OBJECT_SERIAL: &str = "object.serial";
+const CLIENT_ID: &str = "client.id";
+const CLIENT_NAME: &str = "client.name";
+const CLIENT_API: &str = "client.api";
+const APPLICATION_ID: &str = "application.id";
+const APPLICATION_NAME: &str = "application.name";
+const APPLICATION_PROCESS_BINARY: &str = "application.process.binary";
 const PORT_NAME: &str = "port.name";
 const AUDIO_CHANNEL: &str = "audio.channel";
 const PORT_DIRECTION: &str = "port.direction";
@@ -382,6 +391,7 @@ impl PipewireDriver {
     fn build_graph_from_state(&mut self, state: RegistryState) -> BackendResult<Graph> {
         let mut graph = Graph::default();
         let mut node_media_classes = HashMap::new();
+        let clients = &state.clients;
         let effect_nodes: HashMap<NodeId, String> = self
             .effects
             .values()
@@ -401,6 +411,9 @@ impl PipewireDriver {
             }
             node_media_classes.insert(node_id, record.media_class.to_ascii_lowercase());
             let effect_instance_id = effect_nodes.get(&node_id);
+            let client = record
+                .client_id
+                .and_then(|client_id| clients.get(&client_id));
             let mut node = Node::new(
                 node_id,
                 &record.name,
@@ -410,6 +423,37 @@ impl PipewireDriver {
                     NodeType::PipeWire
                 },
             );
+            let identity = NodeIdentity {
+                application_id: record
+                    .application_id
+                    .clone()
+                    .or_else(|| client.and_then(|client| client.application_id.clone())),
+                application_name: record
+                    .application_name
+                    .clone()
+                    .or_else(|| client.and_then(|client| client.application_name.clone())),
+                process_binary: record
+                    .process_binary
+                    .clone()
+                    .or_else(|| client.and_then(|client| client.process_binary.clone())),
+                node_name: record.name.clone(),
+                description: record.description.clone(),
+                media_role: record.media_role.clone(),
+                media_name: record.media_name.clone(),
+                client_name: record
+                    .client_name
+                    .clone()
+                    .or_else(|| client.and_then(|client| client.client_name.clone())),
+                client_api: record
+                    .client_api
+                    .clone()
+                    .or_else(|| client.and_then(|client| client.client_api.clone())),
+                client_id: record.client_id,
+                object_path: record.object_path.clone(),
+                object_serial: record.serial,
+                effect_instance_id: effect_instance_id.cloned(),
+            };
+            node = node.with_identity(identity);
             if let Some(serial) = record.serial {
                 node = node.with_serial(serial);
             }

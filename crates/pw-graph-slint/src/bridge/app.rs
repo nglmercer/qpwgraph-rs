@@ -4,7 +4,7 @@ use pw_graph_command::CommandStack;
 use pw_graph_config::AppConfig;
 use pw_graph_core::PortKey;
 use pw_graph_i18n::I18n;
-use pw_graph_patchbay::Patchbay;
+use pw_graph_patchbay::{Patchbay, PatchbayReconciler};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -25,6 +25,14 @@ pub(crate) enum UiEvent {
     },
     EffectInspect {
         instance_id: String,
+    },
+    EffectDebug {
+        instance_id: String,
+    },
+    EffectDebugClose,
+    EffectDebugCopy,
+    EffectCancel {
+        ticket: u64,
     },
     EffectParameterChanged {
         instance_id: String,
@@ -91,6 +99,12 @@ pub(crate) struct Application {
     pub(crate) source: ApplicationDriver,
     pub(crate) commands: CommandStack,
     pub(crate) patchbay: Patchbay,
+    pub(crate) patchbay_reconciler: PatchbayReconciler,
+    pub(crate) patchbay_graph_generation: u64,
+    /// Runtime-only desired-state suppression for an explicit user delete.
+    /// This prevents a later topology sync from turning a manually removed
+    /// edge back into a saved rule during the current session.
+    pub(crate) manually_suppressed_patchbay: Vec<(PortKey, PortKey)>,
     pub(crate) patchbay_file: PathBuf,
     pub(crate) config: AppConfig,
     pub(crate) config_file: PathBuf,
@@ -112,11 +126,16 @@ pub(crate) struct Application {
     pub(crate) effect_selection_id: Option<String>,
     pub(crate) effect_draft_enabled: bool,
     pub(crate) effect_draft_parameters: BTreeMap<String, f32>,
-    /// Interactive effect preparations that the user can still cancel by
-    /// closing the effects dialog. Restored effects are intentionally not in
-    /// this set: they are background graph restoration work, not a draft the
-    /// user just asked to abandon.
-    pub(crate) pending_effect_tickets: BTreeSet<pw_graph_backend::EffectTicket>,
+    /// Submitted effect preparations. Closing the effects dialog only drops
+    /// the unsubmitted draft; these records remain until a terminal backend
+    /// event arrives or the user explicitly cancels one.
+    pub(crate) pending_effect_tickets: BTreeMap<pw_graph_backend::EffectTicket, PendingEffectUi>,
+    pub(crate) effect_debug_name: String,
+    pub(crate) effect_debug_health: String,
+    pub(crate) effect_debug_report: String,
+    pub(crate) patchbay_debug_report: String,
+    pub(crate) node_debug_name: String,
+    pub(crate) node_debug_report: String,
     pub(crate) debug: bool,
     pub(crate) last_refresh: Instant,
     /// Last time the full model sync ran. The 50 ms pump only refreshes
@@ -185,6 +204,19 @@ pub(crate) struct Application {
     pub(crate) relay_route_preferences_applied: bool,
 }
 
+/// UI metadata for a submitted effect preparation. The ticket belongs to the
+/// backend lifecycle; this record keeps the operation visible after its
+/// configuration dialog has closed.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingEffectUi {
+    pub(crate) ticket: pw_graph_backend::EffectTicket,
+    pub(crate) effect_id: String,
+    pub(crate) effect_name: String,
+    pub(crate) stage: pw_graph_backend::EffectLoadStage,
+    pub(crate) started_at: Instant,
+    pub(crate) cancellable: bool,
+}
+
 #[cfg(feature = "relay")]
 #[derive(Clone, Debug)]
 pub(crate) struct PendingEnrollment {
@@ -205,7 +237,10 @@ pub(crate) struct ReconnectPending {
 
 const CONNECTION_TOAST_DURATION: Duration = Duration::from_secs(4);
 
-pub(crate) fn set_connection_feedback(
+/// Publish short-lived user feedback for any background or graph operation.
+/// The compatibility-named wrapper below keeps the existing connection call
+/// sites readable while effects and future operations use the generic path.
+pub(crate) fn set_app_feedback(
     application: &mut Application,
     message: impl Into<String>,
     error: bool,
@@ -217,6 +252,14 @@ pub(crate) fn set_connection_feedback(
     application.toast_until = Some(Instant::now() + CONNECTION_TOAST_DURATION);
 }
 
+pub(crate) fn set_connection_feedback(
+    application: &mut Application,
+    message: impl Into<String>,
+    error: bool,
+) {
+    set_app_feedback(application, message, error);
+}
+
 pub(crate) fn toast_visible(application: &Application) -> bool {
     application
         .toast_until
@@ -224,9 +267,53 @@ pub(crate) fn toast_visible(application: &Application) -> bool {
 }
 
 impl Application {
+    pub(crate) fn mark_patchbay_graph_dirty(&mut self) {
+        self.patchbay_graph_generation = self.patchbay_graph_generation.wrapping_add(1);
+        if self.config.patchbay_activated {
+            self.patchbay_reconciler.mark_dirty(Instant::now());
+        }
+    }
+
+    pub(crate) fn reconcile_patchbay(&mut self) -> bool {
+        if !self.config.patchbay_activated {
+            return false;
+        }
+        match self.patchbay_reconciler.reconcile_if_due(
+            &self.patchbay,
+            &mut self.source,
+            self.config.patchbay_exclusive,
+            self.config.patchbay_auto_disconnect,
+            Instant::now(),
+            self.patchbay_graph_generation,
+        ) {
+            Ok(Some(report)) => {
+                if report.connected > 0 || report.disconnected > 0 {
+                    self.sync_patchbay_connections();
+                    self.autosave_patchbay();
+                }
+                if let Some(warning) = report.warnings.first() {
+                    self.status = self.tf(
+                        "status.patchbay_reconcile_warning",
+                        &[("warning", warning.clone())],
+                    );
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.status = self.tf(
+                    "status.patchbay_reconcile_failed",
+                    &[("error", error.to_string())],
+                );
+                true
+            }
+        }
+    }
+
     /// Keep durable rules synchronized with the live graph while preserving
     /// the original endpoints of inserted effects. Numeric IDs are only a
-    /// cache; names and port names are the durable identity.
+    /// cache; typed application/effect identity plus role/channel is the
+    /// durable selector, with names as the compatibility fallback.
     pub(crate) fn live_connection_keys(&self) -> Vec<(PortKey, PortKey)> {
         self.source
             .graph()
@@ -244,6 +331,13 @@ impl Application {
 
     pub(crate) fn sync_patchbay_connections(&mut self) {
         for (output, input) in self.live_connection_keys() {
+            if self
+                .manually_suppressed_patchbay
+                .iter()
+                .any(|pair| stable_pair_matches(pair, &(output.clone(), input.clone())))
+            {
+                continue;
+            }
             let Some(output_id) = self.source.graph().resolve_port_key(&output) else {
                 continue;
             };
@@ -265,7 +359,20 @@ impl Application {
     pub(crate) fn remove_patchbay_connections(&mut self, pairs: &[(PortKey, PortKey)]) {
         for (output, input) in pairs {
             self.patchbay.remove_stable_connection(output, input);
+            if !self
+                .manually_suppressed_patchbay
+                .iter()
+                .any(|pair| stable_pair_matches(pair, &(output.clone(), input.clone())))
+            {
+                self.manually_suppressed_patchbay
+                    .push((output.clone(), input.clone()));
+            }
         }
+    }
+
+    pub(crate) fn allow_patchbay_connections(&mut self, pairs: &[(PortKey, PortKey)]) {
+        self.manually_suppressed_patchbay
+            .retain(|saved| !pairs.iter().any(|pair| stable_pair_matches(saved, pair)));
     }
 
     pub(crate) fn autosave_patchbay(&mut self) {
@@ -288,4 +395,51 @@ impl Application {
     pub(crate) fn history(&self) -> (Vec<String>, Vec<String>) {
         (self.commands.undo_history(), self.commands.redo_history())
     }
+}
+
+fn stable_pair_matches(left: &(PortKey, PortKey), right: &(PortKey, PortKey)) -> bool {
+    stable_selector_matches(&left.0.selector(), &right.0.selector())
+        && stable_selector_matches(&left.1.selector(), &right.1.selector())
+}
+
+fn stable_selector_matches(
+    left: &pw_graph_core::EndpointSelector,
+    right: &pw_graph_core::EndpointSelector,
+) -> bool {
+    let app_channel_matches = !matches!(
+        left.match_mode,
+        pw_graph_core::EndpointMatchMode::NamePattern
+    ) && !matches!(
+        right.match_mode,
+        pw_graph_core::EndpointMatchMode::NamePattern
+    ) && left.channel.is_some()
+        && left.channel == right.channel
+        && (left.identity.application_id.is_some()
+            || left.identity.process_binary.is_some()
+            || left.identity.application_name.is_some());
+    let port_name_matches = left.port_name == right.port_name || app_channel_matches;
+    if left.node_type != right.node_type
+        || !port_name_matches
+        || left.channel != right.channel
+        || left.direction != right.direction
+        || left.port_type != right.port_type
+    {
+        return false;
+    }
+    let a = &left.identity;
+    let b = &right.identity;
+    if a.effect_instance_id.is_some() || b.effect_instance_id.is_some() {
+        return a.effect_instance_id == b.effect_instance_id;
+    }
+    if a.application_id.is_some() || b.application_id.is_some() {
+        return a.application_id.is_some() && a.application_id == b.application_id;
+    }
+    if a.process_binary.is_some() || b.process_binary.is_some() {
+        return a.process_binary.is_some()
+            && a.process_binary == b.process_binary
+            && (a.application_name.is_none()
+                || b.application_name.is_none()
+                || a.application_name == b.application_name);
+    }
+    a.node_name == b.node_name
 }

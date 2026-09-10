@@ -1,0 +1,41 @@
+import { UiTheme } from "../foundation/theme.slint";
+import { EffectOperationRow } from "../foundation/structs.slint";
+import { ActionButton } from "button.slint";
+
+export component BackgroundOperations inherits Rectangle {
+    in property <[EffectOperationRow]> operations: [];
+    callback cancel(int);
+
+    visible: root.operations.length > 0;
+    width: 360px;
+    height: 12px + root.operations.length * 62px;
+    background: #202b36f2;
+    border-color: #55718a;
+    border-width: 1px;
+    border-radius: 5px;
+    z: 990;
+
+    for operation[index] in root.operations: Rectangle {
+        x: 8px; y: 6px + index * 58px; width: parent.width - 16px; height: 50px;
+        background: #2a333d;
+        border-color: #40505f;
+        border-width: 1px;
+        border-radius: 4px;
+        Text {
+            x: 9px; y: 6px; width: parent.width - 100px; height: 16px;
+            text: operation.name; color: #edf3f7;
+            font-size: 10px * UiTheme.panel-scale; overflow: elide;
+        }
+        Text {
+            x: 9px; y: 25px; width: parent.width - 100px; height: 15px;
+            text: operation.stage; color: #aebdca;
+            font-size: 9px * UiTheme.panel-scale; overflow: elide;
+        }
+        ActionButton {
+            visible: operation.cancellable;
+            x: parent.width - 82px; y: 9px; width: 72px; height: 30px;
+            text: "Cancel";
+            clicked => { root.cancel(operation.ticket); }
+        }
+    }
+}

@@ -23,6 +23,14 @@ impl EffectDriver for PipewireDriver {
             .collect()
     }
 
+    fn effect_diagnostics(&self, instance_id: &str) -> BackendResult<Option<String>> {
+        let effect = self
+            .effects
+            .get(instance_id)
+            .ok_or_else(|| BackendError::unknown_effect_instance(instance_id))?;
+        Ok(effect.full_diagnostics())
+    }
+
     fn supports_effect_nodes(&self) -> bool {
         true
     }

@@ -1107,6 +1107,8 @@ mod tests {
                 channel: Some("FL".into()),
                 direction: pw_graph_core::Direction::Source,
                 port_type: pw_graph_core::PortType::Audio,
+                identity: None,
+                match_mode: pw_graph_core::EndpointMatchMode::Instance,
             }),
             destination: Some(PortKey {
                 node_name: "Playback".into(),
@@ -1116,6 +1118,8 @@ mod tests {
                 channel: Some("FL".into()),
                 direction: pw_graph_core::Direction::Sink,
                 port_type: pw_graph_core::PortType::Audio,
+                identity: None,
+                match_mode: pw_graph_core::EndpointMatchMode::Instance,
             }),
             position: [260.0, 180.0],
         });

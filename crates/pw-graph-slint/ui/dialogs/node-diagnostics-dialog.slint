@@ -1,0 +1,29 @@
+import { TextEdit } from "std-widgets.slint";
+import { UiTheme } from "../foundation/theme.slint";
+import { ActionButton } from "../components/button.slint";
+import { DialogShell } from "../components/dialog-shell.slint";
+
+export component NodeDiagnosticsDialog inherits DialogShell {
+    title: root.node-name + " · Identity";
+    in property <string> node-name: "Node identity diagnostics";
+    in property <string> report: "";
+    callback copy-diagnostics();
+
+    diagnostics := TextEdit {
+        x: 20px; y: 55px; width: parent.width - 40px; height: parent.height - 114px;
+        text: root.report;
+        read-only: true;
+        wrap: no-wrap;
+        font-size: 10px * UiTheme.panel-scale;
+    }
+    ActionButton {
+        x: 20px; y: parent.height - 48px; width: 145px;
+        text: "Copy diagnostics";
+        clicked => { diagnostics.select-all(); diagnostics.copy(); root.copy-diagnostics(); }
+    }
+    ActionButton {
+        x: parent.width - 105px; y: parent.height - 48px; width: 85px;
+        text: "Close";
+        clicked => { root.close(); }
+    }
+}

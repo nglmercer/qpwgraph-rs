@@ -3,7 +3,10 @@
 use super::app::Application;
 use super::models::{profile_options, selected_patchbay_path};
 use super::MainWindow;
-use pw_graph_core::{Direction, NodeType, PortId, PortType};
+use pw_graph_core::{
+    Direction, EndpointMatchMode, EndpointResolution, EndpointSelector, NodeIdentity, NodeType,
+    PortId, PortType,
+};
 use pw_graph_i18n::I18n;
 use rfd::FileDialog;
 use std::path::PathBuf;
@@ -178,12 +181,16 @@ pub(crate) fn save_profile(application: &mut Application) {
 }
 
 pub(crate) fn activate_patchbay(application: &mut Application) {
+    application.config.patchbay_activated = true;
     match application.patchbay.activate(
         &mut application.source,
         application.config.patchbay_exclusive,
         application.config.patchbay_auto_disconnect,
     ) {
         Ok(report) => {
+            application
+                .patchbay_reconciler
+                .schedule_now(std::time::Instant::now());
             application.sync_patchbay_connections();
             application.autosave_patchbay();
             application.status = application.tf(
@@ -198,12 +205,43 @@ pub(crate) fn activate_patchbay(application: &mut Application) {
                 application.status.push_str(" · ");
                 application.status.push_str(&report.failed.join("; "));
             }
+            if !report.waiting.is_empty() {
+                application
+                    .status
+                    .push_str(" · waiting for saved endpoints");
+            }
+            if !report.ambiguous.is_empty() {
+                application
+                    .status
+                    .push_str(" · saved endpoint is ambiguous");
+            }
         }
         Err(error) => {
             application.status =
                 application.tf("status.activation_failed", &[("error", error.to_string())]);
         }
     }
+}
+
+pub(crate) fn open_patchbay_diagnostics(window: &super::MainWindow, application: &mut Application) {
+    application.patchbay_debug_report = application.patchbay.debug_report(
+        application.source.graph(),
+        application.patchbay_reconciler.last_report(),
+    );
+    window.set_patchbay_debug_report(application.patchbay_debug_report.clone().into());
+    window.set_show_patchbay_diagnostics(true);
+}
+
+pub(crate) fn close_patchbay_diagnostics(
+    window: &super::MainWindow,
+    application: &mut Application,
+) {
+    window.set_show_patchbay_diagnostics(false);
+    application.patchbay_debug_report.clear();
+}
+
+pub(crate) fn copy_patchbay_diagnostics(application: &mut Application) {
+    application.status = application.t("status.patchbay_diagnostics_copied");
 }
 
 pub(crate) fn restore_effect_connections(
@@ -310,18 +348,37 @@ pub(crate) fn save_rule(window: &MainWindow, application: &mut Application) {
     }
 
     let graph = application.source.graph();
-    let Some((output_id, output_node_type, output_type)) =
-        resolve_named_endpoint(graph, &output_node, &output_port, Direction::Source)
-    else {
-        application.status = application.t("status.rule_endpoint_not_found");
-        return;
+    let output = match resolve_named_endpoint(graph, &output_node, &output_port, Direction::Source)
+    {
+        Ok(endpoint) => endpoint,
+        Err(EndpointResolution::Ambiguous(candidates)) => {
+            application.status = application.tf(
+                "status.rule_endpoint_ambiguous",
+                &[("count", candidates.len().to_string())],
+            );
+            return;
+        }
+        Err(_) => {
+            application.status = application.t("status.rule_endpoint_not_found");
+            return;
+        }
     };
-    let Some((input_id, input_node_type, input_type)) =
-        resolve_named_endpoint(graph, &input_node, &input_port, Direction::Sink)
-    else {
-        application.status = application.t("status.rule_endpoint_not_found");
-        return;
+    let input = match resolve_named_endpoint(graph, &input_node, &input_port, Direction::Sink) {
+        Ok(endpoint) => endpoint,
+        Err(EndpointResolution::Ambiguous(candidates)) => {
+            application.status = application.tf(
+                "status.rule_endpoint_ambiguous",
+                &[("count", candidates.len().to_string())],
+            );
+            return;
+        }
+        Err(_) => {
+            application.status = application.t("status.rule_endpoint_not_found");
+            return;
+        }
     };
+    let (output_id, output_node_type, output_type) = output;
+    let (input_id, input_node_type, input_type) = input;
     if !(output_type == input_type
         || output_type == PortType::Unknown
         || input_type == PortType::Unknown)
@@ -329,6 +386,8 @@ pub(crate) fn save_rule(window: &MainWindow, application: &mut Application) {
         application.status = application.t("status.rule_endpoint_incompatible");
         return;
     }
+    let output_selector = graph.port_key(output_id).map(|key| key.selector());
+    let input_selector = graph.port_key(input_id).map(|key| key.selector());
 
     let rule = application
         .patchbay
@@ -345,6 +404,8 @@ pub(crate) fn save_rule(window: &MainWindow, application: &mut Application) {
     rule.output_node_type = Some(output_node_type);
     rule.input_node_type = Some(input_node_type);
     rule.port_type = output_type;
+    rule.output_selector = output_selector;
+    rule.input_selector = input_selector;
     window.set_rule_editor_index(-1);
     application.autosave_patchbay();
     if application.config.patchbay_activated {
@@ -376,23 +437,23 @@ fn resolve_named_endpoint(
     node_name: &str,
     port_name: &str,
     direction: Direction,
-) -> Option<(PortId, NodeType, PortType)> {
-    let mut matches = graph
-        .nodes
-        .values()
-        .filter(|node| node.name == node_name)
-        .flat_map(|node| {
-            node.ports.iter().filter_map(move |port_id| {
-                let port = graph.port(*port_id)?;
-                (port.name == port_name && port.direction == direction).then_some((
-                    port.id,
-                    node.node_type,
-                    port.port_type,
-                ))
-            })
-        });
-    let endpoint = matches.next()?;
-    matches.next().is_none().then_some(endpoint)
+) -> Result<(PortId, NodeType, PortType), EndpointResolution> {
+    let selector = EndpointSelector {
+        node_type: NodeType::Unknown,
+        identity: NodeIdentity::with_node_name(node_name),
+        port_name: port_name.to_owned(),
+        channel: None,
+        direction,
+        port_type: PortType::Unknown,
+        match_mode: EndpointMatchMode::Instance,
+    };
+    let resolution = graph.resolve_endpoint(&selector);
+    let port_id = resolution.port_id().ok_or(resolution)?;
+    let port = graph.port(port_id).ok_or(EndpointResolution::Missing)?;
+    let node = graph
+        .node(port.node_id)
+        .ok_or(EndpointResolution::Missing)?;
+    Ok((port_id, node.node_type, port.port_type))
 }
 
 pub(crate) fn remove_rule(application: &mut Application, index: usize) {

@@ -17,6 +17,7 @@ export struct RuleRow {
     input-node: string,
     input-port: string,
     pinned: bool,
+    status: string,
 }
 
 export struct EffectParameterRow {
@@ -39,6 +40,13 @@ export struct EffectRow {
     description: string,
     enabled: bool,
     parameters: [EffectParameterRow],
+}
+
+export struct EffectOperationRow {
+    ticket: int,
+    name: string,
+    stage: string,
+    cancellable: bool,
 }
 
 export struct RelayRow {

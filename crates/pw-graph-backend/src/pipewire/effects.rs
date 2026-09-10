@@ -568,7 +568,6 @@ impl NativeEffect {
             instance.diagnostics = snapshot.message;
         }
         if let Some(diagnostics) = &callback.hush_diagnostics {
-            instance.diagnostics = Some(diagnostics.status_text());
             instance.error = diagnostics.failure_reason();
         }
         if callback.processor_failed.load(Ordering::Relaxed) && instance.error.is_none() {
@@ -586,6 +585,14 @@ impl NativeEffect {
             }
         }
         instance
+    }
+
+    pub(super) fn full_diagnostics(&self) -> Option<String> {
+        self.runtime
+            .callback()
+            .effect_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.report())
     }
 
     pub(super) fn set_enabled(&mut self, enabled: bool) {

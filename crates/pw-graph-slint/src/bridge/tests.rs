@@ -7,10 +7,10 @@ use super::*;
 use crate::canvas::{self, HIT_NODE, HIT_NODE_BODY};
 use crate::model::{resolve_drag_delta, ConnectMode};
 use pw_graph_core::Direction;
+use pw_graph_patchbay::PatchbayReconciler;
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{LogicalPosition, Model, ModelRc};
 use std::cell::Cell;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -28,6 +28,9 @@ pub(super) fn demo_application() -> Application {
         source,
         commands: pw_graph_command::CommandStack::new(),
         patchbay: Patchbay::new("test"),
+        patchbay_reconciler: PatchbayReconciler::new(),
+        patchbay_graph_generation: 0,
+        manually_suppressed_patchbay: Vec::new(),
         patchbay_file: PathBuf::new(),
         config: config.clone(),
         config_file: PathBuf::new(),
@@ -45,7 +48,13 @@ pub(super) fn demo_application() -> Application {
         effect_selection_id: None,
         effect_draft_enabled: true,
         effect_draft_parameters: BTreeMap::new(),
-        pending_effect_tickets: BTreeSet::new(),
+        pending_effect_tickets: BTreeMap::new(),
+        effect_debug_name: String::new(),
+        effect_debug_health: String::new(),
+        effect_debug_report: String::new(),
+        patchbay_debug_report: String::new(),
+        node_debug_name: String::new(),
+        node_debug_report: String::new(),
         debug: false,
         last_refresh: Instant::now(),
         last_full_sync: Instant::now(),

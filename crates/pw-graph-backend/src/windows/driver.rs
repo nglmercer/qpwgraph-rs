@@ -1017,7 +1017,7 @@ impl crate::api::EffectDriver for WindowsAudioDriver {
                 .as_ref()
                 .and_then(|routing| routing.effect_diagnostics(instance.input_port))
             {
-                instance.diagnostics = Some(diagnostics.status_text());
+                instance.diagnostics = Some(diagnostics.summary_text());
                 instance.error = diagnostics.failure_reason();
                 instance.health = if diagnostics.is_bypassed() {
                     pw_graph_effects::EffectHealth::Bypassed
@@ -1032,6 +1032,19 @@ impl crate::api::EffectDriver for WindowsAudioDriver {
             }
         }
         instances
+    }
+
+    fn effect_diagnostics(&self, instance_id: &str) -> BackendResult<Option<String>> {
+        let input_port = self
+            .effects
+            .get(instance_id)
+            .ok_or_else(|| BackendError::unknown_effect_instance(instance_id))?
+            .input_port;
+        Ok(self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.effect_diagnostics(input_port))
+            .map(|diagnostics| diagnostics.status_text()))
     }
 
     fn supports_effect_nodes(&self) -> bool {
