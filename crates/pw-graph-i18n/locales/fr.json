@@ -103,6 +103,7 @@
   "effects.created": "Nœud d’effet créé — connectez ses ports d’entrée et de sortie sur le canevas",
   "effects.disable": "Désactiver",
   "effects.disabled": "Désactivé",
+  "effects.debug": "Déboguer l’effet",
   "effects.edit_title": "Modifier l’effet",
   "effects.effect_label": "Effet",
   "effects.enable": "Activer",

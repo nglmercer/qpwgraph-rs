@@ -103,6 +103,7 @@
   "effects.created": "Effect node created — connect its input and output ports on the canvas",
   "effects.disable": "Disable",
   "effects.disabled": "Disabled",
+  "effects.debug": "Debug effect",
   "effects.edit_title": "Edit effect",
   "effects.effect_label": "Effect",
   "effects.enable": "Enable",

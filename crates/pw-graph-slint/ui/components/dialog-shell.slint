@@ -1,6 +1,8 @@
 import { UiTheme } from "../foundation/theme.slint";
+import { UiI18n } from "../foundation/i18n.slint";
 import { AppTokens } from "../foundation/tokens.slint";
-import { ActionButton } from "button.slint";
+import { IconButton } from "icon-button.slint";
+import { Tooltip } from "tooltip.slint";
 
 // Reusable centered dialog frame. History, Effects, QR, node appearance and
 // the preference/shortcut dialogs all share this outer rectangle, border
@@ -15,6 +17,14 @@ export component DialogShell inherits Rectangle {
     in property <color> bg: AppTokens.dialog-bg;
     in property <color> border-col: AppTokens.border-dialog;
     callback close();
+
+    // The close control is icon-only, so keep a visible tooltip in the shell
+    // rather than relying only on its accessible label. Rendering it beside
+    // the dialog also keeps it out of any child ScrollView clipping region.
+    property <string> header-tooltip-text: "";
+    property <bool> header-tooltip-shown: false;
+    property <length> header-tooltip-anchor-x: 0px;
+    property <length> header-tooltip-anchor-y: 0px;
 
     background: root.bg;
     border-color: root.border-col;
@@ -36,12 +46,23 @@ export component DialogShell inherits Rectangle {
         overflow: elide;
     }
 
-    ActionButton {
+    IconButton {
         visible: root.show-header-close;
         x: parent.width - 47px;
         y: root.header-close-y;
         width: 30px;
-        text: "×";
+        icon: @image-url("../../../../assets/icons/close.svg");
+        tooltip: UiI18n.localized("shortcuts.close");
+        hover-changed(entered, tip, ax, ay) => {
+            if (entered) {
+                root.header-tooltip-text = tip;
+                root.header-tooltip-anchor-x = ax;
+                root.header-tooltip-anchor-y = ay;
+                root.header-tooltip-shown = true;
+            } else if (root.header-tooltip-text == tip) {
+                root.header-tooltip-shown = false;
+            }
+        }
         clicked => { root.close(); }
     }
 
@@ -52,6 +73,14 @@ export component DialogShell inherits Rectangle {
         width: parent.width;
         height: parent.height;
         @children
+    }
+
+    Tooltip {
+        x: clamp(root.header-tooltip-anchor-x - root.absolute-position.x - self.width - 8px, 8px, parent.width - self.width - 8px);
+        y: clamp(root.header-tooltip-anchor-y - root.absolute-position.y, 8px, parent.height - self.height - 8px);
+        text: root.header-tooltip-text;
+        shown: root.header-tooltip-shown;
+        z: 1000;
     }
 }
 

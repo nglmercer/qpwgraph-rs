@@ -19,6 +19,10 @@ export component IconButton inherits Rectangle {
     opacity: root.enabled ? 1 : 0.45;
     accessible-role: button;
     accessible-label: root.tooltip;
+    // Keep icon-only actions in the same keyboard contract as AppButton.
+    // `forward-focus` makes the small control reachable with Tab while the
+    // scope below gives Enter/Space a deterministic activation path.
+    forward-focus: key-focus;
     accessible-action-default => {
         if (root.enabled) {
             root.clicked();
@@ -42,6 +46,20 @@ export component IconButton inherits Rectangle {
         mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
         enabled: root.enabled;
         clicked => { if (root.enabled) { root.clicked(); } }
+    }
+
+    key-focus := FocusScope {
+        width: 100%;
+        height: 100%;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.repeat) { return accept; }
+            if (event.text == Key.Return || event.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
     }
 
     changed hovered => {

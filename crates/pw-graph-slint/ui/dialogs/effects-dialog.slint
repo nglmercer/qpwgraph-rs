@@ -1,7 +1,10 @@
 import { CheckBox, ComboBox, ScrollView, Slider, VerticalBox } from "std-widgets.slint";
 import { UiTheme } from "../foundation/theme.slint";
 import { UiI18n } from "../foundation/i18n.slint";
+import { AppTokens } from "../foundation/tokens.slint";
 import { ActionButton } from "../components/button.slint";
+import { IconButton } from "../components/icon-button.slint";
+import { Tooltip } from "../components/tooltip.slint";
 import { EffectRow, EffectParameterRow } from "../foundation/structs.slint";
 import { DialogShell } from "../components/dialog-shell.slint";
 
@@ -25,60 +28,193 @@ export component EffectsDialog inherits DialogShell {
     callback effect-draft-parameter-changed(string, float);
     callback effect-draft-enabled-changed(bool);
 
-    Text { x: 20px; y: 45px; width: parent.width - 90px; text: UiI18n.localized("effects.gallery_hint"); color: #aebdca; font-size: 11px * UiTheme.panel-scale; overflow: elide; }
+    // Icon actions live inside the effects ScrollView. Keep one tooltip at
+    // dialog level so it remains visible when the hovered action is close to
+    // the viewport edge instead of being clipped by the scroller.
+    property <string> effect-tooltip-text: "";
+    property <bool> effect-tooltip-shown: false;
+    property <string> effect-tooltip-owner: "";
+    property <length> effect-tooltip-anchor-x: 0px;
+    property <length> effect-tooltip-anchor-y: 0px;
+
+    function set-effect-tooltip(entered: bool, label: string, anchor-x: length, anchor-y: length, owner: string) {
+        if (entered) {
+            root.effect-tooltip-text = label;
+            root.effect-tooltip-anchor-x = anchor-x;
+            root.effect-tooltip-anchor-y = anchor-y;
+            root.effect-tooltip-owner = owner;
+            root.effect-tooltip-shown = true;
+        } else if (root.effect-tooltip-owner == owner) {
+            root.effect-tooltip-shown = false;
+            root.effect-tooltip-owner = "";
+        }
+    }
+
+    Text {
+        x: 20px;
+        y: 45px;
+        width: parent.width - 74px;
+        height: 22px;
+        text: UiI18n.localized("effects.gallery_hint");
+        color: AppTokens.text-secondary;
+        font-size: 11px * UiTheme.panel-scale;
+        vertical-alignment: center;
+        overflow: elide;
+    }
 
     ScrollView {
-        x: 20px; y: 86px; width: parent.width - 40px; height: parent.height - 145px;
+        x: 36px;
+        y: 96px;
+        width: max(1px, parent.width - 72px);
+        height: max(1px, parent.height - 156px);
         VerticalBox {
+            width: parent.width;
+            padding: 0;
             spacing: 8px;
             if !root.effect-configuring: VerticalBox {
+                width: parent.width;
+                padding: 0;
                 spacing: 8px;
-                if root.effects.length == 0: Text { text: UiI18n.localized("effects.no_available"); color: #9eafbc; font-size: 11px * UiTheme.panel-scale; }
+                if root.effects.length == 0: Text {
+                    text: UiI18n.localized("effects.no_available");
+                    color: AppTokens.text-muted;
+                    font-size: 11px * UiTheme.panel-scale;
+                }
                 for effect in root.effects: Rectangle {
-                    height: 76px + effect.parameters.length * 30px; background: #2a333d; border-color: #40505f; border-width: 1px; border-radius: 5px;
-                    Text { x: 11px; y: 8px; width: parent.width - 180px; height: 17px; text: effect.name; color: #edf3f7; font-size: 12px * UiTheme.panel-scale; overflow: elide; }
-                    Text { x: 11px; y: 27px; width: parent.width - 180px; height: 15px; text: effect.vendor; color: #96a8b6; font-size: 9px * UiTheme.panel-scale; overflow: elide; }
+                    property <length> action-column-width: 82px;
+                    height: 76px + effect.parameters.length * 30px;
+                    background: AppTokens.panel-bg;
+                    border-color: AppTokens.border-panel;
+                    border-width: 1px;
+                    border-radius: AppTokens.radius-md;
                     Text {
-                        x: 11px; y: 47px; width: parent.width - 180px; height: 18px;
+                        x: 11px;
+                        y: 8px;
+                        width: max(1px, parent.width - parent.action-column-width - 22px);
+                        height: 17px;
+                        text: effect.name;
+                        color: AppTokens.text-primary;
+                        font-size: 12px * UiTheme.panel-scale;
+                        overflow: elide;
+                    }
+                    Text {
+                        x: 11px;
+                        y: 27px;
+                        width: max(1px, parent.width - parent.action-column-width - 22px);
+                        height: 15px;
+                        text: effect.vendor;
+                        color: #96a8b6;
+                        font-size: 9px * UiTheme.panel-scale;
+                        overflow: elide;
+                    }
+                    Text {
+                        x: 11px;
+                        y: 47px;
+                        width: max(1px, parent.width - parent.action-column-width - 22px);
+                        height: 18px;
                         text: "State: " + effect.health;
                         color: effect.health == "FAILED" ? #ff7b7b : (effect.health == "OVERLOADED" ? #ffc46b : (effect.health == "BYPASSED" ? #c6a0f6 : (effect.health == "HEALTHY" ? #8bd5ca : #b9c7d1)));
-                        font-size: 10px * UiTheme.panel-scale; overflow: elide;
+                        font-size: 10px * UiTheme.panel-scale;
+                        overflow: elide;
                     }
                     for parameter[index] in effect.parameters: Rectangle {
                         y: 72px + (index * 30px);
                         height: 26px;
-                        Text { x: 11px; width: 102px; height: parent.height; text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : ""); color: #aebdca; font-size: 9px * UiTheme.panel-scale; vertical-alignment: center; overflow: elide; }
+                        Text {
+                            x: 11px;
+                            width: 102px;
+                            height: parent.height;
+                            text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : "");
+                            color: AppTokens.text-secondary;
+                            font-size: 9px * UiTheme.panel-scale;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
                         if parameter.boolean: CheckBox {
                             x: 118px; y: 2px; text: UiI18n.localized("effects.enabled"); checked: parameter.value >= 0.5;
                             toggled => { root.effect-parameter-changed(effect.instance-id, parameter.id, self.checked ? 1 : 0); }
                         }
                         if !parameter.boolean: Slider {
-                            x: 118px; y: 2px; width: parent.width - 310px; height: 24px;
+                            x: 118px;
+                            y: 2px;
+                            width: max(80px, parent.width - 310px);
+                            height: 24px;
                             minimum: parameter.minimum;
                             maximum: parameter.maximum;
                             value: parameter.value;
                             changed(value) => { root.effect-parameter-changed(effect.instance-id, parameter.id, value); }
                         }
                     }
-                    ActionButton { x: parent.width - 168px; y: 10px; width: 76px; text: effect.enabled ? UiI18n.localized("effects.disable") : UiI18n.localized("effects.enable"); clicked => { root.effect-toggle(effect.instance-id); } }
-                    ActionButton { x: parent.width - 250px; y: 10px; width: 76px; text: "Debug"; clicked => { root.effect-debug(effect.instance-id); } }
-                    ActionButton { x: parent.width - 168px; y: 43px; width: 76px; text: UiI18n.localized("effects.setup"); clicked => { root.effect-inspect(effect.instance-id); } }
-                    ActionButton { x: parent.width - 86px; y: 43px; width: 76px; text: UiI18n.localized("effects.remove"); clicked => { root.effect-remove(effect.instance-id); } }
+                    IconButton {
+                        x: parent.width - 76px;
+                        y: 10px;
+                        icon: @image-url("../../../../assets/icons/diagnostics.svg");
+                        tooltip: UiI18n.localized("effects.debug");
+                        hover-changed(entered, tip, ax, ay) => { root.set-effect-tooltip(entered, tip, ax, ay, "debug:" + effect.instance-id); }
+                        clicked => { root.effect-debug(effect.instance-id); }
+                    }
+                    IconButton {
+                        x: parent.width - 40px;
+                        y: 10px;
+                        icon: @image-url("../../../../assets/icons/activate.svg");
+                        tooltip: effect.enabled ? UiI18n.localized("effects.disable") : UiI18n.localized("effects.enable");
+                        selected: effect.enabled;
+                        hover-changed(entered, tip, ax, ay) => { root.set-effect-tooltip(entered, tip, ax, ay, "toggle:" + effect.instance-id); }
+                        clicked => { root.effect-toggle(effect.instance-id); }
+                    }
+                    IconButton {
+                        x: parent.width - 76px;
+                        y: 43px;
+                        icon: @image-url("../../../../assets/icons/settings.svg");
+                        tooltip: UiI18n.localized("effects.setup");
+                        hover-changed(entered, tip, ax, ay) => { root.set-effect-tooltip(entered, tip, ax, ay, "setup:" + effect.instance-id); }
+                        clicked => { root.effect-inspect(effect.instance-id); }
+                    }
+                    IconButton {
+                        x: parent.width - 40px;
+                        y: 43px;
+                        icon: @image-url("../../../../assets/icons/delete.svg");
+                        tooltip: UiI18n.localized("effects.remove");
+                        danger: true;
+                        hover-changed(entered, tip, ax, ay) => { root.set-effect-tooltip(entered, tip, ax, ay, "remove:" + effect.instance-id); }
+                        clicked => {
+                            root.set-effect-tooltip(false, "", 0px, 0px, "remove:" + effect.instance-id);
+                            root.effect-remove(effect.instance-id);
+                        }
+                    }
                 }
             }
             if root.effect-configuring: Rectangle {
+                width: parent.width;
                 height: 86px + root.effect-setup-parameters.length * 38px;
-                background: #2a333d;
-                border-color: #40505f;
+                background: AppTokens.panel-bg;
+                border-color: AppTokens.border-panel;
                 border-width: 1px;
-                border-radius: 5px;
-                Text { x: 12px; y: 10px; width: parent.width - 24px; height: 20px; text: UiI18n.localized("effects.initial_settings"); color: #edf3f7; font-size: 13px * UiTheme.panel-scale; }
-                Text { x: 12px; y: 32px; width: parent.width - 24px; height: 18px; text: UiI18n.localized("effects.setup_hint"); color: #aebdca; font-size: 9px * UiTheme.panel-scale; overflow: elide; }
+                border-radius: AppTokens.radius-md;
+                Text {
+                    x: 12px;
+                    y: 10px;
+                    width: parent.width - 24px;
+                    height: 20px;
+                    text: UiI18n.localized("effects.initial_settings");
+                    color: AppTokens.text-primary;
+                    font-size: 13px * UiTheme.panel-scale;
+                }
+                Text {
+                    x: 12px;
+                    y: 32px;
+                    width: parent.width - 24px;
+                    height: 18px;
+                    text: UiI18n.localized("effects.setup_hint");
+                    color: AppTokens.text-secondary;
+                    font-size: 9px * UiTheme.panel-scale;
+                    overflow: elide;
+                }
                 CheckBox { x: 12px; y: 54px; text: UiI18n.localized("effects.enabled"); checked: root.effect-setup-enabled; toggled => { root.effect-draft-enabled-changed(self.checked); } }
                 for parameter[index] in root.effect-setup-parameters: Rectangle {
                     y: 86px + index * 38px;
                     height: 34px;
-                    Text { x: 12px; y: 5px; width: 145px; height: 24px; text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : ""); color: #aebdca; font-size: 10px * UiTheme.panel-scale; vertical-alignment: center; overflow: elide; }
+                    Text { x: 12px; y: 5px; width: 145px; height: 24px; text: parameter.name + (parameter.unit != "" ? " (" + parameter.unit + ")" : ""); color: AppTokens.text-secondary; font-size: 10px * UiTheme.panel-scale; vertical-alignment: center; overflow: elide; }
                     if parameter.boolean: CheckBox {
                         x: 166px; y: 5px; text: UiI18n.localized("effects.enabled"); checked: parameter.value >= 0.5;
                         toggled => { root.effect-draft-parameter-changed(parameter.id, self.checked ? 1 : 0); }
@@ -95,9 +231,55 @@ export component EffectsDialog inherits DialogShell {
             }
         }
     }
-    ComboBox { x: 20px; y: parent.height - 48px; width: 230px; model: root.effect-options; current-index: root.effect-selection-index; selected(value) => { root.effect-selected(self.current-index); } }
-    if !root.effect-configuring: ActionButton { x: 260px; y: parent.height - 48px; width: 112px; text: UiI18n.localized("effects.add"); enabled: root.effects-available && root.effect-options.length > 0; clicked => { root.effect-create-requested(); } }
-    if root.effect-configuring: ActionButton { x: 260px; y: parent.height - 48px; width: 112px; text: UiI18n.localized("effects.create_node"); enabled: root.effects-available && root.effect-options.length > 0; clicked => { root.effect-create-requested(); } }
-    if root.effect-configuring: ActionButton { x: 380px; y: parent.height - 48px; width: 90px; text: UiI18n.localized("effects.back"); clicked => { root.effect-config-back(); } }
-    if !root.effect-configuring: Text { x: 385px; y: parent.height - 39px; text: UiI18n.localized("help.configuration"); color: #aebdca; font-size: 10px * UiTheme.panel-scale; }
+    ComboBox {
+        x: 20px;
+        y: parent.height - 48px;
+        width: 230px;
+        model: root.effect-options;
+        current-index: root.effect-selection-index;
+        selected(value) => { root.effect-selected(self.current-index); }
+    }
+    if !root.effect-configuring: ActionButton {
+        x: 260px;
+        y: parent.height - 48px;
+        width: 112px;
+        text: UiI18n.localized("effects.add");
+        enabled: root.effects-available && root.effect-options.length > 0;
+        clicked => { root.effect-create-requested(); }
+    }
+    if root.effect-configuring: ActionButton {
+        x: 260px;
+        y: parent.height - 48px;
+        width: 112px;
+        text: UiI18n.localized("effects.create_node");
+        enabled: root.effects-available && root.effect-options.length > 0;
+        clicked => { root.effect-create-requested(); }
+    }
+    if root.effect-configuring: ActionButton {
+        x: 380px;
+        y: parent.height - 48px;
+        width: 90px;
+        text: UiI18n.localized("effects.back");
+        clicked => { root.effect-config-back(); }
+    }
+    if !root.effect-configuring: Text {
+        x: 385px;
+        y: parent.height - 43px;
+        width: max(1px, parent.width - 405px);
+        height: 32px;
+        text: UiI18n.localized("help.configuration");
+        color: AppTokens.text-secondary;
+        font-size: 10px * UiTheme.panel-scale;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        overflow: elide;
+    }
+
+    Tooltip {
+        x: clamp(root.effect-tooltip-anchor-x - root.absolute-position.x - self.width - 8px, 8px, parent.width - self.width - 8px);
+        y: clamp(root.effect-tooltip-anchor-y - root.absolute-position.y, 8px, parent.height - self.height - 8px);
+        text: root.effect-tooltip-text;
+        shown: root.effect-tooltip-shown;
+        z: 1000;
+    }
 }

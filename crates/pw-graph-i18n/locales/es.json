@@ -103,6 +103,7 @@
   "effects.created": "Nodo de efecto creado — conecta sus puertos de entrada y salida en el lienzo",
   "effects.disable": "Desactivar",
   "effects.disabled": "Desactivado",
+  "effects.debug": "Depurar efecto",
   "effects.edit_title": "Editar efecto",
   "effects.effect_label": "Efecto",
   "effects.enable": "Activar",
