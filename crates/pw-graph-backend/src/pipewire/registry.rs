@@ -270,6 +270,32 @@ pub(super) struct NodeRecord {
     pub(super) object_path: Option<String>,
 }
 
+impl NodeRecord {
+    /// Merge the complete property dictionary returned by a bound PipeWire
+    /// node. Registry globals intentionally expose only a compact subset of
+    /// properties, while NodeInfo contains application and device metadata.
+    pub(super) fn update_from_node_info(&mut self, props: &pw::spa::utils::dict::DictRef) {
+        self.application_id =
+            non_empty_property(props.get(APPLICATION_ID)).or_else(|| self.application_id.clone());
+        self.application_name = non_empty_property(props.get(APPLICATION_NAME))
+            .or_else(|| self.application_name.clone());
+        self.icon_name = non_empty_property(props.get(APPLICATION_ICON_NAME))
+            .or_else(|| non_empty_property(props.get(DEVICE_ICON_NAME)))
+            .or_else(|| non_empty_property(props.get(MEDIA_ICON_NAME)))
+            .or_else(|| self.icon_name.clone());
+        self.process_binary = non_empty_property(props.get(APPLICATION_PROCESS_BINARY))
+            .or_else(|| self.process_binary.clone());
+        self.client_id = props
+            .get(CLIENT_ID)
+            .and_then(|value| value.parse().ok())
+            .or(self.client_id);
+        self.device_id = props
+            .get(DEVICE_ID)
+            .and_then(|value| value.parse().ok())
+            .or(self.device_id);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ClientRecord {
     pub(super) application_id: Option<String>,

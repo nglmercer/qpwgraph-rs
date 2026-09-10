@@ -215,6 +215,14 @@ mod tests {
             .expect("PipeWire registry snapshot should succeed");
         assert!(!nodes.is_empty());
         assert!(!driver.graph().ports.is_empty());
+        if let Some(firefox) = driver
+            .graph()
+            .nodes
+            .values()
+            .find(|node| node.name == "Firefox")
+        {
+            assert_eq!(firefox.icon_name.as_deref(), Some("firefox"));
+        }
     }
 
     /// Regression guard for the startup behaviour users actually noticed: the

@@ -559,6 +559,12 @@ impl PipewireDriver {
                 // pavucontrol or with a media key reaches the cards.
                 self.refresh_effect_channel_masks_locked();
                 self.read_node_controls_locked();
+                // The node proxy's Info callback carries the complete
+                // application/device property dictionary. Rebuild once more
+                // so metadata discovered during the readback is visible in
+                // this graph snapshot rather than waiting for the next poll.
+                let state = self.state.lock().unwrap().clone();
+                self.graph = self.build_graph_from_state(state)?;
                 self.ensure_meters_locked();
                 return Ok(());
             }

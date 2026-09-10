@@ -451,42 +451,21 @@ impl EffectProcessor for HushNoiseSuppressor {
                     .diagnostics()
                     .dry_host_disabled_blocks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                runtime
-                    .diagnostics()
-                    .dry_host_disabled_frames
-                    .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
             } else if bypassed {
                 runtime
                     .diagnostics()
                     .dry_bypass_blocks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                runtime
-                    .diagnostics()
-                    .dry_manual_bypass_frames
-                    .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
             } else if worker_failed {
                 runtime
                     .diagnostics()
                     .dry_worker_failure_blocks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                runtime
-                    .diagnostics()
-                    .dry_worker_failure_frames
-                    .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
             } else if resyncing {
                 runtime
                     .diagnostics()
                     .dry_resync_blocks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                runtime
-                    .diagnostics()
-                    .dry_resync_frames
-                    .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
-            } else if self.channel_mask == 0 {
-                runtime
-                    .diagnostics()
-                    .dry_no_input_frames
-                    .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
             } else if self.input_frame_position
                 < (self.scheduling_frames + self.synthesis_delay_frames) as u64
             {
@@ -494,19 +473,11 @@ impl EffectProcessor for HushNoiseSuppressor {
                     .diagnostics()
                     .dry_startup_blocks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                runtime
-                    .diagnostics()
-                    .dry_startup_frames
-                    .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
             } else {
                 runtime
                     .diagnostics()
                     .dry_underrun_blocks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                runtime
-                    .diagnostics()
-                    .dry_underrun_frames
-                    .fetch_add(dry_frames as u64, std::sync::atomic::Ordering::Relaxed);
             }
             if !bypassed
                 && !worker_failed
@@ -1932,256 +1903,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    #[ignore = "manual release benchmark for experimental multichannel Hush"]
-    fn benchmark_hush_multichannel_variants() {
-        use nnnoiseless::{HushMaskMode, HUSH_FRAME_SIZE, HUSH_SAMPLE_RATE};
-
-        if cfg!(debug_assertions) {
-            eprintln!("run this native Hush benchmark in release mode");
-            return;
-        }
-        let model = shared_hush_model().expect("embedded Hush model should prepare");
-        let frame_count = 320_usize;
-        let channel_samples = frame_count * HUSH_FRAME_SIZE;
-        let mut input = vec![0.0_f32; channel_samples * 2];
-        for channel in 0..2 {
-            for sample in 0..channel_samples {
-                let frequency = if channel == 0 { 0.071 } else { 0.113 };
-                input[channel * channel_samples + sample] = 0.18
-                    * (sample as f32 * frequency).sin()
-                    + 0.11 * (sample as f32 * (frequency * 7.0)).sin();
-            }
-        }
-
-        let mono_started = Instant::now();
-        let mut mono = [
-            model
-                .denoiser_with_attenuation_db(25.0)
-                .expect("mono Hush denoiser should initialize"),
-            model
-                .denoiser_with_attenuation_db(25.0)
-                .expect("mono Hush denoiser should initialize"),
-        ];
-        let mono_init_ms = mono_started.elapsed().as_secs_f64() * 1000.0;
-        let mut mono_output = vec![0.0_f32; input.len()];
-        let mut mono_timings = Vec::with_capacity(frame_count * 2);
-        let mono_started = Instant::now();
-        for frame in 0..frame_count {
-            for (channel, denoiser) in mono.iter_mut().enumerate() {
-                let start = channel * channel_samples + frame * HUSH_FRAME_SIZE;
-                let end = start + HUSH_FRAME_SIZE;
-                let output_start = start;
-                let inference_started = Instant::now();
-                denoiser
-                    .process_frame(&mut mono_output[output_start..end], &input[start..end])
-                    .expect("mono Hush inference should succeed");
-                mono_timings.push(
-                    inference_started
-                        .elapsed()
-                        .as_nanos()
-                        .min(u128::from(u64::MAX)) as u64,
-                );
-            }
-        }
-        let mono_wall_ns = mono_started.elapsed().as_nanos() as u64;
-
-        let multi_init_started = Instant::now();
-        let mut multi = model
-            .multi_denoiser_with_attenuation_db(2, 25.0, HushMaskMode::Independent)
-            .expect("multi-channel Hush denoiser should initialize");
-        let multi_init_ms = multi_init_started.elapsed().as_secs_f64() * 1000.0;
-        let mut multi_output = vec![0.0_f32; input.len()];
-        let mut multi_timings = Vec::with_capacity(frame_count);
-        let multi_started = Instant::now();
-        for frame in 0..frame_count {
-            let frame_input = [&input[..channel_samples], &input[channel_samples..]];
-            let frame_start = frame * HUSH_FRAME_SIZE;
-            let frame_end = frame_start + HUSH_FRAME_SIZE;
-            let mut planar_input = [0.0_f32; HUSH_FRAME_SIZE * 2];
-            planar_input[..HUSH_FRAME_SIZE]
-                .copy_from_slice(&frame_input[0][frame_start..frame_end]);
-            planar_input[HUSH_FRAME_SIZE..]
-                .copy_from_slice(&frame_input[1][frame_start..frame_end]);
-            let mut planar_output = [0.0_f32; HUSH_FRAME_SIZE * 2];
-            let inference_started = Instant::now();
-            multi
-                .process_frame(&mut planar_output, &planar_input)
-                .expect("multi-channel Hush inference should succeed");
-            multi_timings.push(
-                inference_started
-                    .elapsed()
-                    .as_nanos()
-                    .min(u128::from(u64::MAX)) as u64,
-            );
-            multi_output[frame_start..frame_end].copy_from_slice(&planar_output[..HUSH_FRAME_SIZE]);
-            multi_output[channel_samples + frame_start..channel_samples + frame_end]
-                .copy_from_slice(&planar_output[HUSH_FRAME_SIZE..]);
-        }
-        let multi_wall_ns = multi_started.elapsed().as_nanos() as u64;
-
-        mono_timings.sort_unstable();
-        multi_timings.sort_unstable();
-        let percentile = |timings: &[u64], pct: usize| {
-            timings
-                .get(timings.len() * pct / 100)
-                .copied()
-                .unwrap_or_default()
-        };
-        let max_difference = mono_output
-            .iter()
-            .zip(&multi_output)
-            .map(|(mono, multi)| (mono - multi).abs())
-            .fold(0.0_f32, f32::max);
-        let audio_seconds = channel_samples as f64 / HUSH_SAMPLE_RATE as f64;
-        let mono_factor = mono_wall_ns as f64 / (audio_seconds * 1e9);
-        let multi_factor = multi_wall_ns as f64 / (audio_seconds * 1e9);
-        println!(
-            "multichannel_hush channels=2 mode=independent audio_duration_s={audio_seconds:.2} mono_init_ms={mono_init_ms:.2} multi_init_ms={multi_init_ms:.2} mono_wall_ms={:.2} multi_wall_ms={:.2} mono_rt_factor={mono_factor:.3} multi_rt_factor={multi_factor:.3} mono_p95_ms={:.3} mono_p99_ms={:.3} mono_max_ms={:.3} multi_p95_ms={:.3} multi_p99_ms={:.3} multi_max_ms={:.3} max_output_difference={max_difference:.6}",
-            mono_wall_ns as f64 / 1e6,
-            multi_wall_ns as f64 / 1e6,
-            percentile(&mono_timings, 95) as f64 / 1e6,
-            percentile(&mono_timings, 99) as f64 / 1e6,
-            mono_timings.last().copied().unwrap_or_default() as f64 / 1e6,
-            percentile(&multi_timings, 95) as f64 / 1e6,
-            percentile(&multi_timings, 99) as f64 / 1e6,
-            multi_timings.last().copied().unwrap_or_default() as f64 / 1e6,
-        );
-        assert!(mono_output.iter().all(|sample| sample.is_finite()));
-        assert!(multi_output.iter().all(|sample| sample.is_finite()));
-    }
-
-    #[test]
-    #[ignore = "manual release benchmark for stereo resampler optimization"]
-    fn benchmark_stereo_resampler_variants() {
-        use nnnoiseless::{FixedPolyphaseResampler, Resampler};
-
-        if cfg!(debug_assertions) {
-            eprintln!("run this resampler benchmark in release mode");
-            return;
-        }
-        let input_frames = 48_000_usize * 4;
-        let block_frames = 256_usize;
-        let input: Vec<f32> = (0..input_frames)
-            .flat_map(|frame| {
-                [
-                    0.21 * (frame as f32 * 0.071).sin(),
-                    0.17 * (frame as f32 * 0.113).sin(),
-                ]
-            })
-            .collect();
-        let mut mono_input = [
-            Resampler::new(48_000.0, 16_000.0, 1),
-            Resampler::new(48_000.0, 16_000.0, 1),
-        ];
-        let mut mono_output = [
-            Resampler::new(16_000.0, 48_000.0, 1),
-            Resampler::new(16_000.0, 48_000.0, 1),
-        ];
-        let mut multi_input = Resampler::new(48_000.0, 16_000.0, 2);
-        let mut multi_output = Resampler::new(16_000.0, 48_000.0, 2);
-        let mut fixed_input = FixedPolyphaseResampler::to_hush_rate(2);
-        let mut fixed_output = FixedPolyphaseResampler::from_hush_rate(2);
-        for resampler in &mut mono_input {
-            resampler.reserve(block_frames + 64);
-        }
-        for resampler in &mut mono_output {
-            resampler.reserve(block_frames + 64);
-        }
-        multi_input.reserve(block_frames + 64);
-        multi_output.reserve(block_frames + 64);
-        fixed_input.reserve(block_frames + 64);
-        fixed_output.reserve(block_frames + 64);
-
-        let mut mono_model = [Vec::with_capacity(256), Vec::with_capacity(256)];
-        let mut mono_host = [Vec::with_capacity(768), Vec::with_capacity(768)];
-        let mut multi_model = Vec::with_capacity(512);
-        let mut multi_host = Vec::with_capacity(1536);
-        let mut fixed_model = Vec::with_capacity(512);
-        let mut fixed_host = Vec::with_capacity(1536);
-        let mut mono_timings = Vec::new();
-        let mut multi_timings = Vec::new();
-        let mut fixed_timings = Vec::new();
-        let mut mono_sources = [vec![0.0_f32; block_frames], vec![0.0_f32; block_frames]];
-        let mut multi_source = Vec::with_capacity(block_frames * 2);
-        let mut multi_all = Vec::new();
-        let mut fixed_all = Vec::new();
-
-        for chunk in input.chunks_exact(block_frames * 2) {
-            for (frame, samples) in chunk.chunks_exact(2).enumerate() {
-                mono_sources[0][frame] = samples[0];
-                mono_sources[1][frame] = samples[1];
-            }
-            let started = Instant::now();
-            for channel in 0..2 {
-                mono_model[channel].clear();
-                mono_input[channel].process(&mono_sources[channel], &mut mono_model[channel]);
-                mono_host[channel].clear();
-                mono_output[channel].process(&mono_model[channel], &mut mono_host[channel]);
-            }
-            mono_timings.push(started.elapsed().as_nanos() as u64);
-
-            multi_source.clear();
-            multi_source.extend_from_slice(chunk);
-            let started = Instant::now();
-            multi_model.clear();
-            multi_input.process(&multi_source, &mut multi_model);
-            multi_host.clear();
-            multi_output.process(&multi_model, &mut multi_host);
-            multi_timings.push(started.elapsed().as_nanos() as u64);
-            multi_all.extend_from_slice(&multi_host);
-
-            let started = Instant::now();
-            fixed_model.clear();
-            fixed_input.process(&multi_source, &mut fixed_model);
-            fixed_host.clear();
-            fixed_output.process(&fixed_model, &mut fixed_host);
-            fixed_timings.push(started.elapsed().as_nanos() as u64);
-            fixed_all.extend_from_slice(&fixed_host);
-        }
-
-        mono_timings.sort_unstable();
-        multi_timings.sort_unstable();
-        fixed_timings.sort_unstable();
-        let percentile = |timings: &[u64], pct: usize| {
-            timings
-                .get(timings.len() * pct / 100)
-                .copied()
-                .unwrap_or_default()
-        };
-        let mono_wall_ns: u64 = mono_timings.iter().sum();
-        let multi_wall_ns: u64 = multi_timings.iter().sum();
-        let fixed_wall_ns: u64 = fixed_timings.iter().sum();
-        let max_fixed_difference = multi_all
-            .iter()
-            .zip(&fixed_all)
-            .map(|(generic, fixed)| (generic - fixed).abs())
-            .fold(0.0_f32, f32::max);
-        println!(
-            "stereo_resampler channels=2 input=48000 output=16000+48000 audio_duration_s={:.2} mono_wall_ms={:.3} multi_wall_ms={:.3} fixed_polyphase_wall_ms={:.3} mono_rt_factor={:.4} multi_rt_factor={:.4} fixed_polyphase_rt_factor={:.4} mono_p95_us={:.2} mono_p99_us={:.2} mono_max_us={:.2} multi_p95_us={:.2} multi_p99_us={:.2} multi_max_us={:.2} fixed_polyphase_p95_us={:.2} fixed_polyphase_p99_us={:.2} fixed_polyphase_max_us={:.2} max_fixed_difference={max_fixed_difference:.6}",
-            input_frames as f64 / 48_000.0,
-            mono_wall_ns as f64 / 1e6,
-            multi_wall_ns as f64 / 1e6,
-            fixed_wall_ns as f64 / 1e6,
-            mono_wall_ns as f64 / (input_frames as f64 / 48_000.0 * 1e9),
-            multi_wall_ns as f64 / (input_frames as f64 / 48_000.0 * 1e9),
-            fixed_wall_ns as f64 / (input_frames as f64 / 48_000.0 * 1e9),
-            percentile(&mono_timings, 95) as f64 / 1e3,
-            percentile(&mono_timings, 99) as f64 / 1e3,
-            mono_timings.last().copied().unwrap_or_default() as f64 / 1e3,
-            percentile(&multi_timings, 95) as f64 / 1e3,
-            percentile(&multi_timings, 99) as f64 / 1e3,
-            multi_timings.last().copied().unwrap_or_default() as f64 / 1e3,
-            percentile(&fixed_timings, 95) as f64 / 1e3,
-            percentile(&fixed_timings, 99) as f64 / 1e3,
-            fixed_timings.last().copied().unwrap_or_default() as f64 / 1e3,
-        );
-        assert!(!mono_host[0].is_empty() && !mono_host[1].is_empty());
-        assert!(!multi_host.is_empty());
-        assert!(!fixed_all.is_empty());
-        assert_eq!(multi_all.len(), fixed_all.len());
-        assert!(max_fixed_difference < 0.01);
     }
 }

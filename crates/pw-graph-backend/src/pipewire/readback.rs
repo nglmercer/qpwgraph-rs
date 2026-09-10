@@ -120,8 +120,9 @@ impl PipewireDriver {
             Rc::new(RefCell::new(BTreeMap::new()));
 
         for node_id in nodes {
+            let native_id = native_node_id(node_id);
             let object = pw::registry::GlobalObject {
-                id: native_node_id(node_id),
+                id: native_id,
                 permissions: pw::permissions::PermissionFlags::empty(),
                 type_: pw::types::ObjectType::Node,
                 version: NODE_INTERFACE_VERSION,
@@ -131,8 +132,20 @@ impl PipewireDriver {
                 continue;
             };
             let sink = readings.clone();
+            let state = self.state.clone();
             let listener = proxy
                 .add_listener_local()
+                .info(move |info| {
+                    let Some(props) = info.props() else {
+                        return;
+                    };
+                    let Ok(mut state) = state.lock() else {
+                        return;
+                    };
+                    if let Some(record) = state.nodes.get_mut(&native_id) {
+                        record.update_from_node_info(props);
+                    }
+                })
                 .param(move |_seq, id, _index, _next, param| {
                     if id != ParamType::Props {
                         return;

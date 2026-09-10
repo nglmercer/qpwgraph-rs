@@ -261,7 +261,8 @@ fn parse_icon_size(component: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{icon_path_score, parse_icon_size};
+    use super::{icon_path_score, parse_icon_size, resolve_icon_path};
+    use slint::Image;
     use std::path::Path;
 
     #[test]
@@ -278,6 +279,17 @@ mod tests {
         assert!(
             icon_path_score(preferred, Some("Adwaita"))
                 < icon_path_score(fallback, Some("Adwaita"))
+        );
+    }
+
+    #[test]
+    fn resolves_and_loads_firefox_when_a_system_icon_is_available() {
+        let Some(path) = resolve_icon_path("firefox") else {
+            return;
+        };
+        assert!(
+            Image::load_from_path(&path).is_ok(),
+            "failed to load resolved icon {path:?}"
         );
     }
 }

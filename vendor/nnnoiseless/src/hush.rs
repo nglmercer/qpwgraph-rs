@@ -45,23 +45,7 @@ pub const HUSH_SYNTHESIS_DELAY_SAMPLES: usize = 160;
 pub const HUSH_LATENCY_SAMPLES: usize = HUSH_ALGORITHMIC_LATENCY_SAMPLES;
 
 fn build_runtime_params(attenuation_db: f32) -> RuntimeParams {
-    build_runtime_params_for_channels(1, attenuation_db, ReduceMask::MAX)
-}
-
-fn build_runtime_params_for_channels(
-    channels: usize,
-    attenuation_db: f32,
-    reduce_mask: ReduceMask,
-) -> RuntimeParams {
-    RuntimeParams::new(
-        channels,
-        false,
-        attenuation_db,
-        -15.0,
-        35.0,
-        35.0,
-        reduce_mask,
-    )
+    RuntimeParams::new(1, false, attenuation_db, -15.0, 35.0, 35.0, ReduceMask::MAX)
 }
 
 /// An error returned while loading or running a Hush model.
@@ -206,86 +190,6 @@ impl HushModel {
             last_lsnr_db: -15.0,
         })
     }
-
-    /// Creates an experimental multi-channel streaming denoiser.
-    ///
-    /// The input and output of [`HushMultiDenoiser::process_frame`] are
-    /// planar: channel zero occupies the first frame, channel one the next,
-    /// and so on. `Independent` keeps separate mask decisions for each
-    /// channel; `Maximum` and `Mean` link the mask across channels and are
-    /// useful for experiments that prefer spatially coherent attenuation.
-    ///
-    /// This API is intentionally separate from [`Self::denoiser`]. qpwgraph's
-    /// full stereo path uses `Independent` after a benchmark showed identical
-    /// output to two mono sessions; partially connected routes continue to use
-    /// independent mono sessions so disconnected channels do not consume
-    /// inference time.
-    pub fn multi_denoiser_with_attenuation_db(
-        &self,
-        channels: usize,
-        attenuation_db: f32,
-        mask_mode: HushMaskMode,
-    ) -> Result<HushMultiDenoiser, HushError> {
-        if channels == 0 {
-            return Err(HushError::new(
-                "Hush multi-channel denoiser needs at least one channel",
-            ));
-        }
-        if !attenuation_db.is_finite() || attenuation_db < 0.0 {
-            return Err(HushError::new(
-                "Hush attenuation must be finite and non-negative",
-            ));
-        }
-        let reduce_mask = match mask_mode {
-            HushMaskMode::Independent => ReduceMask::NONE,
-            HushMaskMode::Maximum => ReduceMask::MAX,
-            HushMaskMode::Mean => ReduceMask::MEAN,
-        };
-        let runtime = DfTract::new(
-            self.params.clone(),
-            &build_runtime_params_for_channels(channels, attenuation_db, reduce_mask.clone()),
-        )
-        .map_err(|error| {
-            HushError::new(format!(
-                "could not initialize Hush multi-channel runtime: {error}"
-            ))
-        })?;
-
-        if runtime.sr != HUSH_SAMPLE_RATE
-            || runtime.hop_size != HUSH_FRAME_SIZE
-            || runtime.fft_size.saturating_sub(runtime.hop_size) != HUSH_SYNTHESIS_DELAY_SAMPLES
-        {
-            return Err(HushError::new(format!(
-                "model is {} Hz with {}-sample frames and {}-sample synthesis delay; expected Hush's {} Hz/{}-sample/{}-sample contract",
-                runtime.sr,
-                runtime.hop_size,
-                runtime.fft_size.saturating_sub(runtime.hop_size),
-                HUSH_SAMPLE_RATE,
-                HUSH_FRAME_SIZE,
-                HUSH_SYNTHESIS_DELAY_SAMPLES,
-            )));
-        }
-
-        Ok(HushMultiDenoiser {
-            params: self.params.clone(),
-            runtime,
-            channels,
-            frame_size: HUSH_FRAME_SIZE,
-            attenuation_db,
-            mask_mode,
-        })
-    }
-}
-
-/// Mask reduction used by [`HushModel::multi_denoiser_with_attenuation_db`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HushMaskMode {
-    /// Keep an independent gain decision for every channel.
-    Independent,
-    /// Use the maximum channel mask for all channels.
-    Maximum,
-    /// Use the mean channel mask for all channels.
-    Mean,
 }
 
 /// A stateful, mono Hush denoiser.
@@ -388,94 +292,6 @@ impl HushDenoiser {
         )
         .map_err(|error| HushError::new(format!("could not reset Hush runtime: {error}")))?;
         self.last_lsnr_db = -15.0;
-        Ok(())
-    }
-}
-
-/// A stateful multi-channel Hush denoiser for controlled performance and
-/// spatial-coherence experiments.
-///
-/// Samples are planar rather than interleaved because the pinned DeepFilterNet
-/// runtime consumes an `[channels, frame_size]` tensor. Use one instance per
-/// stream and call [`Self::reset`] before starting a new stream.
-pub struct HushMultiDenoiser {
-    params: DfParams,
-    runtime: DfTract,
-    channels: usize,
-    frame_size: usize,
-    attenuation_db: f32,
-    mask_mode: HushMaskMode,
-}
-
-impl HushMultiDenoiser {
-    /// Returns the number of channels in this runtime.
-    pub fn channels(&self) -> usize {
-        self.channels
-    }
-
-    /// Returns the number of samples per channel expected by
-    /// [`Self::process_frame`].
-    pub fn frame_size(&self) -> usize {
-        self.frame_size
-    }
-
-    /// Returns the configured mask-linking mode.
-    pub fn mask_mode(&self) -> HushMaskMode {
-        self.mask_mode
-    }
-
-    /// Processes one planar multi-channel frame and returns its local-SNR
-    /// estimate.
-    ///
-    /// Both slices must contain exactly `channels * frame_size` samples. The
-    /// operation updates recurrent state and may emit silence during the
-    /// initial synthesis delay period.
-    pub fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> Result<f32, HushError> {
-        let expected = self.channels * self.frame_size;
-        if input.len() != expected || output.len() != expected {
-            return Err(HushError::new(format!(
-                "Hush multi-channel frames must contain {} samples (input {}, output {})",
-                expected,
-                input.len(),
-                output.len()
-            )));
-        }
-
-        let input = ArrayView2::from_shape((self.channels, self.frame_size), input)
-            .map_err(|error| HushError::new(format!("invalid Hush input frame: {error}")))?;
-        let output = ArrayViewMut2::from_shape((self.channels, self.frame_size), output)
-            .map_err(|error| HushError::new(format!("invalid Hush output frame: {error}")))?;
-        self.runtime
-            .process(input, output)
-            .map_err(|error| HushError::new(format!("Hush inference failed: {error}")))
-    }
-
-    /// Changes the maximum attenuation for subsequent frames.
-    pub fn set_attenuation_limit_db(&mut self, attenuation_db: f32) -> Result<(), HushError> {
-        if !attenuation_db.is_finite() || attenuation_db < 0.0 {
-            return Err(HushError::new(
-                "Hush attenuation must be finite and non-negative",
-            ));
-        }
-        self.runtime
-            .set_atten_lim(attenuation_db)
-            .map_err(|error| HushError::new(format!("could not set Hush attenuation: {error}")))?;
-        self.attenuation_db = attenuation_db;
-        Ok(())
-    }
-
-    /// Resets recurrent, spectral-normalization, and overlap-add state.
-    pub fn reset(&mut self) -> Result<(), HushError> {
-        let reduce_mask = match self.mask_mode {
-            HushMaskMode::Independent => ReduceMask::NONE,
-            HushMaskMode::Maximum => ReduceMask::MAX,
-            HushMaskMode::Mean => ReduceMask::MEAN,
-        };
-        self.runtime = DfTract::new(
-            self.params.clone(),
-            &build_runtime_params_for_channels(self.channels, self.attenuation_db, reduce_mask),
-        )
-        .map_err(|error| HushError::new(format!("could not reset Hush runtime: {error}")))?;
         Ok(())
     }
 }
