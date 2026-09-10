@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod adaptive_noise;
 mod hush_delay;
+mod hush_diagnostics;
 mod hush_model;
 mod hush_noise;
 mod hush_overload;
