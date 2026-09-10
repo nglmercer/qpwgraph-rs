@@ -780,6 +780,29 @@ fn easy_mode_groups_a_stereo_pair_behind_one_pin() {
 }
 
 #[test]
+fn easy_mode_selects_all_links_sharing_one_rendered_edge() {
+    let mut graph = stereo_graph();
+    graph.add_link(LinkId(7), PortId(1), PortId(3)).unwrap();
+    graph.add_link(LinkId(8), PortId(2), PortId(4)).unwrap();
+
+    let config = AppConfig {
+        connect_mode: "easy".into(),
+        ..AppConfig::default()
+    };
+    let mut state = UiGraphState::from_config(&config);
+    let snapshot = state.snapshot(&graph, &config);
+    let first_link = state.ids.link(LinkId(7)).unwrap();
+
+    state.select_link(&snapshot, first_link, false);
+    assert_eq!(state.selected_links, BTreeSet::from([LinkId(7), LinkId(8)]));
+
+    // Shift-click toggles the rendered group, not just the link that won
+    // hit-testing on the overlapping curves.
+    state.select_link(&snapshot, first_link, true);
+    assert!(state.selected_links.is_empty());
+}
+
+#[test]
 fn drag_collision_uses_the_projected_easy_mode_height() {
     let graph = stereo_graph();
     let mut config = AppConfig {

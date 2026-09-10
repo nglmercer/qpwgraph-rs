@@ -176,6 +176,27 @@ impl CanvasGeometry {
             .and_then(|index| self.links.get(index).copied())
     }
 
+    /// Return the links represented by the same rendered edge.
+    ///
+    /// In Easy mode, a stereo channel group shares one source pin and one
+    /// destination pin, so its underlying links are drawn on top of each
+    /// other. Selecting only the link found by hit-testing makes the other
+    /// channel look like it was ignored. Advanced mode intentionally keeps
+    /// link selection one-to-one.
+    pub(crate) fn link_selection_group(&self, id: i32) -> Vec<i32> {
+        let Some(selected) = self.link(id) else {
+            return Vec::new();
+        };
+        if !self.easy_mode {
+            return vec![id];
+        }
+        self.links
+            .iter()
+            .filter(|link| link.start_pin == selected.start_pin && link.end_pin == selected.end_pin)
+            .map(|link| link.id)
+            .collect()
+    }
+
     /// Mirror the selection flags of the rendered rows, so a drag started in
     /// the same event that changed the selection already moves the right cards.
     pub(crate) fn apply_selection(&mut self, is_selected: impl Fn(i32) -> bool) {

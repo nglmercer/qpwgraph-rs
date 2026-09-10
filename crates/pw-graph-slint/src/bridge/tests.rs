@@ -1361,6 +1361,47 @@ fn an_easy_mode_pin_drag_on_the_canvas_connects_both_channels() {
 }
 
 #[test]
+fn easy_mode_selects_and_disconnects_a_grouped_edge_as_one_action() {
+    let mut harness = CanvasHarness::new(ConnectMode::Easy);
+    let (output, input) = harness.connectable_pair();
+
+    harness.drag(harness.pin(output), harness.pin(input));
+    for event in harness.take_events() {
+        process_event(&harness.window, &mut harness.application, event);
+    }
+    harness.sync();
+
+    let rendered = rows_of(&harness.links);
+    assert_eq!(rendered.len(), 2);
+    let clicked = harness.point_on_rendered_link(rendered[0].id, 0.5);
+    harness.click(clicked);
+    for event in harness.take_events() {
+        process_event(&harness.window, &mut harness.application, event);
+    }
+    harness.sync();
+
+    assert_eq!(harness.application.view.selected_links.len(), 2);
+    assert_eq!(
+        rows_of(&harness.links)
+            .into_iter()
+            .filter(|link| link.selected)
+            .count(),
+        2,
+        "clicking the overlapping Easy-mode edge selects both channels"
+    );
+
+    process_event(
+        &harness.window,
+        &mut harness.application,
+        UiEvent::Action("delete-selection".into()),
+    );
+
+    assert!(harness.application.source.graph().links.is_empty());
+    assert!(harness.application.view.selected_links.is_empty());
+    assert_eq!(harness.application.toast_message, "Removed 2 connection(s)");
+}
+
+#[test]
 fn an_easy_mode_card_drag_on_the_canvas_connects_both_channels() {
     let mut harness = CanvasHarness::new(ConnectMode::Easy);
     let (output, input) = harness.connectable_pair();

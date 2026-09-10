@@ -34,7 +34,8 @@ pub(crate) fn install_canvas_callbacks(
     let links = links_source.clone();
     let geometry = geometry_source.clone();
     window.on_graph_link_selected(move |id, shift| {
-        project_link_selection(&nodes, &links, id, shift);
+        let group = geometry.borrow().link_selection_group(id);
+        project_link_selection(&nodes, &links, id, &group, shift);
         sync_geometry_selection(&nodes, &geometry);
         events.borrow_mut().push(UiEvent::SelectLink(id, shift));
     });
@@ -215,18 +216,34 @@ fn project_link_selection(
     nodes: &Rc<VecModel<NodeRow>>,
     links: &Rc<VecModel<LinkRow>>,
     link_id: i32,
+    selection_group: &[i32],
     shift: bool,
 ) {
     if !shift {
         clear_selection_flags(nodes, |node| &mut node.selected);
     }
-    let flags = canvas::apply_click(
-        &rows_of(links),
-        |link| link.id,
-        |link| link.selected,
-        link_id,
-        shift,
-    );
+    let group = if selection_group.is_empty() {
+        vec![link_id]
+    } else {
+        selection_group.to_vec()
+    };
+    let rows = rows_of(links);
+    let remove_group = shift
+        && group.iter().all(|id| {
+            rows.iter()
+                .find(|link| link.id == *id)
+                .is_some_and(|link| link.selected)
+        });
+    let flags: Vec<bool> = rows
+        .iter()
+        .map(|link| {
+            if group.contains(&link.id) {
+                !remove_group
+            } else {
+                shift && link.selected
+            }
+        })
+        .collect();
     set_selection_flags(links, |link| &mut link.selected, &flags);
 }
 

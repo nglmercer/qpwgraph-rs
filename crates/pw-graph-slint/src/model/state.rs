@@ -198,18 +198,53 @@ impl UiGraphState {
         }
     }
 
-    pub(crate) fn select_link(&mut self, link_id: i32, shift: bool) {
+    /// Select the visual edge represented by a link.
+    ///
+    /// Easy mode draws every channel in a grouped connection on the same
+    /// pair of rendered pins. Treat that visual edge as one selection unit;
+    /// otherwise clicking the overlapping stereo curves would select only
+    /// whichever underlying link happened to win hit-testing.
+    pub(crate) fn select_link(&mut self, snapshot: &GraphSnapshot, link_id: i32, shift: bool) {
         let Some(link_id) = self.ids.link_id(link_id) else {
             return;
         };
+        let selection_group: Vec<LinkId> = snapshot
+            .links
+            .iter()
+            .find(|link| link.link_id == link_id)
+            .map(|selected| {
+                if self.connect_mode == ConnectMode::Easy {
+                    snapshot
+                        .links
+                        .iter()
+                        .filter(|link| {
+                            link.start_pin_id == selected.start_pin_id
+                                && link.end_pin_id == selected.end_pin_id
+                        })
+                        .map(|link| link.link_id)
+                        .collect()
+                } else {
+                    vec![selected.link_id]
+                }
+            })
+            .unwrap_or_default();
+        if selection_group.is_empty() {
+            return;
+        }
         if !shift {
             self.selected_nodes.clear();
             self.selected_links.clear();
         }
-        if shift && !self.selected_links.insert(link_id) {
-            self.selected_links.remove(&link_id);
+        if shift
+            && selection_group
+                .iter()
+                .all(|id| self.selected_links.contains(id))
+        {
+            for id in selection_group {
+                self.selected_links.remove(&id);
+            }
         } else {
-            self.selected_links.insert(link_id);
+            self.selected_links.extend(selection_group);
         }
     }
 

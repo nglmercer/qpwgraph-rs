@@ -221,7 +221,11 @@ pub(crate) fn process_event(window: &MainWindow, application: &mut Application, 
             set_effect_draft_enabled(application, enabled)
         }
         UiEvent::SelectNode(id, shift) => application.view.select_node(id, shift),
-        UiEvent::SelectLink(id, shift) => application.view.select_link(id, shift),
+        UiEvent::SelectLink(id, shift) => {
+            application
+                .view
+                .select_link(&application.snapshot, id, shift)
+        }
         UiEvent::ClearSelection => application.view.clear_selection(),
         UiEvent::SelectBox(x, y, width, height, shift) => {
             application
