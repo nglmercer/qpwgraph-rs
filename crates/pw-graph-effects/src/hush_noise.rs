@@ -11,8 +11,10 @@ pub(crate) use crate::hush_model::{hush_model_load_info, shared_hush_model, Hush
 pub(crate) use crate::hush_model::{load_hush_model_with_override, HUSH_MODEL_SHA256};
 use crate::hush_worker::{HushDiagnostics, HushRuntime, HUSH_MAX_BACKLOG_MS, HUSH_SCHEDULING_MS};
 use crate::{
-    apply_parameters, AudioSpec, EffectDescriptor, EffectError, EffectIoCapabilities,
-    EffectParameter, EffectPrepareRequest, EffectProcessor, EffectProvider, PreparedEffect,
+    apply_parameters,
+    gain::{rms_db, GainCompensation},
+    AudioSpec, EffectDescriptor, EffectError, EffectIoCapabilities, EffectParameter,
+    EffectPrepareRequest, EffectProcessor, EffectProvider, PreparedEffect,
 };
 use nnnoiseless::HUSH_SYNTHESIS_DELAY_SAMPLES;
 use std::sync::{Arc, OnceLock};
@@ -22,6 +24,8 @@ use std::time::{Duration, Instant};
 pub const HUSH_NOISE_SUPPRESSOR_ID: &str = "builtin.hush-noise-suppressor";
 pub const DEFAULT_EFFECT_ID: &str = HUSH_NOISE_SUPPRESSOR_ID;
 pub const HUSH_NOISE_SUPPRESSOR_REDUCTION: &str = "reduction-db";
+pub const HUSH_NOISE_SUPPRESSOR_OUTPUT_GAIN_DB: &str = "output-gain-db";
+pub const HUSH_NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION: &str = "auto-gain-compensation";
 pub const HUSH_NOISE_SUPPRESSOR_BYPASS: &str = "bypass";
 
 #[inline]
@@ -52,7 +56,7 @@ fn descriptor() -> EffectDescriptor {
         id: HUSH_NOISE_SUPPRESSOR_ID.into(),
         name: "Hush Neural Noise Suppressor".into(),
         vendor: "qpwgraph-rs / Hush".into(),
-        version: "1.0.0".into(),
+        version: "1.1.0".into(),
         parameters: vec![
             EffectParameter {
                 id: HUSH_NOISE_SUPPRESSOR_REDUCTION.into(),
@@ -61,6 +65,22 @@ fn descriptor() -> EffectDescriptor {
                 maximum: 60.0,
                 default: 25.0,
                 unit: "dB".into(),
+            },
+            EffectParameter {
+                id: HUSH_NOISE_SUPPRESSOR_OUTPUT_GAIN_DB.into(),
+                name: "Output Gain".into(),
+                minimum: -12.0,
+                maximum: 12.0,
+                default: 0.0,
+                unit: "dB".into(),
+            },
+            EffectParameter {
+                id: HUSH_NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION.into(),
+                name: "Automatic Gain Compensation".into(),
+                minimum: 0.0,
+                maximum: 1.0,
+                default: 0.0,
+                unit: "boolean".into(),
             },
             EffectParameter {
                 id: HUSH_NOISE_SUPPRESSOR_BYPASS.into(),
@@ -155,6 +175,7 @@ pub struct HushNoiseSuppressor {
     runtime: Option<HushRuntime>,
     diagnostics: Option<Arc<HushDiagnostics>>,
     reduction_db: f32,
+    gain: GainCompensation,
     bypass: bool,
     host_bypass: bool,
     channel_mask: u16,
@@ -175,6 +196,7 @@ impl Default for HushNoiseSuppressor {
             runtime: None,
             diagnostics: None,
             reduction_db: 25.0,
+            gain: GainCompensation::default(),
             bypass: false,
             host_bypass: false,
             channel_mask: 0,
@@ -216,6 +238,7 @@ impl HushNoiseSuppressor {
         }
         self.fallback.fill(0.0);
         self.wet.fill(0.0);
+        self.gain.reset();
     }
 }
 
@@ -353,6 +376,7 @@ impl EffectProcessor for HushNoiseSuppressor {
                 *sample = 0.0;
             }
         }
+        let input_rms_db = rms_db(buffer);
         // Preserve the sanitized live input for the worker before the dry
         // delay overwrites the callback buffer.
         self.wet[..expected].copy_from_slice(buffer);
@@ -492,6 +516,19 @@ impl EffectProcessor for HushNoiseSuppressor {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        // The user/host bypass paths intentionally do not pass through the
+        // gain stage.  In particular, enabling bypass must not turn a saved
+        // output-gain setting into a surprise volume change.
+        if !self.host_bypass && !self.bypass {
+            let processed_rms_db = rms_db(&buffer[..expected]);
+            self.gain.apply(
+                &mut buffer[..expected],
+                spec.channels as usize,
+                spec.sample_rate,
+                input_rms_db,
+                processed_rms_db,
+            );
+        }
         self.input_frame_position += frames as u64;
         Ok(())
     }
@@ -514,8 +551,13 @@ impl EffectProcessor for HushNoiseSuppressor {
                     runtime.set_attenuation(value);
                 }
             }
+            HUSH_NOISE_SUPPRESSOR_OUTPUT_GAIN_DB => self.gain.set_output_gain_db(value),
+            HUSH_NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION => self.gain.set_automatic(value >= 0.5),
             HUSH_NOISE_SUPPRESSOR_BYPASS => {
                 let bypass = value >= 0.5;
+                if self.bypass != bypass {
+                    self.gain.reset();
+                }
                 self.bypass = bypass;
                 if let Some(diagnostics) = &self.diagnostics {
                     diagnostics

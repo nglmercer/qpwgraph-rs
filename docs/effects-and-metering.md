@@ -93,6 +93,13 @@ PipeWire Hush parameter updates use shared atomics rather than the generic
 processor mutex, so slider and bypass changes do not introduce an instantaneous
 host fallback. The existing typed events and stable parameter models are retained.
 
+Noise-suppression effects expose `Output Gain` (`output-gain-db`, -12 dB to
++12 dB, default 0 dB) as a post-denoiser stage. `Automatic Gain Compensation`
+(`auto-gain-compensation`) is off by default; when enabled it compares input
+and processed RMS levels, adds at most +6 dB, and smooths changes to avoid
+pumping. Both gain paths are skipped while the effect is bypassed, and the
+post-gain samples are clamped to -1.0..=1.0.
+
 The normal Effects card uses a cheap typed summary: health, rate, channel
 layout, realtime factor, recent wet percentage, and the most useful worker
 timing. It does not rebuild the large diagnostics report on every UI tick.

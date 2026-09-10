@@ -13,6 +13,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod adaptive_noise;
+mod gain;
 mod hush_delay;
 mod hush_diagnostics;
 mod hush_model;
@@ -42,7 +43,10 @@ pub use wasm::WasmEffectProvider;
 
 pub const NOISE_GATE_ID: &str = "builtin.noise-gate";
 pub const NOISE_SUPPRESSOR_ID: &str = "builtin.adaptive-noise-suppressor";
-pub use hush_noise::{DEFAULT_EFFECT_ID, HUSH_NOISE_SUPPRESSOR_ID};
+pub use hush_noise::{
+    DEFAULT_EFFECT_ID, HUSH_NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION, HUSH_NOISE_SUPPRESSOR_ID,
+    HUSH_NOISE_SUPPRESSOR_OUTPUT_GAIN_DB,
+};
 
 /// Generic health classification shared by built-in and plugin-backed
 /// effects.  Providers may expose richer metrics, but hosts should never
@@ -641,6 +645,10 @@ pub const NOISE_GATE_BYPASS: &str = "bypass";
 pub const NOISE_SUPPRESSOR_REDUCTION: &str = "reduction-db";
 pub const NOISE_SUPPRESSOR_ADAPTATION: &str = "adaptation";
 pub const NOISE_SUPPRESSOR_VOICE_PRESERVE: &str = "voice-preserve";
+pub const NOISE_SUPPRESSOR_OUTPUT_GAIN_DB: &str = "output-gain-db";
+pub const NOISE_SUPPRESSOR_OUTPUT_GAIN: &str = NOISE_SUPPRESSOR_OUTPUT_GAIN_DB;
+pub const NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION: &str = "auto-gain-compensation";
+pub const NOISE_SUPPRESSOR_AUTO_GAIN: &str = NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION;
 pub const NOISE_SUPPRESSOR_BYPASS: &str = "bypass";
 
 fn noise_gate_descriptor() -> EffectDescriptor {
@@ -999,6 +1007,29 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_descriptor_exposes_gain_controls() {
+        let descriptor = EffectHost::new()
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == NOISE_SUPPRESSOR_ID)
+            .expect("adaptive noise descriptor");
+        assert!(descriptor.parameters.iter().any(|parameter| {
+            parameter.id == NOISE_SUPPRESSOR_OUTPUT_GAIN_DB
+                && parameter.name == "Output Gain"
+                && parameter.minimum == -12.0
+                && parameter.maximum == 12.0
+                && parameter.default == 0.0
+                && parameter.unit == "dB"
+        }));
+        assert!(descriptor.parameters.iter().any(|parameter| {
+            parameter.id == NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION
+                && parameter.name == "Automatic Gain Compensation"
+                && parameter.default == 0.0
+                && parameter.unit == "boolean"
+        }));
+    }
+
+    #[test]
     fn host_exposes_hush_as_a_distinct_effect_and_default_identity() {
         let descriptors = EffectHost::new().descriptors();
         assert!(descriptors
@@ -1009,17 +1040,31 @@ mod tests {
     }
 
     #[test]
-    fn hush_descriptor_has_only_real_controls() {
+    fn hush_descriptor_exposes_gain_controls() {
         let descriptor = EffectHost::new()
             .descriptors()
             .into_iter()
             .find(|descriptor| descriptor.id == HUSH_NOISE_SUPPRESSOR_ID)
             .expect("Hush descriptor");
-        assert_eq!(descriptor.parameters.len(), 2);
+        assert_eq!(descriptor.parameters.len(), 4);
         assert!(descriptor
             .parameters
             .iter()
             .any(|parameter| { parameter.id == "reduction-db" && parameter.default == 25.0 }));
+        assert!(descriptor.parameters.iter().any(|parameter| {
+            parameter.id == "output-gain-db"
+                && parameter.name == "Output Gain"
+                && parameter.minimum == -12.0
+                && parameter.maximum == 12.0
+                && parameter.default == 0.0
+                && parameter.unit == "dB"
+        }));
+        assert!(descriptor.parameters.iter().any(|parameter| {
+            parameter.id == "auto-gain-compensation"
+                && parameter.name == "Automatic Gain Compensation"
+                && parameter.default == 0.0
+                && parameter.unit == "boolean"
+        }));
         assert!(descriptor
             .parameters
             .iter()

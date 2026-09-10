@@ -10,9 +10,11 @@
 //! mutates those buffers; it does not allocate, lock, or perform I/O.
 
 use crate::{
+    gain::{rms_db, GainCompensation},
     AudioSpec, EffectDescriptor, EffectError, EffectParameter, EffectProcessor, EffectProvider,
-    NOISE_SUPPRESSOR_ADAPTATION, NOISE_SUPPRESSOR_BYPASS, NOISE_SUPPRESSOR_ID,
-    NOISE_SUPPRESSOR_REDUCTION, NOISE_SUPPRESSOR_VOICE_PRESERVE,
+    NOISE_SUPPRESSOR_ADAPTATION, NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION, NOISE_SUPPRESSOR_BYPASS,
+    NOISE_SUPPRESSOR_ID, NOISE_SUPPRESSOR_OUTPUT_GAIN_DB, NOISE_SUPPRESSOR_REDUCTION,
+    NOISE_SUPPRESSOR_VOICE_PRESERVE,
 };
 use nnnoiseless::{DenoiseParams, DenoiseState, Resampler};
 
@@ -28,7 +30,7 @@ pub(crate) fn descriptor() -> EffectDescriptor {
         id: NOISE_SUPPRESSOR_ID.into(),
         name: "Adaptive Neural Noise Suppressor".into(),
         vendor: "qpwgraph-rs".into(),
-        version: "3.0.0".into(),
+        version: "3.1.0".into(),
         parameters: vec![
             EffectParameter {
                 id: NOISE_SUPPRESSOR_REDUCTION.into(),
@@ -53,6 +55,22 @@ pub(crate) fn descriptor() -> EffectDescriptor {
                 maximum: 100.0,
                 default: 70.0,
                 unit: "%".into(),
+            },
+            EffectParameter {
+                id: NOISE_SUPPRESSOR_OUTPUT_GAIN_DB.into(),
+                name: "Output Gain".into(),
+                minimum: -12.0,
+                maximum: 12.0,
+                default: 0.0,
+                unit: "dB".into(),
+            },
+            EffectParameter {
+                id: NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION.into(),
+                name: "Automatic Gain Compensation".into(),
+                minimum: 0.0,
+                maximum: 1.0,
+                default: 0.0,
+                unit: "boolean".into(),
             },
             EffectParameter {
                 id: NOISE_SUPPRESSOR_BYPASS.into(),
@@ -416,6 +434,7 @@ pub struct AdaptiveNoiseSuppressor {
     reduction_db: f32,
     adaptation: f32,
     voice_preserve: f32,
+    gain: GainCompensation,
     bypass: bool,
 }
 
@@ -428,6 +447,7 @@ impl Default for AdaptiveNoiseSuppressor {
             reduction_db: 20.0,
             adaptation: 55.0,
             voice_preserve: 70.0,
+            gain: GainCompensation::default(),
             bypass: false,
         }
     }
@@ -512,9 +532,19 @@ impl EffectProcessor for AdaptiveNoiseSuppressor {
             return Ok(());
         }
 
+        let input_rms_db = rms_db(buffer);
         let stream = self.stream.as_mut().ok_or(EffectError::NotPrepared)?;
         debug_assert_eq!(stream.sample_rate(), spec.sample_rate);
-        stream.process(buffer, frames)
+        stream.process(buffer, frames)?;
+        let processed_rms_db = rms_db(buffer);
+        self.gain.apply(
+            buffer,
+            channels,
+            spec.sample_rate,
+            input_rms_db,
+            processed_rms_db,
+        );
+        Ok(())
     }
 
     fn set_parameter(&mut self, id: &str, value: f32) -> Result<(), EffectError> {
@@ -532,6 +562,8 @@ impl EffectProcessor for AdaptiveNoiseSuppressor {
             NOISE_SUPPRESSOR_REDUCTION => self.reduction_db = value,
             NOISE_SUPPRESSOR_ADAPTATION => self.adaptation = value,
             NOISE_SUPPRESSOR_VOICE_PRESERVE => self.voice_preserve = value,
+            NOISE_SUPPRESSOR_OUTPUT_GAIN_DB => self.gain.set_output_gain_db(value),
+            NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION => self.gain.set_automatic(value >= 0.5),
             NOISE_SUPPRESSOR_BYPASS => {
                 let bypass = value >= 0.5;
                 if self.bypass != bypass {
@@ -549,6 +581,7 @@ impl EffectProcessor for AdaptiveNoiseSuppressor {
         if let Some(stream) = &mut self.stream {
             stream.reset();
         }
+        self.gain.reset();
     }
 }
 
@@ -662,6 +695,12 @@ mod tests {
     #[test]
     fn bypass_is_transparent_for_valid_audio_and_silent_for_invalid_audio() {
         let mut suppressor = prepared_suppressor(MODEL_SAMPLE_RATE, 1);
+        suppressor
+            .set_parameter(NOISE_SUPPRESSOR_OUTPUT_GAIN_DB, 12.0)
+            .unwrap();
+        suppressor
+            .set_parameter(NOISE_SUPPRESSOR_AUTO_GAIN_COMPENSATION, 1.0)
+            .unwrap();
         suppressor
             .set_parameter(NOISE_SUPPRESSOR_BYPASS, 1.0)
             .unwrap();
