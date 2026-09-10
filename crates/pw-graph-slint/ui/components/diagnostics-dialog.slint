@@ -1,0 +1,35 @@
+import { UiTheme } from "../foundation/theme.slint";
+import { DiagnosticsView } from "diagnostics-view.slint";
+import { DialogShell } from "dialog-shell.slint";
+
+// Generic diagnostics dialog. Feature-specific dialogs should only provide
+// their title, optional summary, report, and copy callback; the report viewer
+// and clipboard interaction stay shared across the application.
+export component DiagnosticsDialog inherits DialogShell {
+    title: "Diagnostics";
+    in property <string> summary: "";
+    in property <color> summary-color: #8bd5ca;
+    in property <string> report: "";
+    in property <string> copy-label: "Copy diagnostics";
+    in property <bool> copy-enabled: true;
+    callback copy-diagnostics();
+
+    property <length> report-y: root.summary == "" ? 55px : 84px;
+
+    if root.summary != "": Text {
+        x: 20px; y: 55px; width: parent.width - 40px; height: 22px;
+        text: root.summary;
+        color: root.summary-color;
+        font-size: 11px * UiTheme.panel-scale;
+        overflow: elide;
+    }
+
+    DiagnosticsView {
+        x: 20px; y: root.report-y;
+        width: parent.width - 40px; height: parent.height - root.report-y;
+        report: root.report;
+        copy-label: root.copy-label;
+        copy-enabled: root.copy-enabled;
+        copy-requested => { root.copy-diagnostics(); }
+    }
+}

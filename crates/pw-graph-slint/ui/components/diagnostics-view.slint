@@ -1,0 +1,27 @@
+import { TextEdit } from "std-widgets.slint";
+import { UiTheme } from "../foundation/theme.slint";
+import { ActionButton } from "button.slint";
+
+// Reusable report viewer for any support/debug surface. It can be embedded in
+// a dialog, panel, or page without coupling the report to a particular
+// feature such as effects or PipeWire.
+export component DiagnosticsView inherits Rectangle {
+    in property <string> report: "";
+    in property <string> copy-label: "Copy diagnostics";
+    in property <bool> copy-enabled: true;
+    callback copy-requested();
+
+    diagnostics := TextEdit {
+        x: 0px; y: 0px; width: parent.width; height: parent.height - 59px;
+        text: root.report;
+        read-only: true;
+        wrap: no-wrap;
+        font-size: 10px * UiTheme.panel-scale;
+    }
+    ActionButton {
+        x: 0px; y: parent.height - 48px; width: 145px;
+        text: root.copy-label;
+        enabled: root.copy-enabled;
+        clicked => { diagnostics.select-all(); diagnostics.copy(); root.copy-requested(); }
+    }
+}

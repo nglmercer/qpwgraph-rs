@@ -101,8 +101,11 @@ not fight the user.
 
 The Slint bridge requests compact Hush snapshots during ordinary synchronization
 and asks the effect driver for a full report only for the diagnostics dialog.
-The same copyable dialog pattern is used for PipeWire identity and patchbay
-reconciliation reports. None of these control-plane operations enter the Hush
+The reusable `DiagnosticsView` and `DiagnosticsDialog` components in
+`ui/components/` provide the selectable report, copy action, optional summary,
+and close behavior for effects, PipeWire identity, patchbay reconciliation, or
+any future support/debug surface. Feature-specific dialogs only adapt their
+data and callbacks. None of these control-plane operations enter the Hush
 realtime callback; model loading, inference, filesystem I/O, locks, waits, and
 joins remain worker/control-plane work.
 
