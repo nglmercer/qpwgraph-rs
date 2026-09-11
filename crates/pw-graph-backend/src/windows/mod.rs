@@ -61,6 +61,7 @@ pub mod audio_policy_config;
 mod callbacks;
 mod driver;
 mod effects;
+mod icons;
 mod identity;
 mod process_capture;
 pub mod process_loopback;
@@ -93,6 +94,7 @@ use self::callbacks::*;
 pub use self::driver::WindowsAudioDriver;
 use self::driver::*;
 use self::effects::*;
+use self::icons::*;
 #[cfg(feature = "relay")]
 pub(crate) use self::identity::find_qpwgraph_endpoint;
 pub use self::identity::WindowsEndpointSelector;

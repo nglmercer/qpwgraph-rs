@@ -372,7 +372,8 @@ impl CoreAudioWorker {
             });
             graph.add_node(
                 Node::new(node_id, name, NodeType::WindowsAudioEndpoint)
-                    .with_serial(stable_local_id(&format!("endpoint:{endpoint_id}"))),
+                    .with_serial(stable_local_id(&format!("endpoint:{endpoint_id}")))
+                    .with_icon_name(endpoint_icon_name(&device, flow)),
             )?;
             graph.add_port(Port::new(
                 port_id,
@@ -1006,11 +1007,14 @@ impl CoreAudioWorker {
             };
             let node_id = NodeId(graph_id(session_node_local_id(&endpoint.id, &session_id)));
             let port_id = PortId(graph_id(session_port_local_id(&endpoint.id, &session_id)));
-            graph.add_node(
+            let mut session_node =
                 Node::new(node_id, name, NodeType::WindowsAudioSession).with_serial(
                     stable_local_id(&format!("session:{}:{session_id}", endpoint.id)),
-                ),
-            )?;
+                );
+            if let Some(icon_name) = session_icon_name(process_id) {
+                session_node = session_node.with_icon_name(icon_name);
+            }
+            graph.add_node(session_node)?;
             let session_direction = session_direction(endpoint.flow);
             graph.add_port(Port::new(
                 port_id,

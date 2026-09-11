@@ -1,8 +1,10 @@
-//! Resolve backend-provided XDG icon names to images for graph nodes.
+//! Resolve backend-provided icon references to images for graph nodes.
 //!
-//! PipeWire only gives us an icon name, not a ready-to-render Slint image.
-//! Keep the theme lookup here, on the UI side, so changing themes or
-//! packaging the application does not affect graph identity or routing.
+//! Linux backends give us an XDG icon name, Windows backends an executable
+//! path, an icon resource reference, or a `windows:...` sentinel. Neither is
+//! a ready-to-render Slint image, so keep the lookup here, on the UI side,
+//! so changing themes or packaging the application does not affect graph
+//! identity or routing.
 
 use slint::Image;
 use std::cell::RefCell;
@@ -27,8 +29,9 @@ struct IconIndex {
 
 static ICON_INDEX: OnceLock<IconIndex> = OnceLock::new();
 
-/// Load an optional XDG icon by name. A missing or invalid icon is treated as
-/// normal: nodes without usable icon data simply render without an image.
+/// Load an optional backend icon reference. A missing or invalid icon is
+/// treated as normal: nodes without usable icon data simply render without
+/// an image.
 pub(crate) fn load_node_icon(icon_name: Option<&str>) -> Option<Image> {
     let icon_name = icon_name?.trim();
     if icon_name.is_empty() {
@@ -39,7 +42,9 @@ pub(crate) fn load_node_icon(icon_name: Option<&str>) -> Option<Image> {
         if let Some(image) = cache.borrow().images.get(icon_name).cloned() {
             return image;
         }
-        let image = resolve_icon_path(icon_name).and_then(|path| Image::load_from_path(&path).ok());
+        let image = resolve_icon_path(icon_name)
+            .and_then(|path| Image::load_from_path(&path).ok())
+            .or_else(|| super::icons_windows::load_windows_icon(icon_name));
         cache
             .borrow_mut()
             .images

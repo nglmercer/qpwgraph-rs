@@ -399,6 +399,17 @@ impl PortType {
     }
 }
 
+/// Fallback [`Node::icon_name`] the Windows backend uses for a playback
+/// endpoint when the MMDevice property store exposes no device icon path.
+/// The UI resolves it to a stock system icon; it never participates in
+/// routing identity or patchbay persistence.
+pub const WINDOWS_ENDPOINT_RENDER_ICON: &str = "windows:endpoint-render";
+
+/// Fallback [`Node::icon_name`] the Windows backend uses for a capture
+/// endpoint when the MMDevice property store exposes no device icon path.
+/// See [`WINDOWS_ENDPOINT_RENDER_ICON`].
+pub const WINDOWS_ENDPOINT_CAPTURE_ICON: &str = "windows:endpoint-capture";
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Node {
     pub id: NodeId,
@@ -419,10 +430,14 @@ pub struct Node {
     /// value by matching helpers.
     #[serde(default, skip_serializing_if = "NodeIdentity::is_empty")]
     pub identity: NodeIdentity,
-    /// Optional XDG icon name supplied by the backend. This is presentation
-    /// metadata rather than part of a node's durable routing identity, so the
-    /// UI may resolve it against the user's current icon theme without
-    /// changing selectors or patchbay files.
+    /// Optional backend-provided icon reference supplied by the backend.
+    /// On Linux this is an XDG icon name; on Windows it is either a full
+    /// executable path (application sessions, icon extracted from the binary),
+    /// a device icon resource reference (`path,-index`, from the MMDevice
+    /// property store), or one of the `WINDOWS_*_ICON` sentinels below.
+    /// This is presentation metadata rather than part of a node's durable
+    /// routing identity, so the UI may resolve it against the user's current
+    /// icon theme without changing selectors or patchbay files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_name: Option<String>,
     pub ports: Vec<PortId>,
@@ -469,7 +484,9 @@ impl Node {
         self
     }
 
-    /// Attach an optional backend-provided XDG icon name.
+    /// Attach an optional backend-provided icon reference (an XDG icon name
+    /// on Linux, an executable path, icon resource reference, or
+    /// `WINDOWS_*_ICON` sentinel on Windows).
     pub fn with_icon_name(mut self, icon_name: impl Into<String>) -> Self {
         let icon_name = icon_name.into().trim().to_owned();
         self.icon_name = (!icon_name.is_empty()).then_some(icon_name);

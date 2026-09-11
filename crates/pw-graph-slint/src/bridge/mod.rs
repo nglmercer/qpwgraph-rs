@@ -22,6 +22,7 @@ mod effects;
 mod effects_restore;
 mod events;
 mod icons;
+mod icons_windows;
 #[cfg(test)]
 mod keyboard;
 mod meters;
