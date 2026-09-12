@@ -341,18 +341,16 @@ fn open_client(
         unsafe { Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|error| native("create the device enumerator", error))?;
 
-    // A named device that has since been unplugged falls back to the default
-    // rather than failing the route outright: the user asked for "speakers",
-    // and the machine still has some.
     let device = match device_id {
         Some(id) => {
             let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe { enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr())) }.ok()
+            // A graph edge names a particular endpoint. Falling back to the
+            // default here would make an unplugged microphone or monitor look
+            // healthy while recording a different source, which is worse than
+            // a visible route failure.
+            unsafe { enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr())) }
+                .map_err(|error| native("open the selected endpoint", error))?
         }
-        None => None,
-    };
-    let device = match device {
-        Some(device) => device,
         None => unsafe { enumerator.GetDefaultAudioEndpoint(kind.data_flow(), Audio::eConsole) }
             .map_err(|error| native("open the default endpoint", error))?,
     };
@@ -460,6 +458,15 @@ fn capture_loop(
                     // counts it, and dropping the tail is better than growing
                     // latency without bound.
                     feed.push(block);
+                } else {
+                    // A non-silent packet must carry a readable buffer. Do
+                    // not turn malformed device data into plausible silence.
+                    let release = unsafe { capture.ReleaseBuffer(frames) };
+                    feed.mark_lost();
+                    if release.is_err() {
+                        feed.mark_lost();
+                    }
+                    return;
                 }
             }
             if unsafe { capture.ReleaseBuffer(frames) }.is_err() {

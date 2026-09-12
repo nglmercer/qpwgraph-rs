@@ -11,6 +11,7 @@ use pw_graph_patchbay::PatchbayReconciler;
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{LogicalPosition, Model, ModelRc};
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -55,6 +56,10 @@ pub(super) fn demo_application() -> Application {
         patchbay_debug_report: String::new(),
         node_debug_name: String::new(),
         node_debug_report: String::new(),
+        recorders: BTreeMap::new(),
+        pending_recorder_stops: BTreeSet::new(),
+        recovered_recordings: Vec::new(),
+        recovery_dialog_visible: false,
         debug: false,
         last_refresh: Instant::now(),
         last_full_sync: Instant::now(),

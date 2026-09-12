@@ -453,6 +453,14 @@ pub(super) fn session_link_local_id(endpoint_id: &str, session_id: &str) -> u64 
     stable_local_id(&format!("session-link:{endpoint_id}:{session_id}"))
 }
 
+pub(super) fn recorder_node_local_id(recorder_id: u64) -> u64 {
+    stable_local_id(&format!("recorder-node:{recorder_id}"))
+}
+
+pub(super) fn recorder_port_local_id(recorder_id: u64) -> u64 {
+    stable_local_id(&format!("recorder-port:{recorder_id}"))
+}
+
 pub(super) fn take_pwstr(value: PWSTR) -> String {
     let text = unsafe { value.to_string() }.unwrap_or_default();
     unsafe { Com::CoTaskMemFree(Some(value.0 as *mut _)) };

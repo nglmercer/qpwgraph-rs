@@ -8,6 +8,7 @@ pub(crate) fn node_type_color(node_type: NodeType) -> [u8; 4] {
     match node_type {
         NodeType::PipeWire => [63, 82, 101, 255],
         NodeType::Effect => [82, 117, 176, 255],
+        NodeType::Recorder => [184, 119, 65, 255],
         NodeType::AlsaMidi => [138, 93, 159, 255],
         NodeType::WindowsAudioEndpoint => [49, 129, 143, 255],
         NodeType::WindowsAudioSession => [64, 157, 168, 255],
@@ -61,10 +62,11 @@ pub(crate) fn link_color(port_type: PortType, direction: Direction, name: &str) 
     }
 }
 
-pub(super) fn node_height(
+pub(super) fn node_height_for_node(
     thumbnail: bool,
     collapsed: bool,
     has_audio_panel: bool,
+    is_recorder: bool,
     port_count: usize,
 ) -> f32 {
     if thumbnail {
@@ -73,7 +75,9 @@ pub(super) fn node_height(
         COLLAPSED_NODE_HEIGHT
     } else {
         NODE_HEADER_HEIGHT
-            + if has_audio_panel {
+            + if is_recorder {
+                crate::canvas::RECORDER_BLOCK_HEIGHT
+            } else if has_audio_panel {
                 AUDIO_CONTROLS_HEIGHT
             } else {
                 0.0

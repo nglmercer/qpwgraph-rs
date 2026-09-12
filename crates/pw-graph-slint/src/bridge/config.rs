@@ -1,3 +1,4 @@
+use pw_graph_config::RecordingSaveMode;
 use pw_graph_i18n::I18n;
 use std::time::{Duration, Instant};
 
@@ -153,6 +154,12 @@ pub(crate) fn read_window_state(window: &MainWindow, application: &mut Applicati
             );
         }
     }
+
+    application.config.recording_save_mode = if window.get_recording_save_mode_index() == 1 {
+        RecordingSaveMode::AutoSave.as_str().into()
+    } else {
+        RecordingSaveMode::AskOnStop.as_str().into()
+    };
 
     if !patchbay_was_activated && application.config.patchbay_activated {
         activate_patchbay(application);

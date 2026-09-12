@@ -37,11 +37,22 @@ pub(crate) fn handle_link_rerouted(application: &mut Application, link_id: i32, 
         );
         return;
     }
-    let target_connectable = application
-        .source
-        .graph()
-        .port(port)
-        .is_some_and(|port| application.source.node_connectable(port.node_id));
+    let proposed_pair = {
+        let graph = application.source.graph();
+        graph.link(link).zip(graph.port(port)).map(|(link, port)| {
+            if port.direction.is_sink() {
+                (link.output_port, port.id)
+            } else {
+                (port.id, link.input_port)
+            }
+        })
+    };
+    let target_connectable = proposed_pair.is_some_and(|(output, input)| {
+        !matches!(
+            application.source.connection_support(output, input),
+            pw_graph_backend::ConnectionSupport::Unsupported
+        )
+    });
     if !target_connectable {
         set_connection_feedback(
             application,
@@ -513,14 +524,10 @@ fn apply_easy_pairs(application: &mut Application, port_keys: Vec<(PortKey, Port
 }
 
 fn pair_is_connectable(application: &Application, output: PortId, input: PortId) -> bool {
-    let graph = application.source.graph();
-    graph
-        .port(output)
-        .zip(graph.port(input))
-        .is_some_and(|(output, input)| {
-            application.source.node_connectable(output.node_id)
-                && application.source.node_connectable(input.node_id)
-        })
+    !matches!(
+        application.source.connection_support(output, input),
+        pw_graph_backend::ConnectionSupport::Unsupported
+    )
 }
 
 pub(crate) fn delete_selected_connections(application: &mut Application) {

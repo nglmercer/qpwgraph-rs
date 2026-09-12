@@ -44,6 +44,10 @@ pub(crate) enum UiEvent {
         value: f32,
     },
     EffectDraftEnabledChanged(bool),
+    RecorderRecord(i32),
+    RecorderStop(i32),
+    RecorderSave(i32),
+    RecorderDiscard(i32),
     SelectNode(i32, bool),
     SelectLink(i32, bool),
     ClearSelection,
@@ -136,6 +140,17 @@ pub(crate) struct Application {
     pub(crate) patchbay_debug_report: String,
     pub(crate) node_debug_name: String,
     pub(crate) node_debug_report: String,
+    /// Recorder instances are runtime graph resources. Their lifecycle is
+    /// intentionally not persisted as ordinary configuration.
+    pub(crate) recorders:
+        BTreeMap<pw_graph_backend::RecorderId, pw_graph_backend::RecorderInstance>,
+    /// Recorder stops are finalized by the writer thread. These IDs await a
+    /// completion event before the Save dialog is offered.
+    pub(crate) pending_recorder_stops: BTreeSet<pw_graph_backend::RecorderId>,
+    /// Crash-repairable `.wav.part` files discovered at startup. They stay
+    /// outside the normal recorder graph because no live node owns them.
+    pub(crate) recovered_recordings: Vec<pw_graph_backend::router::RecoveredRecording>,
+    pub(crate) recovery_dialog_visible: bool,
     pub(crate) debug: bool,
     pub(crate) last_refresh: Instant,
     /// Last time the full model sync ran. The 50 ms pump only refreshes

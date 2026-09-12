@@ -18,6 +18,8 @@ export component PreferencesDialog inherits Rectangle {
     in-out property <bool> connect-through: false;
     in-out property <bool> thumbnail-view: false;
     in-out property <int> meter-policy-index: 1;
+    in-out property <int> recording-save-mode-index: 0;
+    in-out property <string> recording-directory: "";
     in-out property <float> ui-scale: 1.1;
     in-out property <float> panel-scale: 1.2;
     in-out property <float> node-scale: 1.15;
@@ -100,6 +102,29 @@ export component PreferencesDialog inherits Rectangle {
                 SelectSettingRow { x: 0px; y: 0px; width: parent.width; icon: @image-url("../../../../assets/icons/diagnostics.svg"); title: UiI18n.localized("inspector.audio_metering_policy"); help: UiI18n.localized("help.audio_metering_policy"); options: [UiI18n.localized("meters.off"), UiI18n.localized("meters.on_demand"), UiI18n.localized("meters.always")]; current-index <=> root.meter-policy-index; }
                 Rectangle { x: 4px; y: 65px; width: parent.width - 8px; height: 42px; background: #1d242c; border-color: #3f4c59; border-width: 1px; border-radius: AppTokens.radius-sm; Text { x: 9px; width: parent.width - 18px; height: parent.height; text: root.meter-policy-index == 0 ? UiI18n.localized("meters.off_hint") : root.meter-policy-index == 1 ? UiI18n.localized("meters.on_demand_hint") : UiI18n.localized("meters.always_hint"); color: #93a4b1; font-size: 9px * UiTheme.panel-scale; wrap: word-wrap; vertical-alignment: center; } }
                 DialogButton { x: parent.width - 151px; y: 115px; width: 147px; text: UiI18n.localized("inspector.audio_reset"); clicked => { root.action("reset-audio"); } }
+            }
+            SettingsSection {
+                title: UiI18n.localized("recorder.settings"); section-height: 239px;
+                SelectSettingRow {
+                    x: 0px; y: 0px; width: parent.width;
+                    icon: @image-url("../../../../assets/icons/volume.svg");
+                    title: UiI18n.localized("recorder.save_mode");
+                    help: UiI18n.localized("recorder.save_mode_help");
+                    options: [UiI18n.localized("recorder.ask_on_stop"), UiI18n.localized("recorder.auto_save")];
+                    current-index <=> root.recording-save-mode-index;
+                }
+                Rectangle {
+                    x: 4px; y: 67px; width: parent.width - 8px; height: 47px;
+                    background: #1d242c; border-color: #3f4c59; border-width: 1px; border-radius: AppTokens.radius-sm;
+                    Text { x: 9px; y: 4px; width: parent.width - 112px; height: 38px; text: root.recording-directory == "" ? UiI18n.localized("recorder.default_folder") : root.recording-directory; color: #93a4b1; font-size: 9px * UiTheme.panel-scale; overflow: elide; vertical-alignment: center; }
+                    DialogButton { x: parent.width - 101px; y: 9px; width: 92px; text: UiI18n.localized("recorder.choose_folder"); clicked => { root.action("choose-recording-directory"); } }
+                }
+                Rectangle {
+                    x: 4px; y: 123px; width: parent.width - 8px; height: 47px;
+                    background: #1d242c; border-color: #3f4c59; border-width: 1px; border-radius: AppTokens.radius-sm;
+                    Text { x: 9px; y: 4px; width: parent.width - 18px; height: 18px; text: UiI18n.localized("recorder.format"); color: #e6edf2; font-size: 10px * UiTheme.panel-scale; }
+                    Text { x: 9px; y: 23px; width: parent.width - 18px; height: 16px; text: UiI18n.localized("recorder.format_value"); color: #93a4b1; font-size: 9px * UiTheme.panel-scale; }
+                }
             }
             SettingsSection {
                 title: UiI18n.localized("inspector.typography");

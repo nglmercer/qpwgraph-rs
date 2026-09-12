@@ -122,6 +122,7 @@ impl RingProducer {
 }
 
 /// The reading half. Held by the router thread.
+#[derive(Clone)]
 pub struct RingConsumer {
     ring: Arc<Ring>,
 }

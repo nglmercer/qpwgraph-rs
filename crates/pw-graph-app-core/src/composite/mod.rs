@@ -14,6 +14,7 @@
 //! | [`platform`] | accessors that exist on only one platform |
 
 use super::*;
+use std::collections::BTreeMap;
 
 mod effects;
 mod platform;
@@ -41,6 +42,7 @@ pub struct CompositeDriver {
     #[cfg(target_os = "windows")]
     pub windows_midi: Option<WindowsMidiDriver>,
     graph: Graph,
+    recorder_owners: BTreeMap<pw_graph_backend::RecorderId, CompositeRoute>,
     #[cfg(any(
         target_os = "windows",
         all(target_os = "linux", any(feature = "pipewire", feature = "alsa"))
@@ -114,6 +116,7 @@ impl CompositeDriver {
             windows_audio: None,
             refresh_schedule: RefreshSchedule::default(),
             graph: Graph::default(),
+            recorder_owners: BTreeMap::new(),
         }
     }
 
@@ -124,6 +127,7 @@ impl CompositeDriver {
             windows_midi: None,
             refresh_schedule: RefreshSchedule::default(),
             graph: Graph::default(),
+            recorder_owners: BTreeMap::new(),
         }
     }
 
@@ -134,6 +138,7 @@ impl CompositeDriver {
             windows_midi: Some(driver),
             refresh_schedule: RefreshSchedule::default(),
             graph: Graph::default(),
+            recorder_owners: BTreeMap::new(),
         }
     }
 
@@ -212,6 +217,38 @@ impl GraphDriver for CompositeDriver {
 
     fn is_link_mutable(&self, link: LinkId) -> bool {
         self.route_is_link_mutable(link)
+    }
+
+    fn connection_support(
+        &self,
+        output: PortId,
+        input: PortId,
+    ) -> pw_graph_backend::ConnectionSupport {
+        match route_for_ports(output, input) {
+            Ok(CompositeRoute::PipeWire) =>
+            {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                if let Some(driver) = self.pipewire.as_ref() {
+                    return driver.connection_support(output, input);
+                }
+            }
+            Ok(CompositeRoute::WindowsAudio) =>
+            {
+                #[cfg(target_os = "windows")]
+                if let Some(driver) = self.windows_audio.as_ref() {
+                    return driver.connection_support(output, input);
+                }
+            }
+            _ => {}
+        }
+        pw_graph_backend::ConnectionSupport::Unsupported
+    }
+
+    fn node_supports_routing(&self, node: NodeId) -> bool {
+        let Some(backend) = backend_for_node(node) else {
+            return false;
+        };
+        self.child_node_supports_routing(backend, node)
     }
 
     fn set_node_position(&mut self, node: NodeId, position: [f32; 2]) -> BackendResult<()> {
@@ -368,5 +405,341 @@ impl GraphDriver for CompositeDriver {
             return driver.reset_audio_config();
         }
         Ok(())
+    }
+}
+
+impl RecorderDriver for CompositeDriver {
+    fn supports_recorders(&self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "pipewire"))]
+        if self
+            .pipewire
+            .as_ref()
+            .is_some_and(RecorderDriver::supports_recorders)
+        {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if self
+            .windows_audio
+            .as_ref()
+            .is_some_and(RecorderDriver::supports_recorders)
+        {
+            return true;
+        }
+        false
+    }
+
+    fn create_recorder(
+        &mut self,
+        request: pw_graph_backend::RecorderCreateRequest,
+    ) -> BackendResult<pw_graph_backend::RecorderInstance> {
+        let _ = &request;
+        #[cfg(all(target_os = "linux", feature = "pipewire"))]
+        if let Some(driver) = self.pipewire.as_mut() {
+            let instance = driver.create_recorder(request)?;
+            self.recorder_owners
+                .insert(instance.id, CompositeRoute::PipeWire);
+            self.rebuild_merged_graph()?;
+            return Ok(instance);
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(driver) = self.windows_audio.as_mut() {
+            let instance = driver.create_recorder(request)?;
+            self.recorder_owners
+                .insert(instance.id, CompositeRoute::WindowsAudio);
+            self.rebuild_merged_graph()?;
+            return Ok(instance);
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn remove_recorder(&mut self, id: pw_graph_backend::RecorderId) -> BackendResult<()> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                self.pipewire
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .remove_recorder(id)?;
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                self.windows_audio
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .remove_recorder(id)?;
+            }
+            _ => {
+                return Err(BackendError::Unsupported(
+                    "recorder backend is unavailable".into(),
+                ));
+            }
+        }
+        self.recorder_owners.remove(&id);
+        self.rebuild_merged_graph()?;
+        Ok(())
+    }
+
+    fn start_recording(&mut self, id: pw_graph_backend::RecorderId) -> BackendResult<()> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .start_recording(id);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .start_recording(id);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn request_stop_recording(&mut self, id: pw_graph_backend::RecorderId) -> BackendResult<()> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .request_stop_recording(id);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .request_stop_recording(id);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn stop_recording(
+        &mut self,
+        id: pw_graph_backend::RecorderId,
+    ) -> BackendResult<pw_graph_backend::RecorderResult> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .stop_recording(id);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .stop_recording(id);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn save_recording(
+        &mut self,
+        id: pw_graph_backend::RecorderId,
+        destination: &std::path::Path,
+    ) -> BackendResult<std::path::PathBuf> {
+        let _ = destination;
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .save_recording(id, destination);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .save_recording(id, destination);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn recorder_status(
+        &self,
+        id: pw_graph_backend::RecorderId,
+    ) -> BackendResult<pw_graph_backend::RecorderStatus> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .recorder_status(id);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .recorder_status(id);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn poll_recording(
+        &mut self,
+        id: pw_graph_backend::RecorderId,
+    ) -> BackendResult<Option<pw_graph_backend::RecorderResult>> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .poll_recording(id);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .poll_recording(id);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn discard_recording(&mut self, id: pw_graph_backend::RecorderId) -> BackendResult<()> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .discard_recording(id);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_mut()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .discard_recording(id);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
     }
 }

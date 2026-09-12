@@ -6,11 +6,10 @@
 //! module keeps those lifetime decisions in one place and, importantly, keys
 //! them by a verified selector/PID generation rather than by a bare PID.
 //!
-//! The first consumer implemented here is the Windows session RMS meter.  The
-//! relay still owns its realtime source because it has a different lifetime
-//! and format boundary, but it uses the same selector verification before it
-//! starts.  The registry types are deliberately reusable when those streams
-//! are later fanned out from one activation.
+//! The manager owns one process-loopback activation per verified selector and
+//! fans its PCM out through fixed-capacity rings. The relay still owns its
+//! realtime source because it has a different lifetime and format boundary,
+//! while graph-owned Recorder edges lease one of the manager's rings.
 
 use super::app_route_policy::verify_live_process_identity;
 #[cfg(test)]
@@ -19,7 +18,7 @@ use super::process_loopback::{
     ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
 };
 use crate::api::{BackendError, BackendResult};
-use crate::router::{AudioFormat, AudioSource, RingSource, StreamHealth};
+use crate::router::{AudioFormat, AudioSource, RingSource, RingSourceFanoutControl, StreamHealth};
 use pw_graph_core::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -27,6 +26,7 @@ use std::time::{Duration, Instant};
 const CAPTURE_RING_FRAMES: usize = 4_096;
 const METER_BLOCK_FRAMES: usize = 480;
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_PROCESS_CAPTURE_CONSUMERS: usize = 64;
 
 /// A process capture identity.  `generation` comes from the activation, not
 /// from Windows' PID, so a later activation of a reused PID is distinct.
@@ -47,14 +47,15 @@ enum CaptureIdentity {
     },
 }
 
-/// Consumers are tracked even before stream sharing is optimized.  This
-/// prevents a later consumer from accidentally stopping a capture still in
-/// use by a meter or diagnostic request.
+/// Consumers of one verified process-loopback identity. Each realtime
+/// consumer receives its own bounded ring from the single underlying
+/// activation, so removing one cannot stop a meter or Recorder that remains.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ProcessCaptureConsumer {
     Meter(NodeId),
     Relay,
     OwnedRoute,
+    Recorder(crate::api::RecorderId),
     Diagnostics,
 }
 
@@ -103,7 +104,13 @@ pub struct ProcessCaptureRequest {
 
 struct ActiveCapture {
     key: ProcessCaptureKey,
-    source: RingSource,
+    /// One idle template per physical consumer. Recorder routes receive a
+    /// lease cloned from their template; the template remains on the worker
+    /// thread so a later route recovery does not need a second activation.
+    sources: BTreeMap<ProcessCaptureConsumer, RingSource>,
+    slots: BTreeMap<ProcessCaptureConsumer, usize>,
+    available_sources: BTreeMap<usize, RingSource>,
+    fanout: RingSourceFanoutControl,
     loopback: ProcessLoopbackSource,
     consumers: BTreeSet<ProcessCaptureConsumer>,
     state: ProcessCaptureState,
@@ -120,9 +127,10 @@ struct FailedCapture {
 
 /// The worker-thread manager for capture-only process consumers.
 ///
-/// It never exposes a process-loopback source as a graph edge.  The only
+/// It never owns a process-loopback activation as a graph edge. The only
 /// graph-owned process source remains the isolated route path in
-/// `windows::routing`; this manager is for read-only consumers.
+/// `windows::routing`; this manager leases bounded rings to read-only
+/// consumers such as meters and Recorders.
 #[derive(Default)]
 pub struct ProcessCaptureManager {
     active: BTreeMap<ProcessCaptureKey, ActiveCapture>,
@@ -133,7 +141,12 @@ pub struct ProcessCaptureManager {
     /// long-lived process-loopback client for the same PID.
     route_probe_states: BTreeMap<CaptureIdentity, ProcessCaptureState>,
     meter_targets: BTreeMap<NodeId, ProcessMeterTarget>,
-    route_targets: BTreeSet<CaptureIdentity>,
+    /// Process captures explicitly owned by this manager. The current
+    /// application-route reconciler uses `route_probe_targets` instead so a
+    /// graph route does not open a duplicate manager stream.
+    route_capture_targets: BTreeSet<CaptureIdentity>,
+    route_probe_targets: BTreeSet<CaptureIdentity>,
+    recorder_targets: BTreeMap<(crate::api::RecorderId, CaptureIdentity), ProcessCaptureRequest>,
     external_relay: Option<ProcessCaptureKey>,
 }
 
@@ -169,7 +182,7 @@ impl ProcessCaptureManager {
         requests: impl IntoIterator<Item = ProcessCaptureRequest>,
         format: AudioFormat,
     ) {
-        self.route_targets = requests
+        self.route_capture_targets = requests
             .into_iter()
             .filter(|request| validate_capture_selector(&request.selector, request.pid).is_ok())
             .map(|request| CaptureIdentity::Selector {
@@ -178,6 +191,73 @@ impl ProcessCaptureManager {
                 mode: request.mode,
             })
             .collect();
+        self.reconcile(format);
+    }
+
+    /// Lease a bounded process PCM ring for one Recorder route.
+    ///
+    /// The returned [`RingSource`] is the only active reader for that ring;
+    /// the manager keeps an idle template so the same process-loopback
+    /// activation can be recovered after a route/device reset. A second
+    /// request for the same recorder and selector reuses the same consumer
+    /// slot rather than opening another Windows activation.
+    pub fn acquire_recorder(
+        &mut self,
+        recorder_id: crate::api::RecorderId,
+        request: ProcessCaptureRequest,
+        format: AudioFormat,
+    ) -> BackendResult<RingSource> {
+        validate_capture_selector(&request.selector, request.pid)?;
+        let identity = request_identity(&request);
+        let target_key = (recorder_id, identity.clone());
+        let already_requested = self
+            .recorder_targets
+            .insert(target_key.clone(), request)
+            .is_some();
+        self.reconcile(format);
+
+        let consumer = ProcessCaptureConsumer::Recorder(recorder_id);
+        let result = self
+            .active
+            .values()
+            .find(|capture| capture_identity(&capture.key) == identity)
+            .ok_or_else(|| {
+                self.failed
+                    .get(&identity)
+                    .map(|failure| BackendError::unsupported(failure.error.clone()))
+                    .unwrap_or_else(|| {
+                        BackendError::native("process-loopback capture did not become active")
+                    })
+            })
+            .and_then(|capture| {
+                capture
+                    .sources
+                    .get(&consumer)
+                    .map(RingSource::lease)
+                    .ok_or_else(|| {
+                        BackendError::native(
+                            "process-loopback Recorder consumer has no capture ring",
+                        )
+                    })
+            });
+        if result.is_err() && !already_requested {
+            self.recorder_targets.remove(&target_key);
+            self.reconcile(format);
+        }
+        result
+    }
+
+    /// Release one Recorder's request for a selector/PID identity. Other
+    /// Recorder routes for the same process, and meter/relay users, keep the
+    /// shared activation alive.
+    pub fn release_recorder(
+        &mut self,
+        recorder_id: crate::api::RecorderId,
+        request: &ProcessCaptureRequest,
+        format: AudioFormat,
+    ) {
+        let identity = request_identity(request);
+        self.recorder_targets.remove(&(recorder_id, identity));
         self.reconcile(format);
     }
 
@@ -193,7 +273,7 @@ impl ProcessCaptureManager {
         &mut self,
         requests: impl IntoIterator<Item = ProcessCaptureRequest>,
     ) {
-        self.route_targets = requests
+        self.route_probe_targets = requests
             .into_iter()
             .filter_map(|request| {
                 if request.pid == 0
@@ -209,9 +289,9 @@ impl ProcessCaptureManager {
             })
             .collect();
         self.route_probe_states
-            .retain(|identity, _| self.route_targets.contains(identity));
+            .retain(|identity, _| self.route_probe_targets.contains(identity));
 
-        for identity in self.route_targets.clone() {
+        for identity in self.route_probe_targets.clone() {
             let state = match &identity {
                 CaptureIdentity::Selector {
                     selector,
@@ -279,6 +359,10 @@ impl ProcessCaptureManager {
             .iter()
             .map(|identity| (identity.clone(), self.consumers_for(identity)))
             .collect();
+        let source_consumers: BTreeMap<_, _> = wanted
+            .iter()
+            .map(|identity| (identity.clone(), self.source_consumers_for(identity)))
+            .collect();
 
         // A lost worker must not be treated as a healthy lease forever. Keep
         // its failure in the bounded backoff table so a dead PID is not
@@ -303,9 +387,25 @@ impl ProcessCaptureManager {
 
         self.active.retain(|key, capture| {
             let identity = capture_identity(key);
-            if wanted.contains(&identity) && matches!(capture.state, ProcessCaptureState::Active) {
+            if wanted.contains(&identity)
+                && matches!(capture.state, ProcessCaptureState::Active)
+                && capture.loopback.is_running()
+            {
                 capture.consumers = consumers.get(&identity).cloned().unwrap_or_default();
-                true
+                match reconcile_capture_slots(
+                    capture,
+                    source_consumers.get(&identity).cloned().unwrap_or_default(),
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        capture.state = ProcessCaptureState::Unavailable {
+                            reason: error.clone(),
+                        };
+                        capture.last_error = Some(error);
+                        capture.loopback.stop();
+                        false
+                    }
+                }
             } else {
                 capture.loopback.stop();
                 false
@@ -357,19 +457,58 @@ impl ProcessCaptureManager {
                 );
                 continue;
             }
-            match ProcessLoopbackSource::open(pid, mode, format, CAPTURE_RING_FRAMES) {
-                Ok((source, loopback)) => {
+            let needed = source_consumers.get(&identity).cloned().unwrap_or_default();
+            if needed.len() > MAX_PROCESS_CAPTURE_CONSUMERS {
+                let message = format!(
+                    "process-loopback has {} consumers, exceeding the fixed {}-slot fan-out",
+                    needed.len(),
+                    MAX_PROCESS_CAPTURE_CONSUMERS
+                );
+                self.failed.insert(
+                    identity,
+                    FailedCapture {
+                        error: message.clone(),
+                        attempted_at: Instant::now(),
+                        state: ProcessCaptureState::Unavailable { reason: message },
+                    },
+                );
+                continue;
+            }
+            let active_slots: Vec<usize> = (0..needed.len()).collect();
+            match ProcessLoopbackSource::open_fanout(
+                pid,
+                mode,
+                format,
+                CAPTURE_RING_FRAMES,
+                MAX_PROCESS_CAPTURE_CONSUMERS,
+                &active_slots,
+            ) {
+                Ok((sources, loopback, fanout)) => {
                     let key = ProcessCaptureKey {
                         selector,
                         pid,
                         generation: loopback.generation(),
                         mode,
                     };
+                    let mut source_map = BTreeMap::new();
+                    let mut slot_map = BTreeMap::new();
+                    let mut available_sources = BTreeMap::new();
+                    for (slot, source) in sources.into_iter().enumerate() {
+                        if let Some(consumer) = needed.iter().nth(slot).cloned() {
+                            source_map.insert(consumer.clone(), source);
+                            slot_map.insert(consumer, slot);
+                        } else {
+                            available_sources.insert(slot, source);
+                        }
+                    }
                     self.active.insert(
                         key.clone(),
                         ActiveCapture {
                             key,
-                            source,
+                            sources: source_map,
+                            slots: slot_map,
+                            available_sources,
+                            fanout,
                             loopback,
                             consumers: consumers.get(&identity).cloned().unwrap_or_default(),
                             state: ProcessCaptureState::Active,
@@ -403,7 +542,12 @@ impl ProcessCaptureManager {
                 pid: target.pid,
                 mode: target.mode,
             })
-            .chain(self.route_targets.iter().cloned())
+            .chain(self.route_capture_targets.iter().cloned())
+            .chain(
+                self.recorder_targets
+                    .keys()
+                    .map(|(_, identity)| identity.clone()),
+            )
             .collect()
     }
 
@@ -414,8 +558,15 @@ impl ProcessCaptureManager {
                 consumers.insert(ProcessCaptureConsumer::Meter(target.node_id));
             }
         }
-        if self.route_targets.contains(identity) {
+        if self.route_capture_targets.contains(identity)
+            || self.route_probe_targets.contains(identity)
+        {
             consumers.insert(ProcessCaptureConsumer::OwnedRoute);
+        }
+        for ((recorder_id, recorder_identity), _) in &self.recorder_targets {
+            if recorder_identity == identity {
+                consumers.insert(ProcessCaptureConsumer::Recorder(*recorder_id));
+            }
         }
         if self
             .external_relay
@@ -425,6 +576,21 @@ impl ProcessCaptureManager {
             consumers.insert(ProcessCaptureConsumer::Relay);
         }
         consumers
+    }
+
+    fn source_consumers_for(&self, identity: &CaptureIdentity) -> BTreeSet<ProcessCaptureConsumer> {
+        self.consumers_for(identity)
+            .into_iter()
+            .filter(|consumer| {
+                matches!(
+                    consumer,
+                    ProcessCaptureConsumer::Meter(_)
+                        | ProcessCaptureConsumer::Recorder(_)
+                        | ProcessCaptureConsumer::OwnedRoute
+                ) && (self.route_capture_targets.contains(identity)
+                    || !matches!(consumer, ProcessCaptureConsumer::OwnedRoute))
+            })
+            .collect()
     }
 
     /// Read one non-blocking block for a node and calculate true RMS and peak
@@ -453,7 +619,10 @@ impl ProcessCaptureManager {
             });
         }
 
-        let read = capture.source.read(&mut capture.scratch);
+        let read = capture
+            .sources
+            .get_mut(&ProcessCaptureConsumer::Meter(node_id))?
+            .read(&mut capture.scratch);
         if read.health == StreamHealth::Lost {
             let reason = "process-loopback source was lost".to_owned();
             capture.state = ProcessCaptureState::Lost {
@@ -470,7 +639,13 @@ impl ProcessCaptureManager {
         }
 
         if read.frames > 0 {
-            let samples = read.frames * capture.source.format().channels as usize;
+            let samples = read.frames
+                * capture
+                    .sources
+                    .get(&ProcessCaptureConsumer::Meter(node_id))
+                    .expect("meter source still exists")
+                    .format()
+                    .channels as usize;
             let block = &capture.scratch[..samples.min(capture.scratch.len())];
             let sum = block.iter().map(|sample| sample * sample).sum::<f32>();
             let peak = block
@@ -501,6 +676,7 @@ impl ProcessCaptureManager {
     }
 
     pub fn statuses(&self) -> Vec<ProcessCaptureStatus> {
+        let active_identities: BTreeSet<_> = self.active.keys().map(capture_identity).collect();
         let mut statuses: Vec<_> = self
             .active
             .values()
@@ -537,24 +713,29 @@ impl ProcessCaptureManager {
                 })
                 .filter(|status| !probed.contains(&capture_identity(&status.key))),
         );
-        statuses.extend(self.route_probe_states.iter().map(|(identity, state)| {
-            let (selector, pid, mode) = identity_parts(identity);
-            ProcessCaptureStatus {
-                key: ProcessCaptureKey {
-                    selector,
-                    pid,
-                    generation: 0,
-                    mode,
-                },
-                consumers: BTreeSet::from([ProcessCaptureConsumer::OwnedRoute]),
-                state: state.clone(),
-                last_error: match state {
-                    ProcessCaptureState::Unavailable { reason }
-                    | ProcessCaptureState::Lost { reason } => Some(reason.clone()),
-                    ProcessCaptureState::Active => None,
-                },
-            }
-        }));
+        statuses.extend(
+            self.route_probe_states
+                .iter()
+                .filter(|(identity, _)| !active_identities.contains(*identity))
+                .map(|(identity, state)| {
+                    let (selector, pid, mode) = identity_parts(identity);
+                    ProcessCaptureStatus {
+                        key: ProcessCaptureKey {
+                            selector,
+                            pid,
+                            generation: 0,
+                            mode,
+                        },
+                        consumers: BTreeSet::from([ProcessCaptureConsumer::OwnedRoute]),
+                        state: state.clone(),
+                        last_error: match state {
+                            ProcessCaptureState::Unavailable { reason }
+                            | ProcessCaptureState::Lost { reason } => Some(reason.clone()),
+                            ProcessCaptureState::Active => None,
+                        },
+                    }
+                }),
+        );
         if let Some(key) = &self.external_relay {
             let identity = capture_identity(key);
             if !self
@@ -624,6 +805,56 @@ fn identity_matches_target(identity: &CaptureIdentity, target: &ProcessMeterTarg
     )
 }
 
+fn request_identity(request: &ProcessCaptureRequest) -> CaptureIdentity {
+    CaptureIdentity::Selector {
+        selector: request.selector.clone(),
+        pid: request.pid,
+        mode: request.mode,
+    }
+}
+
+/// Add/remove fixed fan-out slots for a capture that is already running.
+///
+/// The templates stay owned by this control-plane object. A Recorder gets a
+/// cloned lease, while a meter reads its template directly; either way the
+/// WASAPI worker sees only preallocated feeds and atomic active flags.
+fn reconcile_capture_slots(
+    capture: &mut ActiveCapture,
+    needed: BTreeSet<ProcessCaptureConsumer>,
+) -> Result<(), String> {
+    let stale: Vec<_> = capture
+        .sources
+        .keys()
+        .filter(|consumer| !needed.contains(*consumer))
+        .cloned()
+        .collect();
+    for consumer in stale {
+        if let Some(slot) = capture.slots.remove(&consumer) {
+            capture.fanout.set_active(slot, false);
+            if let Some(source) = capture.sources.remove(&consumer) {
+                capture.available_sources.insert(slot, source);
+            }
+        }
+    }
+
+    for consumer in needed {
+        if capture.sources.contains_key(&consumer) {
+            continue;
+        }
+        let Some(slot) = capture.available_sources.keys().next().copied() else {
+            return Err("process-loopback fan-out capacity is exhausted".into());
+        };
+        let source = capture
+            .available_sources
+            .remove(&slot)
+            .expect("fan-out slot was selected from the available map");
+        capture.sources.insert(consumer.clone(), source);
+        capture.slots.insert(consumer, slot);
+        capture.fanout.set_active(slot, true);
+    }
+    Ok(())
+}
+
 impl Drop for ProcessCaptureManager {
     fn drop(&mut self) {
         for capture in self.active.values_mut() {
@@ -672,6 +903,43 @@ mod tests {
             ..first.clone()
         };
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn one_capture_identity_tracks_meter_and_recorder_consumers_together() {
+        let request = ProcessCaptureRequest {
+            selector: "sha256:example".into(),
+            pid: 42,
+            mode: ProcessLoopbackMode::IncludeProcessTree,
+        };
+        let identity = request_identity(&request);
+        let mut manager = ProcessCaptureManager::new();
+        manager.meter_targets.insert(
+            NodeId(7),
+            ProcessMeterTarget {
+                node_id: NodeId(7),
+                selector: request.selector.clone(),
+                pid: request.pid,
+                mode: request.mode,
+            },
+        );
+        manager
+            .recorder_targets
+            .insert((3, identity.clone()), request.clone());
+
+        assert_eq!(
+            manager.source_consumers_for(&identity),
+            BTreeSet::from([
+                ProcessCaptureConsumer::Meter(NodeId(7)),
+                ProcessCaptureConsumer::Recorder(3),
+            ])
+        );
+
+        manager.recorder_targets.remove(&(3, identity.clone()));
+        assert_eq!(
+            manager.source_consumers_for(&identity),
+            BTreeSet::from([ProcessCaptureConsumer::Meter(NodeId(7))])
+        );
     }
 
     #[test]

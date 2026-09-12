@@ -156,14 +156,14 @@ impl CompositeDriver {
             return BackendCapabilities::default();
         };
         let mut capabilities = self.capabilities_for_backend(backend);
-        if !self.node_supports_routing(backend, node) {
+        if !self.child_node_supports_routing(backend, node) {
             capabilities.connect = false;
             capabilities.disconnect = false;
         }
         capabilities
     }
 
-    fn node_supports_routing(&self, backend: BackendKind, node: NodeId) -> bool {
+    pub(super) fn child_node_supports_routing(&self, backend: BackendKind, node: NodeId) -> bool {
         // Minimal builds compile out every native backend below, leaving
         // `node` (and `self`) unused. Bind them explicitly so
         // `RUSTFLAGS="-D warnings"` stays green on Linux minimal checks.

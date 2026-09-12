@@ -119,10 +119,17 @@ impl UiGraphState {
             });
             let has_audio_controls = audio.capabilities.has_any_control() && has_audio;
             let has_meter = audio.capabilities.has_any_meter() && has_audio;
-            let has_audio_panel = has_audio_controls || has_meter;
+            let has_audio_panel =
+                node.node_type == NodeType::Recorder || has_audio_controls || has_meter;
             let collapsed = appearance.collapsed;
             let thumbnail = self.thumbnail_mode;
-            let height = node_height(thumbnail, collapsed, has_audio_panel, ports.len());
+            let height = node_height_for_node(
+                thumbnail,
+                collapsed,
+                has_audio_panel,
+                node.node_type == NodeType::Recorder,
+                ports.len(),
+            );
             nodes.push(NodeView {
                 id: self.ids.node(node.id).unwrap_or_default(),
                 node_id: node.id,
@@ -286,10 +293,11 @@ impl UiGraphState {
                         node.position[1] + NODE_HEADER_HEIGHT / 2.0,
                     )
                 } else {
-                    let (offset_x, offset_y) = crate::canvas::pin_offset(
+                    let (offset_x, offset_y) = crate::canvas::pin_offset_for_node(
                         node.width,
                         index,
                         node.has_audio_panel,
+                        node.node_type == NodeType::Recorder,
                         port.direction != Direction::Sink,
                     );
                     (node.position[0] + offset_x, node.position[1] + offset_y)

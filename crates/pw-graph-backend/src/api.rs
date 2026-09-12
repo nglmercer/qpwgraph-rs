@@ -8,7 +8,10 @@ use pw_graph_effects::{
 };
 pub use pw_graph_effects::{EffectLoadStage, EffectTicket};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use thiserror::Error;
+
+pub use crate::router::AudioFormat;
 
 /// How freely a backend may open helper streams to measure audio levels.
 ///
@@ -108,6 +111,159 @@ backend_error_constructors! {
 }
 
 pub type BackendResult<T> = Result<T, BackendError>;
+
+pub type RecorderId = u64;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecorderState {
+    #[default]
+    Idle,
+    Recording,
+    Unsaved,
+    Error,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RecorderStatus {
+    pub id: RecorderId,
+    pub state: RecorderState,
+    pub writer_state: crate::router::RecorderWriterState,
+    pub elapsed_frames: u64,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub temporary_path: Option<PathBuf>,
+    pub final_path: Option<PathBuf>,
+    pub dropped_frames: u64,
+    pub frames_written: u64,
+    pub queue_depth: usize,
+    pub queue_capacity: usize,
+    pub file_bytes: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecorderCreateRequest {
+    pub name: String,
+    pub format: AudioFormat,
+    pub position: [f32; 2],
+    pub recording_dir: Option<PathBuf>,
+    pub capacity_frames: usize,
+}
+
+impl Default for RecorderCreateRequest {
+    fn default() -> Self {
+        Self {
+            name: "Recorder".into(),
+            format: AudioFormat::new(48_000, 2),
+            position: [260.0, 180.0],
+            recording_dir: None,
+            capacity_frames: 12_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecorderInstance {
+    pub id: RecorderId,
+    pub node_id: NodeId,
+    pub input_port: PortId,
+    pub status: RecorderStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecorderResult {
+    pub id: RecorderId,
+    pub temporary_path: PathBuf,
+    pub elapsed_frames: u64,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub frames_written: u64,
+    pub dropped_frames: u64,
+    pub file_bytes: u64,
+}
+
+/// Whether a source/destination pair represents a normal route, a read-only
+/// capture operation, or an unsupported mutation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConnectionSupport {
+    #[default]
+    Unsupported,
+    Route,
+    CaptureOnly,
+}
+
+/// Recorder lifecycle is separate from graph topology. A backend can expose a
+/// recorder node and still use the default Unsupported answers until it has a
+/// native writer integration.
+pub trait RecorderDriver {
+    fn supports_recorders(&self) -> bool {
+        false
+    }
+
+    fn create_recorder(
+        &mut self,
+        _request: RecorderCreateRequest,
+    ) -> BackendResult<RecorderInstance> {
+        Err(BackendError::unsupported(
+            "recorder nodes are not available for this backend",
+        ))
+    }
+
+    fn remove_recorder(&mut self, _id: RecorderId) -> BackendResult<()> {
+        Err(BackendError::unsupported(
+            "recorder nodes are not available for this backend",
+        ))
+    }
+
+    fn start_recording(&mut self, _id: RecorderId) -> BackendResult<()> {
+        Err(BackendError::unsupported(
+            "recording is not available for this backend",
+        ))
+    }
+
+    fn stop_recording(&mut self, _id: RecorderId) -> BackendResult<RecorderResult> {
+        Err(BackendError::unsupported(
+            "recording is not available for this backend",
+        ))
+    }
+
+    /// Copy a finalized temporary recording to a user-selected destination.
+    /// Backends keep ownership of the recorder node so saving does not remove
+    /// its graph destination or make a subsequent recording impossible.
+    fn save_recording(
+        &mut self,
+        _id: RecorderId,
+        _destination: &std::path::Path,
+    ) -> BackendResult<std::path::PathBuf> {
+        Err(BackendError::unsupported(
+            "saving recordings is not available for this backend",
+        ))
+    }
+
+    fn request_stop_recording(&mut self, _id: RecorderId) -> BackendResult<()> {
+        Err(BackendError::unsupported(
+            "recording is not available for this backend",
+        ))
+    }
+
+    fn discard_recording(&mut self, _id: RecorderId) -> BackendResult<()> {
+        Err(BackendError::unsupported(
+            "discarding recordings is not available for this backend",
+        ))
+    }
+
+    fn recorder_status(&self, _id: RecorderId) -> BackendResult<RecorderStatus> {
+        Err(BackendError::unsupported(
+            "recording is not available for this backend",
+        ))
+    }
+
+    /// Poll a non-blocking stop/finalization operation. Empty is a normal
+    /// answer while the writer drains its bounded queue.
+    fn poll_recording(&mut self, _id: RecorderId) -> BackendResult<Option<RecorderResult>> {
+        Ok(None)
+    }
+}
 
 /// Where a prepared effect will be activated. Preparation itself does not
 /// mutate the graph, which keeps insertion transactional until the processor
@@ -327,6 +483,7 @@ pub struct BackendCapabilities {
     pub meters: bool,
     pub effects: bool,
     pub relay: bool,
+    pub recorders: bool,
 }
 
 impl BackendCapabilities {
@@ -341,6 +498,7 @@ impl BackendCapabilities {
             meters: self.meters || other.meters,
             effects: self.effects || other.effects,
             relay: self.relay || other.relay,
+            recorders: self.recorders || other.recorders,
         }
     }
 }
@@ -624,6 +782,52 @@ pub trait GraphDriver: EffectDriver {
     /// every backend whose nodes are uniform.
     fn node_supports_routing(&self, _node: NodeId) -> bool {
         self.capabilities().connect
+    }
+
+    /// Decide what a connection gesture means for this particular pair.
+    ///
+    /// The default is a normal route for uniform backends. Windows overrides
+    /// this for application-session to Recorder connections: the session is
+    /// captured through process loopback and is not made generally routable.
+    fn connection_support(&self, output: PortId, input: PortId) -> ConnectionSupport {
+        let Some(output_port) = self.graph().port(output) else {
+            return ConnectionSupport::Unsupported;
+        };
+        let Some(input_port) = self.graph().port(input) else {
+            return ConnectionSupport::Unsupported;
+        };
+        if !output_port.direction.is_source() || !input_port.direction.is_sink() {
+            return ConnectionSupport::Unsupported;
+        }
+        if output_port.port_type != input_port.port_type
+            && output_port.port_type != PortType::Unknown
+            && input_port.port_type != PortType::Unknown
+        {
+            return ConnectionSupport::Unsupported;
+        }
+        let Some(output_node) = self.graph().node(output_port.node_id) else {
+            return ConnectionSupport::Unsupported;
+        };
+        let Some(input_node) = self.graph().node(input_port.node_id) else {
+            return ConnectionSupport::Unsupported;
+        };
+        if input_node.node_type == NodeType::Recorder && self.capabilities().recorders {
+            if input_port.port_type != PortType::Audio {
+                return ConnectionSupport::Unsupported;
+            }
+            return self
+                .node_supports_routing(output_node.id)
+                .then_some(ConnectionSupport::Route)
+                .unwrap_or(ConnectionSupport::Unsupported);
+        }
+        if self.capabilities().connect
+            && self.node_supports_routing(output_node.id)
+            && self.node_supports_routing(input_node.id)
+        {
+            ConnectionSupport::Route
+        } else {
+            ConnectionSupport::Unsupported
+        }
     }
 
     /// Connect a stable pair, returning `None` when it is already present.

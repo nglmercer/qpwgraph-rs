@@ -3,7 +3,7 @@ use crate::model::{
     node_type_color, ConnectMode, GraphSnapshot, LinkView, MeterState, NodeBackendProfile, NodeView,
 };
 use crate::source::ApplicationDriver;
-use pw_graph_config::{config_path, AppConfig};
+use pw_graph_config::{config_path, AppConfig, RecordingSaveMode};
 use pw_graph_core::{Direction, NodeId};
 use pw_graph_i18n::I18n;
 use pw_graph_patchbay::{Patchbay, ReconcileReport};
@@ -21,6 +21,7 @@ use super::effects::{
 };
 use super::icons::load_node_icon;
 use super::meters::meter_fallback;
+use super::recorders::{recorder_state_slug, recorder_statuses_by_node, recovered_recording_rows};
 #[cfg(feature = "relay")]
 use super::relay::relay_qr_payload;
 #[cfg(feature = "relay")]
@@ -55,10 +56,17 @@ pub(crate) fn sync_models(
         meter_fallback(&application.source),
         &backend_profiles,
     );
+    let recorder_statuses = recorder_statuses_by_node(application);
     let node_rows = snapshot
         .nodes
         .iter()
-        .map(|node| node_row(node, &application.i18n))
+        .map(|node| {
+            node_row(
+                node,
+                &application.i18n,
+                recorder_statuses.get(&node.node_id),
+            )
+        })
         .collect::<Vec<_>>();
     let rows_applied = sync_node_rows(window, nodes, node_rows);
     set_vec_if_changed(
@@ -102,6 +110,25 @@ pub(crate) fn sync_models(
     window.set_toast_message(SharedString::from(application.toast_message.clone()));
     window.set_toast_visible(toast_visible(application));
     window.set_toast_error(application.toast_error);
+    window.set_recording_save_mode_index(
+        (RecordingSaveMode::parse(&application.config.recording_save_mode)
+            == RecordingSaveMode::AutoSave) as i32,
+    );
+    window.set_recording_directory(SharedString::from(
+        application
+            .config
+            .recording_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    ));
+    if let Some(model) = string_model_if_changed(
+        window.get_recovered_recordings(),
+        recovered_recording_rows(application),
+    ) {
+        window.set_recovered_recordings(model);
+    }
+    window.set_show_recovery(application.recovery_dialog_visible);
     let backend = if application.debug {
         application.i18n.format(
             "debug.backend",
@@ -150,6 +177,24 @@ pub(crate) fn sync_models(
         .global::<UiI18n>()
         .set_version(language_index(&application.config.language));
     window.set_meter_policy_index(meter_policy_index(application.source.meter_policy()));
+    window.set_recording_save_mode_index(
+        if matches!(
+            RecordingSaveMode::parse(&application.config.recording_save_mode),
+            RecordingSaveMode::AutoSave
+        ) {
+            1
+        } else {
+            0
+        },
+    );
+    window.set_recording_directory(SharedString::from(
+        application
+            .config
+            .recording_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    ));
     window.set_ui_text_scale(application.config.ui_text_scale);
     window.set_panel_text_scale(application.config.panel_text_scale);
     window.set_node_text_scale(application.view.node_text_scale);
@@ -561,9 +606,24 @@ fn read_backend_profiles(source: &ApplicationDriver) -> BTreeMap<NodeId, NodeBac
         .collect()
 }
 
-fn node_row(node: &NodeView, i18n: &I18n) -> NodeRow {
+fn node_row(
+    node: &NodeView,
+    i18n: &I18n,
+    recorder_status: Option<&pw_graph_backend::RecorderStatus>,
+) -> NodeRow {
     let icon = load_node_icon(node.icon_name.as_deref());
     let has_icon = icon.is_some();
+    let is_recorder = node.node_type == pw_graph_core::NodeType::Recorder;
+    let recorder_state = recorder_status
+        .map(|status| recorder_state_slug(status.state))
+        .unwrap_or("idle");
+    let recorder_elapsed = recorder_status
+        .map(|status| format_elapsed(status.elapsed_frames, status.sample_rate))
+        .unwrap_or_else(|| "00:00:00".into());
+    let recorder_dropped = recorder_status
+        .filter(|status| status.dropped_frames != 0)
+        .map(|status| status.dropped_frames.to_string())
+        .unwrap_or_default();
     NodeRow {
         id: node.id,
         node_title: SharedString::from(compact_label(&display_node_name(&node.title, i18n), 22)),
@@ -588,6 +648,10 @@ fn node_row(node: &NodeView, i18n: &I18n) -> NodeRow {
         ),
         has_audio_controls: node.has_audio_controls,
         has_audio_panel: node.has_audio_panel,
+        is_recorder,
+        recorder_state: SharedString::from(recorder_state),
+        recorder_elapsed: SharedString::from(recorder_elapsed),
+        recorder_dropped: SharedString::from(recorder_dropped),
         has_meter: node.audio.capabilities.has_any_meter(),
         meter_rms: node.meter.rms,
         meter_peak: node.meter.peak,
@@ -618,14 +682,23 @@ fn node_row(node: &NodeView, i18n: &I18n) -> NodeRow {
                 .enumerate()
                 .map(|(index, port)| {
                     let is_output = port.direction != pw_graph_core::Direction::Sink;
-                    let (pin_x, pin_y) =
-                        canvas::pin_offset(node.width, index, node.has_audio_panel, is_output);
+                    let (pin_x, pin_y) = canvas::pin_offset_for_node(
+                        node.width,
+                        index,
+                        node.has_audio_panel,
+                        node.node_type == pw_graph_core::NodeType::Recorder,
+                        is_output,
+                    );
                     PortRow {
                         id: port.pin_id,
                         label: SharedString::from(display_port_name(&port.label, i18n)),
                         direction: if is_output { 1 } else { 0 },
                         color: color(port.color),
-                        row_y: canvas::port_row_top(index, node.has_audio_panel),
+                        row_y: canvas::port_row_top_for_node(
+                            index,
+                            node.has_audio_panel,
+                            node.node_type == pw_graph_core::NodeType::Recorder,
+                        ),
                         pin_x,
                         pin_y,
                     }
@@ -633,6 +706,17 @@ fn node_row(node: &NodeView, i18n: &I18n) -> NodeRow {
                 .collect::<Vec<_>>(),
         ))),
     }
+}
+
+fn format_elapsed(frames: u64, sample_rate: u32) -> String {
+    if sample_rate == 0 {
+        return "00:00:00".into();
+    }
+    let seconds = frames / u64::from(sample_rate);
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 /// Rebuild the world-space cache the canvas hit-tests and draws against.
@@ -659,8 +743,13 @@ fn rebuild_geometry(
         });
         for (index, port) in node.ports.iter().enumerate() {
             let is_output = port.direction != Direction::Sink;
-            let (offset_x, offset_y) =
-                canvas::pin_offset(node.width, index, node.has_audio_panel, is_output);
+            let (offset_x, offset_y) = canvas::pin_offset_for_node(
+                node.width,
+                index,
+                node.has_audio_panel,
+                node.node_type == pw_graph_core::NodeType::Recorder,
+                is_output,
+            );
             pin_geometry.push(PinGeometry {
                 pin_id: port.pin_id,
                 node_id: node.id,

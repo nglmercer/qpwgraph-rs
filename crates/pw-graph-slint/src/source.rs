@@ -10,8 +10,10 @@ use pw_graph_app_core::{BackendAvailability, CompositeDriver};
 #[cfg(all(feature = "relay", target_os = "windows"))]
 use pw_graph_backend::RelayEndpoints;
 use pw_graph_backend::{
-    AudioMeter, BackendCapabilities, DemoDriver, EffectCreateRequest, EffectDriver, EffectEvent,
-    EffectInsertRequest, EffectInstance, EffectNodeRequest, EffectTicket, GraphDriver, MeterPolicy,
+    AudioMeter, BackendCapabilities, ConnectionSupport, DemoDriver, EffectCreateRequest,
+    EffectDriver, EffectEvent, EffectInsertRequest, EffectInstance, EffectNodeRequest,
+    EffectTicket, GraphDriver, MeterPolicy, RecorderCreateRequest, RecorderDriver, RecorderId,
+    RecorderInstance, RecorderResult, RecorderStatus,
 };
 #[cfg(feature = "relay")]
 use pw_graph_backend::{
@@ -301,10 +303,102 @@ impl ApplicationDriver {
     /// node is what lets the canvas offer a connect gesture only where one can
     /// actually succeed.
     pub(crate) fn node_connectable(&self, node: NodeId) -> bool {
-        match &self.backend {
-            BackendKind::Demo(driver) => driver.capabilities().connect,
-            BackendKind::Live(driver) => driver.capabilities_for_node(node).connect,
+        let backend_connectable = match &self.backend {
+            BackendKind::Demo(driver) => driver.node_supports_routing(node),
+            BackendKind::Live(driver) => driver.node_supports_routing(node),
+        };
+        if backend_connectable {
+            return true;
         }
+
+        // Windows application sessions are deliberately not generally
+        // routable. They may still be a valid source for a Recorder through
+        // the destination-aware CaptureOnly capability, so expose a canvas
+        // gesture only when an actual recorder input can accept one of this
+        // node's source ports.
+        let graph = self.graph();
+        let Some(node_record) = graph.node(node) else {
+            return false;
+        };
+        if node_record.node_type == pw_graph_core::NodeType::Recorder {
+            return self.capabilities().recorders
+                && node_record.ports.iter().any(|port| {
+                    graph
+                        .port(*port)
+                        .is_some_and(|port| port.direction.is_sink())
+                });
+        }
+        if node_record.node_type != pw_graph_core::NodeType::WindowsAudioSession {
+            return false;
+        }
+        node_record.ports.iter().copied().any(|output| {
+            graph
+                .port(output)
+                .is_some_and(|port| port.direction.is_source())
+                && graph.nodes.values().any(|candidate| {
+                    candidate.node_type == pw_graph_core::NodeType::Recorder
+                        && candidate.ports.iter().copied().any(|input| {
+                            matches!(
+                                self.connection_support(output, input),
+                                ConnectionSupport::CaptureOnly | ConnectionSupport::Route
+                            )
+                        })
+                })
+        })
+    }
+
+    pub(crate) fn connection_support(
+        &self,
+        output: pw_graph_core::PortId,
+        input: pw_graph_core::PortId,
+    ) -> ConnectionSupport {
+        GraphDriver::connection_support(self, output, input)
+    }
+
+    pub(crate) fn supports_recorders(&self) -> bool {
+        RecorderDriver::supports_recorders(self)
+    }
+
+    pub(crate) fn create_recorder(
+        &mut self,
+        request: RecorderCreateRequest,
+    ) -> Result<RecorderInstance, String> {
+        RecorderDriver::create_recorder(self, request).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn remove_recorder(&mut self, id: RecorderId) -> Result<(), String> {
+        RecorderDriver::remove_recorder(self, id).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn start_recording(&mut self, id: RecorderId) -> Result<(), String> {
+        RecorderDriver::start_recording(self, id).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn request_stop_recording(&mut self, id: RecorderId) -> Result<(), String> {
+        RecorderDriver::request_stop_recording(self, id).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn save_recording(
+        &mut self,
+        id: RecorderId,
+        destination: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
+        RecorderDriver::save_recording(self, id, destination).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn poll_recording(
+        &mut self,
+        id: RecorderId,
+    ) -> Result<Option<RecorderResult>, String> {
+        RecorderDriver::poll_recording(self, id).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn recorder_status(&self, id: RecorderId) -> Result<RecorderStatus, String> {
+        RecorderDriver::recorder_status(self, id).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn discard_recording(&mut self, id: RecorderId) -> Result<(), String> {
+        RecorderDriver::discard_recording(self, id).map_err(|error| error.to_string())
     }
 
     pub(crate) fn connect_by_key_if_missing(
@@ -673,6 +767,24 @@ impl GraphDriver for ApplicationDriver {
         self.delegated_is_link_mutable(link)
     }
 
+    fn node_supports_routing(&self, node: NodeId) -> bool {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.node_supports_routing(node),
+            BackendKind::Live(driver) => driver.node_supports_routing(node),
+        }
+    }
+
+    fn connection_support(
+        &self,
+        output: pw_graph_core::PortId,
+        input: pw_graph_core::PortId,
+    ) -> ConnectionSupport {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.connection_support(output, input),
+            BackendKind::Live(driver) => driver.connection_support(output, input),
+        }
+    }
+
     fn refresh(&mut self) -> pw_graph_backend::BackendResult<Vec<Node>> {
         match &mut self.backend {
             BackendKind::Demo(driver) => driver.refresh(),
@@ -927,6 +1039,91 @@ impl EffectDriver for ApplicationDriver {
         match &mut self.backend {
             BackendKind::Demo(driver) => driver.remove_effect(instance_id),
             BackendKind::Live(driver) => driver.remove_effect(instance_id),
+        }
+    }
+}
+
+impl RecorderDriver for ApplicationDriver {
+    fn supports_recorders(&self) -> bool {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.supports_recorders(),
+            BackendKind::Live(driver) => driver.supports_recorders(),
+        }
+    }
+
+    fn create_recorder(
+        &mut self,
+        request: RecorderCreateRequest,
+    ) -> pw_graph_backend::BackendResult<RecorderInstance> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.create_recorder(request),
+            BackendKind::Live(driver) => driver.create_recorder(request),
+        }
+    }
+
+    fn remove_recorder(&mut self, id: RecorderId) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.remove_recorder(id),
+            BackendKind::Live(driver) => driver.remove_recorder(id),
+        }
+    }
+
+    fn start_recording(&mut self, id: RecorderId) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.start_recording(id),
+            BackendKind::Live(driver) => driver.start_recording(id),
+        }
+    }
+
+    fn request_stop_recording(&mut self, id: RecorderId) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.request_stop_recording(id),
+            BackendKind::Live(driver) => driver.request_stop_recording(id),
+        }
+    }
+
+    fn stop_recording(
+        &mut self,
+        id: RecorderId,
+    ) -> pw_graph_backend::BackendResult<RecorderResult> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.stop_recording(id),
+            BackendKind::Live(driver) => driver.stop_recording(id),
+        }
+    }
+
+    fn save_recording(
+        &mut self,
+        id: RecorderId,
+        destination: &std::path::Path,
+    ) -> pw_graph_backend::BackendResult<std::path::PathBuf> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.save_recording(id, destination),
+            BackendKind::Live(driver) => driver.save_recording(id, destination),
+        }
+    }
+
+    fn discard_recording(&mut self, id: RecorderId) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.discard_recording(id),
+            BackendKind::Live(driver) => driver.discard_recording(id),
+        }
+    }
+
+    fn recorder_status(&self, id: RecorderId) -> pw_graph_backend::BackendResult<RecorderStatus> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.recorder_status(id),
+            BackendKind::Live(driver) => driver.recorder_status(id),
+        }
+    }
+
+    fn poll_recording(
+        &mut self,
+        id: RecorderId,
+    ) -> pw_graph_backend::BackendResult<Option<RecorderResult>> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.poll_recording(id),
+            BackendKind::Live(driver) => driver.poll_recording(id),
         }
     }
 }

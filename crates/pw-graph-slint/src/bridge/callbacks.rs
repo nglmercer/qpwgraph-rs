@@ -161,6 +161,22 @@ pub(crate) fn install_canvas_callbacks(
     window.on_graph_node_collapse_toggled(move |node_id| {
         events.borrow_mut().push(UiEvent::ToggleCollapse(node_id));
     });
+    let events = events_source.clone();
+    window.on_graph_recorder_record(move |node_id| {
+        events.borrow_mut().push(UiEvent::RecorderRecord(node_id));
+    });
+    let events = events_source.clone();
+    window.on_graph_recorder_stop(move |node_id| {
+        events.borrow_mut().push(UiEvent::RecorderStop(node_id));
+    });
+    let events = events_source.clone();
+    window.on_graph_recorder_save(move |node_id| {
+        events.borrow_mut().push(UiEvent::RecorderSave(node_id));
+    });
+    let events = events_source.clone();
+    window.on_graph_recorder_discard(move |node_id| {
+        events.borrow_mut().push(UiEvent::RecorderDiscard(node_id));
+    });
 }
 
 fn set_selection_flags<T: Clone + 'static>(

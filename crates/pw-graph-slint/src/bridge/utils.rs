@@ -8,6 +8,7 @@ pub(crate) fn localized_node_type(i18n: &I18n, node_type: NodeType) -> String {
     let key = match node_type {
         NodeType::PipeWire => "canvas.node_type_pipewire",
         NodeType::Effect => "canvas.node_type_effect",
+        NodeType::Recorder => "canvas.node_type_recorder",
         NodeType::AlsaMidi => "canvas.node_type_alsa_midi",
         NodeType::WindowsAudioEndpoint | NodeType::WindowsAudioSession => {
             "canvas.node_type_windows_audio"

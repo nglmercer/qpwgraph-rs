@@ -239,7 +239,7 @@ fn every_playback_endpoint_offers_a_monitor_alongside_its_input() {
 }
 
 #[test]
-fn only_endpoints_offer_a_connect_gesture() {
+fn only_endpoints_or_isolated_sessions_offer_a_connect_gesture() {
     let Ok(driver) = WindowsAudioDriver::new() else {
         return;
     };
@@ -250,18 +250,14 @@ fn only_endpoints_offer_a_connect_gesture() {
             // Windows exposes no supported way to move one.  The one
             // documented exception is an app that the user already moved to
             // QPWGraph Virtual Output; its process-loopback port is a real
-            // qpwgraph-owned source.
+            // qpwgraph-owned source. Capture-only process ports remain
+            // intentionally non-routable here.
             NodeType::WindowsAudioSession => {
-                let has_process_port = node.ports.iter().any(|port| {
-                    matches!(
-                        driver.endpoint_ports.get(port),
-                        Some(endpoint) if matches!(
-                            &endpoint.role,
-                            EndpointPortRole::Process { .. }
-                        )
-                    )
-                });
-                assert_eq!(routable, has_process_port, "{} routing mismatch", node.name);
+                let mutable_route = driver
+                    .process_audio_capabilities
+                    .get(&node.id)
+                    .is_some_and(|capabilities| capabilities.mutable_route);
+                assert_eq!(routable, mutable_route, "{} routing mismatch", node.name);
             }
             _ => assert!(routable, "{} was not routable", node.name),
         }

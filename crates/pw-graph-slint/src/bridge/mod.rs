@@ -28,6 +28,7 @@ mod keyboard;
 mod meters;
 mod models;
 mod patchbay;
+mod recorders;
 mod relay;
 mod utils;
 use app::*;

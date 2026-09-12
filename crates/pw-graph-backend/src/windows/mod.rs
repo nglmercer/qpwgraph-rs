@@ -23,8 +23,9 @@
 //! | [`routing`] | the links qpwgraph carries, and the audio behind them |
 
 use super::api::{
-    AudioMeter, BackendCapabilities, BackendError, BackendResult, GraphDriver, MeterPolicy,
-    NodeAudioState, NodeCapabilities, UNITY_VOLUME,
+    AudioMeter, BackendCapabilities, BackendError, BackendResult, ConnectionSupport, GraphDriver,
+    MeterPolicy, NodeAudioState, NodeCapabilities, RecorderCreateRequest, RecorderDriver,
+    RecorderId, RecorderInstance, RecorderResult, RecorderState, RecorderStatus, UNITY_VOLUME,
 };
 use pw_graph_core::{
     encode_backend_id, BackendNamespace, Direction, Graph, GraphError, Link, LinkId, Node, NodeId,
@@ -65,6 +66,7 @@ mod icons;
 mod identity;
 mod process_capture;
 pub mod process_loopback;
+mod recorder;
 mod routing;
 pub mod virtual_device;
 mod worker;
@@ -106,6 +108,7 @@ pub use self::process_capture::{
 pub use self::process_loopback::{
     ProcessLoopbackCapability, ProcessLoopbackMode, ProcessLoopbackSource,
 };
+use self::recorder::*;
 use self::routing::*;
 pub use self::virtual_device::{
     classify_driver_owned_endpoint, classify_virtual_endpoint, QpwVirtualEndpointIdentity,

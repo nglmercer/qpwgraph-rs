@@ -161,6 +161,12 @@ impl WindowsEffects {
         self.instances.get(instance_id)
     }
 
+    pub(super) fn has_input_port(&self, input_port: PortId) -> bool {
+        self.instances
+            .values()
+            .any(|instance| instance.input_port == input_port)
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = &EffectInstance> {
         self.instances
             .values()

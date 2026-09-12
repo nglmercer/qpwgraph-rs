@@ -28,7 +28,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::Variant::VT_BLOB;
 
 use crate::api::{BackendError, BackendResult};
-use crate::router::{ring_source, AudioFormat, RingSource, RingSourceFeed};
+use crate::router::{
+    ring_source_fanout, AudioFormat, RingSource, RingSourceFanout, RingSourceFanoutControl,
+};
 
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const BUFFER_DURATION_HNS: i64 = 400_000;
@@ -174,6 +176,28 @@ impl ProcessLoopbackSource {
         format: AudioFormat,
         ring_frames: usize,
     ) -> BackendResult<(RingSource, Self)> {
+        let (mut sources, loopback, _) =
+            Self::open_fanout(pid, mode, format, ring_frames, 1, &[0])?;
+        Ok((
+            sources
+                .pop()
+                .expect("one process-loopback fan-out source was allocated"),
+            loopback,
+        ))
+    }
+
+    /// Activate one process-loopback client with a fixed number of bounded
+    /// router rings. `active_slots` identifies the consumers that should
+    /// receive PCM immediately; the remaining slots can be enabled later by
+    /// the control-plane manager without opening another Windows activation.
+    pub fn open_fanout(
+        pid: u32,
+        mode: ProcessLoopbackMode,
+        format: AudioFormat,
+        ring_frames: usize,
+        slots: usize,
+        active_slots: &[usize],
+    ) -> BackendResult<(Vec<RingSource>, Self, RingSourceFanoutControl)> {
         if pid == 0 {
             return Err(BackendError::native(
                 "process-loopback PID must be non-zero",
@@ -188,20 +212,29 @@ impl ProcessLoopbackSource {
 
         static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let (source, feed) = ring_source(format, ring_frames);
+        let (sources, fanout, control) = ring_source_fanout(format, ring_frames, slots);
+        for &slot in active_slots {
+            if slot >= control.slots() {
+                return Err(BackendError::native(format!(
+                    "process-loopback consumer slot {slot} exceeds the {}-slot fan-out",
+                    control.slots()
+                )));
+            }
+            control.set_active(slot, true);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let (started_tx, started_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(format!("qpwgraph-process-loopback-{pid}"))
-            .spawn(move || run(pid, mode, format, feed, &worker_stop, started_tx))
+            .spawn(move || run(pid, mode, format, fanout, &worker_stop, started_tx))
             .map_err(|error| {
                 BackendError::native(format!("could not start process-loopback worker: {error}"))
             })?;
 
         match started_rx.recv_timeout(START_TIMEOUT) {
             Ok(Ok(())) => Ok((
-                source,
+                sources,
                 Self {
                     pid,
                     mode,
@@ -209,6 +242,7 @@ impl ProcessLoopbackSource {
                     stop,
                     worker: Some(worker),
                 },
+                control,
             )),
             Ok(Err(error)) => {
                 stop.store(true, Ordering::Release);
@@ -284,7 +318,7 @@ fn run(
     pid: u32,
     mode: ProcessLoopbackMode,
     format: AudioFormat,
-    feed: RingSourceFeed,
+    fanout: RingSourceFanout,
     stop: &AtomicBool,
     started: Sender<BackendResult<()>>,
 ) {
@@ -310,7 +344,7 @@ fn run(
             unsafe { client.Start() }
                 .map_err(|error| native("start process-loopback capture", error))?;
             let _ = started.send(Ok(()));
-            capture_loop(&capture, feed, format, stop, &process_liveness);
+            capture_loop(&capture, fanout, format, stop, &process_liveness);
             let _ = unsafe { client.Stop() };
             Ok(())
         });
@@ -525,7 +559,7 @@ impl Drop for ProcessLiveness {
 
 fn capture_loop(
     capture: &Audio::IAudioCaptureClient,
-    mut feed: RingSourceFeed,
+    mut fanout: RingSourceFanout,
     format: AudioFormat,
     stop: &AtomicBool,
     process_liveness: &ProcessLiveness,
@@ -534,13 +568,13 @@ fn capture_loop(
     let silence = vec![0.0f32; format.samples(4096)];
     while !stop.load(Ordering::Acquire) {
         if process_liveness.has_exited() {
-            feed.mark_lost();
+            fanout.mark_lost();
             return;
         }
         let mut pending = match unsafe { capture.GetNextPacketSize() } {
             Ok(value) => value,
             Err(_) => {
-                feed.mark_lost();
+                fanout.mark_lost();
                 return;
             }
         };
@@ -554,39 +588,38 @@ fn capture_loop(
             let mut flags = 0;
             if unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }.is_err()
             {
-                feed.mark_lost();
+                fanout.mark_lost();
                 return;
             }
             let samples = frames as usize * channels;
             if frames > 0 && flags & Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
                 let mut remaining = samples;
                 while remaining > 0 {
-                    let pushed = feed.push(&silence[..remaining.min(silence.len())]);
-                    if pushed == 0 {
-                        break;
-                    }
-                    remaining -= pushed;
+                    let block = &silence[..remaining.min(silence.len())];
+                    fanout.push(block);
+                    remaining -= block.len();
                 }
             } else if frames > 0 && !data.is_null() {
                 // WASAPI owns this buffer through ReleaseBuffer and guarantees
                 // the frame geometry requested during Initialize.
                 let block = unsafe { std::slice::from_raw_parts(data.cast::<f32>(), samples) };
-                feed.push(block);
+                fanout.push(block);
             } else if frames > 0 {
                 // A non-silent packet must carry a readable buffer. Treat a
                 // null pointer as endpoint loss rather than quietly turning
                 // that packet into zeros.
-                feed.mark_lost();
+                let _ = unsafe { capture.ReleaseBuffer(frames) };
+                fanout.mark_lost();
                 return;
             }
             if unsafe { capture.ReleaseBuffer(frames) }.is_err() {
-                feed.mark_lost();
+                fanout.mark_lost();
                 return;
             }
             pending = match unsafe { capture.GetNextPacketSize() } {
                 Ok(value) => value,
                 Err(_) => {
-                    feed.mark_lost();
+                    fanout.mark_lost();
                     return;
                 }
             };
@@ -597,7 +630,7 @@ fn capture_loop(
     // retire the route on the next block, which is the same behavior as a
     // physical endpoint invalidation.
     if !stop.load(Ordering::Acquire) {
-        feed.mark_lost();
+        fanout.mark_lost();
     }
 }
 

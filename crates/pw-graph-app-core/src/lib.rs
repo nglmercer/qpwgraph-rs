@@ -7,7 +7,7 @@
 
 use pw_graph_backend::{
     BackendCapabilities, BackendError, BackendResult, GraphDriver, MeterPolicy, NodeAudioState,
-    NodeCapabilities,
+    NodeCapabilities, RecorderDriver,
 };
 use pw_graph_core::{
     backend_for_link, backend_for_node, backend_for_port, BackendKind, Graph, GraphError, Link,
@@ -34,16 +34,17 @@ pub use composite::{route_for_ports, CompositeDriver, CompositeRoute};
 /// A backend that can be used by the application layer.  Relay is an optional
 /// extension of the same object rather than a second UI-owned driver.
 #[cfg(feature = "relay")]
-pub trait ApplicationDriver: GraphDriver + pw_graph_backend::RelayDriver {}
+pub trait ApplicationDriver: GraphDriver + RecorderDriver + pw_graph_backend::RelayDriver {}
 
 #[cfg(feature = "relay")]
-impl<T> ApplicationDriver for T where T: GraphDriver + pw_graph_backend::RelayDriver {}
+impl<T> ApplicationDriver for T where T: GraphDriver + RecorderDriver + pw_graph_backend::RelayDriver
+{}
 
 #[cfg(not(feature = "relay"))]
-pub trait ApplicationDriver: GraphDriver {}
+pub trait ApplicationDriver: GraphDriver + RecorderDriver {}
 
 #[cfg(not(feature = "relay"))]
-impl<T> ApplicationDriver for T where T: GraphDriver {}
+impl<T> ApplicationDriver for T where T: GraphDriver + RecorderDriver {}
 
 /// Result of attempting to open the optional native backends.  A missing
 /// backend is reported to the caller but does not prevent the other backend

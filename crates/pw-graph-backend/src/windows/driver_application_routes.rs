@@ -499,7 +499,7 @@ impl WindowsAudioDriver {
                 .routing
                 .as_mut()
                 .expect("routing was started before installing a route")
-                .connect(link.clone(), &self.endpoint_ports);
+                .connect(link.clone(), &self.endpoint_ports, None);
             if let Err(error) = result {
                 for link_id in connected.into_iter().rev() {
                     if let Some(routing) = self.routing.as_mut() {
@@ -1234,7 +1234,8 @@ impl WindowsAudioDriver {
                 node.position = *position;
             }
         }
-        self.endpoint_ports = snapshot.endpoint_ports;
+        let old_endpoint_ports =
+            std::mem::replace(&mut self.endpoint_ports, snapshot.endpoint_ports);
         self.endpoint_selectors = snapshot.endpoint_selectors;
         self.process_audio_capabilities = snapshot.process_audio_capabilities;
         self.application_route_candidates = snapshot.application_route_candidates;
@@ -1275,14 +1276,63 @@ impl WindowsAudioDriver {
                 .unwrap_or_default();
             let _ = Self::draw_effect(&mut graph, instance, &name, position);
         }
+        // Recorder nodes are application-owned rather than Core Audio globals,
+        // so publish them again on every worker snapshot just like effects.
+        // Their stable ids keep existing links and saved canvas positions
+        // intact while physical endpoints churn underneath them.
+        let recorder_nodes: Vec<_> = self
+            .recorders
+            .values()
+            .map(|recorder| {
+                let name = if recorder.request.name.trim().is_empty() {
+                    format!("Recorder {}", recorder.instance.id)
+                } else {
+                    recorder.request.name.clone()
+                };
+                let position = self
+                    .positions
+                    .get(&recorder.instance.node_id)
+                    .copied()
+                    .unwrap_or(recorder.request.position);
+                (recorder.instance.clone(), name, position)
+            })
+            .collect();
+        for (instance, name, position) in recorder_nodes {
+            let _ = draw_recorder(&mut graph, &instance, &name, position);
+        }
         // The worker rebuilds the graph from what Core Audio reports, which
         // knows nothing about the routes qpwgraph is carrying. Drop the ones
         // whose devices have gone, then put the survivors back: a link the
         // user drew must not disappear because an unrelated endpoint changed.
-        if let Some(routing) = self.routing.as_mut() {
+        if self.routing.is_some() {
             let live: BTreeSet<PortId> = graph.ports.keys().copied().collect();
-            routing.reconcile(&live)?;
-            routing.recover_lost(&self.endpoint_ports)?;
+            let stale_process_leases: Vec<_> = self
+                .routing
+                .as_ref()
+                .expect("routing exists")
+                .links()
+                .filter(|link| {
+                    !live.contains(&link.output_port) || !live.contains(&link.input_port)
+                })
+                .filter_map(|link| {
+                    self.process_recorder_request_for_link_with_ports(link, &old_endpoint_ports)
+                })
+                .collect();
+            self.routing
+                .as_mut()
+                .expect("routing exists")
+                .reconcile(&live)?;
+            for (recorder_id, request) in stale_process_leases {
+                if !self.has_process_recorder_link(recorder_id, &request) {
+                    self.release_process_recorder(recorder_id, request);
+                }
+            }
+            let shared_process_sources = self.shared_process_sources_for_recovery()?;
+            self.routing
+                .as_mut()
+                .expect("routing exists")
+                .recover_lost(&self.endpoint_ports, &shared_process_sources)?;
+            let routing = self.routing.as_ref().expect("routing exists");
             for link in routing.links() {
                 let _ = graph.insert_existing_link(link.clone());
             }

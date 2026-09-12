@@ -49,6 +49,7 @@ pub mod endpoints;
 pub mod engine;
 pub mod format;
 pub mod meter;
+pub mod recorder;
 pub mod resample;
 pub mod thread;
 /// Real Windows endpoints as router sources and sinks.
@@ -57,8 +58,8 @@ pub mod wasapi;
 
 pub use diagnostics::{RouteFault, RouteMetrics};
 pub use endpoints::{
-    ring_sink, ring_source, BufferSource, CaptureSink, RingSink, RingSinkDrain, RingSource,
-    RingSourceFeed,
+    ring_sink, ring_source, ring_source_fanout, BufferSource, CaptureSink, RingSink, RingSinkDrain,
+    RingSource, RingSourceFanout, RingSourceFanoutControl, RingSourceFeed,
 };
 pub use engine::{
     AudioSink, AudioSource, Backlog, DestinationSpec, ProcessReport, ProcessorId, RouteId,
@@ -67,6 +68,14 @@ pub use engine::{
 };
 pub use format::{AudioFormat, ChannelMap};
 pub use meter::MeterReading;
+pub use recorder::{
+    copy_recording, copy_recording_preserving_source, default_recording_filename,
+    pending_recording_dir, read_wav_header, recover_pending_recordings, render_recording_filename,
+    repair_wav_header, save_recording, scan_pending_recordings, unique_recording_path,
+    RecorderDiagnostics, RecorderError, RecorderResult, RecorderSink, RecorderWriter,
+    RecorderWriterState, RecoveredRecording, WavHeader, WavWriter, DEFAULT_RECORDER_CAPACITY_MS,
+    MAX_RIFF_DATA_BYTES,
+};
 pub use thread::{RouterStopped, RouterThread};
 
 #[cfg(test)]

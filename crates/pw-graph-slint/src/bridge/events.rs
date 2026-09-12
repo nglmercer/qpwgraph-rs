@@ -20,6 +20,9 @@ use super::effects::{
 };
 use super::meters::refresh_meters;
 use super::models::{shortcut_rows, sync_meter_rows, sync_models, vec_model_rows_equal};
+use super::recorders::{
+    discard_for_node, poll_recordings, record_for_node, save_for_node, stop_for_node,
+};
 use super::relay::{poll_relay_events, poll_relay_usb_hotplug};
 use super::utils::volume_from_track_position;
 use super::{CanvasGeometry, LinkRow, MainWindow, MinimapNode, NodeRow, ShortcutRow};
@@ -62,6 +65,7 @@ pub(crate) fn pump(
     poll_relay_usb_hotplug(&mut application);
     poll_relay_events(&mut application);
     let effect_events_changed = poll_effect_events(&mut application);
+    let recorder_events_changed = poll_recordings(&mut application);
     let mut graph_changed = application.source.graph_dirty();
     if graph_changed || application.last_refresh.elapsed() >= refresh_interval(&application) {
         if let Err(error) = application.source.refresh_if_needed() {
@@ -86,6 +90,7 @@ pub(crate) fn pump(
         || view_changed
         || graph_changed
         || effect_events_changed
+        || recorder_events_changed
         || toast_changed
         || full_sync_due
     {
@@ -220,6 +225,10 @@ pub(crate) fn process_event(window: &MainWindow, application: &mut Application, 
         UiEvent::EffectDraftEnabledChanged(enabled) => {
             set_effect_draft_enabled(application, enabled)
         }
+        UiEvent::RecorderRecord(id) => record_for_node(application, id),
+        UiEvent::RecorderStop(id) => stop_for_node(application, id),
+        UiEvent::RecorderSave(id) => save_for_node(application, id),
+        UiEvent::RecorderDiscard(id) => discard_for_node(application, id),
         UiEvent::SelectNode(id, shift) => application.view.select_node(id, shift),
         UiEvent::SelectLink(id, shift) => {
             application

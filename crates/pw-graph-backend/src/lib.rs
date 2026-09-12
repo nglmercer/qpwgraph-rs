@@ -159,6 +159,27 @@ mod tests {
     }
 
     #[test]
+    fn recorder_connection_support_requires_compatible_audio_ports() {
+        let mut driver = DemoDriver::demo();
+        let recorder = driver
+            .create_recorder(RecorderCreateRequest::default())
+            .expect("demo recorder should be creatable");
+
+        assert_eq!(
+            driver.connection_support(PortId(1), recorder.input_port),
+            ConnectionSupport::Route
+        );
+        assert_eq!(
+            driver.connection_support(PortId(5), recorder.input_port),
+            ConnectionSupport::Unsupported
+        );
+        assert_eq!(
+            driver.connection_support(PortId(5), PortId(3)),
+            ConnectionSupport::Unsupported
+        );
+    }
+
+    #[test]
     fn demo_backend_has_a_stable_graph_for_demo_runs() {
         let driver = DemoDriver::demo();
         assert_eq!(driver.graph().nodes.len(), 4);

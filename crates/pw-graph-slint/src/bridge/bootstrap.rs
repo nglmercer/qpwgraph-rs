@@ -6,7 +6,6 @@
 
 use super::*;
 use pw_graph_patchbay::PatchbayReconciler;
-#[cfg(feature = "relay")]
 use std::collections::BTreeSet;
 
 /// The opened application state, plus the meter policy the window shows.
@@ -23,6 +22,21 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
     let i18n = I18n::from_language(&language);
     let meter_policy = MeterPolicy::parse(&config.audio_meters);
     let (mut source, mut status) = ApplicationDriver::new(args, meter_policy, &i18n);
+    let recording_root = config
+        .recording_dir
+        .clone()
+        .unwrap_or_else(|| pw_graph_config::config_dir("qpwgraph-rs").join("recordings"));
+    let recovered_recordings = pw_graph_backend::router::scan_pending_recordings(
+        pw_graph_backend::router::pending_recording_dir(recording_root),
+    )
+    .unwrap_or_default();
+    if !recovered_recordings.is_empty() {
+        status.push_str(" · ");
+        status.push_str(&i18n.format(
+            "status.recorder_recovered",
+            &[("count", recovered_recordings.len().to_string())],
+        ));
+    }
     #[cfg(target_os = "windows")]
     source.configure_windows_app_routing(config.windows.experimental_app_routing);
     restore_node_positions(&mut source, &config);
@@ -106,6 +120,10 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         patchbay_debug_report: String::new(),
         node_debug_name: String::new(),
         node_debug_report: String::new(),
+        recorders: BTreeMap::new(),
+        pending_recorder_stops: BTreeSet::new(),
+        recovery_dialog_visible: !recovered_recordings.is_empty(),
+        recovered_recordings,
         debug: args.debug,
         last_refresh: Instant::now(),
         last_full_sync: Instant::now(),

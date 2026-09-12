@@ -1,0 +1,52 @@
+import { ScrollView, VerticalBox } from "std-widgets.slint";
+import { UiTheme } from "../foundation/theme.slint";
+import { UiI18n } from "../foundation/i18n.slint";
+import { ActionButton } from "../components/button.slint";
+import { DialogShell } from "../components/dialog-shell.slint";
+
+export component RecoveryDialog inherits DialogShell {
+    title: UiI18n.localized("recorder.recovery_title");
+    in property <[string]> recordings: [];
+    callback action(int, string);
+
+    Text {
+        x: 20px; y: 58px; width: parent.width - 40px; height: 42px;
+        text: UiI18n.localized("recorder.recovery_help");
+        color: #aebdca; font-size: 10px * UiTheme.panel-scale;
+        wrap: word-wrap;
+    }
+    recordings-scroll := ScrollView {
+        x: 20px; y: 112px; width: parent.width - 40px; height: parent.height - 174px;
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        viewport-width: self.visible-width;
+        viewport-height: max(self.visible-height, recording-list.min-height);
+        recording-list := VerticalBox {
+            width: recordings-scroll.visible-width;
+            spacing: 8px;
+            for item[index] in root.recordings: Rectangle {
+                width: parent.width; height: 58px;
+                background: #1d242c; border-color: #3f4c59; border-width: 1px; border-radius: 4px;
+                Text {
+                    x: 10px; y: 5px; width: parent.width - 190px; height: 46px;
+                    text: item; color: #dce7ee; font-size: 9px * UiTheme.panel-scale;
+                    vertical-alignment: center; overflow: elide;
+                }
+                ActionButton {
+                    x: parent.width - 164px; y: 9px; width: 72px; height: 22px;
+                    text: UiI18n.localized("recorder.recovery_save");
+                    clicked => { root.action(index, "save"); }
+                }
+                ActionButton {
+                    x: parent.width - 84px; y: 9px; width: 74px; height: 22px;
+                    text: UiI18n.localized("recorder.recovery_discard");
+                    clicked => { root.action(index, "discard"); }
+                }
+            }
+        }
+    }
+    ActionButton {
+        x: parent.width - 100px; y: parent.height - 46px; width: 80px; height: 25px;
+        text: UiI18n.localized("recorder.recovery_later");
+        clicked => { root.close(); }
+    }
+}

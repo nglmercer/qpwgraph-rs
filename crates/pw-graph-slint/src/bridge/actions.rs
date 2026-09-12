@@ -15,6 +15,10 @@ use super::patchbay::{
     open_patchbay_diagnostics, remove_rule, save_patchbay, save_profile, save_rule, select_profile,
     snapshot_patchbay, toggle_rule_pin,
 };
+use super::recorders::{
+    choose_recording_directory, close_recovery_dialog, create_recorder,
+    discard_recovered_recording, save_recovered_recording,
+};
 use super::relay::{
     accept_pending_enrollment, cancel_relay_connect, connect_relay, disconnect_relay,
     forget_trusted_peer, regenerate_host_pin, reject_pending_enrollment, relay_host_active,
@@ -167,6 +171,9 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
             }
             toggle_overlay(window, Overlay::Effects);
         }
+        "add-recorder" => create_recorder(application),
+        "choose-recording-directory" => choose_recording_directory(application),
+        "recovery-close" => close_recovery_dialog(application),
         "node-appearance" => open_node_appearance(window, application),
         "node-appearance-close" => window.set_show_node_editor(false),
         "node-identity-debug" => open_node_identity_diagnostics(window, application),
@@ -352,6 +359,22 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
                 load_recent_patchbay(application, index);
             }
         }
+        _ if action.strip_prefix("recovery-save:").is_some() => {
+            if let Some(index) = action
+                .strip_prefix("recovery-save:")
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                save_recovered_recording(application, index);
+            }
+        }
+        _ if action.strip_prefix("recovery-discard:").is_some() => {
+            if let Some(index) = action
+                .strip_prefix("recovery-discard:")
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                discard_recovered_recording(application, index);
+            }
+        }
         "choose-patchbay-directory" => choose_patchbay_directory(application),
         "add-rule" => add_rule_from_selection(window, application),
         "snapshot-patchbay" => snapshot_patchbay(application),
@@ -486,6 +509,37 @@ fn delete_selection(application: &mut Application) {
         return;
     }
 
+    let recorder_ids = application
+        .view
+        .selected_nodes
+        .iter()
+        .filter_map(|node_id| {
+            application
+                .recorders
+                .values()
+                .find(|recorder| recorder.node_id == *node_id)
+                .map(|recorder| recorder.id)
+        })
+        .collect::<Vec<_>>();
+    if !recorder_ids.is_empty() {
+        for id in recorder_ids {
+            match application.source.remove_recorder(id) {
+                Ok(()) => {
+                    application.recorders.remove(&id);
+                    application.pending_recorder_stops.remove(&id);
+                }
+                Err(error) => {
+                    application.status =
+                        application.tf("status.recorder_failed", &[("error", error)]);
+                    return;
+                }
+            }
+        }
+        application.view.clear_selection();
+        application.mark_patchbay_graph_dirty();
+        return;
+    }
+
     let effect_ids = application
         .view
         .selected_nodes
@@ -549,6 +603,11 @@ fn toggle_overlay(window: &MainWindow, overlay: Overlay) {
 fn escape_topmost_layer(window: &MainWindow, application: &mut Application) {
     if window.get_relay_pending_active() {
         super::relay::reject_pending_enrollment(application);
+        return;
+    }
+    if window.get_show_recovery() {
+        window.set_show_recovery(false);
+        close_recovery_dialog(application);
         return;
     }
     if window.get_show_qr() {

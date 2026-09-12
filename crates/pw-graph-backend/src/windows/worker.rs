@@ -6,6 +6,7 @@
 //! [`WorkerSnapshot`].
 
 use super::*;
+use crate::router::{AudioFormat, RingSource};
 
 const MAX_PROCESS_METER_CAPTURES: usize = 32;
 
@@ -40,9 +41,10 @@ pub(super) struct WorkerSnapshot {
     pub(super) meterable: BTreeSet<NodeId>,
     /// Ports the router can open a real WASAPI stream for.
     ///
-    /// Session ports are present only for render sessions already attached to
-    /// QPWGraph Virtual Output. That documented user action proves the dry
-    /// path is isolated; ordinary sessions remain observed-only.
+    /// Render-session ports are present when Windows supplies a stable process
+    /// identity. They are used for capture-only Recorder links as well as the
+    /// mutable, isolated route path; `GraphDriver::connection_support` keeps
+    /// ordinary application rerouting refused.
     pub(super) endpoint_ports: BTreeMap<PortId, EndpointPort>,
     pub(super) endpoint_selectors: BTreeMap<String, WindowsEndpointSelector>,
     /// Per-application capabilities. Capture-only capabilities are separate
@@ -51,9 +53,9 @@ pub(super) struct WorkerSnapshot {
     /// Stable render-session candidates used by the persisted application
     /// route reconciler. The live PID is runtime-only and never persisted.
     pub(super) application_route_candidates: Vec<ApplicationRouteCandidate>,
-    /// Runtime source ports for isolated application sessions. These are
-    /// looked up by selector/PID during route restoration and never stored in
-    /// configuration.
+    /// Runtime source ports for application sessions with a stable process
+    /// selector. These are looked up by selector/PID during route restoration
+    /// and capture-only Recorder links; they are never stored in configuration.
     pub(super) application_route_ports: BTreeMap<(String, u32), PortId>,
     /// Safe, bounded diagnostics for process-loopback workers owned by this
     /// COM worker. The actual PCM never leaves the worker through a snapshot.
@@ -116,6 +118,18 @@ pub(super) enum WorkerCommand {
     RequestMeters(BTreeSet<NodeId>, Sender<BackendResult<()>>),
     ReconcileProcessCaptures(
         Vec<ProcessCaptureRequest>,
+        Sender<BackendResult<Vec<ProcessCaptureStatus>>>,
+    ),
+    AcquireProcessRecorder(
+        ProcessCaptureRequest,
+        RecorderId,
+        AudioFormat,
+        Sender<BackendResult<(RingSource, Vec<ProcessCaptureStatus>)>>,
+    ),
+    ReleaseProcessRecorder(
+        RecorderId,
+        ProcessCaptureRequest,
+        AudioFormat,
         Sender<BackendResult<Vec<ProcessCaptureStatus>>>,
     ),
     #[cfg(feature = "relay")]
@@ -194,6 +208,19 @@ pub(super) fn worker_thread(
             }
             WorkerCommand::ReconcileProcessCaptures(requests, sender) => {
                 worker.process_captures.reconcile_route_probes(requests);
+                let _ = sender.send(Ok(worker.process_captures.statuses()));
+            }
+            WorkerCommand::AcquireProcessRecorder(request, recorder_id, format, sender) => {
+                let result = worker
+                    .process_captures
+                    .acquire_recorder(recorder_id, request, format)
+                    .map(|source| (source, worker.process_captures.statuses()));
+                let _ = sender.send(result);
+            }
+            WorkerCommand::ReleaseProcessRecorder(recorder_id, request, format, sender) => {
+                worker
+                    .process_captures
+                    .release_recorder(recorder_id, &request, format);
                 let _ = sender.send(Ok(worker.process_captures.statuses()));
             }
             #[cfg(feature = "relay")]
@@ -568,12 +595,11 @@ impl CoreAudioWorker {
 
     /// Which graph ports the router can open a real stream for.
     ///
-    /// Endpoint ports always appear. A render-session port appears only when
-    /// Windows reports that the application is already attached to
-    /// QPWGraph Virtual Output. That proves its dry path is isolated, so a
-    /// process-loopback source cannot accidentally create dry + processed
-    /// duplicate audio. Capture-only consumers use `process_audio_capabilities`
-    /// and never become graph edges.
+    /// Endpoint ports always appear. A render-session port appears when
+    /// Windows supplies a stable process identity: capture-only Recorder
+    /// links use it for selector validation, while the mutable route path
+    /// still requires the separate virtual-output proof in
+    /// `process_audio_capabilities`.
     pub(super) fn endpoint_ports(&self) -> BTreeMap<PortId, EndpointPort> {
         let mut ports = BTreeMap::new();
         for endpoint in &self.endpoints {
@@ -603,28 +629,25 @@ impl CoreAudioWorker {
             if session.flow != Audio::eRender || session.process_id == 0 {
                 continue;
             }
-            let virtualized = self.session_is_virtualized(session);
-            if virtualized {
-                let Some(selector) = session
-                    .process_identity
-                    .as_ref()
-                    .and_then(ProcessIdentity::selector_key)
-                else {
-                    // A mutable process route is not safe without a stable
-                    // identity to compare at activation time.
-                    continue;
-                };
-                ports.insert(
-                    session.port_id,
-                    EndpointPort {
-                        device_id: session.endpoint_id.clone(),
-                        role: EndpointPortRole::Process {
-                            pid: session.process_id,
-                            selector,
-                        },
+            let Some(selector) = session
+                .process_identity
+                .as_ref()
+                .and_then(ProcessIdentity::selector_key)
+            else {
+                // A process-loopback source is not safe without a stable
+                // identity to compare at activation time.
+                continue;
+            };
+            ports.insert(
+                session.port_id,
+                EndpointPort {
+                    device_id: session.endpoint_id.clone(),
+                    role: EndpointPortRole::Process {
+                        pid: session.process_id,
+                        selector,
                     },
-                );
-            }
+                },
+            );
         }
         ports
     }
@@ -642,7 +665,20 @@ impl CoreAudioWorker {
                 } else {
                     ProcessAudioCapabilities::capture_only()
                 };
-                capabilities.meter_peak = session.meter.is_some() || capabilities.capture_readonly;
+                // Advertise capture only after the same operational activation
+                // probe used by the process-capture manager succeeds. This is
+                // cached and invalidated by Core Audio notifications, so an
+                // unavailable Windows build is disabled before the canvas can
+                // offer an Application -> Recorder edge.
+                let loopback_available = ProcessLoopbackSource::detect_capability(
+                    session.process_id,
+                    ProcessLoopbackMode::IncludeProcessTree,
+                )
+                .is_available();
+                capabilities.capture_readonly &= loopback_available;
+                capabilities.relay_source &= loopback_available;
+                capabilities.meter_rms &= loopback_available;
+                capabilities.meter_peak = session.meter.is_some() || loopback_available;
                 (session.node_id, capabilities)
             })
             .collect()

@@ -28,7 +28,7 @@ import { QrDialog } from "dialogs/qr-dialog.slint";
 import { RelayPanel } from "panels/relay-panel.slint";
 import { NodeAppearancePanel } from "panels/node-appearance-panel.slint";
 import { DialogShell } from "components/dialog-shell.slint";
-import { ActionButton } from "components/button.slint";
+import { RecoveryDialog } from "dialogs/recovery-dialog.slint";
 import { EffectParameterRow, EffectOperationRow, EffectRow, RelayRow, HistoryRow } from "foundation/structs.slint";
 
 export { HitResult, LinkRow, MinimapNode, NodeRow, PortRow, UiI18n, UiTheme, EffectParameterRow, EffectOperationRow, EffectRow, RelayRow, HistoryRow }
@@ -73,6 +73,10 @@ export component MainWindow inherits Window {
     in-out property <bool> thumbnail-view: false;
     in-out property <int> language-index: 0;
     in-out property <int> meter-policy-index: 1;
+    in-out property <int> recording-save-mode-index: 0;
+    in-out property <string> recording-directory: "";
+    in property <[string]> recovered-recordings: [];
+    in-out property <bool> show-recovery: false;
     in-out property <float> ui-text-scale: 1.1;
     in-out property <float> panel-text-scale: 1.2;
     in-out property <float> node-text-scale: 1.15;
@@ -118,7 +122,7 @@ export component MainWindow inherits Window {
     out property <bool> modal-open: root.show-preferences || root.show-history
         || root.show-shortcuts || root.show-effects || root.show-effect-diagnostics || root.show-node-editor
         || root.show-node-diagnostics || root.show-patchbay-diagnostics
-        || root.show-qr || root.relay-pending-active;
+        || root.show-qr || root.relay-pending-active || root.show-recovery;
     // Text editing always wins: a typed 'r', 'a' or digit belongs to the field.
     out property <bool> text-editing: TextInputInterface.text-input-focused;
     out property <bool> canvas-shortcuts-enabled: !root.modal-open && !root.text-editing;
@@ -226,6 +230,10 @@ export component MainWindow inherits Window {
     callback graph-audio-volume-changed(int, float);
     callback graph-audio-mute-toggled(int);
     callback graph-node-collapse-toggled(int);
+    callback graph-recorder-record(int);
+    callback graph-recorder-stop(int);
+    callback graph-recorder-save(int);
+    callback graph-recorder-discard(int);
     // Geometry lives in Rust; these are the only questions the canvas asks.
     pure callback graph-hit-test(/* world-x */ float, /* world-y */ float, /* zoom */ float) -> HitResult;
     callback graph-link-rerouted(/* link-id */ int, /* new-pin */ int);
@@ -401,6 +409,7 @@ export component MainWindow inherits Window {
                     if root.show-common-actions && root.links.length > 0 : RailActionButton { enabled: root.connections-available; icon: @image-url("../../../assets/icons/disconnect_all.svg"); label: UiI18n.localized("toolbar.disconnect_all"); clicked => { root.action("disconnect-all"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-common-actions && root.has-selected-node : RailActionButton { enabled: root.connections-available; icon: @image-url("../../../assets/icons/disconnect_node.svg"); label: UiI18n.localized("canvas.disconnect_node"); clicked => { root.action("disconnect-node"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-common-actions : RailActionButton { icon: @image-url("../../../assets/icons/effects.svg"); label: UiI18n.localized("effects.title"); active: root.show-effects; clicked => { root.action("effects"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions : RailActionButton { icon: @image-url("../../../assets/icons/volume.svg"); label: UiI18n.localized("toolbar.add_recorder"); clicked => { root.action("add-recorder"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/save.svg"); label: UiI18n.localized("toolbar.save_patchbay"); clicked => { root.action("save-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/load.svg"); label: UiI18n.localized("toolbar.load_patchbay"); clicked => { root.action("load-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/snapshot.svg"); label: UiI18n.localized("toolbar.snapshot"); clicked => { root.action("snapshot-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
@@ -480,6 +489,10 @@ export component MainWindow inherits Window {
                 audio-volume-changed(id, value) => { root.graph-audio-volume-changed(id, value); }
                 audio-mute-toggled(id) => { root.graph-audio-mute-toggled(id); }
                 collapse-toggled(id) => { root.graph-node-collapse-toggled(id); }
+                recorder-record(id) => { root.graph-recorder-record(id); }
+                recorder-stop(id) => { root.graph-recorder-stop(id); }
+                recorder-save(id) => { root.graph-recorder-save(id); }
+                recorder-discard(id) => { root.graph-recorder-discard(id); }
             }
 
             LineEdit {
@@ -543,6 +556,8 @@ export component MainWindow inherits Window {
                     connect-through <=> root.connect-through;
                     thumbnail-view <=> root.thumbnail-view;
                     meter-policy-index <=> root.meter-policy-index;
+                    recording-save-mode-index <=> root.recording-save-mode-index;
+                    recording-directory <=> root.recording-directory;
                     ui-scale <=> root.ui-text-scale;
                     panel-scale <=> root.panel-text-scale;
                     node-scale <=> root.node-text-scale;
@@ -564,6 +579,22 @@ export component MainWindow inherits Window {
                     rule-input-port <=> root.rule-input-port;
                     close => { root.action("preferences"); }
                     action(action) => { root.action(action); }
+                }
+            }
+
+            if root.show-recovery: Rectangle {
+                width: parent.width; height: parent.height; background: #05070a99;
+                TouchArea { width: 100%; height: 100%; mouse-cursor: default; }
+                RecoveryDialog {
+                    x: max(24px, (parent.width - min(720px, parent.width - 48px)) / 2);
+                    y: max(24px, (parent.height - min(430px, parent.height - 48px)) / 2);
+                    width: min(720px, parent.width - 48px);
+                    height: min(430px, parent.height - 48px);
+                    recordings: root.recovered-recordings;
+                    close => { root.action("recovery-close"); }
+                    action(index, operation) => {
+                        root.action("recovery-" + operation + ":" + index);
+                    }
                 }
             }
 

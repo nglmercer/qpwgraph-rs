@@ -45,7 +45,7 @@ use crate::router::engine::{
 use crate::router::format::AudioFormat;
 use crate::router::thread::{RouterStopped, RouterThread};
 use crate::router::wasapi::{self, WasapiEndpoint};
-use crate::router::{MeterReading, RouteMetrics};
+use crate::router::{MeterReading, RecorderSink, RingSource, RouteMetrics};
 use pw_graph_effects::{AudioSpec, EffectProcessor};
 
 /// The format every qpwgraph-owned Windows route runs at.
@@ -77,6 +77,11 @@ struct Device {
 enum DeviceEndpoint {
     Wasapi(WasapiEndpoint),
     Process(ProcessLoopbackSource),
+    /// The process-loopback worker is owned by ProcessCaptureManager. This
+    /// route owns only a leased RingSource and must never stop that shared
+    /// activation when its last graph link is removed.
+    SharedProcess,
+    Recorder,
 }
 
 impl DeviceEndpoint {
@@ -84,6 +89,8 @@ impl DeviceEndpoint {
         match self {
             Self::Wasapi(endpoint) => endpoint.stop(),
             Self::Process(endpoint) => endpoint.stop(),
+            Self::SharedProcess => {}
+            Self::Recorder => {}
         }
     }
 }
@@ -163,6 +170,107 @@ impl WindowsRouting {
         self.links.contains_key(&link)
     }
 
+    /// Register a recorder's bounded sink as a permanent router destination.
+    /// The destination is present before the first graph link is drawn, so a
+    /// source-to-recorder connection has the same route semantics as any
+    /// physical render endpoint.
+    pub(super) fn add_recorder_sink(
+        &mut self,
+        port: PortId,
+        sink: RecorderSink,
+    ) -> BackendResult<()> {
+        if self.sinks.contains_key(&port) {
+            return Err(BackendError::native(
+                "that recorder destination is already registered",
+            ));
+        }
+        let id = SinkId(self.take_id());
+        self.router
+            .with(move |core| core.add_sink(id, Box::new(sink)))
+            .map_err(router_stopped)?
+            .map_err(router_error)?;
+        self.sinks.insert(
+            port,
+            (
+                id,
+                Device {
+                    endpoint: DeviceEndpoint::Recorder,
+                    users: 0,
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    /// Replace a finished recorder sink while preserving any links that point
+    /// at it. A new recording therefore does not require deleting the graph
+    /// node or its connections.
+    pub(super) fn replace_recorder_sink(
+        &mut self,
+        port: PortId,
+        sink: RecorderSink,
+    ) -> BackendResult<()> {
+        let Some((old_id, device)) = self.sinks.get(&port) else {
+            return Err(BackendError::native(
+                "recorder destination is not registered",
+            ));
+        };
+        if !matches!(device.endpoint, DeviceEndpoint::Recorder) {
+            return Err(BackendError::native("port is not a recorder destination"));
+        }
+        let old_id = *old_id;
+        let users = device.users;
+        let new_id = SinkId(self.take_id());
+        let result = self.router.with(move |core| {
+            core.set_routes(&[])?;
+            let old = core.remove_sink(old_id)?;
+            core.add_sink(new_id, Box::new(sink))?;
+            Ok::<_, RouterError>(old)
+        });
+        let old = match result {
+            Ok(Ok(old)) => old,
+            Ok(Err(error)) => return Err(router_error(error)),
+            Err(error) => return Err(router_stopped(error)),
+        };
+        drop(old);
+        self.sinks.insert(
+            port,
+            (
+                new_id,
+                Device {
+                    endpoint: DeviceEndpoint::Recorder,
+                    users,
+                },
+            ),
+        );
+        self.install()
+    }
+
+    pub(super) fn remove_recorder_sink(&mut self, port: PortId) -> BackendResult<()> {
+        let Some((id, device)) = self.sinks.remove(&port) else {
+            return Ok(());
+        };
+        if !matches!(device.endpoint, DeviceEndpoint::Recorder) {
+            self.sinks.insert(port, (id, device));
+            return Err(BackendError::native("port is not a recorder destination"));
+        }
+        let result = self
+            .router
+            .with(move |core| core.remove_sink(id))
+            .map_err(router_stopped)?
+            .map_err(router_error);
+        match result {
+            Ok(sink) => {
+                drop(sink);
+                Ok(())
+            }
+            Err(error) => {
+                self.sinks.insert(port, (id, device));
+                Err(error)
+            }
+        }
+    }
+
     /// What each route has actually been doing: frames carried, dropouts,
     /// conversion ratio, and the last fault.
     ///
@@ -209,6 +317,16 @@ impl WindowsRouting {
     /// node that owns it.
     pub(super) fn carries_source(&self, port: PortId) -> bool {
         self.sources.contains_key(&port)
+    }
+
+    pub(super) fn uses_shared_process_source(&self, port: PortId) -> bool {
+        self.sources
+            .get(&port)
+            .is_some_and(|(_, device)| matches!(device.endpoint, DeviceEndpoint::SharedProcess))
+    }
+
+    pub(super) fn carries_effect_output(&self, port: PortId) -> bool {
+        self.effect_outputs.contains_key(&port)
     }
 
     /// Gain currently applied to everything a source feeds.
@@ -401,6 +519,7 @@ impl WindowsRouting {
         &mut self,
         link: Link,
         endpoint_ports: &BTreeMap<PortId, EndpointPort>,
+        shared_process_source: Option<RingSource>,
     ) -> BackendResult<()> {
         if self.links.contains_key(&link.id) {
             return Err(BackendError::native("that route already exists"));
@@ -412,14 +531,27 @@ impl WindowsRouting {
         } else {
             Some(routable(endpoint_ports, link.output_port, PortEnd::Output)?)
         };
+        let registered_sink = self.sinks.contains_key(&link.input_port);
         let input = if self.effects.contains_key(&link.input_port) {
+            None
+        } else if self.sinks.contains_key(&link.input_port) {
+            // Recorder sinks (and a physical sink shared by another route)
+            // are already registered with RouterCore. Count this link without
+            // trying to resolve the port as a Core Audio endpoint.
+            self.retain_sink(link.input_port)?;
             None
         } else {
             Some(routable(endpoint_ports, link.input_port, PortEnd::Input)?)
         };
 
         if let Some(output) = output {
-            self.ensure_source(link.output_port, output)?;
+            if let Err(error) = self.ensure_source(link.output_port, output, shared_process_source)
+            {
+                if registered_sink {
+                    self.release_sink(link.input_port);
+                }
+                return Err(error);
+            }
         }
         if let Some(input) = input {
             if let Err(error) = self.ensure_sink(link.input_port, input) {
@@ -510,6 +642,7 @@ impl WindowsRouting {
     pub(super) fn recover_lost(
         &mut self,
         endpoint_ports: &BTreeMap<PortId, EndpointPort>,
+        shared_process_sources: &BTreeMap<PortId, RingSource>,
     ) -> BackendResult<()> {
         let lost = self.router.take_lost_routes();
         if lost.is_empty() {
@@ -546,7 +679,9 @@ impl WindowsRouting {
                 if !self.effect_outputs.contains_key(&link.output_port) {
                     routable(endpoint_ports, link.output_port, PortEnd::Output)?;
                 }
-                if !self.effects.contains_key(&link.input_port) {
+                if !self.effects.contains_key(&link.input_port)
+                    && !self.sinks.contains_key(&link.input_port)
+                {
                     routable(endpoint_ports, link.input_port, PortEnd::Input)?;
                 }
             }
@@ -572,13 +707,18 @@ impl WindowsRouting {
                         return Err(error);
                     }
                 };
-                if let Err(error) = self.ensure_source(link.output_port, endpoint) {
+                let shared = shared_process_sources
+                    .get(&link.output_port)
+                    .map(RingSource::lease);
+                if let Err(error) = self.ensure_source(link.output_port, endpoint, shared) {
                     let _ = self.clear_devices();
                     self.router.requeue_lost_routes(&recovered);
                     return Err(error);
                 }
             }
-            if !self.effects.contains_key(&link.input_port) {
+            if !self.effects.contains_key(&link.input_port)
+                && !self.sinks.contains_key(&link.input_port)
+            {
                 let endpoint = match routable(endpoint_ports, link.input_port, PortEnd::Input) {
                     Ok(endpoint) => endpoint,
                     Err(error) => {
@@ -639,7 +779,19 @@ impl WindowsRouting {
     /// middle of a block.
     fn clear_devices(&mut self) -> BackendResult<()> {
         let source_entries = std::mem::take(&mut self.sources);
-        let sink_entries = std::mem::take(&mut self.sinks);
+        let mut sink_entries = BTreeMap::new();
+        let mut recorder_sinks = BTreeMap::new();
+        for (port, entry) in std::mem::take(&mut self.sinks) {
+            if matches!(&entry.1.endpoint, DeviceEndpoint::Recorder) {
+                recorder_sinks.insert(port, entry);
+            } else {
+                sink_entries.insert(port, entry);
+            }
+        }
+        // Recorder destinations are not tied to a physical endpoint. Keep
+        // their bounded sinks registered while device workers are rebuilt, or
+        // a physical-device loss would silently erase the user's graph edge.
+        self.sinks = recorder_sinks;
         let source_ids: Vec<SourceId> = source_entries.values().map(|(id, _)| *id).collect();
         let sink_ids: Vec<SinkId> = sink_entries.values().map(|(id, _)| *id).collect();
 
@@ -758,7 +910,12 @@ impl WindowsRouting {
 
     /// Take a use of the device behind an output port, opening it if this is
     /// the first route that needs it.
-    fn ensure_source(&mut self, port: PortId, endpoint: &EndpointPort) -> BackendResult<()> {
+    fn ensure_source(
+        &mut self,
+        port: PortId,
+        endpoint: &EndpointPort,
+        shared_process_source: Option<RingSource>,
+    ) -> BackendResult<()> {
         if let Some((_, device)) = self.sources.get_mut(&port) {
             device.users += 1;
             return Ok(());
@@ -776,14 +933,18 @@ impl WindowsRouting {
                 (source, DeviceEndpoint::Wasapi(worker))
             }
             EndpointPortRole::Process { pid, selector } => {
-                verify_live_process_identity(selector, *pid)?;
-                let (source, worker) = ProcessLoopbackSource::open(
-                    *pid,
-                    ProcessLoopbackMode::IncludeProcessTree,
-                    ROUTE_FORMAT,
-                    RING_FRAMES,
-                )?;
-                (source, DeviceEndpoint::Process(worker))
+                if let Some(source) = shared_process_source {
+                    (source, DeviceEndpoint::SharedProcess)
+                } else {
+                    verify_live_process_identity(selector, *pid)?;
+                    let (source, worker) = ProcessLoopbackSource::open(
+                        *pid,
+                        ProcessLoopbackMode::IncludeProcessTree,
+                        ROUTE_FORMAT,
+                        RING_FRAMES,
+                    )?;
+                    (source, DeviceEndpoint::Process(worker))
+                }
             }
             EndpointPortRole::Render => {
                 return Err(BackendError::unsupported(
@@ -864,8 +1025,15 @@ impl WindowsRouting {
         let Some((id, device)) = self.sinks.get_mut(&port) else {
             return;
         };
-        device.users -= 1;
+        device.users = device.users.saturating_sub(1);
         if device.users > 0 {
+            return;
+        }
+        if matches!(device.endpoint, DeviceEndpoint::Recorder) {
+            // A recorder node owns its destination for its whole lifetime;
+            // links are transient users of the same bounded sink. Keeping it
+            // registered at zero users also lets a later connection reuse the
+            // node without opening a fake WASAPI endpoint.
             return;
         }
         let id = *id;
@@ -880,6 +1048,14 @@ impl WindowsRouting {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    fn retain_sink(&mut self, port: PortId) -> BackendResult<()> {
+        let Some((_, device)) = self.sinks.get_mut(&port) else {
+            return Err(BackendError::native("route destination is not registered"));
+        };
+        device.users = device.users.saturating_add(1);
+        Ok(())
     }
 }
 

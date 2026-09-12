@@ -256,6 +256,7 @@ pub enum NodeType {
     #[default]
     PipeWire,
     Effect,
+    Recorder,
     AlsaMidi,
     WindowsAudioEndpoint,
     WindowsAudioSession,

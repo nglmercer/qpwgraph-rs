@@ -39,6 +39,7 @@ const WINDOWS_MIDI_CAPABILITIES: BackendCapabilities = BackendCapabilities {
     meters: false,
     effects: false,
     relay: false,
+    recorders: false,
 };
 
 /// `MMSYSERR_NOERROR`.

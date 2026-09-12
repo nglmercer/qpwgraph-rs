@@ -836,10 +836,11 @@ fn drag_collision_uses_the_projected_easy_mode_height() {
         .position(|node| node.node_id == NodeId(2))
         .unwrap();
     let projected_height = snapshot.nodes[moving].height;
-    let raw_height = node_height(
+    let raw_height = node_height_for_node(
         false,
         false,
         true,
+        false,
         graph.node(NodeId(1)).unwrap().ports.len(),
     );
     assert!(raw_height > projected_height);

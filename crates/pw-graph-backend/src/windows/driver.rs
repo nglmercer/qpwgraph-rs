@@ -8,6 +8,12 @@ use super::*;
 #[cfg(feature = "relay")]
 use crate::api;
 use crate::api::EffectTicket;
+use crate::router::{
+    copy_recording_preserving_source, AudioFormat, RecorderSink, RecorderWriter,
+    RecorderWriterState, RingSource, DEFAULT_RECORDER_CAPACITY_MS,
+};
+use std::fs;
+use std::path::PathBuf;
 
 #[path = "driver_application_routes.rs"]
 mod application_routes;
@@ -20,6 +26,11 @@ mod relay_driver;
 /// both platforms when qpwgraph owns the audio. An unrouted Windows endpoint
 /// still reports unity, because that is all its own control can do.
 pub(super) const ROUTED_VOLUME_MAX: f32 = 1.5;
+
+/// The first Windows recorder format is intentionally fixed to the same
+/// geometry used by the existing WASAPI/router path. WASAPI performs endpoint
+/// conversion at its boundary, while the router and WAV writer stay f32.
+const WINDOWS_RECORDER_FORMAT: AudioFormat = AudioFormat::new(48_000, 2);
 
 /// Read the kernel-reported Windows version for diagnostics.  `GetVersionExW`
 /// is compatibility-shimmed for some application manifests; `RtlGetVersion`
@@ -62,6 +73,7 @@ pub(super) const WINDOWS_AUDIO_CAPABILITIES: BackendCapabilities = BackendCapabi
     // Kept in step with `RelayDriver::relay_available` below: the WASAPI relay
     // endpoints exist whenever the feature is compiled in.
     relay: cfg!(feature = "relay"),
+    recorders: true,
 };
 
 /// Audio state shared between the COM worker, the Core Audio change callbacks,
@@ -171,6 +183,10 @@ pub struct WindowsAudioDriver {
     /// Started on the first connect rather than at construction: a session
     /// that never draws a link should not pay for an audio thread.
     pub(super) routing: Option<WindowsRouting>,
+    /// Recorder destinations own their bounded sinks for the lifetime of the
+    /// graph node. The Windows routing table references those sinks while
+    /// links are connected; the writer itself stays on this control side.
+    pub(super) recorders: BTreeMap<RecorderId, NativeRecorder>,
     /// Effect instances and the factory that builds them.
     pub(super) effects: WindowsEffects,
     /// Where each effect node sits, by instance id. Kept separately from
@@ -280,6 +296,7 @@ impl WindowsAudioDriver {
             application_route_leases: BTreeMap::new(),
             application_route_policy_generation: 0,
             routing: None,
+            recorders: BTreeMap::new(),
             effects: WindowsEffects::new(),
             effect_positions: BTreeMap::new(),
             #[cfg(feature = "relay")]
@@ -700,6 +717,151 @@ impl WindowsAudioDriver {
     pub fn process_audio_capabilities(&self, node: NodeId) -> Option<ProcessAudioCapabilities> {
         self.process_audio_capabilities.get(&node).copied()
     }
+
+    fn recorder_directory(request: &RecorderCreateRequest) -> PathBuf {
+        request.recording_dir.clone().unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("qpwgraph-rs")
+                .join("recordings")
+        })
+    }
+
+    fn recorder_capacity(request: &RecorderCreateRequest) -> usize {
+        let default_capacity = usize::try_from(request.format.sample_rate)
+            .unwrap_or(48_000)
+            .saturating_mul(DEFAULT_RECORDER_CAPACITY_MS as usize)
+            / 1_000;
+        request.capacity_frames.max(default_capacity.max(1))
+    }
+
+    fn start_paused_recorder_writer(
+        request: &RecorderCreateRequest,
+    ) -> BackendResult<(RecorderSink, RecorderWriter)> {
+        RecorderWriter::start_pending_paused(
+            Self::recorder_directory(request),
+            request.format,
+            Self::recorder_capacity(request),
+        )
+        .map_err(|error| BackendError::native(error.to_string()))
+    }
+
+    fn process_recorder_request_for_link(
+        &self,
+        link: &Link,
+    ) -> Option<(RecorderId, ProcessCaptureRequest)> {
+        self.process_recorder_request_for_link_with_ports(link, &self.endpoint_ports)
+    }
+
+    fn process_recorder_request_for_link_with_ports(
+        &self,
+        link: &Link,
+        endpoint_ports: &BTreeMap<PortId, EndpointPort>,
+    ) -> Option<(RecorderId, ProcessCaptureRequest)> {
+        let recorder_id = self
+            .recorders
+            .values()
+            .find(|recorder| recorder.instance.input_port == link.input_port)
+            .map(|recorder| recorder.instance.id)?;
+        let EndpointPortRole::Process { pid, selector } =
+            &endpoint_ports.get(&link.output_port)?.role
+        else {
+            return None;
+        };
+        Some((
+            recorder_id,
+            ProcessCaptureRequest {
+                selector: selector.clone(),
+                pid: *pid,
+                mode: ProcessLoopbackMode::IncludeProcessTree,
+            },
+        ))
+    }
+
+    fn acquire_process_recorder_source(
+        &mut self,
+        recorder_id: RecorderId,
+        request: ProcessCaptureRequest,
+    ) -> BackendResult<RingSource> {
+        let (sender, receiver) = mpsc::channel();
+        self.command_tx
+            .send(WorkerCommand::AcquireProcessRecorder(
+                request,
+                recorder_id,
+                WINDOWS_RECORDER_FORMAT,
+                sender,
+            ))
+            .map_err(|_| BackendError::Native("Windows audio worker is unavailable".into()))?;
+        let (source, statuses) = Self::response(receiver)?;
+        self.process_captures = statuses;
+        Ok(source)
+    }
+
+    fn release_process_recorder(
+        &mut self,
+        recorder_id: RecorderId,
+        request: ProcessCaptureRequest,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        if self
+            .command_tx
+            .send(WorkerCommand::ReleaseProcessRecorder(
+                recorder_id,
+                request,
+                WINDOWS_RECORDER_FORMAT,
+                sender,
+            ))
+            .is_ok()
+        {
+            if let Ok(Ok(statuses)) = receiver.recv() {
+                self.process_captures = statuses;
+            }
+        }
+    }
+
+    fn has_process_recorder_link(
+        &self,
+        recorder_id: RecorderId,
+        request: &ProcessCaptureRequest,
+    ) -> bool {
+        self.routing.as_ref().is_some_and(|routing| {
+            routing.links().any(|link| {
+                self.process_recorder_request_for_link(link)
+                    .is_some_and(|(id, candidate)| id == recorder_id && candidate == *request)
+            })
+        })
+    }
+
+    fn shared_process_sources_for_recovery(
+        &mut self,
+    ) -> BackendResult<BTreeMap<PortId, RingSource>> {
+        let candidates: Vec<_> = self
+            .routing
+            .as_ref()
+            .map(|routing| {
+                routing
+                    .links()
+                    .filter(|link| routing.uses_shared_process_source(link.output_port))
+                    .filter_map(|link| {
+                        self.process_recorder_request_for_link(link)
+                            .map(|(id, request)| (link.output_port, id, request))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut sources = BTreeMap::new();
+        for (port, recorder_id, request) in candidates {
+            // One router source is shared by all links leaving a port, but
+            // every Recorder identity still gets registered with the manager
+            // so removing one destination cannot stop another consumer.
+            let source = self.acquire_process_recorder_source(recorder_id, request)?;
+            if !sources.contains_key(&port) {
+                sources.insert(port, source);
+            }
+        }
+        Ok(sources)
+    }
 }
 
 impl Drop for WindowsAudioDriver {
@@ -742,6 +904,12 @@ impl GraphDriver for WindowsAudioDriver {
     /// see [`super::routing`] for what Windows does and does not allow.
     fn connect(&mut self, src: PortId, dst: PortId) -> BackendResult<Link> {
         self.validate_route(src, dst)?;
+        let support = self.connection_support(src, dst);
+        if support == ConnectionSupport::Unsupported {
+            return Err(BackendError::unsupported(
+                "Windows does not support that source/destination connection",
+            ));
+        }
         let link = managed_link(src, dst);
         if self.graph.links.contains_key(&link.id) {
             return Err(GraphError::DuplicateLink(link.id).into());
@@ -749,13 +917,48 @@ impl GraphDriver for WindowsAudioDriver {
         if self.routing.is_none() {
             self.routing = Some(WindowsRouting::start()?);
         }
+        let capture_lease = if support == ConnectionSupport::CaptureOnly {
+            Some(
+                self.process_recorder_request_for_link(&link)
+                    .ok_or_else(|| {
+                        BackendError::unsupported(
+                            "application capture requires a stable process and Recorder identity",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let shared_process_source = if let Some((recorder_id, request)) = &capture_lease {
+            Some(self.acquire_process_recorder_source(*recorder_id, request.clone())?)
+        } else {
+            None
+        };
         let routing = self.routing.as_mut().expect("routing was just started");
-        routing.connect(link.clone(), &self.endpoint_ports)?;
-        self.graph.add_link(link.id, src, dst)?;
+        if let Err(error) =
+            routing.connect(link.clone(), &self.endpoint_ports, shared_process_source)
+        {
+            if let Some((recorder_id, request)) = capture_lease {
+                self.release_process_recorder(recorder_id, request);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.graph.add_link(link.id, src, dst) {
+            let _ = routing.disconnect(link.id);
+            if let Some((recorder_id, request)) = capture_lease {
+                self.release_process_recorder(recorder_id, request);
+            }
+            return Err(error.into());
+        }
         Ok(link)
     }
 
     fn disconnect(&mut self, link: LinkId) -> BackendResult<Link> {
+        let capture_lease = self
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.links().find(|candidate| candidate.id == link))
+            .and_then(|candidate| self.process_recorder_request_for_link(candidate));
         let Some(routing) = self.routing.as_mut() else {
             return Err(BackendError::unsupported(
                 "that link is a relationship Windows reports, not a route qpwgraph carries",
@@ -766,6 +969,11 @@ impl GraphDriver for WindowsAudioDriver {
         // the graph after its route is gone is exactly the stale link the
         // parity contract forbids.
         let _ = self.graph.remove_link(link);
+        if let Some((recorder_id, request)) = capture_lease {
+            if !self.has_process_recorder_link(recorder_id, &request) {
+                self.release_process_recorder(recorder_id, request);
+            }
+        }
         Ok(removed)
     }
 
@@ -793,6 +1001,98 @@ impl GraphDriver for WindowsAudioDriver {
                         .get(&node)
                         .is_some_and(|capabilities| capabilities.mutable_route))
         })
+    }
+
+    fn connection_support(&self, output: PortId, input: PortId) -> ConnectionSupport {
+        let Some(output_port) = self.graph.port(output) else {
+            return ConnectionSupport::Unsupported;
+        };
+        let Some(input_port) = self.graph.port(input) else {
+            return ConnectionSupport::Unsupported;
+        };
+        if !output_port.direction.is_source()
+            || !input_port.direction.is_sink()
+            || output_port.port_type != input_port.port_type
+        {
+            return ConnectionSupport::Unsupported;
+        }
+        let Some(output_node) = self.graph.node(output_port.node_id) else {
+            return ConnectionSupport::Unsupported;
+        };
+        let Some(input_node) = self.graph.node(input_port.node_id) else {
+            return ConnectionSupport::Unsupported;
+        };
+
+        if input_node.node_type == NodeType::Effect {
+            // An effect is a qpwgraph-owned destination. It may receive a
+            // physical endpoint or an application only after that source is
+            // itself routable/isolated; a plain Windows session therefore
+            // remains unsupported here, just as it is for a normal playback
+            // endpoint. Effect outputs may continue an already-owned chain.
+            let effect_source = self
+                .routing
+                .as_ref()
+                .is_some_and(|routing| routing.carries_effect_output(output));
+            return (self.effects.has_input_port(input)
+                && (self.node_supports_routing(output_node.id) || effect_source))
+                .then_some(ConnectionSupport::Route)
+                .unwrap_or(ConnectionSupport::Unsupported);
+        }
+
+        if input_node.node_type == NodeType::Recorder {
+            if !self.recorders.values().any(|recorder| {
+                recorder.instance.node_id == input_node.id && recorder.instance.input_port == input
+            }) {
+                return ConnectionSupport::Unsupported;
+            }
+            if output_node.node_type == NodeType::WindowsAudioSession {
+                // A session-to-recorder edge is an explicit read-only
+                // process-loopback capture. It never grants general session
+                // rerouting or effect insertion.
+                if self
+                    .routing
+                    .as_ref()
+                    .is_some_and(|routing| routing.carries_source(output))
+                {
+                    // Once qpwgraph already owns the session's PCM, reuse
+                    // that route instead of opening a second process-loopback
+                    // activation for the same application.
+                    return ConnectionSupport::Route;
+                }
+                return self
+                    .process_audio_capabilities
+                    .get(&output_node.id)
+                    .filter(|capabilities| capabilities.capture_readonly)
+                    .filter(|_| self.endpoint_ports.contains_key(&output))
+                    .map(|_| ConnectionSupport::CaptureOnly)
+                    .unwrap_or(ConnectionSupport::Unsupported);
+            }
+
+            let endpoint_source = self.endpoint_ports.get(&output).is_some_and(|endpoint| {
+                matches!(
+                    &endpoint.role,
+                    EndpointPortRole::Capture | EndpointPortRole::Monitor
+                )
+            });
+            let effect_source = self
+                .routing
+                .as_ref()
+                .is_some_and(|routing| routing.carries_effect_output(output));
+            return (self.node_supports_routing(output_node.id)
+                && (endpoint_source || output_node.node_type == NodeType::Effect)
+                || effect_source)
+                .then_some(ConnectionSupport::Route)
+                .unwrap_or(ConnectionSupport::Unsupported);
+        }
+
+        if self.capabilities().connect
+            && self.node_supports_routing(output_node.id)
+            && self.node_supports_routing(input_node.id)
+        {
+            ConnectionSupport::Route
+        } else {
+            ConnectionSupport::Unsupported
+        }
     }
 
     fn set_node_position(&mut self, node: NodeId, position: [f32; 2]) -> BackendResult<()> {
@@ -924,7 +1224,7 @@ impl GraphDriver for WindowsAudioDriver {
     fn is_node_type(&self, node_type: NodeType) -> bool {
         matches!(
             node_type,
-            NodeType::WindowsAudioEndpoint | NodeType::WindowsAudioSession
+            NodeType::WindowsAudioEndpoint | NodeType::WindowsAudioSession | NodeType::Recorder
         )
     }
 
@@ -997,6 +1297,471 @@ impl GraphDriver for WindowsAudioDriver {
             .map_err(|_| BackendError::Native("Windows audio worker is unavailable".into()))?;
         Self::response(receiver)
     }
+}
+
+impl RecorderDriver for WindowsAudioDriver {
+    fn supports_recorders(&self) -> bool {
+        true
+    }
+
+    fn create_recorder(
+        &mut self,
+        request: RecorderCreateRequest,
+    ) -> BackendResult<RecorderInstance> {
+        if request.format != WINDOWS_RECORDER_FORMAT {
+            return Err(BackendError::unsupported(
+                "Windows recording currently supports 48 kHz stereo float32 WAV only",
+            ));
+        }
+
+        let id = self
+            .recorders
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let node_id = NodeId(graph_id(recorder_node_local_id(id)));
+        let input_port = PortId(graph_id(recorder_port_local_id(id)));
+        let name = if request.name.trim().is_empty() {
+            format!("Recorder {id}")
+        } else {
+            request.name.clone()
+        };
+        let capacity = Self::recorder_capacity(&request);
+        let (sink, writer) = Self::start_paused_recorder_writer(&request)?;
+
+        let mut routing = match self.routing.take() {
+            Some(routing) => routing,
+            None => WindowsRouting::start()?,
+        };
+        if let Err(error) = routing.add_recorder_sink(input_port, sink) {
+            self.routing = Some(routing);
+            return Err(error);
+        }
+
+        let instance = RecorderInstance {
+            id,
+            node_id,
+            input_port,
+            status: RecorderStatus {
+                id,
+                state: RecorderState::Idle,
+                writer_state: RecorderWriterState::Starting,
+                sample_rate: request.format.sample_rate,
+                channels: request.format.channels,
+                temporary_path: Some(writer.temporary_path().to_owned()),
+                queue_capacity: capacity,
+                ..RecorderStatus::default()
+            },
+        };
+        if let Err(error) = draw_recorder(&mut self.graph, &instance, &name, request.position) {
+            self.graph.ports.remove(&input_port);
+            self.graph.nodes.remove(&node_id);
+            let _ = routing.remove_recorder_sink(input_port);
+            self.routing = Some(routing);
+            return Err(error);
+        }
+        self.positions.insert(node_id, request.position);
+        self.routing = Some(routing);
+        self.recorders.insert(
+            id,
+            NativeRecorder {
+                request,
+                instance: instance.clone(),
+                writer,
+            },
+        );
+        Ok(instance)
+    }
+
+    fn remove_recorder(&mut self, id: RecorderId) -> BackendResult<()> {
+        let recorder = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let state = recorder.instance.status.state;
+        if state == RecorderState::Recording {
+            return Err(BackendError::native(
+                "stop or discard the recording before removing its node",
+            ));
+        }
+        if matches!(state, RecorderState::Unsaved | RecorderState::Error)
+            && recorder.instance.status.temporary_path.is_some()
+        {
+            return Err(BackendError::native(
+                "save or explicitly discard the pending recording before removing its node",
+            ));
+        }
+        let input_port = recorder.instance.input_port;
+        let node_id = recorder.instance.node_id;
+
+        let links: Vec<LinkId> = self
+            .routing
+            .as_ref()
+            .map(|routing| {
+                routing
+                    .links()
+                    .filter(|link| link.input_port == input_port)
+                    .map(|link| link.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for link_id in links {
+            self.disconnect(link_id)?;
+        }
+        if let Some(routing) = self.routing.as_mut() {
+            routing.remove_recorder_sink(input_port)?;
+        }
+
+        let mut recorder = self
+            .recorders
+            .remove(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let temporary_path = recorder.writer.temporary_path().to_owned();
+        if !matches!(
+            recorder.writer.status().writer_state,
+            RecorderWriterState::Finished
+        ) {
+            let _ = recorder.writer.finish();
+        }
+        drop(recorder);
+        if temporary_path.exists() {
+            fs::remove_file(temporary_path)
+                .map_err(|error| BackendError::native(error.to_string()))?;
+        }
+        self.graph
+            .links
+            .retain(|_, link| link.input_port != input_port);
+        self.graph.ports.remove(&input_port);
+        self.graph.nodes.remove(&node_id);
+        self.positions.remove(&node_id);
+        Ok(())
+    }
+
+    fn start_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let (state, input_port, request, writer_state) = {
+            let recorder = self
+                .recorders
+                .get(&id)
+                .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+            (
+                recorder.instance.status.state,
+                recorder.instance.input_port,
+                recorder.request.clone(),
+                recorder.writer.status().writer_state,
+            )
+        };
+        if state == RecorderState::Recording {
+            return Err(BackendError::native("recorder is already recording"));
+        }
+        if state != RecorderState::Idle {
+            return Err(BackendError::native(
+                "save or discard the pending recording before starting again",
+            ));
+        }
+
+        if writer_state == RecorderWriterState::Starting {
+            let recorder = self
+                .recorders
+                .get_mut(&id)
+                .expect("recorder was checked above");
+            recorder
+                .writer
+                .resume()
+                .map_err(|error| BackendError::native(error.to_string()))?;
+            recorder.instance.status.state = RecorderState::Recording;
+            recorder.instance.status.writer_state = RecorderWriterState::Recording;
+            recorder.instance.status.final_path = None;
+            recorder.instance.status.error = None;
+            return Ok(());
+        }
+
+        let old_path = self
+            .recorders
+            .get(&id)
+            .map(|recorder| recorder.writer.temporary_path().to_owned())
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let (sink, mut writer) = Self::start_paused_recorder_writer(&request)?;
+        let new_path = writer.temporary_path().to_owned();
+        if let Some(routing) = self.routing.as_mut() {
+            if let Err(error) = routing.replace_recorder_sink(input_port, sink) {
+                let _ = writer.finish();
+                let _ = fs::remove_file(&new_path);
+                return Err(error);
+            }
+        } else {
+            let _ = writer.finish();
+            let _ = fs::remove_file(&new_path);
+            return Err(BackendError::native(
+                "Windows recorder router is unavailable",
+            ));
+        }
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .expect("recorder was checked above");
+        let old_writer = std::mem::replace(&mut recorder.writer, writer);
+        drop(old_writer);
+        if old_path.exists() {
+            let _ = fs::remove_file(old_path);
+        }
+        recorder
+            .writer
+            .resume()
+            .map_err(|error| BackendError::native(error.to_string()))?;
+        recorder.instance.status = RecorderStatus {
+            id,
+            state: RecorderState::Recording,
+            writer_state: RecorderWriterState::Recording,
+            sample_rate: request.format.sample_rate,
+            channels: request.format.channels,
+            temporary_path: Some(new_path),
+            queue_capacity: Self::recorder_capacity(&request),
+            ..RecorderStatus::default()
+        };
+        Ok(())
+    }
+
+    fn request_stop_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state != RecorderState::Recording {
+            return Err(BackendError::native("recorder is not recording"));
+        }
+        recorder
+            .writer
+            .request_stop()
+            .map_err(|error| BackendError::native(error.to_string()))
+    }
+
+    fn stop_recording(&mut self, id: RecorderId) -> BackendResult<RecorderResult> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state != RecorderState::Recording {
+            return Err(BackendError::native("recorder is not recording"));
+        }
+        let raw = match recorder.writer.finish() {
+            Ok(result) => result,
+            Err(error) => {
+                recorder.instance.status.state = RecorderState::Error;
+                recorder.instance.status.error = Some(error.to_string());
+                return Err(BackendError::native(error.to_string()));
+            }
+        };
+        let result = recorder_result(id, &recorder.request, raw);
+        update_recorder_status(&mut recorder.instance.status, &result);
+        recorder.instance.status.state = RecorderState::Unsaved;
+        Ok(result)
+    }
+
+    fn save_recording(
+        &mut self,
+        id: RecorderId,
+        destination: &std::path::Path,
+    ) -> BackendResult<PathBuf> {
+        let (state, input_port, request, source) = {
+            let recorder = self
+                .recorders
+                .get(&id)
+                .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+            (
+                recorder.instance.status.state,
+                recorder.instance.input_port,
+                recorder.request.clone(),
+                recorder
+                    .instance
+                    .status
+                    .temporary_path
+                    .clone()
+                    .ok_or_else(|| BackendError::native("recorder has no pending recording"))?,
+            )
+        };
+        if state == RecorderState::Recording {
+            return Err(BackendError::native("stop the recorder before saving it"));
+        }
+        if state != RecorderState::Unsaved {
+            return Err(BackendError::native(
+                "recorder has no finished recording to save",
+            ));
+        }
+
+        // Copy first while the finished writer and its sink are still intact;
+        // a failed destination leaves the pending recording untouched.
+        copy_recording_preserving_source(&source, destination)
+            .map_err(|error| BackendError::native(error.to_string()))?;
+        let (sink, mut writer) = match Self::start_paused_recorder_writer(&request) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        let new_path = writer.temporary_path().to_owned();
+        if let Some(routing) = self.routing.as_mut() {
+            if let Err(error) = routing.replace_recorder_sink(input_port, sink) {
+                let _ = writer.finish();
+                let _ = fs::remove_file(&new_path);
+                return Err(error);
+            }
+        } else {
+            let _ = writer.finish();
+            let _ = fs::remove_file(&new_path);
+            return Err(BackendError::native(
+                "Windows recorder router is unavailable",
+            ));
+        }
+
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .expect("recorder was checked above");
+        let old_writer = std::mem::replace(&mut recorder.writer, writer);
+        drop(old_writer);
+        fs::remove_file(&source).map_err(|error| BackendError::native(error.to_string()))?;
+        let destination = destination.to_owned();
+        recorder.instance.status.state = RecorderState::Idle;
+        recorder.instance.status.final_path = Some(destination.clone());
+        recorder.instance.status.temporary_path = None;
+        recorder.instance.status.error = None;
+        Ok(destination)
+    }
+
+    fn recorder_status(&self, id: RecorderId) -> BackendResult<RecorderStatus> {
+        let recorder = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let diagnostics = recorder.writer.status();
+        let mut status = recorder.instance.status.clone();
+        status.elapsed_frames = diagnostics.frames_written;
+        status.frames_written = diagnostics.frames_written;
+        status.dropped_frames = diagnostics.dropped_frames;
+        status.queue_depth = diagnostics.queue_depth;
+        status.queue_capacity = diagnostics.queue_capacity;
+        status.file_bytes = diagnostics.file_bytes;
+        status.error = diagnostics.last_error;
+        status.writer_state = diagnostics.writer_state;
+        if status.temporary_path.is_some()
+            || matches!(
+                status.state,
+                RecorderState::Recording | RecorderState::Unsaved
+            )
+        {
+            status.temporary_path = Some(diagnostics.temporary_path);
+        }
+        if diagnostics.writer_state == RecorderWriterState::Error {
+            status.state = RecorderState::Error;
+        }
+        Ok(status)
+    }
+
+    fn poll_recording(&mut self, id: RecorderId) -> BackendResult<Option<RecorderResult>> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let polled = recorder.writer.poll();
+        let Some(raw) = (match polled {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.to_string();
+                recorder.instance.status.state = RecorderState::Error;
+                recorder.instance.status.error = Some(message.clone());
+                return Err(BackendError::native(message));
+            }
+        }) else {
+            return Ok(None);
+        };
+        let result = recorder_result(id, &recorder.request, raw);
+        update_recorder_status(&mut recorder.instance.status, &result);
+        recorder.instance.status.state = RecorderState::Unsaved;
+        Ok(Some(result))
+    }
+
+    fn discard_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let (state, input_port, request, old_path) = {
+            let recorder = self
+                .recorders
+                .get(&id)
+                .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+            (
+                recorder.instance.status.state,
+                recorder.instance.input_port,
+                recorder.request.clone(),
+                recorder.writer.temporary_path().to_owned(),
+            )
+        };
+        if state == RecorderState::Recording {
+            return Err(BackendError::native(
+                "stop the recorder before discarding it",
+            ));
+        }
+
+        let (sink, mut writer) = Self::start_paused_recorder_writer(&request)?;
+        let new_path = writer.temporary_path().to_owned();
+        if let Some(routing) = self.routing.as_mut() {
+            if let Err(error) = routing.replace_recorder_sink(input_port, sink) {
+                let _ = writer.finish();
+                let _ = fs::remove_file(&new_path);
+                return Err(error);
+            }
+        } else {
+            let _ = writer.finish();
+            let _ = fs::remove_file(&new_path);
+            return Err(BackendError::native(
+                "Windows recorder router is unavailable",
+            ));
+        }
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .expect("recorder was checked above");
+        let old_writer = std::mem::replace(&mut recorder.writer, writer);
+        drop(old_writer);
+        if old_path.exists() {
+            fs::remove_file(old_path).map_err(|error| BackendError::native(error.to_string()))?;
+        }
+        recorder.instance.status = RecorderStatus {
+            id,
+            state: RecorderState::Idle,
+            writer_state: RecorderWriterState::Starting,
+            sample_rate: request.format.sample_rate,
+            channels: request.format.channels,
+            ..RecorderStatus::default()
+        };
+        Ok(())
+    }
+}
+
+fn recorder_result(
+    id: RecorderId,
+    request: &RecorderCreateRequest,
+    raw: crate::router::RecorderResult,
+) -> RecorderResult {
+    RecorderResult {
+        id,
+        temporary_path: raw.temporary_path,
+        elapsed_frames: raw.frames_written,
+        sample_rate: request.format.sample_rate,
+        channels: request.format.channels,
+        frames_written: raw.frames_written,
+        dropped_frames: raw.dropped_frames,
+        file_bytes: raw.file_bytes,
+    }
+}
+
+fn update_recorder_status(status: &mut RecorderStatus, result: &RecorderResult) {
+    status.elapsed_frames = result.elapsed_frames;
+    status.frames_written = result.frames_written;
+    status.dropped_frames = result.dropped_frames;
+    status.file_bytes = result.file_bytes;
+    status.sample_rate = result.sample_rate;
+    status.channels = result.channels;
+    status.temporary_path = Some(result.temporary_path.clone());
+    status.error = None;
+    status.writer_state = RecorderWriterState::Finished;
 }
 
 /// Effects on Windows.

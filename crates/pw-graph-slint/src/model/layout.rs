@@ -165,6 +165,7 @@ pub(crate) fn node_layout_key(node: &Node) -> String {
     let kind = match node.node_type {
         NodeType::PipeWire => "PipeWire",
         NodeType::Effect => "Effect",
+        NodeType::Recorder => "Recorder",
         NodeType::AlsaMidi => "AlsaMidi",
         NodeType::WindowsAudioEndpoint => "WindowsAudioEndpoint",
         NodeType::WindowsAudioSession => "WindowsAudioSession",
@@ -202,6 +203,7 @@ pub(crate) fn node_layout_legacy_key(node: &Node) -> String {
     let kind = match node.node_type {
         NodeType::PipeWire => "PipeWire",
         NodeType::Effect => "Effect",
+        NodeType::Recorder => "Recorder",
         NodeType::AlsaMidi => "AlsaMidi",
         NodeType::WindowsAudioEndpoint => "WindowsAudioEndpoint",
         NodeType::WindowsAudioSession => "WindowsAudioSession",

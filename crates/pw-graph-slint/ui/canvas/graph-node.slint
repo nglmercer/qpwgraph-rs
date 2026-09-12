@@ -2,6 +2,7 @@ import { NodeAudioControl, NodeMeter } from "../components/node-audio.slint";
 import { UiTheme } from "../foundation/theme.slint";
 import { UiI18n } from "../foundation/i18n.slint";
 import { NodeRow } from "../foundation/structs.slint";
+import { ActionButton } from "../components/button.slint";
 
 export component GraphNode inherits Rectangle {
     in property <NodeRow> data;
@@ -10,6 +11,10 @@ export component GraphNode inherits Rectangle {
     callback audio-volume-changed(int, float);
     callback audio-mute-toggled(int);
     callback collapse-toggled(int);
+    callback recorder-record(int);
+    callback recorder-stop(int);
+    callback recorder-save(int);
+    callback recorder-discard(int);
 
     x: data.x * 1px + root.offset-x;
     y: data.y * 1px + root.offset-y;
@@ -101,6 +106,49 @@ export component GraphNode inherits Rectangle {
             rms-position: data.meter-rms-position; peak-position: data.meter-peak-position;
             peak-supported: data.meter-peak-supported; rms-supported: data.meter-rms-supported;
             available: data.meter-available; label: data.meter-label; accent: data.accent;
+        }
+        if data.is-recorder: Rectangle {
+            x: 9px; y: 4px; width: parent.width - 18px; height: parent.height - 8px;
+            Text {
+                x: 0px; y: 0px; width: parent.width - 2px; height: 16px;
+                text: data.recorder-state == "recording"
+                    ? UiI18n.localized("canvas.recorder_recording")
+                    : data.recorder-state == "unsaved"
+                    ? UiI18n.localized("canvas.recorder_unsaved")
+                    : data.recorder-state == "error"
+                    ? UiI18n.localized("canvas.recorder_error")
+                    : UiI18n.localized("canvas.recorder_idle");
+                color: data.recorder-state == "recording" ? #ff8b82
+                    : data.recorder-state == "error" ? #ffb36b : #c6d3dc;
+                font-size: 9px * data.font-scale * UiTheme.node-scale;
+                vertical-alignment: center; overflow: elide;
+            }
+            Text {
+                x: 0px; y: 15px; width: parent.width - 2px; height: 16px;
+                text: data.recorder-elapsed + (data.recorder-dropped == "" ? "" : "  ⚠ " + data.recorder-dropped);
+                color: #dce7ee; font-size: 9px * data.font-scale * UiTheme.node-scale;
+                vertical-alignment: center; overflow: elide;
+            }
+            if data.recorder-state == "recording": ActionButton {
+                x: parent.width - 78px; y: 31px; width: 78px; height: 22px;
+                text: UiI18n.localized("canvas.recorder_stop");
+                clicked => { root.recorder-stop(data.id); }
+            }
+            if data.recorder-state == "unsaved": Rectangle {
+                x: parent.width - 151px; y: 31px; width: 151px; height: 22px;
+                ActionButton { x: 0px; y: 0px; width: 72px; height: 22px; text: UiI18n.localized("canvas.recorder_save"); clicked => { root.recorder-save(data.id); } }
+                ActionButton { x: 78px; y: 0px; width: 72px; height: 22px; text: UiI18n.localized("canvas.recorder_discard"); clicked => { root.recorder-discard(data.id); } }
+            }
+            if data.recorder-state == "idle": ActionButton {
+                x: parent.width - 78px; y: 31px; width: 78px; height: 22px;
+                text: UiI18n.localized("canvas.recorder_record");
+                clicked => { root.recorder-record(data.id); }
+            }
+            if data.recorder-state == "error": ActionButton {
+                x: parent.width - 78px; y: 31px; width: 78px; height: 22px;
+                text: UiI18n.localized("canvas.recorder_discard");
+                clicked => { root.recorder-discard(data.id); }
+            }
         }
     }
 

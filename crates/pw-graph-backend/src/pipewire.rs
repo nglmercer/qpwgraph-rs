@@ -19,6 +19,7 @@ use pw_graph_effects::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -33,15 +34,20 @@ mod links;
 mod metering;
 mod properties;
 mod readback;
+mod recorder;
 mod registry;
 #[cfg(all(target_os = "linux", feature = "relay"))]
 mod relay;
 #[cfg(all(target_os = "linux", feature = "relay"))]
 mod relay_driver;
 
+use crate::router::{
+    copy_recording_preserving_source, RecorderWriterState, DEFAULT_RECORDER_CAPACITY_MS,
+};
 use effect_topology::active_channel_mask;
 use effects::NativeEffect;
 use metering::{process_meter_buffer, MeterCallbackState, MeterHandle, MeterReadingState};
+use recorder::RecorderHandle;
 use registry::{
     classify_port_type, install_default_metadata_listener, install_registry_listener,
     MetadataBindings, NodeRecord, RegistryState,
@@ -77,6 +83,12 @@ struct PendingEffect {
     request: EffectCreateRequest,
 }
 
+struct NativeRecorder {
+    request: RecorderCreateRequest,
+    instance: RecorderInstance,
+    handle: RecorderHandle,
+}
+
 /// Property keys for the client-owned helper nodes (`pw_filter`s and meter
 /// streams). Shared by the effect, relay, and metering runtimes so a property
 /// name only needs to be spelled once.
@@ -96,6 +108,7 @@ const MEDIA_CATEGORY_FILTER: &str = "Filter";
 /// Node name given to our own metering streams. They are helper objects, so
 /// they are filtered back out of the graph the UI renders.
 const METER_NODE_PREFIX: &str = "qpwgraph-rs meter";
+const RECORDER_NODE_PREFIX: &str = "qpwgraph-rs recorder";
 
 /// How long a metering stream outlives the last request for it. Without a
 /// grace period, minimizing and immediately restoring the window would tear
@@ -138,6 +151,8 @@ pub struct PipewireDriver {
     state: Arc<Mutex<RegistryState>>,
     registry_dirty: Arc<AtomicBool>,
     meters: BTreeMap<NodeId, MeterHandle>,
+    /// Client-owned input streams and their asynchronous WAV writers.
+    recorders: BTreeMap<RecorderId, NativeRecorder>,
     meter_policy: MeterPolicy,
     /// Nodes the UI asked to measure, with the time of the last request so a
     /// stream can linger briefly instead of dying the moment a tooltip closes.
@@ -208,6 +223,7 @@ impl PipewireDriver {
             state,
             registry_dirty,
             meters: BTreeMap::new(),
+            recorders: BTreeMap::new(),
             meter_policy: MeterPolicy::default(),
             meter_requests: BTreeMap::new(),
             epoch: Instant::now(),
@@ -323,6 +339,158 @@ impl PipewireDriver {
         Ok(())
     }
 
+    /// Recreate a finished recorder stream and keep its graph destination
+    /// usable for another take. PipeWire stream writers are deliberately
+    /// single-use: once the WAV worker has finalized, its sink cannot be
+    /// swapped from outside the realtime callback. Replacing the stream on
+    /// the control side gives the next take a fresh bounded sink while the
+    /// stable Rust recorder ID, name, position, and incoming graph edges are
+    /// retained.
+    ///
+    /// The caller must hold the ThreadLoop lock.
+    fn restart_recorder_locked(
+        &mut self,
+        id: RecorderId,
+        final_path: Option<std::path::PathBuf>,
+        remove_old_path: bool,
+    ) -> BackendResult<()> {
+        let old = self
+            .recorders
+            .remove(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let old_node_id = old.instance.node_id;
+        let old_input = old.instance.input_port;
+        let incoming: Vec<PortKey> = self
+            .graph
+            .links
+            .values()
+            .filter(|link| link.input_port == old_input)
+            .filter_map(|link| self.graph.port_key(link.output_port))
+            .collect();
+        let name = old.handle.name.clone();
+        let request = old.request.clone();
+        let position = self
+            .positions
+            .get(&old_node_id)
+            .copied()
+            .unwrap_or(request.position);
+        let old_path = old.handle.writer.temporary_path().to_owned();
+        drop(old);
+
+        // Let PipeWire observe destruction before publishing another stream
+        // with the same node.name. This also removes links touching the old
+        // global port from the next graph snapshot.
+        self.roundtrip_locked()?;
+        self.rebuild_graph_locked()?;
+
+        let core = self.core()?.clone();
+        let capacity = request.capacity_frames.max(
+            (usize::try_from(request.format.sample_rate)
+                .unwrap_or(48_000)
+                .saturating_mul(DEFAULT_RECORDER_CAPACITY_MS as usize)
+                / 1_000)
+                .max(1),
+        );
+        let handle = RecorderHandle::create(
+            &core,
+            name.clone(),
+            request.format,
+            request.recording_dir.as_deref(),
+            capacity,
+        )?;
+        let temporary_path = handle.writer.temporary_path().to_owned();
+        self.recorders.insert(
+            id,
+            NativeRecorder {
+                request: request.clone(),
+                instance: RecorderInstance {
+                    id,
+                    node_id: NodeId(0),
+                    input_port: PortId(0),
+                    status: RecorderStatus {
+                        id,
+                        state: RecorderState::Idle,
+                        writer_state: RecorderWriterState::Starting,
+                        sample_rate: request.format.sample_rate,
+                        channels: request.format.channels,
+                        temporary_path: Some(temporary_path),
+                        final_path,
+                        queue_capacity: capacity,
+                        ..RecorderStatus::default()
+                    },
+                },
+                handle,
+            },
+        );
+
+        let publication = self.wait_for_publication(|driver| {
+            let Some(node) = driver.graph.nodes.values().find(|node| node.name == name) else {
+                return false;
+            };
+            driver.graph.ports.values().any(|port| {
+                port.node_id == node.id
+                    && port.direction.is_sink()
+                    && port.port_type == PortType::Audio
+            })
+        });
+        if let Err(error) = publication {
+            self.recorders.remove(&id);
+            let _ = self.roundtrip_locked();
+            let _ = self.rebuild_graph_locked();
+            return Err(error);
+        }
+        let (node_id, input_port) = {
+            let Some(node) = self.graph.nodes.values().find(|node| node.name == name) else {
+                self.recorders.remove(&id);
+                let _ = self.roundtrip_locked();
+                let _ = self.rebuild_graph_locked();
+                return Err(BackendError::native(
+                    "PipeWire did not publish the restarted recorder node",
+                ));
+            };
+            let Some(input_port) = node.ports.iter().copied().find(|port_id| {
+                self.graph.port(*port_id).is_some_and(|port| {
+                    port.direction.is_sink() && port.port_type == PortType::Audio
+                })
+            }) else {
+                self.recorders.remove(&id);
+                let _ = self.roundtrip_locked();
+                let _ = self.rebuild_graph_locked();
+                return Err(BackendError::native(
+                    "PipeWire did not publish the restarted recorder input port",
+                ));
+            };
+            (node.id, input_port)
+        };
+
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .expect("restarted recorder was inserted before publication");
+        recorder.instance.node_id = node_id;
+        recorder.instance.input_port = input_port;
+        self.positions.remove(&old_node_id);
+        self.positions.insert(node_id, position);
+        if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+            node.position = position;
+        }
+
+        // Stream destruction removes the native links. Recreate them from
+        // stable source keys where the source is still present; a vanished
+        // source is intentionally skipped and will not produce a phantom
+        // connection in the graph.
+        for output_key in incoming {
+            let Some(output) = self.graph.resolve_port_key(&output_key) else {
+                continue;
+            };
+            let _ = self.connect_locked(output, input_port);
+        }
+        if remove_old_path && old_path.exists() {
+            let _ = fs::remove_file(old_path);
+        }
+        Ok(())
+    }
+
     /// Reattach backend-owned effect instances to the global IDs PipeWire is
     /// currently using. A `pw_filter` has a stable Rust-side instance ID, but
     /// its node and port globals are assigned asynchronously and may change
@@ -416,6 +584,10 @@ impl PipewireDriver {
             }
             node_media_classes.insert(node_id, record.media_class.to_ascii_lowercase());
             let effect_instance_id = effect_nodes.get(&node_id);
+            let recorder = self
+                .recorders
+                .values()
+                .find(|recorder| recorder.handle.name == record.name);
             let client = record
                 .client_id
                 .and_then(|client_id| clients.get(&client_id));
@@ -445,7 +617,9 @@ impl PipewireDriver {
             let mut node = Node::new(
                 node_id,
                 &record.name,
-                if effect_instance_id.is_some() {
+                if recorder.is_some() {
+                    NodeType::Recorder
+                } else if effect_instance_id.is_some() {
                     NodeType::Effect
                 } else {
                     NodeType::PipeWire
@@ -1297,6 +1471,7 @@ impl Drop for PipewireDriver {
     fn drop(&mut self) {
         let guard = self.thread_loop.lock();
         self.meters.clear();
+        self.recorders.clear();
         // Each raw `pw_filter` owns callbacks on this loop, so destroy them
         // before releasing the registry/core that created their globals.
         #[cfg(all(target_os = "linux", feature = "relay"))]
@@ -1324,6 +1499,7 @@ impl GraphDriver for PipewireDriver {
             meters: true,
             effects: true,
             relay: cfg!(feature = "relay"),
+            recorders: true,
         }
     }
 
@@ -1418,7 +1594,7 @@ impl GraphDriver for PipewireDriver {
             .nodes
             .get(&node)
             .ok_or(GraphError::MissingNode(node))?;
-        if record.node_type == NodeType::Effect {
+        if matches!(record.node_type, NodeType::Effect | NodeType::Recorder) {
             return Ok(NodeAudioState::UNSUPPORTED);
         }
         // The `relay` field only exists with the `relay` feature; without it
@@ -1496,6 +1672,13 @@ impl GraphDriver for PipewireDriver {
     /// dirty flag covers every topology change.
     fn reports_graph_changes(&self) -> bool {
         true
+    }
+
+    fn is_node_type(&self, node_type: NodeType) -> bool {
+        matches!(
+            node_type,
+            NodeType::PipeWire | NodeType::Effect | NodeType::Recorder
+        )
     }
 
     fn is_port_type(&self, port_type: PortType) -> bool {
@@ -1598,6 +1781,369 @@ impl GraphDriver for PipewireDriver {
 /// Those filters publish no `Props`, so their volume and mute can neither be
 /// read nor written. Reporting them as unsupported keeps the card from
 /// offering a fader that does nothing and a mute button stuck on "unknown".
+impl RecorderDriver for PipewireDriver {
+    fn supports_recorders(&self) -> bool {
+        true
+    }
+
+    fn create_recorder(
+        &mut self,
+        request: RecorderCreateRequest,
+    ) -> BackendResult<RecorderInstance> {
+        let id = self
+            .recorders
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let name = format!("{RECORDER_NODE_PREFIX} {id}");
+        let format = request.format;
+        let directory = request.recording_dir.clone();
+        let capacity = request.capacity_frames.max(
+            (usize::try_from(format.sample_rate)
+                .unwrap_or(48_000)
+                .saturating_mul(DEFAULT_RECORDER_CAPACITY_MS as usize)
+                / 1_000)
+                .max(1),
+        );
+        self.with_loop(|driver| {
+            let core = driver.core()?.clone();
+            let handle = RecorderHandle::create(
+                &core,
+                name.clone(),
+                format,
+                directory.as_deref(),
+                capacity,
+            )?;
+            driver.recorders.insert(
+                id,
+                NativeRecorder {
+                    request: request.clone(),
+                    instance: RecorderInstance {
+                        id,
+                        node_id: NodeId(0),
+                        input_port: PortId(0),
+                        status: RecorderStatus {
+                            id,
+                            state: RecorderState::Idle,
+                            writer_state: RecorderWriterState::Starting,
+                            sample_rate: format.sample_rate,
+                            channels: format.channels,
+                            temporary_path: Some(handle.writer.temporary_path().to_owned()),
+                            queue_capacity: capacity,
+                            ..RecorderStatus::default()
+                        },
+                    },
+                    handle,
+                },
+            );
+            let published = driver.wait_for_publication(|driver| {
+                let Some(node) = driver.graph.nodes.values().find(|node| node.name == name) else {
+                    return false;
+                };
+                driver.graph.ports.values().any(|port| {
+                    port.node_id == node.id
+                        && port.direction.is_sink()
+                        && port.port_type == PortType::Audio
+                })
+            });
+            if let Err(error) = published {
+                driver.recorders.remove(&id);
+                return Err(error);
+            }
+            let Some(node) = driver.graph.nodes.values().find(|node| node.name == name) else {
+                driver.recorders.remove(&id);
+                return Err(BackendError::native(
+                    "PipeWire did not publish the recorder node",
+                ));
+            };
+            let Some(input_port) = node.ports.iter().copied().find(|port_id| {
+                driver.graph.port(*port_id).is_some_and(|port| {
+                    port.direction.is_sink() && port.port_type == PortType::Audio
+                })
+            }) else {
+                driver.recorders.remove(&id);
+                return Err(BackendError::native(
+                    "PipeWire did not publish the recorder input port",
+                ));
+            };
+            let recorder = driver
+                .recorders
+                .get_mut(&id)
+                .expect("recorder inserted before publication");
+            recorder.instance.node_id = node.id;
+            recorder.instance.input_port = input_port;
+            Ok(recorder.instance.clone())
+        })
+    }
+
+    fn remove_recorder(&mut self, id: RecorderId) -> BackendResult<()> {
+        let state = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if state.instance.status.state == RecorderState::Recording {
+            return Err(BackendError::native(
+                "stop or discard the recording before removing its node",
+            ));
+        }
+        if matches!(
+            state.instance.status.state,
+            RecorderState::Unsaved | RecorderState::Error
+        ) && state.instance.status.temporary_path.is_some()
+        {
+            return Err(BackendError::native(
+                "save or explicitly discard the pending recording before removing its node",
+            ));
+        }
+        self.with_loop(|driver| {
+            let recorder = driver
+                .recorders
+                .remove(&id)
+                .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+            let path = Some(recorder.handle.writer.temporary_path().to_owned());
+            drop(recorder);
+            if let Some(path) = path {
+                if path.exists() {
+                    std::fs::remove_file(path)
+                        .map_err(|error| BackendError::native(error.to_string()))?;
+                }
+            }
+            driver.sync()?;
+            Ok(())
+        })
+    }
+
+    fn start_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let (state, writer_state, final_path) = self
+            .recorders
+            .get(&id)
+            .map(|recorder| {
+                (
+                    recorder.instance.status.state,
+                    recorder.handle.status().writer_state,
+                    recorder.instance.status.final_path.clone(),
+                )
+            })
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if state == RecorderState::Recording {
+            return Err(BackendError::native("recorder is already recording"));
+        }
+        if state != RecorderState::Idle {
+            return Err(BackendError::native(
+                "save or discard the pending recording before starting again",
+            ));
+        }
+        if writer_state != crate::router::RecorderWriterState::Starting {
+            self.with_loop(|driver| {
+                driver.restart_recorder_locked(id, final_path, true)?;
+                let recorder = driver
+                    .recorders
+                    .get_mut(&id)
+                    .expect("restarted recorder was inserted before resuming");
+                recorder.handle.resume()?;
+                recorder.instance.status.state = RecorderState::Recording;
+                recorder.instance.status.writer_state = RecorderWriterState::Recording;
+                recorder.instance.status.final_path = None;
+                recorder.instance.status.error = None;
+                Ok(())
+            })
+        } else {
+            let recorder = self
+                .recorders
+                .get_mut(&id)
+                .expect("recorder was checked above");
+            recorder.handle.resume()?;
+            recorder.instance.status.state = RecorderState::Recording;
+            recorder.instance.status.writer_state = RecorderWriterState::Recording;
+            recorder.instance.status.final_path = None;
+            recorder.instance.status.error = None;
+            Ok(())
+        }
+    }
+
+    fn request_stop_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state != RecorderState::Recording {
+            return Err(BackendError::native("recorder is not recording"));
+        }
+        recorder.handle.request_stop()?;
+        // The writer drains asynchronously. Keep the public state as
+        // Recording until poll_recording observes the finalized result, so
+        // the UI cannot offer Save while the `.part` header is still open.
+        Ok(())
+    }
+
+    fn stop_recording(&mut self, id: RecorderId) -> BackendResult<RecorderResult> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state != RecorderState::Recording {
+            return Err(BackendError::native("recorder is not recording"));
+        }
+        let result = match recorder.handle.stop() {
+            Ok(result) => result,
+            Err(error) => {
+                recorder.instance.status.state = RecorderState::Error;
+                recorder.instance.status.error = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        recorder.instance.status.state = RecorderState::Unsaved;
+        recorder.instance.status.writer_state = RecorderWriterState::Finished;
+        recorder.instance.status.elapsed_frames = result.frames_written;
+        recorder.instance.status.frames_written = result.frames_written;
+        recorder.instance.status.dropped_frames = result.dropped_frames;
+        recorder.instance.status.file_bytes = result.file_bytes;
+        recorder.instance.status.temporary_path = Some(result.temporary_path.clone());
+        Ok(RecorderResult {
+            id,
+            temporary_path: result.temporary_path,
+            elapsed_frames: result.frames_written,
+            sample_rate: recorder.request.format.sample_rate,
+            channels: recorder.request.format.channels,
+            frames_written: result.frames_written,
+            dropped_frames: result.dropped_frames,
+            file_bytes: result.file_bytes,
+        })
+    }
+
+    fn save_recording(
+        &mut self,
+        id: RecorderId,
+        destination: &std::path::Path,
+    ) -> BackendResult<std::path::PathBuf> {
+        let recorder = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state == RecorderState::Recording {
+            return Err(BackendError::native("stop the recorder before saving it"));
+        }
+        if recorder.instance.status.state != RecorderState::Unsaved {
+            return Err(BackendError::native(
+                "recorder has no finished recording to save",
+            ));
+        }
+        let source = recorder
+            .instance
+            .status
+            .temporary_path
+            .clone()
+            .ok_or_else(|| BackendError::native("recorder has no pending recording"))?;
+        copy_recording_preserving_source(&source, destination)
+            .map_err(|error| BackendError::native(error.to_string()))?;
+        let destination = destination.to_owned();
+        self.with_loop(|driver| {
+            driver.restart_recorder_locked(id, Some(destination.clone()), false)?;
+            let recorder = driver
+                .recorders
+                .get_mut(&id)
+                .expect("restarted recorder was inserted before saving");
+            recorder.instance.status.state = RecorderState::Idle;
+            recorder.instance.status.writer_state = RecorderWriterState::Starting;
+            recorder.instance.status.final_path = Some(destination.clone());
+            recorder.instance.status.temporary_path = None;
+            recorder.instance.status.error = None;
+            Ok(())
+        })?;
+        fs::remove_file(&source).map_err(|error| BackendError::native(error.to_string()))?;
+        Ok(destination)
+    }
+
+    fn recorder_status(&self, id: RecorderId) -> BackendResult<RecorderStatus> {
+        let recorder = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let diagnostics = recorder.handle.status();
+        let mut status = recorder.instance.status.clone();
+        status.elapsed_frames = diagnostics.frames_written;
+        status.frames_written = diagnostics.frames_written;
+        status.dropped_frames = diagnostics.dropped_frames;
+        status.queue_depth = diagnostics.queue_depth;
+        status.queue_capacity = diagnostics.queue_capacity;
+        status.file_bytes = diagnostics.file_bytes;
+        status.error = diagnostics.last_error;
+        status.writer_state = diagnostics.writer_state;
+        if diagnostics.writer_state == crate::router::RecorderWriterState::Error {
+            status.state = RecorderState::Error;
+        }
+        if let Some(error) = recorder.handle.failure_message() {
+            status.state = RecorderState::Error;
+            status.error = Some(error.into());
+        }
+        Ok(status)
+    }
+
+    fn poll_recording(&mut self, id: RecorderId) -> BackendResult<Option<RecorderResult>> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let polled = recorder.handle.poll();
+        let Some(result) = (match polled {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.to_string();
+                recorder.instance.status.state = RecorderState::Error;
+                recorder.instance.status.error = Some(message.clone());
+                return Err(BackendError::native(message));
+            }
+        }) else {
+            return Ok(None);
+        };
+        recorder.instance.status.state = RecorderState::Unsaved;
+        recorder.instance.status.writer_state = RecorderWriterState::Finished;
+        recorder.instance.status.elapsed_frames = result.frames_written;
+        recorder.instance.status.frames_written = result.frames_written;
+        recorder.instance.status.dropped_frames = result.dropped_frames;
+        recorder.instance.status.file_bytes = result.file_bytes;
+        recorder.instance.status.temporary_path = Some(result.temporary_path.clone());
+        Ok(Some(RecorderResult {
+            id,
+            temporary_path: result.temporary_path,
+            elapsed_frames: result.frames_written,
+            sample_rate: recorder.request.format.sample_rate,
+            channels: recorder.request.format.channels,
+            frames_written: result.frames_written,
+            dropped_frames: result.dropped_frames,
+            file_bytes: result.file_bytes,
+        }))
+    }
+
+    fn discard_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let state = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if state.instance.status.state == RecorderState::Recording {
+            return Err(BackendError::native(
+                "stop the recorder before discarding it",
+            ));
+        }
+        self.with_loop(|driver| {
+            driver.restart_recorder_locked(id, None, true)?;
+            let recorder = driver
+                .recorders
+                .get_mut(&id)
+                .expect("restarted recorder was inserted before discard");
+            recorder.instance.status.state = RecorderState::Idle;
+            recorder.instance.status.writer_state = RecorderWriterState::Starting;
+            recorder.instance.status.temporary_path = None;
+            recorder.instance.status.final_path = None;
+            recorder.instance.status.error = None;
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
 fn is_relay_device_node(name: &str) -> bool {
     #[cfg(all(target_os = "linux", feature = "relay"))]
     {

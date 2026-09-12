@@ -8,6 +8,7 @@
 //! which is how the routing semantics are tested without a driver at all --
 //! the Phase 3 exit criterion in the parity roadmap.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::buffer::{ring, RingConsumer, RingProducer};
@@ -21,6 +22,23 @@ pub struct RingSource {
     /// Set by the producing side when its device goes away, so the router
     /// stops the route instead of treating a dead device as a quiet one.
     lost: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RingSource {
+    /// Make a second handle for the same single-consumer ring.
+    ///
+    /// The process-capture manager uses this only as a lease: the template
+    /// handle remains idle while the returned handle is the active router
+    /// consumer. Keeping the template lets a later route recovery obtain a
+    /// fresh handle without opening another operating-system capture.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn lease(&self) -> Self {
+        Self {
+            format: self.format,
+            consumer: self.consumer.clone(),
+            lost: Arc::clone(&self.lost),
+        }
+    }
 }
 
 /// The writing end of a [`RingSource`], held by the device thread.
@@ -62,6 +80,94 @@ pub fn ring_source(format: AudioFormat, capacity_frames: usize) -> (RingSource, 
         },
         RingSourceFeed { producer, lost },
     )
+}
+
+/// The capture side of a fixed-capacity process-loopback fan-out.
+///
+/// The feed vector is fixed before the capture worker starts. The worker only
+/// loads an atomic enable bit and writes to already allocated rings; adding or
+/// removing a consumer on the control thread therefore never takes a lock or
+/// allocates in the audio loop.
+pub struct RingSourceFanout {
+    feeds: Vec<RingSourceFeed>,
+    active: Arc<[AtomicBool]>,
+}
+
+/// Control handle for the active slots in [`RingSourceFanout`].
+#[derive(Clone)]
+pub struct RingSourceFanoutControl {
+    active: Arc<[AtomicBool]>,
+}
+
+impl RingSourceFanoutControl {
+    pub fn set_active(&self, slot: usize, active: bool) {
+        if let Some(flag) = self.active.get(slot) {
+            flag.store(active, Ordering::Release);
+        }
+    }
+
+    pub fn is_active(&self, slot: usize) -> bool {
+        self.active
+            .get(slot)
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    pub fn slots(&self) -> usize {
+        self.active.len()
+    }
+}
+
+impl RingSourceFanout {
+    /// Push one captured block to every currently active consumer.
+    ///
+    /// A full individual ring does not prevent another consumer from
+    /// receiving the block. Each consumer has its own bounded overflow
+    /// boundary, which is exactly what a slow Recorder or meter needs.
+    pub fn push(&mut self, samples: &[f32]) {
+        for (slot, feed) in self.feeds.iter_mut().enumerate() {
+            if self.active[slot].load(Ordering::Acquire) {
+                let _ = feed.push(samples);
+            }
+        }
+    }
+
+    pub fn mark_lost(&self) {
+        for feed in &self.feeds {
+            feed.mark_lost();
+        }
+    }
+}
+
+/// Allocate a bounded ring and producer for each fan-out slot.
+///
+/// `slots` is intentionally fixed for the lifetime of the capture. It is a
+/// control-plane capacity limit, not an audio queue: unused slots are
+/// disabled and consume only their preallocated bounded ring.
+pub fn ring_source_fanout(
+    format: AudioFormat,
+    capacity_frames: usize,
+    slots: usize,
+) -> (Vec<RingSource>, RingSourceFanout, RingSourceFanoutControl) {
+    let slots = slots.max(1);
+    let mut sources = Vec::with_capacity(slots);
+    let mut feeds = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        let (source, feed) = ring_source(format, capacity_frames);
+        sources.push(source);
+        feeds.push(feed);
+    }
+    let active: Arc<[AtomicBool]> = Arc::from(
+        (0..slots)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let fanout = RingSourceFanout {
+        feeds,
+        active: Arc::clone(&active),
+    };
+    let control = RingSourceFanoutControl { active };
+    (sources, fanout, control)
 }
 
 impl AudioSource for RingSource {
@@ -430,6 +536,23 @@ mod tests {
         let read = source.read(&mut block);
         assert_eq!(read.frames, 2);
         assert_eq!(block, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn a_fanout_delivers_one_capture_block_to_each_active_consumer() {
+        let (mut sources, mut fanout, control) = ring_source_fanout(STEREO, 64, 3);
+        control.set_active(0, true);
+        control.set_active(2, true);
+        fanout.push(&[1.0, 2.0, 3.0, 4.0]);
+
+        for slot in [0, 2] {
+            let mut block = [0.0; 4];
+            assert_eq!(sources[slot].read(&mut block).frames, 2);
+            assert_eq!(block, [1.0, 2.0, 3.0, 4.0]);
+        }
+        let mut inactive = [9.0; 4];
+        assert_eq!(sources[1].read(&mut inactive).frames, 0);
+        assert_eq!(inactive, [9.0; 4]);
     }
 
     #[test]

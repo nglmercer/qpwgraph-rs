@@ -55,6 +55,10 @@ export component NodeCanvas inherits Rectangle {
     callback audio-volume-changed(int, float);
     callback audio-mute-toggled(int);
     callback collapse-toggled(int);
+    callback recorder-record(int);
+    callback recorder-stop(int);
+    callback recorder-save(int);
+    callback recorder-discard(int);
 
     property <int> gesture: 0;
     property <int> reroute-anchor: 0;
@@ -370,6 +374,10 @@ export component NodeCanvas inherits Rectangle {
             audio-volume-changed(id, value) => { root.audio-volume-changed(id, value); }
             audio-mute-toggled(id) => { root.audio-mute-toggled(id); }
             collapse-toggled(id) => { root.collapse-toggled(id); }
+            recorder-record(id) => { root.recorder-record(id); }
+            recorder-stop(id) => { root.recorder-stop(id); }
+            recorder-save(id) => { root.recorder-save(id); }
+            recorder-discard(id) => { root.recorder-discard(id); }
         }
     }
 

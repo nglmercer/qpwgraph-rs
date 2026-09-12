@@ -5,7 +5,8 @@ use super::api::RelayDriver;
 use super::api::{
     BackendCapabilities, BackendError, BackendResult, EffectCreateRequest, EffectDriver,
     EffectEvent, EffectInsertRequest, EffectInstance, EffectNodeRequest, EffectTarget, GraphDriver,
-    NodeAudioControl, NodeAudioState, NodeCapabilities,
+    NodeAudioControl, NodeAudioState, NodeCapabilities, RecorderCreateRequest, RecorderDriver,
+    RecorderId, RecorderInstance, RecorderResult, RecorderState, RecorderStatus,
 };
 use pw_graph_core::{
     Direction, Graph, GraphError, Link, LinkId, Node, NodeId, NodeType, Port, PortId, PortKey,
@@ -16,6 +17,12 @@ use pw_graph_effects::{
     EffectPrepareRequest, EffectProcessor, EffectTicket, PreparedEffect,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use crate::router::{
+    save_recording as save_recording_file, RecorderSink, RecorderWriter,
+    DEFAULT_RECORDER_CAPACITY_MS,
+};
 
 /// Boost headroom, matching PipeWire so demo mode behaves like the real thing.
 const DEMO_MAX_VOLUME: f32 = 1.5;
@@ -35,6 +42,8 @@ pub struct DemoDriver {
     effect_loader: EffectComponentManager,
     pending_effects: BTreeMap<EffectTicket, EffectCreateRequest>,
     next_effect_id: u64,
+    recorders: BTreeMap<RecorderId, DemoRecorder>,
+    next_recorder_id: RecorderId,
     /// Suppression state used by backends that remember an explicit manual
     /// disconnect. Keeping it in the demo driver makes command rollback tests
     /// able to verify that unrelated pairs are not accidentally unsuppressed.
@@ -42,6 +51,14 @@ pub struct DemoDriver {
     /// Operations forced to fail. Boxed and absent by default so the common
     /// driver stays small; see [`DemoDriver::fail_connect_of`].
     forced_failures: Option<Box<ForcedFailures>>,
+}
+
+struct DemoRecorder {
+    instance: RecorderInstance,
+    request: RecorderCreateRequest,
+    sink: Option<RecorderSink>,
+    writer: Option<RecorderWriter>,
+    result: Option<RecorderResult>,
 }
 
 /// Operations a test wants the driver to refuse.
@@ -77,6 +94,8 @@ impl DemoDriver {
             effect_loader: EffectComponentManager::new(2, 16),
             pending_effects: BTreeMap::new(),
             next_effect_id: 1000,
+            recorders: BTreeMap::new(),
+            next_recorder_id: 1,
             suppressed_connections: Vec::new(),
             forced_failures: None,
         }
@@ -86,6 +105,7 @@ impl DemoDriver {
     /// backend gets this event from its registry; tests use it to model a
     /// destroy/recreate cycle without exposing the driver's private state.
     pub fn replace_graph(&mut self, graph: Graph) {
+        self.recorders.clear();
         self.next_link_id = graph.links.keys().map(|id| id.0).max().unwrap_or(0) + 1;
         self.graph = graph;
         self.observed_links.clear();
@@ -237,6 +257,10 @@ impl DemoDriver {
         let id = LinkId(self.next_link_id);
         self.next_link_id += 1;
         id
+    }
+
+    fn default_recording_directory() -> PathBuf {
+        std::env::temp_dir().join("qpwgraph-rs-recordings")
     }
 
     fn create_effect_node_internal(
@@ -679,6 +703,7 @@ impl GraphDriver for DemoDriver {
             meters: true,
             effects: true,
             relay: false,
+            recorders: true,
         }
     }
 
@@ -763,7 +788,7 @@ impl GraphDriver for DemoDriver {
             .nodes
             .get(&node)
             .ok_or(GraphError::MissingNode(node))?;
-        if record.node_type == NodeType::Effect {
+        if matches!(record.node_type, NodeType::Effect | NodeType::Recorder) {
             return Ok(NodeAudioState::UNSUPPORTED);
         }
         let control = self.audio_controls.get(&node).copied().unwrap_or_default();
@@ -789,6 +814,13 @@ impl GraphDriver for DemoDriver {
         &self.graph
     }
 
+    fn is_node_type(&self, node_type: NodeType) -> bool {
+        matches!(
+            node_type,
+            NodeType::PipeWire | NodeType::Effect | NodeType::Recorder
+        )
+    }
+
     fn allow_connection(&mut self, output: &PortKey, input: &PortKey) {
         self.suppressed_connections
             .retain(|pair| pair != &(output.clone(), input.clone()));
@@ -802,6 +834,337 @@ impl GraphDriver for DemoDriver {
             self.suppressed_connections
                 .push((output.clone(), input.clone()));
         }
+    }
+}
+
+impl RecorderDriver for DemoDriver {
+    fn supports_recorders(&self) -> bool {
+        true
+    }
+
+    fn create_recorder(
+        &mut self,
+        request: RecorderCreateRequest,
+    ) -> BackendResult<RecorderInstance> {
+        let id = self.next_recorder_id;
+        self.next_recorder_id = self.next_recorder_id.saturating_add(1);
+        let mut node_id = NodeId(self.next_effect_id);
+        while self.graph.nodes.contains_key(&node_id) {
+            self.next_effect_id = self.next_effect_id.saturating_add(1);
+            node_id = NodeId(self.next_effect_id);
+        }
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let input_port = PortId(self.next_effect_id);
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let name = if request.name.trim().is_empty() {
+            format!("Recorder {id}")
+        } else {
+            request.name.clone()
+        };
+        let mut node = Node::new(node_id, name, NodeType::Recorder);
+        node.position = request.position;
+        self.graph.add_node(node)?;
+        if let Err(error) = self.graph.add_port(Port::new(
+            input_port,
+            node_id,
+            "record",
+            Direction::Sink,
+            PortType::Audio,
+        )) {
+            self.graph.nodes.remove(&node_id);
+            return Err(error.into());
+        }
+        let status = RecorderStatus {
+            id,
+            state: RecorderState::Idle,
+            writer_state: crate::router::RecorderWriterState::Starting,
+            sample_rate: request.format.sample_rate,
+            channels: request.format.channels,
+            ..RecorderStatus::default()
+        };
+        let instance = RecorderInstance {
+            id,
+            node_id,
+            input_port,
+            status,
+        };
+        self.recorders.insert(
+            id,
+            DemoRecorder {
+                instance: instance.clone(),
+                request,
+                sink: None,
+                writer: None,
+                result: None,
+            },
+        );
+        Ok(instance)
+    }
+
+    fn remove_recorder(&mut self, id: RecorderId) -> BackendResult<()> {
+        let recorder = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state == RecorderState::Recording {
+            return Err(BackendError::native(
+                "stop or discard the recording before removing its node",
+            ));
+        }
+        if recorder.instance.status.temporary_path.is_some()
+            && matches!(
+                recorder.instance.status.state,
+                RecorderState::Unsaved | RecorderState::Error
+            )
+        {
+            return Err(BackendError::native(
+                "save or explicitly discard the pending recording before removing its node",
+            ));
+        }
+        let recorder = self
+            .recorders
+            .remove(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        self.graph
+            .links
+            .retain(|_, link| link.input_port != recorder.instance.input_port);
+        self.graph.ports.remove(&recorder.instance.input_port);
+        self.graph.nodes.remove(&recorder.instance.node_id);
+        Ok(())
+    }
+
+    fn start_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let directory = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?
+            .request
+            .recording_dir
+            .clone()
+            .unwrap_or_else(Self::default_recording_directory);
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state == RecorderState::Recording {
+            return Err(BackendError::native("recorder is already recording"));
+        }
+        if recorder.instance.status.state != RecorderState::Idle {
+            return Err(BackendError::native(
+                "save or discard the pending recording before starting again",
+            ));
+        }
+        let capacity = recorder.request.capacity_frames.max(
+            (usize::try_from(recorder.request.format.sample_rate)
+                .unwrap_or(48_000)
+                .saturating_mul(DEFAULT_RECORDER_CAPACITY_MS as usize)
+                / 1_000)
+                .max(1),
+        );
+        let (sink, writer) =
+            RecorderWriter::start_pending(directory, recorder.request.format, capacity)
+                .map_err(|error| BackendError::native(error.to_string()))?;
+        let path = writer.temporary_path().to_owned();
+        recorder.sink = Some(sink);
+        recorder.writer = Some(writer);
+        recorder.result = None;
+        recorder.instance.status = RecorderStatus {
+            id,
+            state: RecorderState::Recording,
+            writer_state: crate::router::RecorderWriterState::Recording,
+            sample_rate: recorder.request.format.sample_rate,
+            channels: recorder.request.format.channels,
+            temporary_path: Some(path),
+            queue_capacity: capacity,
+            ..RecorderStatus::default()
+        };
+        Ok(())
+    }
+
+    fn request_stop_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state != RecorderState::Recording {
+            return Err(BackendError::native("recorder is not recording"));
+        }
+        recorder
+            .writer
+            .as_mut()
+            .ok_or_else(|| BackendError::native("recorder is not recording"))?
+            .request_stop()
+            .map_err(|error| BackendError::native(error.to_string()))
+    }
+
+    fn stop_recording(&mut self, id: RecorderId) -> BackendResult<RecorderResult> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let writer = recorder
+            .writer
+            .as_mut()
+            .ok_or_else(|| BackendError::native("recorder is not recording"))?;
+        let result = writer
+            .finish()
+            .map_err(|error| BackendError::native(error.to_string()))?;
+        let result = RecorderResult {
+            id,
+            temporary_path: result.temporary_path,
+            elapsed_frames: result.frames_written,
+            sample_rate: recorder.request.format.sample_rate,
+            channels: recorder.request.format.channels,
+            frames_written: result.frames_written,
+            dropped_frames: result.dropped_frames,
+            file_bytes: result.file_bytes,
+        };
+        recorder.instance.status.state = RecorderState::Unsaved;
+        recorder.instance.status.writer_state = crate::router::RecorderWriterState::Finished;
+        recorder.instance.status.elapsed_frames = result.elapsed_frames;
+        recorder.instance.status.frames_written = result.frames_written;
+        recorder.instance.status.dropped_frames = result.dropped_frames;
+        recorder.instance.status.file_bytes = result.file_bytes;
+        recorder.instance.status.temporary_path = Some(result.temporary_path.clone());
+        recorder.result = Some(result.clone());
+        Ok(result)
+    }
+
+    fn save_recording(
+        &mut self,
+        id: RecorderId,
+        destination: &std::path::Path,
+    ) -> BackendResult<PathBuf> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state == RecorderState::Recording {
+            return Err(BackendError::native("stop the recorder before saving it"));
+        }
+        if recorder.instance.status.state != RecorderState::Unsaved {
+            return Err(BackendError::native(
+                "recorder has no finished recording to save",
+            ));
+        }
+        let source = recorder
+            .instance
+            .status
+            .temporary_path
+            .clone()
+            .ok_or_else(|| BackendError::native("recorder has no pending recording"))?;
+        if let Some(writer) = recorder.writer.as_mut() {
+            if writer.status().writer_state != crate::router::RecorderWriterState::Finished {
+                let _ = writer
+                    .finish()
+                    .map_err(|error| BackendError::native(error.to_string()))?;
+            }
+        }
+        save_recording_file(&source, destination)
+            .map_err(|error| BackendError::native(error.to_string()))?;
+        let destination = destination.to_owned();
+        recorder.sink = None;
+        recorder.writer = None;
+        recorder.result = None;
+        recorder.instance.status.state = RecorderState::Idle;
+        recorder.instance.status.writer_state = crate::router::RecorderWriterState::Starting;
+        recorder.instance.status.final_path = Some(destination.clone());
+        recorder.instance.status.temporary_path = None;
+        Ok(destination)
+    }
+
+    fn recorder_status(&self, id: RecorderId) -> BackendResult<RecorderStatus> {
+        let recorder = self
+            .recorders
+            .get(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let mut status = recorder.instance.status.clone();
+        if let Some(writer) = recorder.writer.as_ref() {
+            let diagnostics = writer.status();
+            status.elapsed_frames = diagnostics.frames_written;
+            status.frames_written = diagnostics.frames_written;
+            status.dropped_frames = diagnostics.dropped_frames;
+            status.queue_depth = diagnostics.queue_depth;
+            status.queue_capacity = diagnostics.queue_capacity;
+            status.file_bytes = diagnostics.file_bytes;
+            status.error = diagnostics.last_error;
+            status.writer_state = diagnostics.writer_state;
+            if diagnostics.writer_state == crate::router::RecorderWriterState::Error {
+                status.state = RecorderState::Error;
+            }
+        }
+        Ok(status)
+    }
+
+    fn poll_recording(&mut self, id: RecorderId) -> BackendResult<Option<RecorderResult>> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        let Some(writer) = recorder.writer.as_mut() else {
+            return Ok(None);
+        };
+        let polled = writer.poll();
+        let Some(result) = (match polled {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.to_string();
+                recorder.instance.status.state = RecorderState::Error;
+                recorder.instance.status.error = Some(message.clone());
+                return Err(BackendError::native(message));
+            }
+        }) else {
+            return Ok(None);
+        };
+        let result = RecorderResult {
+            id,
+            temporary_path: result.temporary_path,
+            elapsed_frames: result.frames_written,
+            sample_rate: recorder.request.format.sample_rate,
+            channels: recorder.request.format.channels,
+            frames_written: result.frames_written,
+            dropped_frames: result.dropped_frames,
+            file_bytes: result.file_bytes,
+        };
+        recorder.instance.status.state = RecorderState::Unsaved;
+        recorder.instance.status.writer_state = crate::router::RecorderWriterState::Finished;
+        recorder.instance.status.elapsed_frames = result.elapsed_frames;
+        recorder.instance.status.frames_written = result.frames_written;
+        recorder.instance.status.dropped_frames = result.dropped_frames;
+        recorder.instance.status.file_bytes = result.file_bytes;
+        recorder.instance.status.temporary_path = Some(result.temporary_path.clone());
+        recorder.result = Some(result.clone());
+        Ok(Some(result))
+    }
+
+    fn discard_recording(&mut self, id: RecorderId) -> BackendResult<()> {
+        let recorder = self
+            .recorders
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state == RecorderState::Recording {
+            return Err(BackendError::native(
+                "stop the recorder before discarding it",
+            ));
+        }
+        if let Some(path) = recorder.instance.status.temporary_path.take() {
+            if path.exists() {
+                std::fs::remove_file(path)
+                    .map_err(|error| BackendError::native(error.to_string()))?;
+            }
+        }
+        recorder.sink = None;
+        recorder.writer = None;
+        recorder.result = None;
+        recorder.instance.status = RecorderStatus {
+            id,
+            state: RecorderState::Idle,
+            writer_state: crate::router::RecorderWriterState::Starting,
+            sample_rate: recorder.request.format.sample_rate,
+            channels: recorder.request.format.channels,
+            ..RecorderStatus::default()
+        };
+        Ok(())
     }
 }
 

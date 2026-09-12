@@ -6,6 +6,7 @@
 //! one its group does not mention.
 
 use super::*;
+use pw_graph_config::RecordingSaveMode;
 
 /// Resolve localized strings through the application's `I18n`.
 pub(super) fn install_i18n(window: &MainWindow, app: &Rc<RefCell<Application>>) {
@@ -71,6 +72,18 @@ pub(super) fn apply_window_state(
     window.set_thumbnail_view(application.view.thumbnail_mode);
     window.set_language_index(language_index(&application.config.language));
     window.set_meter_policy_index(meter_policy_index(meter_policy));
+    window.set_recording_save_mode_index(
+        (RecordingSaveMode::parse(&application.config.recording_save_mode)
+            == RecordingSaveMode::AutoSave) as i32,
+    );
+    window.set_recording_directory(SharedString::from(
+        application
+            .config
+            .recording_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    ));
     window.set_ui_text_scale(application.config.ui_text_scale);
     window.set_panel_text_scale(application.config.panel_text_scale);
     window.set_node_text_scale(application.config.node_text_scale);

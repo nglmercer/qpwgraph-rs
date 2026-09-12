@@ -10,6 +10,29 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecordingSaveMode {
+    #[default]
+    AskOnStop,
+    AutoSave,
+}
+
+impl RecordingSaveMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AskOnStop => "ask",
+            Self::AutoSave => "auto",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "autosave" | "auto-save" => Self::AutoSave,
+            _ => Self::AskOnStop,
+        }
+    }
+}
+
 /// Windows-only behavior is persisted on every platform so a configuration
 /// remains portable, but non-Windows backends simply ignore this table.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -483,6 +506,16 @@ pub struct AppConfig {
     /// qpwgraph XML format, which has no portable representation for DSP
     /// modules.
     pub effects: Vec<PersistedEffect>,
+    /// Directory used for automatic saves and as the initial directory for
+    /// the native Save dialog. Active recordings are never persisted here.
+    #[serde(default)]
+    pub recording_dir: Option<PathBuf>,
+    #[serde(default = "default_recording_save_mode")]
+    pub recording_save_mode: String,
+    #[serde(default = "default_recording_filename_template")]
+    pub recording_filename_template: String,
+    #[serde(default = "default_recording_format")]
+    pub recording_format: String,
     #[serde(default)]
     pub windows: WindowsConfig,
     #[serde(default)]
@@ -643,6 +676,15 @@ fn default_true() -> bool {
 fn default_playback_gain() -> f32 {
     1.0
 }
+fn default_recording_save_mode() -> String {
+    RecordingSaveMode::AskOnStop.as_str().into()
+}
+fn default_recording_filename_template() -> String {
+    "Recording {date} {time}".into()
+}
+fn default_recording_format() -> String {
+    "wav-f32".into()
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PersistedEffect {
@@ -699,6 +741,10 @@ impl Default for AppConfig {
             patchbay_profiles: std::collections::BTreeMap::new(),
             active_patchbay_profile: "default".into(),
             effects: Vec::new(),
+            recording_dir: None,
+            recording_save_mode: default_recording_save_mode(),
+            recording_filename_template: default_recording_filename_template(),
+            recording_format: default_recording_format(),
             windows: WindowsConfig::default(),
             windows_application_routes: Vec::new(),
             relay_device_id: String::new(),
@@ -914,6 +960,37 @@ mod tests {
         expected.save_to(&path).unwrap();
         assert_eq!(AppConfig::load_from(&path).unwrap(), expected);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recording_defaults_and_save_mode_are_backward_compatible() {
+        let defaults = AppConfig::default();
+        assert_eq!(defaults.recording_dir, None);
+        assert_eq!(defaults.recording_save_mode, "ask");
+        assert_eq!(
+            defaults.recording_filename_template,
+            "Recording {date} {time}"
+        );
+        assert_eq!(defaults.recording_format, "wav-f32");
+        assert_eq!(
+            RecordingSaveMode::parse(&defaults.recording_save_mode),
+            RecordingSaveMode::AskOnStop
+        );
+        assert_eq!(
+            RecordingSaveMode::parse("AUTO"),
+            RecordingSaveMode::AutoSave
+        );
+
+        let config: AppConfig = toml::from_str("language = 'en'\n").unwrap();
+        assert_eq!(config.recording_save_mode, "ask");
+        assert_eq!(config.recording_format, "wav-f32");
+
+        let auto: AppConfig =
+            toml::from_str("language = 'en'\nrecording_save_mode = 'auto'\n").unwrap();
+        assert_eq!(
+            RecordingSaveMode::parse(&auto.recording_save_mode),
+            RecordingSaveMode::AutoSave
+        );
     }
 
     #[test]
