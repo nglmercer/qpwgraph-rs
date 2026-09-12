@@ -624,6 +624,9 @@ fn node_row(
         .filter(|status| status.dropped_frames != 0)
         .map(|status| status.dropped_frames.to_string())
         .unwrap_or_default();
+    let recorder_error = recorder_status
+        .and_then(|status| status.error.clone())
+        .unwrap_or_default();
     NodeRow {
         id: node.id,
         node_title: SharedString::from(compact_label(&display_node_name(&node.title, i18n), 22)),
@@ -652,6 +655,7 @@ fn node_row(
         recorder_state: SharedString::from(recorder_state),
         recorder_elapsed: SharedString::from(recorder_elapsed),
         recorder_dropped: SharedString::from(recorder_dropped),
+        recorder_error: SharedString::from(recorder_error),
         has_meter: node.audio.capabilities.has_any_meter(),
         meter_rms: node.meter.rms,
         meter_peak: node.meter.peak,

@@ -24,7 +24,9 @@ export component GraphNode inherits Rectangle {
     clip: false;
     accessible-role: list-item;
     accessible-label: data.node-title;
-    accessible-description: data.selected ? UiI18n.localized("canvas.selected") : "";
+    accessible-description: data.recorder-error != ""
+        ? data.recorder-error
+        : data.selected ? UiI18n.localized("canvas.selected") : "";
 
     Rectangle {
         width: 100%;
@@ -125,8 +127,11 @@ export component GraphNode inherits Rectangle {
             }
             Text {
                 x: 0px; y: 15px; width: parent.width - 2px; height: 16px;
-                text: data.recorder-elapsed + (data.recorder-dropped == "" ? "" : "  ⚠ " + data.recorder-dropped);
-                color: #dce7ee; font-size: 9px * data.font-scale * UiTheme.node-scale;
+                text: data.recorder-error != ""
+                    ? data.recorder-error
+                    : data.recorder-elapsed + (data.recorder-dropped == "" ? "" : "  ⚠ " + data.recorder-dropped);
+                color: data.recorder-error != "" ? #ffb36b : #dce7ee;
+                font-size: (data.recorder-error != "" ? 8px : 9px) * data.font-scale * UiTheme.node-scale;
                 vertical-alignment: center; overflow: elide;
             }
             if data.recorder-state == "recording": ActionButton {

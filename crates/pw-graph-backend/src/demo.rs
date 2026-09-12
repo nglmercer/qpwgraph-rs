@@ -1055,13 +1055,18 @@ impl RecorderDriver for DemoDriver {
             .ok_or_else(|| BackendError::native("recorder has no pending recording"))?;
         if let Some(writer) = recorder.writer.as_mut() {
             if writer.status().writer_state != crate::router::RecorderWriterState::Finished {
-                let _ = writer
-                    .finish()
-                    .map_err(|error| BackendError::native(error.to_string()))?;
+                if let Err(error) = writer.finish() {
+                    let message = error.to_string();
+                    recorder.instance.status.error = Some(message.clone());
+                    return Err(BackendError::native(message));
+                }
             }
         }
-        save_recording_file(&source, destination)
-            .map_err(|error| BackendError::native(error.to_string()))?;
+        if let Err(error) = save_recording_file(&source, destination) {
+            let message = error.to_string();
+            recorder.instance.status.error = Some(message.clone());
+            return Err(BackendError::native(message));
+        }
         let destination = destination.to_owned();
         recorder.sink = None;
         recorder.writer = None;
@@ -1070,6 +1075,7 @@ impl RecorderDriver for DemoDriver {
         recorder.instance.status.writer_state = crate::router::RecorderWriterState::Starting;
         recorder.instance.status.final_path = Some(destination.clone());
         recorder.instance.status.temporary_path = None;
+        recorder.instance.status.error = None;
         Ok(destination)
     }
 
@@ -1087,7 +1093,7 @@ impl RecorderDriver for DemoDriver {
             status.queue_depth = diagnostics.queue_depth;
             status.queue_capacity = diagnostics.queue_capacity;
             status.file_bytes = diagnostics.file_bytes;
-            status.error = diagnostics.last_error;
+            status.error = diagnostics.last_error.or(status.error);
             status.writer_state = diagnostics.writer_state;
             if diagnostics.writer_state == crate::router::RecorderWriterState::Error {
                 status.state = RecorderState::Error;
@@ -1096,11 +1102,21 @@ impl RecorderDriver for DemoDriver {
         Ok(status)
     }
 
+    fn recorder_instance(&self, id: RecorderId) -> BackendResult<RecorderInstance> {
+        self.recorders
+            .get(&id)
+            .map(|recorder| recorder.instance.clone())
+            .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))
+    }
+
     fn poll_recording(&mut self, id: RecorderId) -> BackendResult<Option<RecorderResult>> {
         let recorder = self
             .recorders
             .get_mut(&id)
             .ok_or_else(|| BackendError::native(format!("unknown recorder {id}")))?;
+        if recorder.instance.status.state != RecorderState::Recording {
+            return Ok(None);
+        }
         let Some(writer) = recorder.writer.as_mut() else {
             return Ok(None);
         };

@@ -252,6 +252,16 @@ pub trait RecorderDriver {
         ))
     }
 
+    /// Return the backend-authoritative runtime identity for a recorder. A
+    /// native stream may be recreated after saving or discarding, so its graph
+    /// node and input-port IDs are not guaranteed to remain unchanged even
+    /// though the public [`RecorderId`] does.
+    fn recorder_instance(&self, _id: RecorderId) -> BackendResult<RecorderInstance> {
+        Err(BackendError::unsupported(
+            "recording is not available for this backend",
+        ))
+    }
+
     fn recorder_status(&self, _id: RecorderId) -> BackendResult<RecorderStatus> {
         Err(BackendError::unsupported(
             "recording is not available for this backend",

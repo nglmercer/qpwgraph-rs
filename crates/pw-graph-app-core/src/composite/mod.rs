@@ -500,23 +500,35 @@ impl RecorderDriver for CompositeDriver {
         match owner {
             CompositeRoute::PipeWire => {
                 #[cfg(all(target_os = "linux", feature = "pipewire"))]
-                return self
-                    .pipewire
-                    .as_mut()
-                    .ok_or_else(|| {
-                        BackendError::Unsupported("PipeWire backend is unavailable".into())
-                    })?
-                    .start_recording(id);
+                {
+                    let result = self
+                        .pipewire
+                        .as_mut()
+                        .ok_or_else(|| {
+                            BackendError::Unsupported("PipeWire backend is unavailable".into())
+                        })?
+                        .start_recording(id);
+                    if result.is_ok() {
+                        let _ = self.rebuild_merged_graph();
+                    }
+                    return result;
+                }
             }
             CompositeRoute::WindowsAudio => {
                 #[cfg(target_os = "windows")]
-                return self
-                    .windows_audio
-                    .as_mut()
-                    .ok_or_else(|| {
-                        BackendError::Unsupported("Windows audio backend is unavailable".into())
-                    })?
-                    .start_recording(id);
+                {
+                    let result = self
+                        .windows_audio
+                        .as_mut()
+                        .ok_or_else(|| {
+                            BackendError::Unsupported("Windows audio backend is unavailable".into())
+                        })?
+                        .start_recording(id);
+                    if result.is_ok() {
+                        let _ = self.rebuild_merged_graph();
+                    }
+                    return result;
+                }
             }
             _ => {}
         }
@@ -610,23 +622,35 @@ impl RecorderDriver for CompositeDriver {
         match owner {
             CompositeRoute::PipeWire => {
                 #[cfg(all(target_os = "linux", feature = "pipewire"))]
-                return self
-                    .pipewire
-                    .as_mut()
-                    .ok_or_else(|| {
-                        BackendError::Unsupported("PipeWire backend is unavailable".into())
-                    })?
-                    .save_recording(id, destination);
+                {
+                    let result = self
+                        .pipewire
+                        .as_mut()
+                        .ok_or_else(|| {
+                            BackendError::Unsupported("PipeWire backend is unavailable".into())
+                        })?
+                        .save_recording(id, destination);
+                    if result.is_ok() {
+                        let _ = self.rebuild_merged_graph();
+                    }
+                    return result;
+                }
             }
             CompositeRoute::WindowsAudio => {
                 #[cfg(target_os = "windows")]
-                return self
-                    .windows_audio
-                    .as_mut()
-                    .ok_or_else(|| {
-                        BackendError::Unsupported("Windows audio backend is unavailable".into())
-                    })?
-                    .save_recording(id, destination);
+                {
+                    let result = self
+                        .windows_audio
+                        .as_mut()
+                        .ok_or_else(|| {
+                            BackendError::Unsupported("Windows audio backend is unavailable".into())
+                        })?
+                        .save_recording(id, destination);
+                    if result.is_ok() {
+                        let _ = self.rebuild_merged_graph();
+                    }
+                    return result;
+                }
             }
             _ => {}
         }
@@ -664,6 +688,43 @@ impl RecorderDriver for CompositeDriver {
                         BackendError::Unsupported("Windows audio backend is unavailable".into())
                     })?
                     .recorder_status(id);
+            }
+            _ => {}
+        }
+        Err(BackendError::Unsupported(
+            "recorder backend is unavailable".into(),
+        ))
+    }
+
+    fn recorder_instance(
+        &self,
+        id: pw_graph_backend::RecorderId,
+    ) -> BackendResult<pw_graph_backend::RecorderInstance> {
+        let owner = self
+            .recorder_owners
+            .get(&id)
+            .copied()
+            .ok_or_else(|| BackendError::Native(format!("unknown recorder {id}")))?;
+        match owner {
+            CompositeRoute::PipeWire => {
+                #[cfg(all(target_os = "linux", feature = "pipewire"))]
+                return self
+                    .pipewire
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("PipeWire backend is unavailable".into())
+                    })?
+                    .recorder_instance(id);
+            }
+            CompositeRoute::WindowsAudio => {
+                #[cfg(target_os = "windows")]
+                return self
+                    .windows_audio
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("Windows audio backend is unavailable".into())
+                    })?
+                    .recorder_instance(id);
             }
             _ => {}
         }
@@ -718,23 +779,35 @@ impl RecorderDriver for CompositeDriver {
         match owner {
             CompositeRoute::PipeWire => {
                 #[cfg(all(target_os = "linux", feature = "pipewire"))]
-                return self
-                    .pipewire
-                    .as_mut()
-                    .ok_or_else(|| {
-                        BackendError::Unsupported("PipeWire backend is unavailable".into())
-                    })?
-                    .discard_recording(id);
+                {
+                    let result = self
+                        .pipewire
+                        .as_mut()
+                        .ok_or_else(|| {
+                            BackendError::Unsupported("PipeWire backend is unavailable".into())
+                        })?
+                        .discard_recording(id);
+                    if result.is_ok() {
+                        let _ = self.rebuild_merged_graph();
+                    }
+                    return result;
+                }
             }
             CompositeRoute::WindowsAudio => {
                 #[cfg(target_os = "windows")]
-                return self
-                    .windows_audio
-                    .as_mut()
-                    .ok_or_else(|| {
-                        BackendError::Unsupported("Windows audio backend is unavailable".into())
-                    })?
-                    .discard_recording(id);
+                {
+                    let result = self
+                        .windows_audio
+                        .as_mut()
+                        .ok_or_else(|| {
+                            BackendError::Unsupported("Windows audio backend is unavailable".into())
+                        })?
+                        .discard_recording(id);
+                    if result.is_ok() {
+                        let _ = self.rebuild_merged_graph();
+                    }
+                    return result;
+                }
             }
             _ => {}
         }

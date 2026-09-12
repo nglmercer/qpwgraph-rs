@@ -71,10 +71,10 @@ pub use meter::MeterReading;
 pub use recorder::{
     copy_recording, copy_recording_preserving_source, default_recording_filename,
     pending_recording_dir, read_wav_header, recover_pending_recordings, render_recording_filename,
-    repair_wav_header, save_recording, scan_pending_recordings, unique_recording_path,
-    RecorderDiagnostics, RecorderError, RecorderResult, RecorderSink, RecorderWriter,
-    RecorderWriterState, RecoveredRecording, WavHeader, WavWriter, DEFAULT_RECORDER_CAPACITY_MS,
-    MAX_RIFF_DATA_BYTES,
+    repair_wav_header, replace_recording_preserving_source, save_recording,
+    scan_pending_recordings, unique_recording_path, RecorderDiagnostics, RecorderError,
+    RecorderResult, RecorderSink, RecorderWriter, RecorderWriterState, RecoveredRecording,
+    WavHeader, WavWriter, DEFAULT_RECORDER_CAPACITY_MS, MAX_RIFF_DATA_BYTES,
 };
 pub use thread::{RouterStopped, RouterThread};
 

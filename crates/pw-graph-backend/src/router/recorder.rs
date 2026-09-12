@@ -421,6 +421,23 @@ impl RecorderWriter {
     }
 
     pub fn poll(&mut self) -> Result<Option<RecorderResult>, RecorderError> {
+        // A completed writer has already delivered its result and joined its
+        // worker. Polling it again is a normal no-op: the recorder may remain
+        // visible in the graph while the user decides whether to save or
+        // discard the finished take.
+        if self.worker.is_none() {
+            return match self.status().writer_state {
+                RecorderWriterState::Finished => Ok(None),
+                RecorderWriterState::Error => Err(self
+                    .status()
+                    .last_error
+                    .map(RecorderError::Writer)
+                    .unwrap_or_else(|| RecorderError::Writer("writer failed".into()))),
+                RecorderWriterState::Starting
+                | RecorderWriterState::Recording
+                | RecorderWriterState::Stopping => Ok(None),
+            };
+        }
         match self.result_rx.try_recv() {
             Ok(result) => {
                 self.join_worker()?;
@@ -1016,13 +1033,131 @@ pub fn copy_recording_preserving_source(
     Ok(())
 }
 
+/// Replace a user-selected recording destination without touching the source
+/// until the replacement is complete. The payload is copied to a sibling
+/// temporary file, flushed to the filesystem, and then renamed into place.
+/// Keeping the temporary beside the destination also keeps the replacement on
+/// one filesystem, which makes the final rename atomic on Unix.
+pub fn replace_recording_preserving_source(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<(), RecorderError> {
+    let source = source.as_ref();
+    let destination = destination.as_ref();
+    if source == destination {
+        return Err(RecorderError::InvalidPath(
+            "recording source and destination are identical".into(),
+        ));
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| RecorderError::InvalidPath("destination has no parent".into()))?;
+    fs::create_dir_all(parent)?;
+    let (temporary, mut output) = temporary_destination_file(destination)?;
+    let result: io::Result<()> = (|| {
+        let mut input = File::open(source)?;
+        io::copy(&mut input, &mut output)?;
+        output.flush()?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    drop(output);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    if let Err(error) = replace_destination(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn temporary_destination_file(destination: &Path) -> Result<(PathBuf, File), RecorderError> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| RecorderError::InvalidPath("destination has no parent".into()))?;
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| RecorderError::InvalidPath("destination has no file name".into()))?;
+    for _ in 0..128 {
+        let mut temporary_name = file_name.to_os_string();
+        temporary_name.push(format!(".qpwgraph-{}.tmp", recording_id()));
+        let temporary = parent.join(temporary_name);
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(RecorderError::InvalidPath(
+        "could not allocate a temporary recording destination".into(),
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_destination(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_destination(temporary: &Path, destination: &Path) -> io::Result<()> {
+    if !destination.exists() {
+        return fs::rename(temporary, destination);
+    }
+
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = destination.file_name().unwrap_or_default();
+    let mut backup = None;
+    for _ in 0..128 {
+        let mut backup_name = file_name.to_os_string();
+        backup_name.push(format!(".qpwgraph-backup-{}.tmp", recording_id()));
+        let candidate = parent.join(backup_name);
+        if !candidate.exists() {
+            backup = Some(candidate);
+            break;
+        }
+    }
+    let backup = backup.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a temporary recording backup",
+        )
+    })?;
+    fs::rename(destination, &backup)?;
+    match fs::rename(temporary, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, destination);
+            Err(error)
+        }
+    }
+}
+
 pub fn copy_recording(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
 ) -> Result<(), RecorderError> {
     let source = source.as_ref();
-    copy_recording_preserving_source(source, destination)?;
-    fs::remove_file(source)?;
+    replace_recording_preserving_source(source, destination)?;
+    // The destination is the user's saved recording. If cleanup is denied,
+    // keep reporting Save success rather than claiming that the destination
+    // was not written; the leftover .part remains recoverable on the next
+    // startup.
+    let _ = fs::remove_file(source);
     Ok(())
 }
 
@@ -1118,6 +1253,21 @@ mod tests {
     }
 
     #[test]
+    fn polling_finished_writer_twice_is_not_an_error() {
+        let directory = test_directory("poll-finished");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("take.wav.part");
+        let format = AudioFormat::new(48_000, 2);
+        let (_sink, mut writer) = RecorderWriter::start(format, &path, 128).unwrap();
+        writer.request_stop().unwrap();
+
+        while writer.poll().unwrap().is_none() {}
+
+        assert_eq!(writer.poll().unwrap(), None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn writer_failures_are_reported_without_replacing_the_existing_file() {
         let directory = test_directory("writer-error");
         fs::create_dir_all(&directory).unwrap();
@@ -1208,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn save_does_not_overwrite_and_sanitizes_filename() {
+    fn save_replaces_existing_destination_and_sanitizes_filename() {
         let directory = test_directory("save");
         fs::create_dir_all(&directory).unwrap();
         let source = directory.join("source.wav.part");
@@ -1216,11 +1366,9 @@ mod tests {
         fs::write(&source, b"recording").unwrap();
         fs::write(&destination, b"existing").unwrap();
 
-        let error = copy_recording(&source, &destination).unwrap_err();
-        assert!(
-            matches!(error, RecorderError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists)
-        );
-        assert_eq!(fs::read(&source).unwrap(), b"recording");
+        copy_recording(&source, &destination).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"recording");
         assert_eq!(
             render_recording_filename("Bad:Name {date} {time}", UNIX_EPOCH),
             "Bad-Name 1970-01-01 00-00-00"

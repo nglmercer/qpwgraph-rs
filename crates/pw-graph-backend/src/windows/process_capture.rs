@@ -563,7 +563,7 @@ impl ProcessCaptureManager {
         {
             consumers.insert(ProcessCaptureConsumer::OwnedRoute);
         }
-        for ((recorder_id, recorder_identity), _) in &self.recorder_targets {
+        for (recorder_id, recorder_identity) in self.recorder_targets.keys() {
             if recorder_identity == identity {
                 consumers.insert(ProcessCaptureConsumer::Recorder(*recorder_id));
             }

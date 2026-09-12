@@ -132,6 +132,14 @@ pub(crate) fn poll_recordings(application: &mut Application) -> bool {
     let ids: Vec<_> = application.recorders.keys().copied().collect();
     let mut changed = false;
     for id in ids {
+        let should_poll = application
+            .recorders
+            .get(&id)
+            .is_some_and(|recorder| recorder.status.state == RecorderState::Recording);
+        if !should_poll {
+            changed |= refresh_recorder_instance(application, id).unwrap_or(false);
+            continue;
+        }
         match application.source.poll_recording(id) {
             Ok(Some(result)) => {
                 update_instance_from_result(application, id, &result);
@@ -261,10 +269,13 @@ pub(crate) fn record_for_node(application: &mut Application, rendered_id: i32) {
     };
     match application.source.start_recording(id) {
         Ok(()) => {
-            if let Some(instance) = application.recorders.get_mut(&id) {
-                instance.status.state = RecorderState::Recording;
-                instance.status.error = None;
+            if refresh_recorder_instance(application, id).is_err() {
+                if let Some(instance) = application.recorders.get_mut(&id) {
+                    instance.status.state = RecorderState::Recording;
+                    instance.status.error = None;
+                }
             }
+            application.mark_patchbay_graph_dirty();
             application.status =
                 application.tf("status.recorder_started", &[("id", id.to_string())]);
         }
@@ -369,7 +380,11 @@ fn finish_recording(application: &mut Application, id: RecorderId) {
 }
 
 fn ensure_wav_extension(path: PathBuf) -> PathBuf {
-    if path.extension().is_some() {
+    let is_wav = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+    if is_wav {
         path
     } else {
         path.with_extension("wav")
@@ -382,20 +397,37 @@ fn save_recording_to(
     destination: &Path,
 ) -> Result<(), String> {
     let destination = destination.to_owned();
-    application.source.save_recording(id, &destination)?;
-    if let Some(instance) = application.recorders.get_mut(&id) {
-        instance.status.state = RecorderState::Idle;
-        instance.status.final_path = Some(destination.clone());
-        instance.status.temporary_path = None;
-        instance.status.error = None;
+    if let Err(error) = application.source.save_recording(id, &destination) {
+        if let Some(instance) = application.recorders.get_mut(&id) {
+            instance.status.error = Some(error.clone());
+        }
+        return Err(error);
+    }
+    if refresh_recorder_instance(application, id).is_err() {
+        if let Some(instance) = application.recorders.get_mut(&id) {
+            instance.status.state = RecorderState::Idle;
+            instance.status.final_path = Some(destination.clone());
+            instance.status.temporary_path = None;
+        }
     }
     if let Some(parent) = destination.parent() {
         application.config.recording_dir = Some(parent.to_owned());
     }
-    application.status = application.tf(
+    application.mark_patchbay_graph_dirty();
+    let mut status = application.tf(
         "status.recorder_saved",
         &[("path", destination.display().to_string())],
     );
+    if let Some(warning) = application
+        .recorders
+        .get(&id)
+        .and_then(|recorder| recorder.status.error.as_deref())
+        .filter(|warning| !warning.is_empty())
+    {
+        status.push_str(" · ");
+        status.push_str(warning);
+    }
+    application.status = status;
     Ok(())
 }
 
@@ -434,16 +466,7 @@ fn discard_recording(application: &mut Application, id: RecorderId) {
     match application.source.discard_recording(id) {
         Ok(()) => {
             application.pending_recorder_stops.remove(&id);
-            let still_exists = application.recorders.get(&id).is_some_and(|recorder| {
-                application.source.graph().node(recorder.node_id).is_some()
-            });
-            if still_exists {
-                if let Some(instance) = application.recorders.get_mut(&id) {
-                    instance.status.state = RecorderState::Idle;
-                    instance.status.temporary_path = None;
-                    instance.status.error = None;
-                }
-            } else {
+            if refresh_recorder_instance(application, id).is_err() {
                 application.recorders.remove(&id);
             }
             application.status = application.t("status.recorder_discarded");
@@ -486,6 +509,16 @@ fn update_instance_status(
     }
     instance.status = status;
     true
+}
+
+fn refresh_recorder_instance(
+    application: &mut Application,
+    id: RecorderId,
+) -> Result<bool, String> {
+    let instance = application.source.recorder_instance(id)?;
+    let changed = application.recorders.get(&id) != Some(&instance);
+    application.recorders.insert(id, instance);
+    Ok(changed)
 }
 
 /// Keep the cached instance snapshot useful to the model and to node-removal
@@ -533,5 +566,27 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_wav_extension;
+    use std::path::PathBuf;
+
+    #[test]
+    fn wav_extension_is_enforced() {
+        assert_eq!(
+            ensure_wav_extension(PathBuf::from("recording")),
+            PathBuf::from("recording.wav")
+        );
+        assert_eq!(
+            ensure_wav_extension(PathBuf::from("recording.WAV")),
+            PathBuf::from("recording.WAV")
+        );
+        assert_eq!(
+            ensure_wav_extension(PathBuf::from("recording.mp3")),
+            PathBuf::from("recording.wav")
+        );
     }
 }

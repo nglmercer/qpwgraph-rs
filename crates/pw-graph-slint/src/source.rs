@@ -397,6 +397,10 @@ impl ApplicationDriver {
         RecorderDriver::recorder_status(self, id).map_err(|error| error.to_string())
     }
 
+    pub(crate) fn recorder_instance(&self, id: RecorderId) -> Result<RecorderInstance, String> {
+        RecorderDriver::recorder_instance(self, id).map_err(|error| error.to_string())
+    }
+
     pub(crate) fn discard_recording(&mut self, id: RecorderId) -> Result<(), String> {
         RecorderDriver::discard_recording(self, id).map_err(|error| error.to_string())
     }
@@ -1114,6 +1118,16 @@ impl RecorderDriver for ApplicationDriver {
         match &self.backend {
             BackendKind::Demo(driver) => driver.recorder_status(id),
             BackendKind::Live(driver) => driver.recorder_status(id),
+        }
+    }
+
+    fn recorder_instance(
+        &self,
+        id: RecorderId,
+    ) -> pw_graph_backend::BackendResult<RecorderInstance> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.recorder_instance(id),
+            BackendKind::Live(driver) => driver.recorder_instance(id),
         }
     }
 
