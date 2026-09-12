@@ -120,8 +120,9 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     var showScanner by remember { mutableStateOf(false) }
     var pendingPermissionAction by remember { mutableStateOf<(() -> Unit)?>(null) }
-    var pendingMicrophonePermission by remember { mutableStateOf(false) }
+    var pendingRecordAudioPermission by remember { mutableStateOf(false) }
     var pendingHostAction by remember { mutableStateOf(false) }
+    var connectAfterProjection by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Surface transient ViewModel messages in Snackbar as well as inline alerts.
@@ -139,14 +140,14 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { permissions ->
-        val microphoneGranted = permissions[Manifest.permission.RECORD_AUDIO] != false
+        val recordAudioGranted = permissions[Manifest.permission.RECORD_AUDIO] != false
         val action = pendingPermissionAction
-        val needsMicrophone = pendingMicrophonePermission
+        val needsRecordAudio = pendingRecordAudioPermission
         val hostAction = pendingHostAction
         pendingPermissionAction = null
-        pendingMicrophonePermission = false
+        pendingRecordAudioPermission = false
         pendingHostAction = false
-        if (needsMicrophone && !microphoneGranted) {
+        if (needsRecordAudio && !recordAudioGranted) {
             viewModel.permissionDenied(hostAction)
         } else {
             action?.invoke()
@@ -155,8 +156,10 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     val mediaProjectionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        val shouldConnect = connectAfterProjection
+        connectAfterProjection = false
         viewModel.onMediaProjectionResult(result.resultCode, result.data)
-        if (result.resultCode == Activity.RESULT_OK && state.mode == RelayMode.Emitter) {
+        if (result.resultCode == Activity.RESULT_OK && shouldConnect && state.mode == RelayMode.Emitter) {
             viewModel.connect()
         }
     }
@@ -165,12 +168,12 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
     ) { granted -> if (granted) showScanner = true }
 
     fun runWithServicePermissions(
-        requiresMicrophone: Boolean,
+        requiresRecordAudio: Boolean,
         host: Boolean,
         action: () -> Unit,
     ) {
         val permissions = buildList {
-            if (requiresMicrophone) add(Manifest.permission.RECORD_AUDIO)
+            if (requiresRecordAudio) add(Manifest.permission.RECORD_AUDIO)
             if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
         }
         val missing = permissions.filter {
@@ -179,7 +182,7 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
         if (missing.isEmpty()) action()
         else {
             pendingPermissionAction = action
-            pendingMicrophonePermission = requiresMicrophone
+            pendingRecordAudioPermission = requiresRecordAudio
             pendingHostAction = host
             permissionLauncher.launch(missing.toTypedArray())
         }
@@ -239,7 +242,9 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                 RelayMode.Emitter -> if (state.connection == RelayConnectionState.Error) AlertSeverity.Error else AlertSeverity.Info
                 RelayMode.Receiver -> if (state.hostState == RelayHostState.Error) AlertSeverity.Error else AlertSeverity.Info
             }
-            if (state.switchingDirection) {
+            if (!state.nativeAvailable && state.nativeError.isNotBlank()) {
+                AppAlert(message = state.nativeError, severity = AlertSeverity.Error)
+            } else if (state.switchingDirection) {
                 AppAlert(message = stringResource(R.string.relay_mode_switching), severity = AlertSeverity.Info)
             } else if (globalError.isNotBlank()) {
                 AppAlert(message = globalError, severity = globalSeverity)
@@ -250,12 +255,13 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                     state, viewModel,
                     connectWithPermission = {
                         runWithServicePermissions(
-                            requiresMicrophone = clientNeedsMicrophone(state.mode, state.settings.captureSource),
+                            requiresRecordAudio = captureRequiresRecordAudio(state.mode, state.settings.captureSource),
                             host = false,
                             action = {
                                 if (state.settings.captureSource == CaptureSource.DEVICE_PLAYBACK &&
                                     !viewModel.hasMediaProjectionConsent()
                                 ) {
+                                    connectAfterProjection = true
                                     val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                                     mediaProjectionLauncher.launch(mgr.createScreenCaptureIntent())
                                 } else viewModel.connect()
@@ -264,6 +270,7 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                     },
                     openScanner = ::openScanner,
                     requestPlaybackConsent = {
+                        connectAfterProjection = false
                         val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                         mediaProjectionLauncher.launch(mgr.createScreenCaptureIntent())
                     },
@@ -271,7 +278,7 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                 RelayMode.Receiver -> ReceiverCard(
                     state, viewModel,
                     startHost = {
-                        runWithServicePermissions(requiresMicrophone = false, host = true, action = viewModel::startHost)
+                        runWithServicePermissions(requiresRecordAudio = false, host = true, action = viewModel::startHost)
                     },
                 )
             }
@@ -283,7 +290,7 @@ private fun RelayApp(viewModel: RelayViewModel = viewModel()) {
                 connectToPeer = { address ->
                     if (state.mode == RelayMode.Emitter) {
                         runWithServicePermissions(
-                            requiresMicrophone = clientNeedsMicrophone(state.mode, state.settings.captureSource),
+                            requiresRecordAudio = captureRequiresRecordAudio(state.mode, state.settings.captureSource),
                             host = false,
                             action = { viewModel.connectToPeer(address) },
                         )

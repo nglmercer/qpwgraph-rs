@@ -14,6 +14,10 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64", "armeabi-v7a")
+        }
     }
 
     buildFeatures {
@@ -33,6 +37,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    lint {
+        // The translated resource sets are intentionally partial; Android's
+        // normal locale fallback supplies the English source string for keys
+        // that have not been translated yet.
+        disable += "MissingTranslation"
+    }
 }
 
 dependencies {
@@ -44,6 +55,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-process:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
@@ -61,6 +73,10 @@ dependencies {
     // `unitTests.isReturnDefaultValues` would instead have them pass
     // vacuously against null results.
     testImplementation("org.json:json:20260814")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
 }
 
 // Build the Rust bridge separately with cargo-ndk and copy the resulting

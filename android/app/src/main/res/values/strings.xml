@@ -144,7 +144,8 @@
     <string name="relay_error_native_create">Unable to create the native relay handle.</string>
     <string name="relay_connected">Connected</string>
     <string name="relay_error_connect_failed">Connection failed</string>
-    <string name="relay_error_microphone_permission">Microphone permission is required for the selected capture source. Audio was not started.</string>
+    <string name="relay_error_record_audio_permission">Audio recording permission is required for the selected capture source. Audio was not started.</string>
+    <string name="relay_reconnect_deferred_background">Trusted reconnect is waiting until the app is in the foreground.</string>
     <string name="relay_disconnected">Disconnected</string>
     <string name="relay_validation_missing_pin">Enter a pairing PIN.</string>
     <string name="relay_host_starting">Starting relay host…</string>
@@ -152,6 +153,7 @@
     <string name="relay_error_host_failed">Unable to start the relay host.</string>
     <string name="relay_error_host_audio_failed">Audio playback initialization failed — host remains listening for trusted connections.</string>
     <string name="relay_error_media_projection_denied">MediaProjection permission denied — device playback capture not started.</string>
+    <string name="relay_media_projection_granted">Device playback capture consent granted.</string>
     <string name="relay_error_media_projection_revoked">Device playback capture stopped — projection was revoked.</string>
     <string name="relay_error_tcp_refused">TCP connection refused: host is not listening (check address/port and that host is Running).</string>
     <string name="relay_error_no_route">No route to host: network changed or host unreachable — retry discovery or check Wi-Fi/USB.</string>

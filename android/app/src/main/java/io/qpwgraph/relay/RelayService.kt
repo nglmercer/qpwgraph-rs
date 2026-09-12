@@ -1,6 +1,7 @@
 package io.qpwgraph.relay
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
@@ -15,6 +16,10 @@ import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -24,6 +29,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
@@ -125,6 +132,7 @@ class RelayService : Service() {
         private const val CHANNEL = "relay-audio"
         private const val NOTIFICATION_ID = 48123
         private const val TAG = "RelayService"
+        private const val WORKER_JOIN_TIMEOUT_MS = 5_000L
     }
 
     private data class AudioRequest(
@@ -140,6 +148,18 @@ class RelayService : Service() {
         val mediaProjectionData: Intent?,
     )
 
+    private data class WorkerLatches(
+        val capture: CountDownLatch?,
+        val playback: CountDownLatch?,
+    )
+
+    /** Best-effort microphone effects; an unsupported effect never blocks audio. */
+    private class OptionalAudioEffects(private val effects: List<AudioEffect>) {
+        fun release() {
+            effects.asReversed().forEach { effect -> runCatching { effect.release() } }
+        }
+    }
+
     private val running = AtomicBoolean(false)
     private val startupRemaining = AtomicInteger(0)
     private val startupFinished = AtomicBoolean(false)
@@ -150,6 +170,7 @@ class RelayService : Service() {
     @Volatile private var activeRecorder: AudioRecord? = null
     @Volatile private var activeTrack: AudioTrack? = null
     @Volatile private var mediaProjection: MediaProjection? = null
+    @Volatile private var workerLatches: WorkerLatches? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -162,6 +183,15 @@ class RelayService : Service() {
             if (activeRequest == null && !running.get()) {
                 stopSelfResult(startId)
             }
+            return START_NOT_STICKY
+        }
+
+        if (!NativeRuntime.available) {
+            RelayServiceBridge.completeStart(
+                request.startToken,
+                RelayServiceStartResult(false, NativeRuntime.diagnostic),
+            )
+            stopSelfResult(startId)
             return START_NOT_STICKY
         }
 
@@ -248,28 +278,44 @@ class RelayService : Service() {
         }
 
     private fun startAudio(request: AudioRequest) {
-        require(request.channels == 1 || request.channels == 2) {
-            "Android relay audio supports mono or stereo, got ${request.channels} channels"
-        }
+        validateAndroidAudioGeometry(AudioGeometry(request.sampleRate, request.channels, request.frameMs))
         val frames = audioFrameCount(request.sampleRate, request.frameMs)
         val samples = frames * request.channels
         val captureWanted = clientRoleEmits(request.role)
         val playbackWanted = clientRoleReceives(request.role)
+        val latches = WorkerLatches(
+            capture = if (captureWanted) CountDownLatch(1) else null,
+            playback = if (playbackWanted) CountDownLatch(1) else null,
+        )
+        workerLatches = latches
 
         if (captureWanted && running.get() && activeRequest === request) {
             captureThread = Thread(
-                { runCapture(request, frames, samples) },
+                {
+                    try {
+                        runCapture(request, frames, samples)
+                    } finally {
+                        latches.capture?.countDown()
+                    }
+                },
                 "qpw-relay-capture-${request.mode}",
             ).also { it.start() }
         }
         if (playbackWanted && running.get() && activeRequest === request) {
             playbackThread = Thread(
-                { runPlayback(request, frames, samples) },
+                {
+                    try {
+                        runPlayback(request, frames, samples)
+                    } finally {
+                        latches.playback?.countDown()
+                    }
+                },
                 "qpw-relay-playback-${request.mode}",
             ).also { it.start() }
         }
     }
 
+    @SuppressLint("InlinedApi")
     private fun startForegroundForRequest(request: AudioRequest) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             var type = 0
@@ -277,19 +323,26 @@ class RelayService : Service() {
             val isPlaybackCapture = captureSource == CaptureSource.DEVICE_PLAYBACK.name.lowercase() ||
                 captureSource == "device_playback"
             if (clientRoleEmits(request.role)) {
-                type = if (isPlaybackCapture && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                type = if (isPlaybackCapture) {
                     type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                } else {
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                } else {
+                    type
                 }
             }
             if (clientRoleReceives(request.role)) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
             }
-            // Ensure mediaPlayback is always present for modern Android
-            if (type == 0) type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
             Log.i(TAG, "RELAY FOREGROUND type=$type mode=${request.mode} role=${request.role}")
-            startForeground(NOTIFICATION_ID, notification(), type)
+            if (type == 0) {
+                // API 29 has no microphone foreground-service type. The
+                // two-argument overload is valid there and avoids claiming an
+                // unrelated mediaPlayback operation.
+                startForeground(NOTIFICATION_ID, notification())
+            } else {
+                startForeground(NOTIFICATION_ID, notification(), type)
+            }
         } else {
             startForeground(NOTIFICATION_ID, notification())
         }
@@ -297,6 +350,7 @@ class RelayService : Service() {
 
     private fun runCapture(request: AudioRequest, frames: Int, samples: Int) {
         var recorder: AudioRecord? = null
+        var optionalEffects: OptionalAudioEffects? = null
         var recording = false
         try {
             check(running.get() && activeRequest === request) { "relay audio service is stopping" }
@@ -304,14 +358,13 @@ class RelayService : Service() {
             val isDevicePlayback = captureSource == "device_playback" || captureSource == "playback" || captureSource == "media"
             Log.i(TAG, "Emitter capture starting source=$captureSource isDevicePlayback=$isDevicePlayback mode=${request.mode}")
 
-            // MediaProjection consent authorizes device-playback capture.
-            // RECORD_AUDIO is required only for a microphone source; asking
-            // for it for playback capture unnecessarily blocks Emitter mode.
-            if (!isDevicePlayback &&
-                ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
-                    PackageManager.PERMISSION_GRANTED
+            // Both microphone and device-playback capture require
+            // RECORD_AUDIO. Playback capture additionally needs a
+            // user-approved MediaProjection grant.
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED
             ) {
-                throw SecurityException("the microphone permission has not been granted")
+                throw SecurityException("the audio-recording permission has not been granted")
             }
 
             recorder = if (isDevicePlayback) {
@@ -328,6 +381,9 @@ class RelayService : Service() {
                 recording = true
             } catch (error: Throwable) {
                 throw IllegalStateException("AudioRecord.startRecording failed", error)
+            }
+            if (!isDevicePlayback) {
+                optionalEffects = attachOptionalMicrophoneEffects(recorder.audioSessionId)
             }
             val pcm = ShortArray(samples)
             // Accumulate exact quanta to avoid inconsistent packet sizes.
@@ -384,6 +440,7 @@ class RelayService : Service() {
                 failAudio(request, "$prefix: ${error.message ?: error.javaClass.simpleName}")
             }
         } finally {
+            optionalEffects?.release()
             if (recording) runCatching { recorder?.stop() }
             recorder?.release()
             if (activeRecorder === recorder) activeRecorder = null
@@ -395,7 +452,62 @@ class RelayService : Service() {
         }
     }
 
+    /**
+     * Android audio effects are device/OEM dependent. Auto-enable only an
+     * effect the platform reports as available, and treat every creation or
+     * enable failure as a diagnostic rather than a capture failure.
+     */
+    private fun attachOptionalMicrophoneEffects(audioSessionId: Int): OptionalAudioEffects {
+        val effects = listOfNotNull(
+            createOptionalEffect(
+                name = "AEC",
+                available = { AcousticEchoCanceler.isAvailable() },
+                create = { AcousticEchoCanceler.create(audioSessionId) },
+            ),
+            createOptionalEffect(
+                name = "noise suppression",
+                available = { NoiseSuppressor.isAvailable() },
+                create = { NoiseSuppressor.create(audioSessionId) },
+            ),
+            createOptionalEffect(
+                name = "automatic gain control",
+                available = { AutomaticGainControl.isAvailable() },
+                create = { AutomaticGainControl.create(audioSessionId) },
+            ),
+        )
+        if (effects.isNotEmpty()) {
+            Log.i(TAG, "Microphone effects enabled: ${effects.size}")
+        }
+        return OptionalAudioEffects(effects)
+    }
+
+    private fun createOptionalEffect(
+        name: String,
+        available: () -> Boolean,
+        create: () -> AudioEffect?,
+    ): AudioEffect? {
+        if (!runCatching { available() }.getOrDefault(false)) return null
+        val effect = runCatching { create() }
+            .onFailure { error ->
+                Log.w(TAG, "Optional microphone effect unavailable: $name (${error.message})")
+            }
+            .getOrNull() ?: return null
+        return runCatching {
+            effect.enabled = true
+            if (!effect.enabled) {
+                throw IllegalStateException("effect did not enable")
+            }
+            effect
+        }.onFailure { error ->
+            Log.w(TAG, "Optional microphone effect could not be enabled: $name (${error.message})")
+            runCatching { effect.release() }
+        }.getOrNull()
+    }
+
     private fun createMicrophoneRecord(request: AudioRequest, frames: Int): AudioRecord {
+        check(ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) { "the audio-recording permission has not been granted" }
         val inMask = if (request.channels == 2) {
             AudioFormat.CHANNEL_IN_STEREO
         } else {
@@ -427,13 +539,16 @@ class RelayService : Service() {
         }
         val projectionManager = getSystemService(MediaProjectionManager::class.java)
             ?: throw IllegalStateException("MediaProjectionManager unavailable")
+        check(ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) { "the audio-recording permission has not been granted" }
         val projection = projectionManager.getMediaProjection(request.mediaProjectionResultCode, data)
             ?: throw IllegalStateException("MediaProjection unavailable")
         mediaProjection = projection
         // Handle revocation
         projection.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
-                Log.w(TAG, "Emitter capture stopped: projection revoked (bind=$projection)")
+                Log.w(TAG, "Emitter capture stopped: projection revoked")
                 if (activeRequest === request && running.get()) {
                     failAudio(request, "Device playback capture stopped: projection revoked")
                 }
@@ -452,11 +567,11 @@ class RelayService : Service() {
         )
         require(minimum > 0) { "AudioRecord returned invalid minimum buffer size $minimum" }
 
-        val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
-            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-            .addMatchingUsage(AudioAttributes.USAGE_GAME)
-            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-            .build()
+        val policy = playbackCapturePolicy(applicationInfo.uid)
+        val captureConfigBuilder = AudioPlaybackCaptureConfiguration.Builder(projection)
+        policy.includedUsages.forEach { usage -> captureConfigBuilder.addMatchingUsage(usage) }
+        policy.excludedUids.forEach { uid -> captureConfigBuilder.excludeUid(uid) }
+        val captureConfig = captureConfigBuilder.build()
 
         val format = AudioFormat.Builder()
             .setSampleRate(request.sampleRate)
@@ -477,31 +592,31 @@ class RelayService : Service() {
         var playing = false
         try {
             check(running.get() && activeRequest === request) { "relay audio service is stopping" }
-        val outMask = if (request.channels == 2) {
-            AudioFormat.CHANNEL_OUT_STEREO
-        } else {
-            AudioFormat.CHANNEL_OUT_MONO
-        }
-        val minimum = AudioTrack.getMinBufferSize(
-            request.sampleRate,
-            outMask,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        require(minimum > 0) { "AudioTrack returned invalid minimum buffer size $minimum" }
-        val created = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build(),
+            val outMask = if (request.channels == 2) {
+                AudioFormat.CHANNEL_OUT_STEREO
+            } else {
+                AudioFormat.CHANNEL_OUT_MONO
+            }
+            val minimum = AudioTrack.getMinBufferSize(
+                request.sampleRate,
+                outMask,
+                AudioFormat.ENCODING_PCM_16BIT,
             )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(request.sampleRate)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(outMask)
-                    .build(),
-            )
+            require(minimum > 0) { "AudioTrack returned invalid minimum buffer size $minimum" }
+            val created = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build(),
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(request.sampleRate)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(outMask)
+                        .build(),
+                )
                 .setBufferSizeInBytes(maxOf(minimum, pcm16BufferBytes(frames, request.channels)))
                 .build()
             track = created
@@ -592,34 +707,27 @@ class RelayService : Service() {
     override fun onDestroy() {
         val request = activeRequest
         running.set(false)
-        Log.i(TAG, "HOST AUDIO STOP mode=${request?.mode} handle=${request?.handle} captureSource=${request?.captureSource}")
+        Log.i(TAG, "RELAY AUDIO STOP mode=${request?.mode} handle=${request?.handle} captureSource=${request?.captureSource}")
         runCatching { activeRecorder?.stop() }
         runCatching { activeTrack?.stop() }
         runCatching { mediaProjection?.stop() }
         mediaProjection = null
-        captureThread?.let { thread ->
-            if (thread !== Thread.currentThread()) runCatching { thread.join(500) }
-        }
-        playbackThread?.let { thread ->
-            if (thread !== Thread.currentThread()) runCatching { thread.join(500) }
-        }
+        val latches = workerLatches
+        awaitWorkerExit("capture", captureThread, latches?.capture)
+        awaitWorkerExit("playback", playbackThread, latches?.playback)
         captureThread = null
         playbackThread = null
+        workerLatches = null
         activeRecorder = null
         activeTrack = null
         activeRequest = null
         if (request != null && request.handle != 0L) {
             when (request.mode) {
-                MODE_HOST -> {
-                    // Decouple: do NOT stop native host when audio service dies.
-                    // Just notify ViewModel that audio stopped; host ownership stays with HostController.
-                    Log.i(TAG, "HOST STOP audio service destroyed but keeping native host handle=${request.handle} listening")
-                    // Do NOT call NativeBridge.hostStop here.
-                }
-                else -> {
-                    runCatching { NativeBridge.disconnect(request.handle) }
-                    runCatching { NativeBridge.release(request.handle) }
-                }
+                MODE_HOST -> Log.i(
+                    TAG,
+                    "HOST AUDIO STOP service destroyed; native host remains owned by controller handle=${request.handle}",
+                )
+                else -> Unit
             }
             RelayServiceBridge.reportStopped(request.mode, request.handle)
         }
@@ -628,6 +736,36 @@ class RelayService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * A timeout is a diagnostic threshold, not permission to release a native
+     * handle. If a platform audio implementation ignores stop(), wait until
+     * the worker's finally block confirms that it has exited.
+     */
+    private fun awaitWorkerExit(name: String, thread: Thread?, latch: CountDownLatch?) {
+        if (thread == null || latch == null || thread === Thread.currentThread()) return
+        var interrupted = false
+        try {
+            if (!latch.await(WORKER_JOIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                Log.e(
+                    TAG,
+                    "RELAY AUDIO worker did not exit within ${WORKER_JOIN_TIMEOUT_MS}ms; " +
+                        "waiting before handle teardown: $name",
+                )
+            }
+        } catch (_: InterruptedException) {
+            interrupted = true
+            Log.e(TAG, "RELAY AUDIO worker wait interrupted; continuing until safe teardown: $name")
+        }
+        while (latch.count > 0L) {
+            try {
+                latch.await()
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

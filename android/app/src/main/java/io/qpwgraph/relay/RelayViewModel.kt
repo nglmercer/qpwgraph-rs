@@ -8,6 +8,9 @@ import android.content.pm.PackageManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
@@ -55,11 +58,12 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
             direction = initialSettings.direction,
             settings = initialSettings,
             host = settings.loadHostSettings(),
+            nativeAvailable = NativeRuntime.available,
+            nativeError = NativeRuntime.diagnostic,
         ),
     )
-    /** Pending MediaProjection consent for device-playback capture. */
-    @Volatile private var pendingMediaProjectionResultCode: Int = Activity.RESULT_CANCELED
-    @Volatile private var pendingMediaProjectionData: Intent? = null
+    /** Pending MediaProjection consent for one device-playback session. */
+    private val projectionGrants = PendingProjectionGrantStore<Intent>()
     val state: StateFlow<RelayUiState> = mutableState.asStateFlow()
     // The native handles and their teardown rules live in the controllers.
     // This class owns the UI state, the operation mutex that serializes the
@@ -78,6 +82,17 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private var usbWasPresent = false
     private var lastTrustedAutoAttemptAt = 0L
     private val trustedCandidateBackoff = TrustedCandidateBackoff()
+    @Volatile private var appVisibility = AppVisibility.Background
+    private val processLifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) {
+            appVisibility = AppVisibility.Foreground
+            if (NativeRuntime.available) autoConnectTrustedCandidate(mutableState.value.peers)
+        }
+
+        override fun onStop(owner: LifecycleOwner) {
+            appVisibility = AppVisibility.Background
+        }
+    }
     private val discovery = DiscoveryController(
         application = application,
         scope = viewModelScope,
@@ -87,12 +102,17 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     init {
         settings.purgeLegacyPins()
         setState { it.copy(trustedPeers = trustedStore.summaries()) }
+        ProcessLifecycleOwner.get().lifecycle.addObserver(processLifecycleObserver)
         serviceEvents = viewModelScope.launch(Dispatchers.IO) {
             RelayServiceBridge.events.collect { event ->
                 handleServiceEvent(event)
             }
         }
-        startUsbPolling()
+        if (NativeRuntime.available) {
+            startUsbPolling()
+        } else {
+            Log.e(TAG, NativeRuntime.diagnostic)
+        }
     }
 
     private fun setState(transform: (RelayUiState) -> RelayUiState) {
@@ -102,10 +122,22 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     private fun text(id: Int, vararg args: Any): String =
         getApplication<Application>().getString(id, *args)
 
-    private fun hasMicrophonePermission(): Boolean = ContextCompat.checkSelfPermission(
+    private fun hasRecordAudioPermission(): Boolean = ContextCompat.checkSelfPermission(
         getApplication(),
         Manifest.permission.RECORD_AUDIO,
     ) == PackageManager.PERMISSION_GRANTED
+
+    /** Never let an unavailable JNI library become an app-start crash. */
+    private fun ensureNativeRuntime(): Boolean {
+        if (NativeRuntime.available) return true
+        setState {
+            it.copy(
+                nativeAvailable = false,
+                nativeError = NativeRuntime.diagnostic,
+            )
+        }
+        return false
+    }
 
     /** Reading failures surface once, then degrade to an empty record. */
     private fun trustedPeers(): List<TrustedRelayPeer> =
@@ -219,6 +251,9 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                                         switchingDirection = true,
                                     )
                                 }
+                                // A grant belongs to the old capture session;
+                                // never carry it through a role transition.
+                                projectionGrants.clear()
                                 settings.save(updatedSettings)
 
                                 val activeSession = when (old) {
@@ -432,11 +467,11 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                 it.copy(
                     hostState = RelayHostState.Error,
                     hostAudioState = RelayHostAudioState.Error,
-                    hostAudioMessage = text(R.string.relay_error_microphone_permission),
+                    hostAudioMessage = text(R.string.relay_error_record_audio_permission),
                     hostPort = null,
                     hostActive = false,
                     hostAddress = null,
-                    hostMessage = text(R.string.relay_error_microphone_permission),
+                    hostMessage = text(R.string.relay_error_record_audio_permission),
                 )
             }
         } else {
@@ -448,7 +483,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                     transport = "",
                     link = "",
                     audioChannelState = "",
-                    message = text(R.string.relay_error_microphone_permission),
+                    message = text(R.string.relay_error_record_audio_permission),
                 )
             }
         }
@@ -464,31 +499,49 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onMediaProjectionResult(resultCode: Int, data: Intent?) {
-        pendingMediaProjectionResultCode = resultCode
-        pendingMediaProjectionData = data
+        projectionGrants.clear()
         if (resultCode != Activity.RESULT_OK || data == null) {
-            Log.w(TAG, "HOST AUDIO FAILURE MediaProjection permission denied")
-            setState {
-                it.copy(
-                    hostAudioState = RelayHostAudioState.Error,
-                    hostAudioMessage = text(R.string.relay_error_media_projection_denied),
-                    hostMessage = text(R.string.relay_error_media_projection_denied),
-                )
+            val message = text(R.string.relay_error_media_projection_denied)
+            Log.w(TAG, "MediaProjection permission denied")
+            if (mutableState.value.mode == RelayMode.Emitter) {
+                setState { it.copy(connection = RelayConnectionState.Error, message = message) }
+            } else {
+                setState {
+                    it.copy(
+                        hostAudioState = RelayHostAudioState.Error,
+                        hostAudioMessage = message,
+                        hostMessage = message,
+                    )
+                }
             }
-        } else {
+        } else if (
+            mutableState.value.mode == RelayMode.Emitter &&
+            mutableState.value.settings.captureSource == CaptureSource.DEVICE_PLAYBACK
+        ) {
+            projectionGrants.set(PendingProjectionGrant(resultCode, data))
+            setState { it.copy(message = text(R.string.relay_media_projection_granted)) }
             Log.i(TAG, "MediaProjection consent granted")
+        } else {
+            // The Activity may have been recreated or the user may have
+            // switched roles while the consent sheet was open. Do not carry
+            // a grant into an unrelated future capture session.
+            Log.w(TAG, "Ignoring MediaProjection consent for an inactive playback-capture request")
         }
     }
 
     fun hasMediaProjectionConsent(): Boolean =
-        pendingMediaProjectionResultCode == Activity.RESULT_OK && pendingMediaProjectionData != null
+        projectionGrants.peek() != null
 
     // ------------------------------------------------------------------
     // Emitter client
     // ------------------------------------------------------------------
 
     fun update(updated: RelaySettings) {
+        val previous = mutableState.value.settings
         val previousDirection = mutableState.value.direction
+        if (updated.captureSource != previous.captureSource || updated.mode != previous.mode) {
+            projectionGrants.clear()
+        }
         setState { it.copy(settings = updated) }
         settings.save(updated)
         if (updated.direction != previousDirection) {
@@ -516,6 +569,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connect() {
+        if (!ensureNativeRuntime()) return
         val settings = mutableState.value.settings
         if (settings.mode != RelayMode.Emitter) {
             setState {
@@ -523,7 +577,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        if (clientNeedsMicrophone(settings.mode, settings.captureSource) && !hasMicrophonePermission()) {
+        if (captureRequiresRecordAudio(settings.mode, settings.captureSource) && !hasRecordAudioPermission()) {
             permissionDenied(host = false)
             return
         }
@@ -550,22 +604,48 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Connect to a discovered peer with its previously enrolled credential. */
     fun connectToTrustedPeer(peer: DiscoveredPeer) {
+        connectToTrustedPeer(peer, automatic = false)
+    }
+
+    private fun connectToTrustedPeer(peer: DiscoveredPeer, automatic: Boolean) {
+        if (!ensureNativeRuntime()) return
         if (mutableState.value.mode != RelayMode.Emitter) {
             setState { it.copy(message = text(R.string.relay_direction_host_required)) }
+            return
+        }
+        if (
+            automatic && autoReconnectAction(
+                RelayMode.Emitter,
+                mutableState.value.settings.captureSource,
+                foreground = appVisibility == AppVisibility.Foreground,
+            ) == AutoReconnectAction.DeferUntilForeground
+        ) {
+            setState { it.copy(discoveryMessage = text(R.string.relay_reconnect_deferred_background)) }
             return
         }
         // This is an explicit user action, so it may retry this candidate
         // immediately even while automatic reconnect has it backed off.
         val trusted = trustedStore.peer(peer.id) ?: return
         update(mutableState.value.settings.copy(target = peer.address))
-        connectInternal(trusted)
+        connectInternal(trusted, automatic)
     }
 
-    private fun connectInternal(trusted: TrustedRelayPeer?) {
+    private fun connectInternal(trusted: TrustedRelayPeer?, automatic: Boolean = false) {
+        if (!ensureNativeRuntime()) return
         if (mutableState.value.connection == RelayConnectionState.Connecting) return
         val settings = mutableState.value.settings
         if (settings.mode != RelayMode.Emitter) return
-        if (clientNeedsMicrophone(settings.mode, settings.captureSource) && !hasMicrophonePermission()) {
+        if (
+            automatic && autoReconnectAction(
+                settings.mode,
+                settings.captureSource,
+                foreground = appVisibility == AppVisibility.Foreground,
+            ) == AutoReconnectAction.DeferUntilForeground
+        ) {
+            setState { it.copy(discoveryMessage = text(R.string.relay_reconnect_deferred_background)) }
+            return
+        }
+        if (captureRequiresRecordAudio(settings.mode, settings.captureSource) && !hasRecordAudioPermission()) {
             permissionDenied(host = false)
             return
         }
@@ -600,6 +680,21 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             operationMutex.withLock {
                 if (mutableState.value.mode != RelayMode.Emitter) {
+                    return@withLock
+                }
+                if (
+                    automatic && autoReconnectAction(
+                        settings.mode,
+                        settings.captureSource,
+                        foreground = appVisibility == AppVisibility.Foreground,
+                    ) == AutoReconnectAction.DeferUntilForeground
+                ) {
+                    setState {
+                        it.copy(
+                            connection = RelayConnectionState.Disconnected,
+                            discoveryMessage = text(R.string.relay_reconnect_deferred_background),
+                        )
+                    }
                     return@withLock
                 }
                 var nativeConnected = false
@@ -649,6 +744,13 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
                     // Do not publish Connected until the foreground audio
                     // service has initialized every requested worker.
+                    // Consuming is the commit point: a projection token is
+                    // never reused for a second independent capture.
+                    val projection = if (settings.captureSource == CaptureSource.DEVICE_PLAYBACK) {
+                        projectionGrants.consume()
+                    } else {
+                        null
+                    }
                     service.start(
                         RelayService.MODE_CLIENT,
                         client.nativeHandle,
@@ -659,8 +761,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                             host = mutableState.value.host,
                         ),
                         captureSource = settings.captureSource,
-                        mediaProjectionResultCode = pendingMediaProjectionResultCode,
-                        mediaProjectionData = pendingMediaProjectionData,
+                        mediaProjectionResultCode = projection?.resultCode ?: Activity.RESULT_CANCELED,
+                        mediaProjectionData = projection?.data,
                     )
                     setState {
                         it.copy(
@@ -880,6 +982,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startHost() {
+        if (!ensureNativeRuntime()) return
         if (mutableState.value.mode != RelayMode.Receiver) {
             setState { it.copy(message = text(R.string.relay_direction_client_required)) }
             return
@@ -963,8 +1066,6 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                                 host = wanted,
                             ),
                             captureSource = wanted.captureSource,
-                            mediaProjectionResultCode = pendingMediaProjectionResultCode,
-                            mediaProjectionData = pendingMediaProjectionData,
                         )
                         Log.i(TAG, "HOST AUDIO START success captureSource=${wanted.captureSource}")
                         setState {
@@ -1065,7 +1166,20 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private fun consumeHostEvents(raw: String) {
+    private suspend fun consumeHostEvents(raw: String) {
+        RelayJson.pollError(raw)?.let { failure ->
+            if (failure.unknownHandle) {
+                // Native has already retired this handle. Quiesce the shared
+                // service before clearing the UI owner, so a dead worker
+                // cannot race a subsequent Receiver start.
+                operationMutex.withLock {
+                    service.stopAndWait()
+                    host.forgetHandle()
+                }
+            }
+            hostError(failure.message)
+            return
+        }
         val events = JSONArray(raw)
         for (index in 0 until events.length()) {
             val event = events.getJSONObject(index)
@@ -1297,8 +1411,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                         if (event.message.contains("projection revoked", ignoreCase = true) ||
                             event.message.contains("MediaProjection", ignoreCase = true)
                         ) {
-                            pendingMediaProjectionResultCode = Activity.RESULT_CANCELED
-                            pendingMediaProjectionData = null
+                            projectionGrants.clear()
                             Log.w(TAG, "Cleared stale MediaProjection consent after revocation")
                         }
                         hostAudioError(event.message)
@@ -1317,6 +1430,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     // ------------------------------------------------------------------
 
     fun startDiscovery() {
+        if (!ensureNativeRuntime()) return
         if (mutableState.value.discoveryActive) return
         viewModelScope.launch(Dispatchers.IO) {
             when (
@@ -1399,6 +1513,16 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun autoConnectTrustedCandidate(peers: List<DiscoveredPeer>) {
         val current = mutableState.value
+        if (
+            autoReconnectAction(
+                current.settings.mode,
+                current.settings.captureSource,
+                foreground = appVisibility == AppVisibility.Foreground,
+            ) == AutoReconnectAction.DeferUntilForeground
+        ) {
+            setState { it.copy(discoveryMessage = text(R.string.relay_reconnect_deferred_background)) }
+            return
+        }
         val trustedRecords = trustedPeers()
         val now = android.os.SystemClock.elapsedRealtime()
         val candidate = peers
@@ -1416,10 +1540,10 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                 }.thenBy { it.address },
             )
             ?: return
-        val microphoneReady = !clientNeedsMicrophone(current.settings.mode, current.settings.captureSource) ||
-            hasMicrophonePermission()
+        val recordAudioReady = !captureRequiresRecordAudio(current.settings.mode, current.settings.captureSource) ||
+            hasRecordAudioPermission()
         if (
-            microphoneReady &&
+            recordAudioReady &&
             (current.connection == RelayConnectionState.Disconnected ||
                 current.connection == RelayConnectionState.Error) &&
             current.hostState != RelayHostState.Starting &&
@@ -1427,7 +1551,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
             now - lastTrustedAutoAttemptAt >= TRUSTED_AUTO_RETRY_INTERVAL_MS
         ) {
             lastTrustedAutoAttemptAt = now
-            connectToTrustedPeer(candidate)
+            connectToTrustedPeer(candidate, automatic = true)
         }
     }
 
@@ -1463,6 +1587,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun refreshLinks() {
+        if (!NativeRuntime.available) return
         val links = RelayJson.localLinks(NativeBridge.localLinks()) ?: return
         val usb = links.firstOrNull { it.kind == "usb" }?.let { UsbLinkInfo(it.name, it.addr) }
         val current = mutableState.value
@@ -1499,6 +1624,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     // ------------------------------------------------------------------
 
     override fun onCleared() {
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(processLifecycleObserver)
+        projectionGrants.clear()
         client.cancelPolling()
         host.cancelPolling()
         serviceEvents?.cancel()

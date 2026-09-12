@@ -34,6 +34,12 @@ class RelayServiceController(private val application: Application) {
         mediaProjectionResultCode: Int = android.app.Activity.RESULT_CANCELED,
         mediaProjectionData: android.content.Intent? = null,
     ) {
+        NativeRuntime.requireAvailable()
+        require(handle != 0L) { "relay audio service requires a live native handle" }
+        require(isOneWayAudioRole(role)) {
+            "relay audio service accepts one-way Emitter or Receiver roles only"
+        }
+        validateAndroidAudioGeometry(geometry)
         val token = UUID.randomUUID().toString()
         val ready = RelayServiceBridge.registerStart(token)
         val intent = Intent(application, RelayService::class.java)

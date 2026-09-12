@@ -6,11 +6,23 @@
 //! reach a public API that would deadlock it.
 
 use super::*;
-use std::cell::RefCell;
 
-thread_local! {
-    static REALTIME_SNAPSHOT_CACHE: RefCell<Option<Arc<Vec<Arc<SessionRecord>>>>> = const { RefCell::new(None) };
+/// Keep the Android target-specific Clippy expansion quirk local to the
+/// thread-local cache. The initializer is already const; Clippy 1.97 reports
+/// a false positive for this macro on Android while accepting the same item on
+/// the host target.
+#[cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
+mod realtime_snapshot_cache {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(super) static CACHE: RefCell<Option<Arc<Vec<Arc<SessionRecord>>>>> =
+            const { RefCell::new(None) };
+    }
 }
+
+use realtime_snapshot_cache::CACHE as REALTIME_SNAPSHOT_CACHE;
 
 pub(crate) struct EngineInner {
     pub(crate) config: Mutex<EngineConfig>,

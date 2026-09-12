@@ -7,17 +7,22 @@ bridge in `crates/pw-graph-relay-android`.
 ## Build the native library
 
 Install Android Studio, the Android SDK/NDK, Rust Android targets, and
-`cargo-ndk`. The first supported ABI is `arm64-v8a`:
+`cargo-ndk`. The supported development/release ABIs are `arm64-v8a` and
+`x86_64`; `armeabi-v7a` remains available for 32-bit ARM devices:
 
 ```bash
-rustup target add aarch64-linux-android
+rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
 cargo install cargo-ndk
 cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build \
   -p pw-graph-relay-android --release
+cargo ndk -t x86_64 -o android/app/src/main/jniLibs build \
+  -p pw-graph-relay-android --release
 ```
 
-Build additional ABIs only after the corresponding Rust targets and Opus
-native build are available. Do not commit generated `.so` files.
+Set `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, and `ANDROID_NDK` to the same
+installed NDK before running `cargo ndk`; the vendored Opus build uses that
+CMake toolchain.
+Do not commit generated `.so` files.
 
 ## Build the app
 
@@ -29,12 +34,14 @@ the Android SDK configured:
 ./gradlew :app:installDebug
 ```
 
-The app requests microphone permission only for the **Phone → PC** direction,
-where the phone captures a microphone or device-playback source. **PC → Phone**
-is playback-only on Android. Android 13+ notification permission is requested
-for the foreground audio service. Pairing PINs are entered for the current
-client or host lifetime and are not persisted; there is no insecure app-wide
-default.
+The app requests `RECORD_AUDIO` for either capture source in **Phone → PC**:
+microphone capture additionally needs the runtime microphone grant, while
+device-playback capture needs `RECORD_AUDIO` plus one fresh Android 10+
+MediaProjection consent. **PC → Phone** is playback-only on Android and does
+not request microphone permission. Android 13+ notification permission is
+requested for the foreground audio service. Pairing PINs are entered for the
+current client or host lifetime and are not persisted; there is no insecure
+app-wide default.
 
 The app mirrors the desktop relay panel with two direction tabs:
 
@@ -148,6 +155,41 @@ requires the current PIN and explicit user approval; subsequent automatic
 connections are limited to the stored credential and stable identity of that
 same peer. USB tethering uses TCP plus encrypted UDP. ADB forwarding uses the
 explicit TCP audio mode described above.
+
+## Android verification
+
+The fast checks do not need a device. From this directory, run:
+
+```bash
+./gradlew --no-daemon :app:testDebugUnitTest
+./gradlew --no-daemon :app:lintDebug
+./gradlew --no-daemon :app:assembleDebugAndroidTest
+```
+
+Instrumentation tests require a connected ARM64 device or an x86_64 emulator.
+The suite includes native-library loading, invalid-handle safety, repeated JNI
+handle creation/release, and receive-service start/stop cycles:
+
+```bash
+./gradlew --no-daemon :app:connectedDebugAndroidTest
+```
+
+Before installing a debug APK, verify that the native bridge was packaged for
+the runtime ABI:
+
+```bash
+unzip -l app/build/outputs/apk/debug/app-debug.apk \
+  | grep libpw_graph_relay_android.so
+```
+
+An x86_64 emulator must show `lib/x86_64/`; a modern physical ARM device must
+show `lib/arm64-v8a/`. A missing ABI is a packaging error, not an audio
+permission failure.
+
+Microphone sessions best-effort enable Android's Acoustic Echo Canceler, Noise
+Suppressor, and Automatic Gain Control when the device reports them as
+available. Unsupported or failed optional effects do not prevent capture;
+device-playback capture does not attach microphone effects.
 
 ### Physical-device validation checklist
 

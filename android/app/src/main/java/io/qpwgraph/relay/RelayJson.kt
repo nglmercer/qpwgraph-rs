@@ -127,6 +127,7 @@ object RelayJson {
     }
 
     data class PollError(val message: String, val code: String) {
-        val unknownHandle: Boolean get() = code == "unknown_client_handle"
+        val unknownHandle: Boolean
+            get() = code == "unknown_client_handle" || code == "unknown_host_handle"
     }
 }

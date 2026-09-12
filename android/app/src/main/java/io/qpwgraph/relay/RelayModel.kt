@@ -159,6 +159,15 @@ data class AudioGeometry(
     val frameMs: Int,
 )
 
+/** Validate the platform audio shape before a service or JNI worker starts. */
+fun validateAndroidAudioGeometry(geometry: AudioGeometry) {
+    require(geometry.channels == 1 || geometry.channels == 2) {
+        "Android relay audio supports mono or stereo, got ${geometry.channels} channels"
+    }
+    val frames = audioFrameCount(geometry.sampleRate, geometry.frameMs)
+    pcm16BufferBytes(frames, geometry.channels)
+}
+
 /** Select the geometry belonging to the operation being started. */
 fun audioGeometryForHostMode(
     hostMode: Boolean,
@@ -178,16 +187,23 @@ fun clientRoleReceives(role: String): Boolean = role.equals("receive", ignoreCas
 fun isOneWayAudioRole(role: String): Boolean =
     clientRoleEmits(role) != clientRoleReceives(role)
 
-fun clientNeedsMicrophone(role: String): Boolean = clientRoleEmits(role)
+/**
+ * Both Android capture sources are protected by RECORD_AUDIO. Device playback
+ * additionally requires a user-approved MediaProjection grant; it is not a
+ * permission-free replacement for microphone capture.
+ */
+fun captureRequiresRecordAudio(role: String): Boolean = clientRoleEmits(role)
 
-fun clientNeedsMicrophone(direction: AudioDirection): Boolean =
+fun captureRequiresRecordAudio(direction: AudioDirection): Boolean =
     direction == AudioDirection.MobileToDesktop
 
-fun clientNeedsMicrophone(mode: RelayMode, source: CaptureSource): Boolean =
-    mode == RelayMode.Emitter && source == CaptureSource.MICROPHONE
+fun captureRequiresRecordAudio(mode: RelayMode, source: CaptureSource): Boolean =
+    mode == RelayMode.Emitter && when (source) {
+        CaptureSource.MICROPHONE, CaptureSource.DEVICE_PLAYBACK -> true
+    }
 
-fun clientNeedsMicrophone(role: String, source: String): Boolean =
-    clientRoleEmits(role) && source.lowercase() in setOf("microphone", "mic")
+fun captureRequiresRecordAudio(role: String, source: String): Boolean =
+    clientRoleEmits(role)
 
 /** Number of interleaved PCM frames in one configured relay quantum. */
 fun audioFrameCount(sampleRate: Int, frameMs: Int): Int {
@@ -394,6 +410,8 @@ data class RelayUiState(
     /** Direction is the authority for which local engine may run. */
     val direction: AudioDirection = AudioDirection.MobileToDesktop,
     val switchingDirection: Boolean = false,
+    val nativeAvailable: Boolean = true,
+    val nativeError: String = "",
     // Emitter connection section.
     val settings: RelaySettings = RelaySettings(),
     val connection: RelayConnectionState = RelayConnectionState.Disconnected,

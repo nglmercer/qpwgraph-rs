@@ -42,6 +42,11 @@ internal class HostController(
 
     fun owns(candidate: Long): Boolean = candidate != 0L && candidate == handle
 
+    /** Drop a handle that native has already invalidated. */
+    fun forgetHandle() {
+        clear()
+    }
+
     /** Whether a restart would have to rebuild the native host. */
     fun preparedFor(
         host: HostSettings,
@@ -64,6 +69,7 @@ internal class HostController(
         trustedCredentialsJson: String,
         nullHandleMessage: () -> String,
     ) {
+        NativeRuntime.requireAvailable()
         if (handle != 0L) return
         handle = RelayJson.createdHandle(
             NativeBridge.hostCreate(
@@ -99,6 +105,7 @@ internal class HostController(
         require(mode == RelayMode.Receiver) {
             "Android hosts are Receiver endpoints; use the client for Emitter"
         }
+        NativeRuntime.requireAvailable()
         if (handle != 0L) return
         handle = RelayJson.createdHandle(
             NativeBridge.hostCreateMode(
@@ -123,7 +130,10 @@ internal class HostController(
         preparedGeneration = generation
     }
 
-    fun start(): JSONObject = JSONObject(NativeBridge.hostStart(handle))
+    fun start(): JSONObject {
+        NativeRuntime.requireAvailable()
+        return JSONObject(NativeBridge.hostStart(handle))
+    }
 
     fun offerMode(sessionId: Long, mode: RelayMode, generation: Long): JSONObject =
         JSONObject(NativeBridge.hostOfferMode(handle, sessionId, mode.serialized(), generation))
@@ -161,10 +171,14 @@ internal class HostController(
     }
 
     fun startPolling(
-        onEvents: (String) -> Unit,
+        onEvents: suspend (String) -> Unit,
         onStatus: (JSONObject) -> Unit,
         onError: (Exception) -> Unit,
     ) {
+        if (!NativeRuntime.available) {
+            onError(IllegalStateException(NativeRuntime.diagnostic))
+            return
+        }
         polling?.cancel()
         polling = scope.launch(Dispatchers.IO) {
             while (isActive) {

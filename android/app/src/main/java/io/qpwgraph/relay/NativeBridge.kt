@@ -11,10 +11,6 @@ package io.qpwgraph.relay
  * neither persists nor silently regenerates them.
  */
 internal object NativeBridge {
-    init {
-        System.loadLibrary("pw_graph_relay_android")
-    }
-
     // Emitter client ------------------------------------------------------
     external fun create(
         deviceName: String,

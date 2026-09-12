@@ -48,6 +48,7 @@ internal class ClientController(
         trustedCredentialsJson: String,
         nullHandleMessage: () -> String,
     ) {
+        NativeRuntime.requireAvailable()
         if (handle != 0L) return
         handle = RelayJson.createdHandle(
             NativeBridge.create(
@@ -66,8 +67,10 @@ internal class ClientController(
         )
     }
 
-    fun connect(target: String, pin: String): JSONObject =
-        JSONObject(NativeBridge.connect(handle, target, pin))
+    fun connect(target: String, pin: String): JSONObject {
+        NativeRuntime.requireAvailable()
+        return JSONObject(NativeBridge.connect(handle, target, pin))
+    }
 
     fun openMode(
         settings: RelaySettings,
@@ -75,6 +78,7 @@ internal class ClientController(
         trustedCredentialsJson: String,
         nullHandleMessage: () -> String,
     ) {
+        NativeRuntime.requireAvailable()
         if (handle != 0L) return
         handle = RelayJson.createdHandle(
             NativeBridge.createMode(
@@ -93,8 +97,10 @@ internal class ClientController(
         )
     }
 
-    fun connectTrusted(target: String, peer: TrustedRelayPeer): JSONObject =
-        JSONObject(NativeBridge.connectTrusted(handle, target, peer.peerId, peer.secret))
+    fun connectTrusted(target: String, peer: TrustedRelayPeer): JSONObject {
+        NativeRuntime.requireAvailable()
+        return JSONObject(NativeBridge.connectTrusted(handle, target, peer.peerId, peer.secret))
+    }
 
     fun offerDirection(
         sessionId: Long,
@@ -150,6 +156,10 @@ internal class ClientController(
         onStatus: (JSONObject) -> Unit,
         onError: (Exception) -> Unit,
     ) {
+        if (!NativeRuntime.available) {
+            onError(IllegalStateException(NativeRuntime.diagnostic))
+            return
+        }
         polling?.cancel()
         polling = scope.launch(Dispatchers.IO) {
             while (isActive) {

@@ -65,6 +65,7 @@ internal class DiscoveryController(
         mutex.withLock {
             if (alreadyActive()) return@withLock Started.AlreadyRunning
             try {
+                NativeRuntime.requireAvailable()
                 val multicastAvailable = acquireMulticastLock()
                 if (handle == 0L) {
                     handle = RelayJson.createdHandle(
