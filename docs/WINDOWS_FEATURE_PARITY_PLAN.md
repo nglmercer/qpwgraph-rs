@@ -36,13 +36,24 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   build, but the first live `GetPersistedDefaultAudioEndpoint` call returns
   `E_INVALIDARG`; the backend therefore demotes automatic routing to
   `ManualOnly` and the automatic-switching acceptance rows remain open;
-- live candidate-driver acceptance is still open: the installed development
-  devnode is currently rejected by Windows as `CM_PROB_UNSIGNED_DRIVER`, and
-  Verifier, lifecycle, HLK, Secure Boot, Microsoft signing, and ordinary-client
-  acceptance evidence remain external release gates.
+- after the Test Mode reboot, the installed development devnode starts and
+  all four provider-owned roles enumerate. Both cables pass the 1.5-second
+  tone/isolation and stopped-render silence probe. The installed SYS hash
+  matches the September 6 baseline, not the newly built Rust candidate;
+- the Rust candidate now uses the ACX stream cleanup callback and separates
+  single-packet page-aligned allocation from two-packet allocation. Candidate
+  installation, live timing/stream tests, Verifier, lifecycle, HLK, Secure
+  Boot, Microsoft signing, and ordinary-client acceptance remain open.
 
-These results are source/build and host-mode evidence only. They do not mark
-the live driver rows below complete.
+Candidate evidence remains limited to source/build and host-mode checks.
+The installed-baseline results do not mark the Rust candidate's live rows
+below complete.
+
+Development machine instruction: preserve Test Mode. Do not disable
+test-signing or change Secure Boot on this PC. Record readiness for the user
+only after the full requirements are verified; readiness is not permission
+to change boot settings. Secure Boot release validation needs a separately
+configured test environment while this development PC remains in Test Mode.
 
 ---
 

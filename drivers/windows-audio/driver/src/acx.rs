@@ -611,17 +611,18 @@ mod runtime {
         packet_size: ffi::ULONG,
         packets: *mut ffi::PACX_RTPACKET,
     ) -> NTSTATUS {
-        if packets.is_null()
-            || packet_count == 0
-            || packet_count > MAX_PACKET_COUNT
-            || packet_size == 0
-            || packet_size > MAX_PACKET_BYTES
-            || !packet_size.is_multiple_of(4)
-            || packet_size > u32::MAX - (wdk_sys::PAGE_SIZE - 1)
-        {
+        if packets.is_null() {
             return wdk_sys::STATUS_INVALID_PARAMETER;
         }
         unsafe { *packets = ptr::null_mut() };
+        let Some(layout) = qpwgraph_audio_core::packet_layout::pcm16_packet_layout(
+            packet_count,
+            packet_size,
+            wdk_sys::PAGE_SIZE,
+            MAX_PACKET_BYTES,
+        ) else {
+            return wdk_sys::STATUS_INVALID_PARAMETER;
+        };
         let Some(slot) = find_stream(stream) else {
             return wdk_sys::STATUS_INVALID_PARAMETER;
         };
@@ -636,9 +637,9 @@ mod runtime {
             // orphaning non-paged buffers and MDLs.
             return wdk_sys::STATUS_INVALID_DEVICE_STATE;
         }
-        let page_size = wdk_sys::PAGE_SIZE;
-        let allocation_size = (packet_size + page_size - 1) & !(page_size - 1);
-        let first_offset = allocation_size - packet_size;
+        let allocation_size = layout.allocation_bytes;
+        let packet_size = layout.packet_bytes;
+        let first_offset = layout.first_offset;
         let array_bytes = size_of::<ffi::ACX_RTPACKET>() * packet_count as usize;
         let packet_array = unsafe {
             ExAllocatePool2(

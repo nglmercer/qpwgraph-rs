@@ -5,6 +5,35 @@ what passed on the available Windows test machine; it is not evidence for a
 current WDK build, Microsoft signing, HLK, Secure Boot, or final release.
 Regenerate it after installing a package produced from the candidate commit.
 
+## September 12 recheck after Test Mode reboot
+
+The installed SYS still hashes to
+`C097A4C14E4EB528A409D038B8CF9E581879CD3D119A8A54CAE220E59A91B3AD`,
+matching this baseline. It differs from the Rust candidate staged after
+commit `61542ff` (before the packet-layout change), whose SYS hashes to
+`A0B3EAB8B1A9D3DF2834F47E54D2B6793E29E5EC398A36F29367A48DAB8B7172`.
+
+Commands run from the repository root with the existing smoke executable:
+
+```powershell
+Get-FileHash C:/Windows/System32/drivers/qpwgraph_audio.sys
+& ./drivers/windows-audio/target/debug/qpwgraph-audio-smoke.exe --verify-roles
+& ./drivers/windows-audio/target/debug/qpwgraph-audio-smoke.exe --verify-cables --duration-ms 1500
+```
+
+Both probes exited 0. Four roles enumerated; app and relay target peaks were
+0.208038 and 0.250031 respectively. Each other cable stayed at peak 0;
+stopped-render checks captured 24,000 silent frames on each endpoint.
+These results revalidate the installed baseline only. They do not validate
+the current Rust candidate or its cleanup and packet-layout changes.
+
+The candidate's single-packet allocator now returns a whole-page audio
+extent at offset zero, including the rounded size in its runtime timing
+state. Its two-packet layout retains the requested audio size. This follows
+the [ACX buffer mapping requirements](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/acx-streaming#stream-resource-allocation).
+Live timer-driven consumption and position accuracy still need verification;
+allocation tests alone cannot prove those streaming requirements.
+
 ## Machine and package
 
 - OS: Windows 10 Pro, build 19045

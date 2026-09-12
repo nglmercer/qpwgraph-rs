@@ -3,6 +3,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod packet_layout;
 pub mod render_eos;
 
 use core::cell::UnsafeCell;
