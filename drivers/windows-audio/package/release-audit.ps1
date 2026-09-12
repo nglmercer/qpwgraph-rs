@@ -321,6 +321,26 @@ if (Test-Path -LiteralPath $driverSourceRoot -PathType Container) {
     Add-Check '100% Rust driver source' 'unknown' "driver source root was not found: $driverSourceRoot"
 }
 
+# ACX stream buffers and driver-owned stream state must be released from the
+# WDF cleanup callback. WDF destroy timing is indeterminate after the last
+# reference, so accepting EvtDestroyCallback here could reintroduce a stream
+# lifetime race even when the Rust code compiles successfully.
+$acxWrapperPath = Join-Path $driverSourceRoot 'acx_wrapper.h'
+if (-not (Test-Path -LiteralPath $acxWrapperPath -PathType Leaf)) {
+    Add-Check 'ACX stream cleanup callback' 'unknown' "ACX wrapper was not found: $acxWrapperPath"
+} else {
+    $acxWrapperText = Get-Content -LiteralPath $acxWrapperPath -Raw
+    $hasCleanupCallback = $acxWrapperText -match '(?m)attributes\.EvtCleanupCallback\s*='
+    $hasDestroyCallback = $acxWrapperText -match '(?m)attributes\.EvtDestroyCallback\s*='
+    if ($hasCleanupCallback -and -not $hasDestroyCallback) {
+        Add-Check 'ACX stream cleanup callback' 'pass' 'stream object uses EvtCleanupCallback; EvtDestroyCallback is absent'
+    } elseif ($hasDestroyCallback) {
+        Add-Check 'ACX stream cleanup callback' 'blocked' 'stream object uses EvtDestroyCallback; use EvtCleanupCallback for stream resource cleanup'
+    } else {
+        Add-Check 'ACX stream cleanup callback' 'blocked' 'stream object cleanup callback was not found in the ACX wrapper'
+    }
+}
+
 # Build prerequisites. These checks are intentionally read-only and overlap the
 # xtask audit so the same report can be collected from a staged package.
 $wdkRootText = [Environment]::GetEnvironmentVariable('WDKContentRoot', 'Process')

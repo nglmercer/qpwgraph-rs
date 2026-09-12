@@ -975,7 +975,7 @@ mod runtime {
         }
     }
 
-    unsafe extern "C" fn stream_destroy(object: ffi::WDFOBJECT) {
+    unsafe extern "C" fn stream_cleanup(object: ffi::WDFOBJECT) {
         let stream = object.cast::<ffi::ACXSTREAM__>();
         let Some(slot) = find_stream(stream) else {
             return;
@@ -1052,7 +1052,7 @@ mod runtime {
                 as_void(device),
                 circuit,
                 as_void(stream_init),
-                stream_destroy as *const () as *mut c_void,
+                stream_cleanup as *const () as *mut c_void,
                 &mut stream,
             )
         };

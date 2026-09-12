@@ -22,6 +22,10 @@ $baseline = Invoke-AuditJson @('-PackageRoot', $packageRoot, '-Json')
 if ($baseline.checks.Count -lt 1) {
     throw 'The baseline release audit did not return any checks.'
 }
+$cleanup = @($baseline.checks | Where-Object { $_.Gate -eq 'ACX stream cleanup callback' })
+if ($cleanup.Count -ne 1 -or $cleanup[0].Status -ne 'pass') {
+    throw 'The ACX stream cleanup callback guard did not pass.'
+}
 
 $tempPath = Join-Path ([IO.Path]::GetTempPath()) ("qpwgraph-release-audit-{0}.json" -f [Guid]::NewGuid())
 $evidence = @'

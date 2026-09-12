@@ -220,8 +220,12 @@ static inline NTSTATUS qpwgraph_acx_rt_stream_create(
   WDF_OBJECT_ATTRIBUTES attributes;
   PACXSTREAM_INIT init = (PACXSTREAM_INIT)stream_init;
   WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
-  attributes.EvtDestroyCallback =
-      (PFN_WDF_OBJECT_CONTEXT_DESTROY)destroy_callback;
+  // ACX stream resources are released when the client handle closes.  The
+  // destroy callback runs only after the last object reference is gone, which
+  // is indeterminate and is not the lifecycle boundary ACX documents for
+  // stream buffers and driver-owned state.
+  attributes.EvtCleanupCallback =
+      (PFN_WDF_OBJECT_CONTEXT_CLEANUP)destroy_callback;
   return AcxRtStreamCreate((WDFDEVICE)device, circuit, &attributes,
                            &init, stream);
 }
