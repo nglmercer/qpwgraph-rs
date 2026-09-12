@@ -456,6 +456,85 @@ fn effect_parameter_model_is_kept_in_place_during_slider_updates() {
 }
 
 #[test]
+fn effect_nodes_stay_canvas_connectable_into_a_recorder() {
+    let mut application = demo_application();
+    let effect = application
+        .source
+        .create_effect_node(pw_graph_backend::EffectNodeRequest {
+            instance_id: "canvas-effect".into(),
+            effect_id: pw_graph_effects::NOISE_GATE_ID.into(),
+            module_path: None,
+            enabled: true,
+            parameters: std::collections::BTreeMap::new(),
+            channel_policy: pw_graph_effects::ChannelPolicy::Auto,
+            position: [0.0, 0.0],
+        })
+        .expect("demo effect should be created");
+    let recorder = application
+        .source
+        .create_recorder(pw_graph_backend::RecorderCreateRequest::default())
+        .expect("demo recorder should be creatable");
+
+    // The canvas gates a connection gesture on the node flag, which
+    // rebuild_geometry() then projects verbatim into every pin's
+    // PinGeometry.connectable (see bridge/models.rs). An effect node must
+    // therefore be connectable so dragging from its Out pin starts a cable
+    // instead of a box selection.
+    assert!(
+        application.source.node_connectable(effect.node_id),
+        "effect node should offer a connect gesture"
+    );
+    assert!(
+        application.source.node_connectable(recorder.node_id),
+        "recorder node should offer a connect gesture"
+    );
+    let graph = application.source.graph();
+    for port in [effect.input_port, effect.output_port] {
+        let owner = graph.port(port).expect("effect port").node_id;
+        assert!(
+            application.source.node_connectable(owner),
+            "effect pin should be canvas-connectable"
+        );
+    }
+    let recorder_owner = graph
+        .port(recorder.input_port)
+        .expect("recorder port")
+        .node_id;
+    assert!(
+        application.source.node_connectable(recorder_owner),
+        "recorder input pin should be canvas-connectable"
+    );
+
+    // Actual pair validity stays destination-aware: endpoint into effect and
+    // effect into recorder route, while a MIDI source into the recorder or
+    // into an audio sink stays unsupported.
+    assert_eq!(
+        application
+            .source
+            .connection_support(pw_graph_core::PortId(1), effect.input_port),
+        pw_graph_backend::ConnectionSupport::Route
+    );
+    assert_eq!(
+        application
+            .source
+            .connection_support(effect.output_port, recorder.input_port),
+        pw_graph_backend::ConnectionSupport::Route
+    );
+    assert_eq!(
+        application
+            .source
+            .connection_support(pw_graph_core::PortId(5), recorder.input_port),
+        pw_graph_backend::ConnectionSupport::Unsupported
+    );
+    assert_eq!(
+        application
+            .source
+            .connection_support(pw_graph_core::PortId(5), pw_graph_core::PortId(3)),
+        pw_graph_backend::ConnectionSupport::Unsupported
+    );
+}
+
+#[test]
 fn programmatic_effect_selection_does_not_emit_user_event() {
     let window = MainWindow::new().expect("test window");
     let events = Rc::new(Cell::new(0));

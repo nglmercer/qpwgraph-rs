@@ -180,6 +180,46 @@ mod tests {
     }
 
     #[test]
+    fn effect_chain_routes_endpoint_through_effect_into_recorder() {
+        let mut driver = DemoDriver::demo();
+        let effect = driver
+            .create_effect_node(EffectNodeRequest {
+                instance_id: "chain-effect".into(),
+                effect_id: pw_graph_effects::NOISE_GATE_ID.into(),
+                module_path: None,
+                enabled: true,
+                parameters: BTreeMap::new(),
+                channel_policy: pw_graph_effects::ChannelPolicy::Auto,
+                position: [250.0, 180.0],
+            })
+            .expect("demo effect should be creatable");
+        let recorder = driver
+            .create_recorder(RecorderCreateRequest::default())
+            .expect("demo recorder should be creatable");
+
+        // 1. Physical endpoint output into the effect input is a route.
+        assert_eq!(
+            driver.connection_support(PortId(1), effect.input_port),
+            ConnectionSupport::Route
+        );
+        // 2. Effect output into the recorder input is a route.
+        assert_eq!(
+            driver.connection_support(effect.output_port, recorder.input_port),
+            ConnectionSupport::Route
+        );
+        // Unsupported pairs stay unsupported: connection gating must remain
+        // destination-aware rather than blanket-allowing audio ports.
+        assert_eq!(
+            driver.connection_support(PortId(5), recorder.input_port),
+            ConnectionSupport::Unsupported
+        );
+        assert_eq!(
+            driver.connection_support(PortId(5), PortId(3)),
+            ConnectionSupport::Unsupported
+        );
+    }
+
+    #[test]
     fn demo_backend_has_a_stable_graph_for_demo_runs() {
         let driver = DemoDriver::demo();
         assert_eq!(driver.graph().nodes.len(), 4);

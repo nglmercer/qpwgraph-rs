@@ -328,6 +328,13 @@ impl ApplicationDriver {
                         .is_some_and(|port| port.direction.is_sink())
                 });
         }
+        // Effect nodes are qpwgraph-owned routing intermediates.
+        // The node must be connectable so its input/output pins can start
+        // connection gestures. Actual source/destination compatibility is
+        // still validated later by connection_support().
+        if node_record.node_type == pw_graph_core::NodeType::Effect {
+            return self.supports_effect_nodes();
+        }
         if node_record.node_type != pw_graph_core::NodeType::WindowsAudioSession {
             return false;
         }
