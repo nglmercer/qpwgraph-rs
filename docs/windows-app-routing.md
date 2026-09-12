@@ -31,8 +31,12 @@ an explicit Windows 10 `AudioPolicyConfig` vtable declaration, the downlevel
 IID, and a narrow build table covering 19041 through 19045. Construction
 activates that exact interface before reporting `Experimental`; unsupported
 builds, activation failures, and any HRESULT failure remain `ManualOnly` or
-degraded with diagnostics. The Windows 11 IID is recorded but is not enabled
-until the same method layout has live evidence on Windows 11.
+degraded with diagnostics. On the current Windows 10 validation run, factory
+activation succeeded but the first `GetPersistedDefaultAudioEndpoint` call
+returned `E_INVALIDARG`; the policy consequently demoted itself to
+`ManualOnly`. Activation alone is not automatic-routing evidence. The Windows
+11 IID is recorded but is not enabled until the same method layout has live
+evidence on Windows 11.
 
 Automatic isolation revalidates the live process identity before every private
 policy call, reads all three render roles, saves the prior endpoint in a

@@ -32,6 +32,10 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   package staging, and Rust transport/EOS tests pass on the available PC;
 - process-loopback recovery and application-relay restart/session probes pass
   without a virtual driver;
+- private AudioPolicyConfig activation succeeds on the current Windows 10
+  build, but the first live `GetPersistedDefaultAudioEndpoint` call returns
+  `E_INVALIDARG`; the backend therefore demotes automatic routing to
+  `ManualOnly` and the automatic-switching acceptance rows remain open;
 - live candidate-driver acceptance is still open: the installed development
   devnode is currently rejected by Windows as `CM_PROB_UNSIGNED_DRIVER`, and
   Verifier, lifecycle, HLK, Secure Boot, Microsoft signing, and ordinary-client

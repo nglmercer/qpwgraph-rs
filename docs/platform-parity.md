@@ -370,6 +370,10 @@ above the line has landed; what is left is blocked on something specific.
    has live evidence on a Windows 11 build. Automatic reassignment is still
    experimental: the default is off, identity and endpoint ambiguity fail
    closed, and the route is not activated until the worker confirms isolation.
+   The current direct policy round-trip additionally reports
+   `GetPersistedDefaultAudioEndpoint` as `E_INVALIDARG` after successful
+   activation, so this build demotes the feature to `ManualOnly`; activation is
+   not treated as proof that automatic switching works.
 2. **Automatic per-application policy.** The process-loopback capture
    primitive and relay source adapter remain read-only for ordinary sessions.
    With the opt-in policy enabled on a supported Windows 10 build, a stable
