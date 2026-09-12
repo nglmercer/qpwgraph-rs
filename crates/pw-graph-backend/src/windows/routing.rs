@@ -45,7 +45,7 @@ use crate::router::engine::{
 use crate::router::format::AudioFormat;
 use crate::router::thread::{RouterStopped, RouterThread};
 use crate::router::wasapi::{self, WasapiEndpoint};
-use crate::router::{MeterReading, RecorderSink, RingSource, RouteMetrics};
+use crate::router::{MeterReading, RecorderSink, RingSource, RouteFault, RouteMetrics};
 use pw_graph_effects::{AudioSpec, EffectProcessor};
 
 /// The format every qpwgraph-owned Windows route runs at.
@@ -128,6 +128,11 @@ pub(super) struct WindowsRouting {
     /// Each effect's output port, so a link leaving one is recognised as
     /// routable without searching every effect.
     effect_outputs: BTreeMap<PortId, PortId>,
+    /// The RouterCore route(s) that carry each graph link. A link leaving an
+    /// effect still belongs to the upstream source route; it does not own a
+    /// route ID of its own. A set is intentional because multiple sources
+    /// may converge on one effect/recorder path.
+    link_routes: BTreeMap<LinkId, BTreeSet<RouteId>>,
     next_id: u64,
 }
 
@@ -157,6 +162,7 @@ impl WindowsRouting {
             sinks: BTreeMap::new(),
             effects: BTreeMap::new(),
             effect_outputs: BTreeMap::new(),
+            link_routes: BTreeMap::new(),
             source_gains: BTreeMap::new(),
             next_id: 1,
         })
@@ -280,10 +286,13 @@ impl WindowsRouting {
     pub(super) fn metrics(&self) -> Vec<(LinkId, RouteMetrics)> {
         let mut out = Vec::with_capacity(self.links.len());
         for link in self.links.values() {
-            // Routes are keyed by output port, so every link sharing a source
-            // reports that route's counters.
-            let route = RouteId(link.output_port.0);
-            let Ok(Some(metrics)) = self.router.with(move |core| core.metrics(route)) else {
+            let Some(routes) = self.link_routes.get(&link.id).cloned() else {
+                continue;
+            };
+            let Ok(Some(metrics)) = self
+                .router
+                .with(move |core| aggregate_route_metrics(core, routes))
+            else {
                 continue;
             };
             out.push((link.id, metrics));
@@ -861,24 +870,28 @@ impl WindowsRouting {
     /// stops an effect inserted into one link from processing a sibling
     /// fan-out. Either way the source is pulled exactly once per block.
     fn install(&mut self) -> BackendResult<()> {
-        let mut forward: BTreeMap<PortId, Vec<PortId>> = BTreeMap::new();
+        let mut forward: BTreeMap<PortId, Vec<(LinkId, PortId)>> = BTreeMap::new();
         for link in self.links.values() {
             forward
                 .entry(link.output_port)
                 .or_default()
-                .push(link.input_port);
+                .push((link.id, link.input_port));
         }
 
         let mut specs = Vec::with_capacity(self.sources.len());
+        let mut link_routes: BTreeMap<LinkId, BTreeSet<RouteId>> = BTreeMap::new();
         for (output, (source, _)) in &self.sources {
             let mut chains: BTreeMap<Vec<ProcessorId>, Vec<DestinationSpec>> = BTreeMap::new();
+            let route = RouteId(output.0);
             walk(
                 &forward,
                 &self.sinks,
                 &self.effects,
                 *output,
+                route,
                 &mut Vec::new(),
                 &mut chains,
+                &mut link_routes,
             );
             if chains.is_empty() {
                 // The source is registered but nothing downstream resolves to
@@ -905,7 +918,12 @@ impl WindowsRouting {
         self.router
             .with(move |core| core.set_routes(&specs))
             .map_err(router_stopped)?
-            .map_err(router_error)
+            .map_err(router_error)?;
+        // `set_routes` is transactional. Publish the corresponding link
+        // diagnostics only after the new route table is live; on failure the
+        // previous route table and mapping remain intact.
+        self.link_routes = link_routes;
+        Ok(())
     }
 
     /// Take a use of the device behind an output port, opening it if this is
@@ -1059,25 +1077,77 @@ impl WindowsRouting {
     }
 }
 
+/// Aggregate the diagnostics for all RouterCore routes that reach one graph
+/// link. The normal case has one route; aggregation keeps the link API honest
+/// if several upstream sources converge on the same effect path.
+fn aggregate_route_metrics(
+    core: &crate::router::engine::RouterCore,
+    routes: BTreeSet<RouteId>,
+) -> Option<RouteMetrics> {
+    let mut aggregate: Option<RouteMetrics> = None;
+    for route in routes {
+        let Some(metrics) = core.metrics(route) else {
+            continue;
+        };
+        aggregate = Some(match aggregate {
+            None => metrics,
+            Some(mut total) => {
+                total.source_underruns = total
+                    .source_underruns
+                    .saturating_add(metrics.source_underruns);
+                total.source_overruns = total
+                    .source_overruns
+                    .saturating_add(metrics.source_overruns);
+                total.sink_underruns = total.sink_underruns.saturating_add(metrics.sink_underruns);
+                total.sink_overruns = total.sink_overruns.saturating_add(metrics.sink_overruns);
+                total.discontinuities = total
+                    .discontinuities
+                    .saturating_add(metrics.discontinuities);
+                total.restarts = total.restarts.saturating_add(metrics.restarts);
+                total.frames_processed = total
+                    .frames_processed
+                    .saturating_add(metrics.frames_processed);
+                total.queue_depth = total.queue_depth.saturating_add(metrics.queue_depth);
+                total.process_us = total.process_us.saturating_add(metrics.process_us);
+                total.effect_us = total.effect_us.saturating_add(metrics.effect_us);
+                // Keep the deterministic last route's conversion snapshot,
+                // matching RouterCore's existing "last destination" meaning
+                // for a route with several branches.
+                total.resampler_ratio = metrics.resampler_ratio;
+                total.clock_drift_ppm = metrics.clock_drift_ppm;
+                // A fault must not be hidden by a later healthy route.
+                if total.fault == RouteFault::None {
+                    total.fault = metrics.fault;
+                }
+                total
+            }
+        });
+    }
+    aggregate
+}
+
 /// Follow every link out of `port`, collecting the destinations each distinct
-/// chain of effects reaches.
+/// chain of effects reaches and recording which upstream route owns each edge.
 ///
 /// Recursive because the graph is: an effect's output is just another port
 /// with links of its own. `chain` is the effects passed through to get here,
 /// and it doubles as the cycle guard — an effect already in the chain would
 /// otherwise be re-entered forever.
 fn walk(
-    forward: &BTreeMap<PortId, Vec<PortId>>,
+    forward: &BTreeMap<PortId, Vec<(LinkId, PortId)>>,
     sinks: &BTreeMap<PortId, (SinkId, Device)>,
     effects: &BTreeMap<PortId, Effect>,
     port: PortId,
+    route: RouteId,
     chain: &mut Vec<ProcessorId>,
     chains: &mut BTreeMap<Vec<ProcessorId>, Vec<DestinationSpec>>,
-) {
+    link_routes: &mut BTreeMap<LinkId, BTreeSet<RouteId>>,
+) -> bool {
     let Some(next) = forward.get(&port) else {
-        return;
+        return false;
     };
-    for &input in next {
+    let mut reached_sink = false;
+    for &(link_id, input) in next {
         if let Some((sink, _)) = sinks.get(&input) {
             let destinations = chains.entry(chain.clone()).or_default();
             if !destinations
@@ -1086,6 +1156,8 @@ fn walk(
             {
                 destinations.push(DestinationSpec::new(*sink));
             }
+            link_routes.entry(link_id).or_default().insert(route);
+            reached_sink = true;
             continue;
         }
         let Some(effect) = effects.get(&input) else {
@@ -1097,9 +1169,22 @@ fn walk(
             continue;
         }
         chain.push(effect.processor);
-        walk(forward, sinks, effects, effect.output_port, chain, chains);
+        if walk(
+            forward,
+            sinks,
+            effects,
+            effect.output_port,
+            route,
+            chain,
+            chains,
+            link_routes,
+        ) {
+            link_routes.entry(link_id).or_default().insert(route);
+            reached_sink = true;
+        }
         chain.pop();
     }
+    reached_sink
 }
 
 enum PortEnd {
@@ -1145,5 +1230,69 @@ pub(super) fn managed_link(output: PortId, input: PortId) -> Link {
         id: LinkId(graph_id(managed_link_local_id(output, input))),
         output_port: output,
         input_port: input,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effect_to_recorder_link_keeps_the_upstream_route_identity() {
+        let source_port = PortId(10);
+        let effect_input = PortId(20);
+        let effect_output = PortId(21);
+        let recorder_port = PortId(30);
+        let source_link = LinkId(100);
+        let recorder_link = LinkId(101);
+
+        let mut forward = BTreeMap::new();
+        forward.insert(source_port, vec![(source_link, effect_input)]);
+        forward.insert(effect_output, vec![(recorder_link, recorder_port)]);
+
+        let mut effects = BTreeMap::new();
+        effects.insert(
+            effect_input,
+            Effect {
+                processor: ProcessorId(200),
+                diagnostics: None,
+                output_port: effect_output,
+            },
+        );
+
+        let mut sinks = BTreeMap::new();
+        sinks.insert(
+            recorder_port,
+            (
+                SinkId(300),
+                Device {
+                    endpoint: DeviceEndpoint::Recorder,
+                    users: 0,
+                },
+            ),
+        );
+
+        let mut chains = BTreeMap::new();
+        let mut link_routes = BTreeMap::new();
+        let route = RouteId(source_port.0);
+
+        assert!(walk(
+            &forward,
+            &sinks,
+            &effects,
+            source_port,
+            route,
+            &mut Vec::new(),
+            &mut chains,
+            &mut link_routes,
+        ));
+
+        let expected = BTreeSet::from([route]);
+        assert_eq!(link_routes.get(&source_link), Some(&expected));
+        assert_eq!(link_routes.get(&recorder_link), Some(&expected));
+        assert_eq!(
+            chains.keys().collect::<Vec<_>>(),
+            vec![&vec![ProcessorId(200)]]
+        );
     }
 }

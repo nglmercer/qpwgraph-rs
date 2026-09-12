@@ -1172,7 +1172,11 @@ pub fn save_recording(
 mod tests {
     use super::*;
     use crate::router::endpoints::BufferSource;
-    use crate::router::engine::{RouteId, RouteSpec, RouterConfig, RouterCore, SinkId, SourceId};
+    use crate::router::engine::{
+        BranchSpec, DestinationSpec, ProcessorId, RouteId, RouteSpec, RouterConfig, RouterCore,
+        SinkId, SourceId,
+    };
+    use pw_graph_effects::{AudioSpec, EffectDescriptor, EffectError, EffectProcessor};
     use std::io::Read;
 
     fn test_directory(label: &str) -> PathBuf {
@@ -1184,6 +1188,52 @@ mod tests {
             "qpwgraph-recorder-{label}-{}-{stamp}",
             std::process::id()
         ))
+    }
+
+    struct TestDoubler {
+        descriptor: EffectDescriptor,
+        prepared: bool,
+    }
+
+    impl TestDoubler {
+        fn new() -> Self {
+            Self {
+                descriptor: EffectDescriptor {
+                    id: "test.recorder-doubler".into(),
+                    name: "Recorder test doubler".into(),
+                    vendor: "qpwgraph-rs".into(),
+                    version: "1".into(),
+                    parameters: Vec::new(),
+                },
+                prepared: false,
+            }
+        }
+    }
+
+    impl EffectProcessor for TestDoubler {
+        fn descriptor(&self) -> &EffectDescriptor {
+            &self.descriptor
+        }
+
+        fn prepare(&mut self, spec: AudioSpec) -> Result<(), EffectError> {
+            spec.validate()?;
+            self.prepared = true;
+            Ok(())
+        }
+
+        fn process(&mut self, buffer: &mut [f32], _frames: u32) -> Result<(), EffectError> {
+            assert!(self.prepared, "the router must prepare the recorder effect");
+            for sample in buffer {
+                *sample *= 2.0;
+            }
+            Ok(())
+        }
+
+        fn set_parameter(&mut self, id: &str, _value: f32) -> Result<(), EffectError> {
+            Err(EffectError::UnsupportedParameter(id.into()))
+        }
+
+        fn reset(&mut self) {}
     }
 
     #[test]
@@ -1326,6 +1376,63 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(decoded, vec![0.75; 4]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn effect_output_reaches_recorder_after_processing() {
+        let directory = test_directory("effect-router");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("take.wav.part");
+        let format = AudioFormat::new(48_000, 1);
+        let (sink, mut writer) = RecorderWriter::start(format, &path, 128).unwrap();
+        let mut core = RouterCore::new(RouterConfig {
+            block_frames: 4,
+            clock_rate: 48_000,
+        });
+
+        core.add_source(
+            SourceId(1),
+            Box::new(BufferSource::new(format, vec![0.25; 4])),
+        )
+        .unwrap();
+        core.add_processor(
+            ProcessorId(2),
+            Box::new(TestDoubler::new()),
+            AudioSpec {
+                sample_rate: format.sample_rate,
+                channels: format.channels,
+                max_frames: 4,
+            },
+        )
+        .unwrap();
+        core.add_sink(SinkId(1), Box::new(sink)).unwrap();
+        core.set_routes(&[RouteSpec {
+            id: RouteId(1),
+            source: SourceId(1),
+            gain: 1.0,
+            branches: vec![BranchSpec {
+                processors: vec![ProcessorId(2)],
+                gain: 1.0,
+                destinations: vec![DestinationSpec::new(SinkId(1))],
+            }],
+        }])
+        .unwrap();
+
+        core.process();
+        let result = writer.finish().unwrap();
+
+        assert_eq!(result.frames_written, 4);
+        let mut file = File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(WAV_HEADER_BYTES)).unwrap();
+        let mut bytes = vec![0_u8; 4 * std::mem::size_of::<f32>()];
+        file.read_exact(&mut bytes).unwrap();
+        let decoded: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+
+        assert_eq!(decoded, vec![0.5; 4]);
         fs::remove_dir_all(directory).unwrap();
     }
 
