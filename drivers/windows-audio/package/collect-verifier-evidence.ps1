@@ -85,10 +85,34 @@ $installedDriver = Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name='
     Select-Object Name, State, StartMode, PathName, ServiceType
 $devices = @()
 $pnp = Get-Command -Name 'Get-PnpDevice' -CommandType Cmdlet -ErrorAction SilentlyContinue
+$providerDeviceQuery = $null
 if ($null -ne $pnp) {
     $devices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.FriendlyName -match '(?i)QPWGraph|QPW' -or $_.InstanceId -match '(?i)QPWGraph|QPW' } |
         Select-Object Status, Problem, Class, FriendlyName, InstanceId)
+} else {
+    $pnputil = Get-Command -Name 'pnputil.exe' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $pnputil) {
+        $captured = Invoke-Captured $pnputil.Source @(
+            '/enum-devices',
+            '/instanceid',
+            'ROOT\DEVGEN\QPWGRAPH_AUDIO'
+        )
+        $providerDeviceQuery = [pscustomobject]@{
+            method = 'pnputil'
+            available = $true
+            exit_code = $captured.exit_code
+            output = @($captured.output)
+        }
+    } else {
+        $providerDeviceQuery = [pscustomobject]@{
+            method = 'pnputil'
+            available = $false
+            exit_code = $null
+            output = @()
+        }
+    }
 }
 
 $packageFiles = @()
@@ -119,6 +143,7 @@ $evidence = [ordered]@{
     boot_configuration = $boot
     installed_service = $installedDriver
     provider_devices = $devices
+    provider_device_query = $providerDeviceQuery
     package_root = $packageRootPath
     package_files = $packageFiles
     notes = @(

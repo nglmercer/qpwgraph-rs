@@ -21,6 +21,27 @@ The implementation must preserve all already-working Windows functionality.
 
 ---
 
+## 0.1 Current verification snapshot (2026-09-12)
+
+The repository-level Windows work is ahead of the original bootstrap wording:
+
+- the driver source tree contains Rust runtime modules (`acx.rs`, `driver.rs`,
+  `ffi.rs`, and `transport.rs`) plus the WDK-facing header wrapper; no
+  project-authored `.c`, `.cc`, or `.cpp` runtime source remains;
+- the WDK/ACX toolchain audit, ACX-enabled release build, package metadata,
+  package staging, and Rust transport/EOS tests pass on the available PC;
+- process-loopback recovery and application-relay restart/session probes pass
+  without a virtual driver;
+- live candidate-driver acceptance is still open: the installed development
+  devnode is currently rejected by Windows as `CM_PROB_UNSIGNED_DRIVER`, and
+  Verifier, lifecycle, HLK, Secure Boot, Microsoft signing, and ordinary-client
+  acceptance evidence remain external release gates.
+
+These results are source/build and host-mode evidence only. They do not mark
+the live driver rows below complete.
+
+---
+
 # 1. Non-negotiable architectural rules
 
 ## 1.1 Preserve the existing user-mode architecture
@@ -263,7 +284,10 @@ No cross-talk is allowed.
 
 Remove project-authored C runtime implementation from the Windows audio driver.
 
-Current state includes a substantial `acx_bridge.c`.
+The current runtime port is Rust-based. The driver source tree contains no
+project-authored `.c`, `.cc`, or `.cpp` runtime implementation; the remaining
+live acceptance work is tracked below and must pass before this feature is
+called complete.
 
 Final state must have:
 
@@ -530,10 +554,10 @@ if active stream exists:
 After all live tests pass:
 
 ```text
-[ ] remove acx_bridge.c
-[ ] remove project-authored C runtime build path
-[ ] ensure `cargo check --features acx`
-[ ] ensure package build
+[x] confirm no project-authored C/C++ runtime source remains
+[x] confirm the project-authored C runtime build path is absent
+[x] ensure `cargo check --features acx`
+[x] ensure package build
 [ ] ensure test-signed live install
 ```
 
@@ -1640,7 +1664,7 @@ Do NOT call Windows full parity complete until all required rows below are true.
 ## Driver implementation
 
 ```text
-[ ] no project-authored C/C++ runtime driver code
+[x] no project-authored C/C++ runtime driver code (static source audit)
 [ ] four ACX endpoints implemented in Rust
 [ ] two independent Rust PCM cables
 [ ] correct stream timing

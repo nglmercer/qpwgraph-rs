@@ -86,6 +86,49 @@ function Find-Executable([string] $Name) {
     return $null
 }
 
+function Get-QpwgraphPnPUtilState {
+    # Get-PnpDevice is supplied by the optional PnpDevice PowerShell module and
+    # is absent from some normal Windows PowerShell sessions. PnPUtil is part
+    # of Windows itself, so use its read-only query as a fallback rather than
+    # turning an observable device problem into an unknown result.
+    $pnputilPath = Find-Executable 'pnputil.exe'
+    if ($null -eq $pnputilPath) {
+        return $null
+    }
+
+    $captured = Invoke-Captured $pnputilPath @(
+        '/enum-devices',
+        '/instanceid',
+        'ROOT\DEVGEN\QPWGRAPH_AUDIO'
+    )
+    $text = (@($captured.output) -join [Environment]::NewLine).Trim()
+    $hasDevice = $text -match '(?im)^\s*Instance ID:\s*ROOT\\DEVGEN\\QPWGRAPH_AUDIO\s*$'
+    $description = if ($text -match '(?im)^\s*Device Description:\s*(.+?)\s*$') {
+        $Matches[1].Trim()
+    } else {
+        $null
+    }
+    $status = if ($text -match '(?im)^\s*Status:\s*(.+?)\s*$') {
+        $Matches[1].Trim()
+    } else {
+        $null
+    }
+    $problem = if ($text -match '(?im)^\s*Problem Code:\s*(.+?)\s*$') {
+        $Matches[1].Trim()
+    } else {
+        $null
+    }
+    return [pscustomobject]@{
+        available = $true
+        exit_code = $captured.exit_code
+        has_device = $hasDevice
+        description = $description
+        status = $status
+        problem = $problem
+        output = $text
+    }
+}
+
 function Invoke-Captured([string] $FileName, [string[]] $Arguments) {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
@@ -450,7 +493,26 @@ if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
 # package audit on a build machine. Do not install, disable, or restart devices.
 $pnpCommand = Get-Command -Name 'Get-PnpDevice' -CommandType Cmdlet -ErrorAction SilentlyContinue
 if ($null -eq $pnpCommand) {
-    Add-Check 'QPWGraph provider device state' 'unknown' 'Get-PnpDevice is unavailable in this PowerShell session'
+    $pnputilState = Get-QpwgraphPnPUtilState
+    if ($null -eq $pnputilState) {
+        Add-Check 'QPWGraph provider device state' 'unknown' 'Get-PnpDevice and pnputil.exe are unavailable in this PowerShell session'
+    } elseif (-not $pnputilState.has_device) {
+        Add-Check 'QPWGraph provider device state' 'unknown' 'pnputil did not find ROOT\DEVGEN\QPWGRAPH_AUDIO; this audit is read-only'
+    } elseif (-not [string]::IsNullOrWhiteSpace($pnputilState.problem) -or
+        $pnputilState.status -match '(?i)problem') {
+        $detail = @(
+            $pnputilState.status,
+            $pnputilState.problem,
+            $pnputilState.description
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        Add-Check 'QPWGraph provider device state' 'blocked' (($detail -join '; '))
+    } else {
+        $detail = @(
+            $pnputilState.status,
+            $pnputilState.description
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        Add-Check 'QPWGraph provider device state' 'pass' (($detail -join '; '))
+    }
 } else {
     $qpwDevices = @()
     foreach ($deviceClass in @('Media', 'AudioEndpoint')) {
