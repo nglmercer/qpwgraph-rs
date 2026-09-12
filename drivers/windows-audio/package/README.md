@@ -74,6 +74,14 @@ Set-Location drivers/windows-audio/target/qpwgraph-audio-package
 .\run-validation.cmd -Phase DisableTestMode -Reboot
 ```
 
+The workflow cannot change the UEFI Secure Boot setting from Windows. The
+`EnableTestMode` phase checks Secure Boot before touching BCD and reports the
+exact `shutdown.exe /r /fw /t 0` handoff when firmware configuration is
+required. Disable Secure Boot manually on the disposable test machine, boot
+back into Windows, and rerun that phase. Normal `TESTSIGNING` mode is not
+compatible with Secure Boot; a Secure-Boot-on validation requires a Microsoft
+preproduction/production-signed package instead.
+
 The launcher requires Administrator elevation, builds the smoke probe during
 `Prepare`, imports only the public test certificate, creates the development
 root devnode through the WDK `devgen.exe` tool, performs role and round-trip

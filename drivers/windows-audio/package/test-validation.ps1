@@ -22,6 +22,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$rootDeviceInstanceId = 'ROOT\DEVGEN\QPWGRAPH_AUDIO'
+
 if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
     $PackageRoot = $PSScriptRoot
 }
@@ -108,6 +110,22 @@ function Test-TestSigningEnabled {
     return $output -match '(?im)^\s*testsigning\s+Yes\s*$'
 }
 
+function Get-SecureBootState {
+    try {
+        return [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
+    } catch {
+        # Confirm-SecureBootUEFI can be unavailable on downlevel/non-UEFI
+        # sessions. The registry value is read-only and is sufficient for the
+        # fail-closed decision below when Windows has published it.
+        $value = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' `
+            -Name 'UEFISecureBootEnabled' -ErrorAction SilentlyContinue
+        if ($null -ne $value) {
+            return ([int]$value.UEFISecureBootEnabled) -eq 1
+        }
+        return $null
+    }
+}
+
 function Invoke-Prepare {
     Assert-ReadyPackage
     if ($null -eq $repositoryRoot) {
@@ -157,6 +175,13 @@ function Invoke-EnableTestMode {
         if ($WhatIfPreference) {
             Write-Output 'WhatIf mode: Windows test-signing was not enabled.'
             return
+        }
+        $secureBoot = Get-SecureBootState
+        if ($secureBoot -eq $true) {
+            throw 'Secure Boot is enabled. Windows cannot enable TESTSIGNING in this state. Reboot with shutdown.exe /r /fw /t 0, disable Secure Boot in UEFI, boot Windows again, then rerun -Phase EnableTestMode.'
+        }
+        if ($null -eq $secureBoot) {
+            throw 'Secure Boot state could not be determined; refusing to change the boot configuration. Run secure-boot-audit.ps1 from an elevated Windows PowerShell session and resolve the firmware state first.'
         }
         Invoke-Native 'bcdedit.exe' @('/set', 'testsigning', 'on') 'Enabling Windows test-signing'
         Write-Output 'Windows test-signing enabled for the next boot.'
@@ -230,9 +255,36 @@ function Invoke-DisableTestMode {
     }
 }
 
+function Show-QpwgraphDeviceStatus {
+    $getPnpDevice = Get-Command -Name 'Get-PnpDevice' -CommandType Cmdlet -ErrorAction SilentlyContinue
+    if ($null -ne $getPnpDevice) {
+        Get-PnpDevice -InstanceId $rootDeviceInstanceId -ErrorAction SilentlyContinue |
+            Select-Object Status, Problem, Class, FriendlyName, InstanceId
+        return
+    }
+
+    # Windows PowerShell installations without the PnpDevice module still
+    # have PnPUtil. Keep Status useful on those machines instead of silently
+    # hiding the exact devnode that the installer and smoke probe target.
+    $pnputil = Get-Command -Name 'pnputil.exe' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $pnputil) {
+        Write-Warning 'Neither Get-PnpDevice nor pnputil.exe is available; QPWGraph device status is unknown.'
+        return
+    }
+    Write-Output 'Get-PnpDevice is unavailable; using pnputil.exe for the exact QPWGraph devnode.'
+    Invoke-Native $pnputil.Source @('/enum-devices', '/instanceid', $rootDeviceInstanceId) 'Enumerating the QPWGraph device'
+}
+
 function Show-Status {
     Write-Output "Package: $packageRootPath"
     Write-Output ("Package present: {0}" -f (Test-Path -LiteralPath $manifestPath -PathType Leaf))
+    $secureBoot = Get-SecureBootState
+    if ($null -eq $secureBoot) {
+        Write-Output 'Secure Boot enabled: unknown'
+    } else {
+        Write-Output ("Secure Boot enabled: {0}" -f $secureBoot)
+    }
     try {
         Write-Output ("Test-signing enabled: {0}" -f (Test-TestSigningEnabled))
     } catch {
@@ -243,9 +295,7 @@ function Show-Status {
     } else {
         Write-Output 'Smoke probe: not found; run Prepare or pass -SmokeProbe.'
     }
-    Get-PnpDevice -Class MEDIA -PresentOnly -ErrorAction SilentlyContinue |
-        Where-Object { $_.FriendlyName -like 'QPWGraph*' } |
-        Select-Object Status, FriendlyName, InstanceId
+    Show-QpwgraphDeviceStatus
 }
 
 switch ($Phase) {
