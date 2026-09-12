@@ -692,6 +692,17 @@ impl PipewireDriver {
             graph.add_port(port)?;
         }
 
+        for (id, record) in state.links {
+            let _ = graph.insert_existing_link(Link {
+                id: LinkId(graph_id(id as u64)),
+                output_port: PortId(graph_id(record.output_port as u64)),
+                input_port: PortId(graph_id(record.input_port as u64)),
+            });
+        }
+
+        // Compute defaults after links are in the graph. Otherwise the first
+        // refresh has no topology for the layered layout to follow and every
+        // node falls back to its port-role column until the next arrange.
         let default_positions = graph.default_node_positions();
         for (node_id, node) in &mut graph.nodes {
             if let Some(position) = self.positions.get(node_id).copied() {
@@ -700,14 +711,6 @@ impl PipewireDriver {
                 node.position = position;
                 self.positions.insert(*node_id, position);
             }
-        }
-
-        for (id, record) in state.links {
-            let _ = graph.insert_existing_link(Link {
-                id: LinkId(graph_id(id as u64)),
-                output_port: PortId(graph_id(record.output_port as u64)),
-                input_port: PortId(graph_id(record.input_port as u64)),
-            });
         }
 
         Ok(graph)

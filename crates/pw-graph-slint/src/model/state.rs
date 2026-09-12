@@ -812,31 +812,72 @@ pub(crate) fn layout_inputs_fingerprint(view: &UiGraphState, graph: &Graph) -> u
     hash
 }
 
-/// FNV-1a hash of the graph topology that the default auto-layout depends
-/// on: node identities, their port lists, and link endpoints. Positions and
-/// names do not affect layering, so moving a card or renaming it must not
+/// FNV-1a hash of the graph inputs that the default auto-layout depends on:
+/// node kind/application lane, display name, port roles/types, and link
+/// endpoints. Positions do not affect layering, so moving a card must not
 /// invalidate the cached layout.
+fn mix_layout_hash(hash: &mut u64, bytes: &[u8]) {
+    const PRIME: u64 = 0x100000001b3;
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(PRIME);
+    }
+}
+
 pub(crate) fn topology_fingerprint(graph: &Graph) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
     let mut hash = OFFSET;
-    let mut mix = |word: u64| {
-        for byte in word.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
-    };
     for (id, node) in &graph.nodes {
-        mix(id.0);
-        mix(node.ports.len() as u64);
-        for port in &node.ports {
-            mix(port.0);
+        mix_layout_hash(&mut hash, &id.0.to_le_bytes());
+        mix_layout_hash(
+            &mut hash,
+            &match node.node_type {
+                NodeType::PipeWire => 0_u64,
+                NodeType::Effect => 1,
+                NodeType::Recorder => 2,
+                NodeType::AlsaMidi => 3,
+                NodeType::WindowsAudioEndpoint => 4,
+                NodeType::WindowsAudioSession => 5,
+                NodeType::WindowsMidi => 6,
+                NodeType::Unknown => 7,
+            }
+            .to_le_bytes(),
+        );
+        mix_layout_hash(
+            &mut hash,
+            &u64::from(node.matching_identity().has_application_identity()).to_le_bytes(),
+        );
+        mix_layout_hash(&mut hash, node.name.as_bytes());
+        mix_layout_hash(&mut hash, &(node.ports.len() as u64).to_le_bytes());
+        for port_id in &node.ports {
+            mix_layout_hash(&mut hash, &port_id.0.to_le_bytes());
+            if let Some(port) = graph.port(*port_id) {
+                mix_layout_hash(
+                    &mut hash,
+                    &match port.direction {
+                        Direction::Source => 0_u64,
+                        Direction::Sink => 1,
+                    }
+                    .to_le_bytes(),
+                );
+                mix_layout_hash(
+                    &mut hash,
+                    &match port.port_type {
+                        PortType::Audio => 0_u64,
+                        PortType::Video => 1,
+                        PortType::MidiJack => 2,
+                        PortType::MidiAlsa => 3,
+                        PortType::Unknown => 4,
+                    }
+                    .to_le_bytes(),
+                );
+            }
         }
     }
     for (id, link) in &graph.links {
-        mix(id.0);
-        mix(link.output_port.0);
-        mix(link.input_port.0);
+        mix_layout_hash(&mut hash, &id.0.to_le_bytes());
+        mix_layout_hash(&mut hash, &link.output_port.0.to_le_bytes());
+        mix_layout_hash(&mut hash, &link.input_port.0.to_le_bytes());
     }
     hash
 }

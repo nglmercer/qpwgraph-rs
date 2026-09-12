@@ -461,13 +461,17 @@ impl CoreAudioWorker {
             endpoints.push(endpoint);
         }
 
+        self.endpoints = endpoints;
+        self.sessions = sessions;
+
+        // Session links are already present above. Compute defaults only now
+        // so the first endpoint refresh can align connected sources and sinks
+        // instead of ordering an unlinked registry alphabetically.
         for (node_id, position) in graph.default_node_positions() {
             if let Some(node) = graph.nodes.get_mut(&node_id) {
                 node.position = position;
             }
         }
-        self.endpoints = endpoints;
-        self.sessions = sessions;
         self.graph = graph;
         let states = self.read_audio_states();
         if let Ok(mut shared) = self.audio_states.lock() {

@@ -14,6 +14,7 @@
 #[cfg(any(target_os = "windows", test))]
 use pw_graph_core::{WINDOWS_ENDPOINT_CAPTURE_ICON, WINDOWS_ENDPOINT_RENDER_ICON};
 use slint::Image;
+#[cfg(any(target_os = "windows", test))]
 use std::path::Path;
 
 #[cfg(target_os = "windows")]
@@ -89,6 +90,7 @@ pub(super) fn load_windows_icon(_icon_name: &str) -> Option<Image> {
 /// Split a device icon resource reference (`module path,-index`) into its
 /// parts, expanding any `%VARIABLE%` environment prefixes. A plain file path
 /// without a resource index is not a resource reference and yields `None`.
+#[cfg(any(target_os = "windows", test))]
 pub(super) fn parse_icon_resource(reference: &str) -> Option<(String, i32)> {
     let reference = reference
         .trim()
@@ -108,6 +110,7 @@ pub(super) fn parse_icon_resource(reference: &str) -> Option<(String, i32)> {
 /// Expand `%NAME%` environment prefixes the way icon resource references use
 /// them (`%SystemRoot%\System32\mmres.dll,-300`). Unknown or unterminated
 /// variables are left untouched.
+#[cfg(any(target_os = "windows", test))]
 pub(super) fn expand_windows_env(value: &str) -> String {
     let mut expanded = String::with_capacity(value.len());
     let mut rest = value;
@@ -132,6 +135,7 @@ pub(super) fn expand_windows_env(value: &str) -> String {
     expanded
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn has_icon_module_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())

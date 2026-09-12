@@ -652,7 +652,7 @@ impl WavWriter {
 
     pub fn write_interleaved(&mut self, samples: &[f32]) -> Result<(), RecorderError> {
         let channels = self.format.channels as usize;
-        if samples.len() % channels != 0 {
+        if !samples.len().is_multiple_of(channels) {
             return Err(RecorderError::InvalidFormat(format!(
                 "{} samples are not a whole number of {}-channel frames",
                 samples.len(),
@@ -873,7 +873,7 @@ pub fn scan_pending_recordings(
             modified,
         });
     }
-    recovered.sort_by(|left, right| right.modified.cmp(&left.modified));
+    recovered.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
     Ok(recovered)
 }
 

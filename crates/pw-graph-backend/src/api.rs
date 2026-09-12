@@ -815,10 +815,11 @@ pub trait GraphDriver: EffectDriver {
             if input_port.port_type != PortType::Audio {
                 return ConnectionSupport::Unsupported;
             }
-            return self
-                .node_supports_routing(output_node.id)
-                .then_some(ConnectionSupport::Route)
-                .unwrap_or(ConnectionSupport::Unsupported);
+            return if self.node_supports_routing(output_node.id) {
+                ConnectionSupport::Route
+            } else {
+                ConnectionSupport::Unsupported
+            };
         }
         if self.capabilities().connect
             && self.node_supports_routing(output_node.id)
