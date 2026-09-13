@@ -527,6 +527,51 @@ fn verify_unsupported_format_is_rejected(
     Ok(())
 }
 
+fn verify_pin_lifecycle(paths: &[String], name: &str, capture: bool) -> Result<()> {
+    use std::time::Duration;
+    println!("direct KS lifecycle: {name}, capture={capture}");
+    for cycle in 1..=2 {
+        let pin = create_pin(owned_path(paths, name)?, capture, 2, 3840)?;
+        if pin.packets()? != 0 {
+            return Err(format!(
+                "new lifecycle pin {name} started with queued packets"
+            ));
+        }
+        pin.state(KSSTATE_RUN)?;
+        std::thread::sleep(Duration::from_millis(20));
+        let running = pin.packets()?;
+        if running == 0 {
+            return Err(format!("lifecycle start produced no packets on {name}"));
+        }
+        pin.state(KSSTATE_PAUSE)?;
+        let paused = pin.packets()?;
+        std::thread::sleep(Duration::from_millis(15));
+        if pin.packets()? != paused {
+            return Err(format!("paused lifecycle pin advanced on {name}"));
+        }
+        pin.state(KSSTATE_RUN)?;
+        std::thread::sleep(Duration::from_millis(20));
+        let resumed = pin.packets()?;
+        if resumed <= paused {
+            return Err(format!("lifecycle resume produced no progress on {name}"));
+        }
+        pin.stop()?;
+        println!(
+            "  cycle {cycle}: start={running}, paused={paused}, resumed={resumed}; STOP passed"
+        );
+    }
+
+    let reopened = create_pin(owned_path(paths, name)?, capture, 2, 3840)?;
+    if reopened.packets()? != 0 {
+        return Err(format!(
+            "reopened lifecycle pin {name} retained packet state"
+        ));
+    }
+    reopened.stop()?;
+    println!("  reopen: packet state reset; explicit STOP passed");
+    Ok(())
+}
+
 fn verify_eos(
     paths: &[String],
     render_name: &str,
@@ -757,6 +802,19 @@ pub fn run() -> Result<()> {
         println!("Unsupported 44.1 kHz format rejected on all four endpoints.");
         return Ok(());
     }
+    if args == ["--verify-lifecycle"] {
+        let paths = interfaces()?;
+        for (name, capture) in [
+            ("QPWGraphVirtualOutput", false),
+            ("QPWGraphVirtualMonitor", true),
+            ("QPWGraphRelaySink", false),
+            ("QPWGraphRelayMicrophone", true),
+        ] {
+            verify_pin_lifecycle(&paths, name, capture)?;
+        }
+        println!("Direct KS lifecycle checks passed on all four endpoints.");
+        return Ok(());
+    }
     if args == ["--open-pins"] {
         let paths = interfaces()?;
         for (name, capture) in [
@@ -773,7 +831,7 @@ pub fn run() -> Result<()> {
     }
     if args.iter().any(|arg| arg != "--inspect") {
         return Err(
-            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats]".into(),
+            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats | --verify-lifecycle]".into(),
         );
     }
     for path in interfaces()? {
