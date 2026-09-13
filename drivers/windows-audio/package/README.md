@@ -394,7 +394,9 @@ smoke-test bound, **not an HLK limit**. A polling gap over 250 ms, zero frames,
 insufficient observations, or an inaccurate `S_FALSE` reading fails the probe.
 Each running phase lasts at least two seconds; short requested durations do
 not weaken the measurement. This is shared-mode client-visible evidence, not
-direct ACX packet timing, single-packet mapping coverage, or kernel EOS proof.
+direct ACX packet timing or long-run counter-wrap/certification evidence.
+Direct one- and two-packet KS EOS coverage is available from the workspace
+probe: `cargo run -p qpwgraph-audio-ks-probe --locked -- --verify-eos`.
 
 For abrupt process death, use the default read-only plan first, then opt in:
 

@@ -6,18 +6,18 @@ does not transfer that baseline's client/policy acceptance to this candidate.
 
 ## Installed package
 
-- Driver source commit: `20da4d7` (ACX cleanup lifetime and single-packet mapping fixes).
+- Driver source commit: `9c9484b` (single-packet EOS coverage and rollover-safe packet admission).
 - Windows 10 Pro; exact devnode `ROOT\DEVGEN\QPWGRAPH_AUDIO`.
-- Published INF: `oem21.inf`; INF DriverVer `09/12/2026,11.8.52.696`.
+- Published INF: `oem22.inf`; INF DriverVer `09/13/2026,10.38.4.168`.
 - Service `qpwgraph_audio` running, devnode problem code 0.
 - Existing development signer: `CN=QPWGraph Audio Test`, certificate
   `30D29DBE073E11B6308872DA7170B3371BE6C037`.
 - SYS SHA-256 (signed staged package and installed file agree):
-  `5FBD69AE4A4C0C19965958BB11EA1E25A111F9AD386F42E5EC2462B48F9F6EB4`.
+  `9D3F7B552F58643F6BB80E95F7EC0CBE50B98B3BFB86838D98822EBB1A192192`.
 - INF SHA-256:
-  `5E9EBC46E4E503206CC268D7520B360D9DBA9AD7B4ED414AADCC6A3F8F57B57E`.
+  `AF77AC7DB1A471D2233A131E676AF8C65AA6C73AF3F8AC58D2F4C9881C899A3B`.
 - CAT SHA-256:
-  `F89369A2A28E814E07D08E9E0B8A8778F20A11509893A63514AACD1ECE7DC0ED`.
+  `DC8C5408419FF49D3F31D87B4B7FF1E8E5AB4DC78DAA675A38CE0548267A0FCC`.
 
 Signing, catalog membership verification, installation, active binding, and
 four-role enumeration succeeded. Local transcripts (ignored build outputs):
@@ -29,7 +29,13 @@ Test-signing was verified **True**, Secure Boot **False**. No boot settings
 or system default audio devices were changed. Keep Test Mode enabled on this
 PC; full parity and readiness to disable Test Mode are **not complete**.
 
-## Initial live smoke
+The sections through the owned-client crash checks below retain the original
+`oem21.inf`/`20da4d7` evidence. They are historical, intentionally preserved
+for auditability; the currently installed `oem22.inf` package and its hashes
+are recorded above and its post-install checks are recorded in the direct KS
+section below.
+
+## Initial live smoke (historical oem21 package)
 
 From repository root:
 
@@ -332,7 +338,7 @@ separately tested: it failed before spawning a child and preserved the JSON hash
 The WASAPI checks above do not establish delivery of an ACX EOS packet.
 The subsequent direct KS probe supplies the bounded evidence below.
 
-## Direct two-packet KS EOS — September 13
+## Direct KS EOS and sequence coverage — September 13
 
 Added `tests/ks-probe` to the driver workspace. It enumerates interfaces only
 for `ROOT\DEVGEN\QPWGRAPH_AUDIO`, requires unique circuit names and verifies
@@ -343,36 +349,47 @@ host-pin direction before opening. Default `--inspect` does not create streams;
 cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-eos
 ```
 
-All ten live cases passed on candidate `20da4d7`: both cables, each with final
-lengths 0, 4, 16, 960 and 1920 bytes. The probe maps two 1920-byte packets at
-48 kHz, stereo PCM16 and submits `KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM` directly
-through SETWRITEPACKET. It requires exactly 960 first-packet samples followed
-by the requested final prefix, rejects poisoned-tail/unknown/replayed/reordered
-samples, and requires at least ten subsequent silent capture packets with
-render packet count at least 20. All cases also passed explicit PAUSE/ACQUIRE/
-STOP cleanup. Oversized and unaligned EOS, undefined flags, and writes after
+All 20 live cases passed on current candidate `9c9484b` (ten on each cable).
+The two-packet cases use 1920-byte packets at 48 kHz stereo PCM16 and final
+lengths 0, 4, 16, 960 and 1920 bytes. The one-notification cases request 1920
+bytes and verify the corrected 4096-byte page-aligned mapping, then reuse that
+single mapped packet across the first-to-final boundary with lengths 0, 4, 16,
+2048 and 4096 bytes. Every case submits
+`KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM` directly through SETWRITEPACKET.
+
+The oracle permits only leading capture underflow silence. It then requires
+the complete first packet, the exact final prefix, zeroes through the rest of
+the final packet, no poisoned/replayed/reordered samples, at least ten later
+silent capture packets, and explicit PAUSE/ACQUIRE/STOP cleanup. Oversized and
+unaligned EOS, undefined flags, late packets, skipped packets, and writes after
 EOS were rejected (specific rejection status codes are not asserted).
 
 Polling gaps or a changed packet during inspection fail as inconclusive;
-the probe does not silently retry lost observations. Four unit tests cover
-the sample oracle, native request layout and circuit identity. Unit tests and
+the probe does not silently retry lost observations. Six unit tests cover the
+sample oracle, native request layout, and circuit identity. Unit tests and
 strict all-target clippy passed; both are included in Windows CI without live
-driver access. A subsequent WASAPI `--verify-cables --duration-ms 1500` passed
-both cable isolation and stopped-render silence checks.
+driver access. The core crate has 21 passing tests, including late/skipped
+admission and `u32::MAX -> 0` sequence cases. A post-install WASAPI
+`--verify-timing --duration-ms 2000` and `--verify-cables --duration-ms 1500`
+also passed with this current driver.
 
-Retained local logs: `drivers/windows-audio/target/candidate-20da4d7-ks-eos-initial.log`
-and `candidate-20da4d7-ks-eos-ordered.log` in the same directory. Ordered-probe
-executable SHA-256:
-`0AA293939516C7B9026FF40F98936647B898BE6E1EBC28B7613C6A5BC07FD8F9`.
-No driver installation or boot configuration change was made.
+Retained local logs: `drivers/windows-audio/target/candidate-current-source-ks-eos.log`,
+`candidate-current-source-timing.log`, and `candidate-current-source-cables.log`
+in the same directory. Current probe executable SHA-256:
+`EE939D84994A43134AEF8AE09B96439B15F7EA862A6AB4B2B1BF8B5267F7E689`.
+The staged and installed current SYS SHA-256 is
+`9D3F7B552F58643F6BB80E95F7EC0CBE50B98B3BFB86838D98822EBB1A192192`.
+The package was installed without a reboot; no boot configuration or Secure
+Boot setting was changed.
 
-This establishes direct EOS for the tested two-packet configuration only,
-not single-packet operation, wrapping/skipped EOS, counter rollover, precise
-kernel presentation timing, or certification. The full EOS gate remains open.
+This establishes direct EOS for the tested one- and two-packet configurations,
+including live skipped/late rejection. It does not establish a real
+32-bit-counter wrap run, preroll/long-run wrap behavior, precise kernel
+presentation timing, or certification. The full EOS gate remains open.
 
 ## Remaining release gates
 
-Precise stream timing and EOS, controlled active-stream sleep/resume,
+Precise kernel stream timing and the remaining EOS wrap/preroll cases, controlled active-stream sleep/resume,
 hibernate/reboot, client crashes, repeated upgrades/removals, Driver Verifier,
 HLK, Microsoft production signing, Secure Boot on a separate release-test
 environment, and remaining ordinary-client acceptance are not established by

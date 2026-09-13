@@ -38,9 +38,10 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   switching, replacement-PID rebind, and exact restoration on rule removal
   and backend shutdown. The earlier error is not a blanket routing blocker;
   MSIX, manual-override, and full restart/client coverage remain open;
-- Rust candidate `20da4d7`, including the stream cleanup and packet-layout
-  fixes, is test-signed and installed as `oem21.inf`. The running devnode
-  reports problem code 0; installed and staged signed SYS hashes match;
+- Rust candidate `9c9484b` adds the rollover-safe packet admission rule and
+  monotonic scheduling counter. It is test-signed and installed as
+  `oem22.inf`; the running devnode reports problem code 0 and installed and
+  staged signed SYS hashes match;
 - all four provider-owned roles enumerate on that candidate. Both cables
   pass the 1.5-second tone/isolation and stopped-render silence probe;
 - the first candidate stress run passed 100 app cycles, 100 relay cycles,
@@ -57,10 +58,15 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   progression and stopped-position checks. Six owned-process crash/reopen
   cycles also pass (both render/capture clients die together). These do not
   close direct kernel timing/EOS, independent-client, or Verifier gates;
-- direct two-packet KS EOS now passes ten cases across both cables: empty,
-  4-byte, 16-byte, half-packet and full-packet endings, ordered PCM without
-  poisoned-tail replay, continued packet progress, and explicit stream STOP.
-  Single-packet, wrapping/skipped EOS and precise kernel timing remain open;
+- direct KS EOS now passes 20 live cases across both cables: ten two-packet
+  cases and ten one-notification/page-aligned cases, including empty, partial,
+  half-packet and full-packet endings. The probe also rejects skipped/late
+  submissions and checks ordered PCM, poisoned-tail suppression, continued
+  notifications, and explicit STOP;
+- the rollover-safe packet rule is integrated into the driver and covered by
+  core tests, including `u32::MAX -> 0`; a real 32-bit counter-wrap run is not
+  claimed because it would require billions of packets. Precise kernel timing,
+  preroll/long-run wrap behavior, and the remaining release gates stay open;
 - remaining timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
   signing, and remaining ordinary-client acceptance are still release gates.
 
@@ -565,6 +571,14 @@ malformed EOS
 non-EOS packet length ignored per ACX contract
 ```
 
+Current evidence: the direct KS probe passes empty/partial/full EOS in both
+one-notification (single page-aligned packet) and two-notification layouts on
+both owned cables, and live rejects late/skipped/malformed submissions. The
+shared packet-order helper and the monotonic scheduling counter cover the
+`u32::MAX -> 0` transition in unit tests. A real long-run counter wrap and
+preroll-at-wrap run remain release-gate work; do not mark this phase complete
+from the bounded live cases alone.
+
 ### Phase R8 — Power callbacks
 
 Port:
@@ -592,7 +606,7 @@ After all live tests pass:
 [x] confirm the project-authored C runtime build path is absent
 [x] ensure `cargo check --features acx`
 [x] ensure package build
-[x] ensure test-signed live install (`20da4d7`, `oem21.inf`)
+[x] ensure test-signed live install (`9c9484b`, `oem22.inf`)
 ```
 
 Do not delete the old C file before equivalent Rust live validation succeeds.
