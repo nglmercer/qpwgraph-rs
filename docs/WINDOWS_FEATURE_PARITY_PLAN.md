@@ -69,9 +69,9 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   submissions and checks ordered PCM, poisoned-tail suppression, continued
   notifications, and explicit STOP. It also verifies on both render endpoints
   that a non-EOS packet accepts an oversized ignored EOS-length field;
-- direct KS lifecycle now passes two start/pause/resume/stop cycles and a
-  reopen on all four endpoints, with packet counts frozen during pause and
-  reset on reopen;
+- direct KS lifecycle now passes 17 start/pause/resume/stop cycles—one beyond
+  the driver's 16-slot stream registry—and a reopen on all four endpoints,
+  with packet counts frozen during pause and reset on reopen;
 - direct KS presentation timing now passes on all four endpoints: the probe
   correlates `KSPROPERTY_RTAUDIO_PRESENTATION_POSITION` block positions with
   returned QPC timestamps, observed 71–72 position samples and 74 packets per
@@ -539,7 +539,7 @@ Acceptance:
 [x] stop
 [x] reset (shared-mode smoke)
 [x] reopen
-[ ] no leaked stream context
+[ ] no leaked stream context (17-cycle reuse passes; Verifier still required)
 ```
 
 Current evidence: `qpwgraph-audio-ks-probe --verify-lifecycle` completes two

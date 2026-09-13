@@ -410,8 +410,10 @@ Use `--verify-formats` to verify that the four canonical endpoints reject a
 valid but unsupported 44.1 kHz stereo PCM16 pin request.
 Use `--verify-jacks` to query one `KSJACK_DESCRIPTION` for each bridge pin and
 verify its channel map and connection/location metadata.
-Use `--verify-lifecycle` to exercise direct KS start/pause/resume/stop and
-reopen behavior on all four endpoints.
+Use `--verify-lifecycle` to exercise 17 direct KS start/pause/resume/stop
+cycles and reopen behavior on all four endpoints. The count deliberately
+exceeds the driver's 16-slot stream registry so slot leaks become observable;
+Driver Verifier is still required for a release leak gate.
 
 For abrupt process death, use the default read-only plan first, then opt in:
 

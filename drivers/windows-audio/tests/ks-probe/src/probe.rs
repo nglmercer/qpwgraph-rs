@@ -689,7 +689,11 @@ fn verify_jack_metadata(paths: &[String], name: &str) -> Result<()> {
 fn verify_pin_lifecycle(paths: &[String], name: &str, capture: bool) -> Result<()> {
     use std::time::Duration;
     println!("direct KS lifecycle: {name}, capture={capture}");
-    for cycle in 1..=2 {
+    // The driver has a bounded 16-slot stream registry. Repeating more than
+    // that capacity makes a leaked slot observable without requiring a
+    // privileged or long-running stress harness.
+    const CYCLES: u32 = 17;
+    for cycle in 1..=CYCLES {
         let pin = create_pin(owned_path(paths, name)?, capture, 2, 3840)?;
         if pin.packets()? != 0 {
             return Err(format!(
@@ -715,9 +719,11 @@ fn verify_pin_lifecycle(paths: &[String], name: &str, capture: bool) -> Result<(
             return Err(format!("lifecycle resume produced no progress on {name}"));
         }
         pin.stop()?;
-        println!(
-            "  cycle {cycle}: start={running}, paused={paused}, resumed={resumed}; STOP passed"
-        );
+        if cycle == 1 || cycle == CYCLES {
+            println!(
+                "  cycle {cycle}/{CYCLES}: start={running}, paused={paused}, resumed={resumed}; STOP passed"
+            );
+        }
     }
 
     let reopened = create_pin(owned_path(paths, name)?, capture, 2, 3840)?;

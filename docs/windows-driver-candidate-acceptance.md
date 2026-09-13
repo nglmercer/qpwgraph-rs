@@ -381,7 +381,8 @@ The direct lifecycle mode also passed on all four endpoints:
 cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-lifecycle
 ```
 
-Each endpoint completed two start/pause/resume/stop cycles; packet counts did
+Each endpoint completed 17 start/pause/resume/stop cycles—one beyond the
+driver's 16-slot stream registry—without slot exhaustion. Packet counts did
 not advance while paused, and a fresh reopen started with packet count zero.
 
 The direct presentation-position timing mode also passed on all four endpoints:
@@ -429,11 +430,12 @@ also passed with this current driver.
 Retained local logs: `drivers/windows-audio/target/candidate-current-source-r8-formats.log`,
 `candidate-current-source-r8-eos.log`, `candidate-current-source-r8-lifecycle.log`,
 `candidate-current-source-r8-jacks.log`, `candidate-current-source-r8-timing.log`, and
-`candidate-current-source-r8-cables.log` in the same directory. The direct KS timing
-output is retained in `drivers/windows-audio/target/candidate-current-source-r8-direct-timing.log`.
+`candidate-current-source-r8-cables.log` in the same directory. The repeated direct
+KS lifecycle output is retained in `drivers/windows-audio/target/candidate-current-source-r8-repeated-lifecycle.log`,
+and direct KS timing output is retained in `drivers/windows-audio/target/candidate-current-source-r8-direct-timing.log`.
 Current
 probe executable SHA-256:
-`ADCD69B3813049B14AC9C3B0BB698FC2FF84EBBDDD596517D721C5AFFF624E14`.
+`82607A50F0A369F0981FB05BEB932738AD9AABC570CAE44B9D15BDF63E928874`.
 The staged and installed current SYS SHA-256 is
 `099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
 The package was installed without a reboot; no boot configuration or Secure
