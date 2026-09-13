@@ -6,7 +6,7 @@ does not transfer that baseline's client/policy acceptance to this candidate.
 
 Core acceptance uses generic WASAPI and deterministic project-owned helpers.
 Brand-specific application checks are optional compatibility sampling and do
-not require Chrome, Discord, VLC, OBS, or similar applications to be installed.
+not require extra third-party applications to be installed.
 
 ## Installed package
 

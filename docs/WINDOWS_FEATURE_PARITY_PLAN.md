@@ -1366,10 +1366,9 @@ No partial effect chain may remain.
 # 11. Optional ecosystem compatibility
 
 Core parity is defined by the generic WASAPI and deterministic project-owned
-helpers already used by automated tests. Chrome, Discord, VLC, OBS, Teams,
-Zoom, DAWs, or any other branded application are optional compatibility
-sampling only. They are not required dependencies, release gates, or reasons
-to install software on a development machine.
+helpers already used by automated tests. Brand-specific application checks are
+optional compatibility sampling only. They are not required dependencies,
+release gates, or reasons to install software on a development machine.
 
 If a distributor chooses to run an ecosystem matrix, keep its evidence
 separate from core acceptance and verify the same public contracts:
