@@ -394,7 +394,7 @@ cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-
 It queried the driver's `KSPROPERTY_RTAUDIO_PRESENTATION_POSITION` response
 for 750 ms per endpoint, checked monotonic audio blocks and QPC timestamps,
 and compared the block slope with the declared 48 kHz format. The run
-observed 71–72 position samples and 74 packets per endpoint with a maximum
+observed 71–72 position samples and 73–74 packets per endpoint with a maximum
 error of one audio block. Pause held the position constant and explicit STOP
 passed. This closes the bounded direct timing check; long-run counter-wrap,
 preroll, Driver Verifier, and HLK timing evidence remain open.

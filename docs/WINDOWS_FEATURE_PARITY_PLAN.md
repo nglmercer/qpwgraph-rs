@@ -74,8 +74,8 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   with packet counts frozen during pause and reset on reopen;
 - direct KS presentation timing now passes on all four endpoints: the probe
   correlates `KSPROPERTY_RTAUDIO_PRESENTATION_POSITION` block positions with
-  returned QPC timestamps, observed 71–72 position samples and 74 packets per
-  endpoint, and measured at most one-frame error; pause and STOP also pass;
+  returned QPC timestamps, observed 71–72 position samples and 73–74 packets
+  per endpoint, and measured at most one-frame error; pause and STOP also pass;
 - the rollover-safe packet rule is integrated into the driver and covered by
   core tests, including `u32::MAX -> 0`; a real 32-bit counter-wrap run is not
   claimed because it would require billions of packets. Preroll/long-run wrap
