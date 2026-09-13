@@ -444,10 +444,30 @@ including live skipped/late rejection, and bounded direct presentation timing.
 It does not establish a real 32-bit-counter wrap run, preroll/long-run wrap
 behavior, or certification. The full EOS gate remains open.
 
+## Independent client crash recovery — September 13
+
+The crash harness now has an explicit independent-client mode. It starts
+separate owned render and capture helpers, confirms active PCM from each
+matching PID, terminates one flow, confirms the surviving flow remains alive
+for 750 ms, cleans up both helpers, and verifies both cables again:
+
+```powershell
+./drivers/windows-audio/package/run-client-crash.ps1 -Independent -Execute -Cycles 1 -SmokeProbe ./drivers/windows-audio/target/debug/qpwgraph-audio-smoke.exe -EvidencePath ./drivers/windows-audio/target/candidate-current-source-r8-independent-client-crash-20260913-v2.json
+```
+
+All four rows passed: app render-target, app capture-target, relay
+render-target, and relay capture-target. The retained JSON records four
+successful target terminations, four live-survivor checks, recovery output,
+the smoke probe hash
+`50CA81C05FCB785DD33BE7D8B0C8B18C3B0467D97AEB46F141115D55D5F2C237`, and the installed SYS hash
+`099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
+This closes the bounded independent render/capture client-crash rows, but not
+qpwgraph backend crash recovery or Driver Verifier evidence.
+
 ## Remaining release gates
 
 The remaining EOS wrap/preroll cases, controlled active-stream sleep/resume,
-hibernate/reboot, client crashes, repeated upgrades/removals, Driver Verifier,
+hibernate/reboot, qpwgraph backend crash recovery, repeated upgrades/removals, Driver Verifier,
 HLK, Microsoft production signing, Secure Boot on a separate release-test
 environment, and remaining ordinary-client acceptance are not established by
 the basic cable checks. Follow `WINDOWS_FEATURE_PARITY_PLAN.md`; do not mark

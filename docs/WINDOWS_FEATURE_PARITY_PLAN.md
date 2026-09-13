@@ -59,6 +59,10 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   progression and stopped-position checks. Six owned-process crash/reopen
   cycles also pass (both render/capture clients die together). These do not
   close direct kernel timing/EOS, independent-client, or Verifier gates;
+- the independent-client crash probe now passes one render-target and one
+  capture-target termination on each cable: the surviving client stayed alive
+  for 750 ms after its peer was terminated, and both cables recovered; qpwgraph
+  backend-crash and Verifier evidence remain open;
 - direct KS EOS now passes 20 live cases across both cables: ten two-packet
   cases and ten one-notification/page-aligned cases, including empty, partial,
   half-packet and full-packet endings. The probe also rejects skipped/late
@@ -1296,8 +1300,8 @@ Close these live rows:
 [x] device disable/enable (idle-device transition; September 13 candidate)
 [x] AudioSrv restart (fresh-client recovery; September 13 candidate)
 [ ] qpwgraph crash during active stream
-[ ] render client crash
-[ ] capture client crash
+[x] render client crash (independent survivor probe; one cycle per cable)
+[x] capture client crash (independent survivor probe; one cycle per cable)
 [ ] reboot
 [ ] repeated install/uninstall
 [ ] repeated upgrade

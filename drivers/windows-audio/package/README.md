@@ -425,6 +425,14 @@ and the matching PID, kills that process only, then verifies both cables without
 automatic retries. It preserves hashes, readiness, child exit status, and every
 recovery result. Existing evidence files are rejected instead of overwritten.
 It does not change Test Mode, services, devices, defaults, or existing apps.
-Both render and capture die together in each child: independent-client crashes,
-surviving-client behavior, qpwgraph backend crashes, and Verifier still need
+Without `-Independent`, both render and capture die together in each child.
+For separate-client survivor coverage, use:
+
+```powershell
+./run-client-crash.ps1 -Independent -Execute -Cycles 1 -SmokeProbe C:/path/to/qpwgraph-audio-smoke.exe -EvidencePath C:/path/to/independent-client-crash.json
+```
+
+This starts one owned render and one owned capture child per cable, terminates
+each flow in turn, verifies the peer remains alive for 750 ms, and then checks
+both cables after cleanup. qpwgraph backend crashes and Verifier still need
 separate tests. Run on a quiet machine with no other virtual-cable producers.

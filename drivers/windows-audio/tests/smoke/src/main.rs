@@ -81,6 +81,7 @@ mod windows_smoke {
         verify_absent: bool,
         verify_cables: bool,
         verify_timing: bool,
+        hold: Option<(Flow, Selector)>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +127,23 @@ mod windows_smoke {
             )?;
         let renders = enumerate(&enumerator, Flow::Render)?;
         let captures = enumerate(&enumerator, Flow::Capture)?;
+
+        if let Some((flow, selector)) = &options.hold {
+            let endpoints = if *flow == Flow::Render {
+                &renders
+            } else {
+                &captures
+            };
+            let endpoint = select(*flow, endpoints, selector)?;
+            println!(
+                "holding {} endpoint {:?} ({}) as an independent client",
+                flow.label(),
+                endpoint.name,
+                endpoint.id
+            );
+            hold_stream(&endpoint.device, *flow, options.duration)?;
+            return Ok(());
+        }
 
         if options.verify_timing {
             verify_provider_endpoints(&renders, &captures, false)?;
@@ -251,6 +269,7 @@ mod windows_smoke {
         let mut verify_absent = false;
         let mut verify_cables = false;
         let mut verify_timing = false;
+        let mut hold = None;
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -273,6 +292,28 @@ mod windows_smoke {
                 "--verify-absent" => verify_absent = true,
                 "--verify-cables" => verify_cables = true,
                 "--verify-timing" => verify_timing = true,
+                "--hold-render-role" => {
+                    if hold.is_some() {
+                        return Err(SmokeError::Failure(
+                            "only one independent hold role may be selected".into(),
+                        ));
+                    }
+                    hold = Some((
+                        Flow::Render,
+                        Selector::Role(next_value(&mut args, "--hold-render-role")?),
+                    ));
+                }
+                "--hold-capture-role" => {
+                    if hold.is_some() {
+                        return Err(SmokeError::Failure(
+                            "only one independent hold role may be selected".into(),
+                        ));
+                    }
+                    hold = Some((
+                        Flow::Capture,
+                        Selector::Role(next_value(&mut args, "--hold-capture-role")?),
+                    ));
+                }
                 "--render-name" => {
                     render = Selector::Name(next_value(&mut args, "--render-name")?);
                 }
@@ -301,6 +342,18 @@ mod windows_smoke {
                 }
             }
         }
+        if hold.is_some()
+            && (verify_timing
+                || verify_roles
+                || verify_absent
+                || verify_cables
+                || list
+                || round_trip.is_some())
+        {
+            return Err(SmokeError::Failure(
+                "independent hold mode cannot be combined with another probe mode".into(),
+            ));
+        }
         if verify_timing
             && (verify_roles || verify_absent || verify_cables || list || round_trip.is_some())
         {
@@ -318,6 +371,7 @@ mod windows_smoke {
             verify_absent,
             verify_cables,
             verify_timing,
+            hold,
         })
     }
 
@@ -344,6 +398,8 @@ mod windows_smoke {
              --verify-absent             require no provider-owned QPWGraph endpoints\n\
              --verify-cables             test both cables for cross-talk and silence after stop\n\
              --verify-timing             check all four shared-mode clocks (minimum 2s per run phase)\n\
+             --hold-render-role ROLE     hold one render client until process termination\n\
+             --hold-capture-role ROLE    hold one capture client until process termination\n\
              --duration-ms N             start each client for N milliseconds (max 60000)"
         );
     }
@@ -778,6 +834,84 @@ mod windows_smoke {
             Ok(())
         })();
         unsafe { Com::CoTaskMemFree(Some(format.cast())) };
+        result
+    }
+
+    fn hold_stream(
+        device: &Audio::IMMDevice,
+        flow: Flow,
+        duration: Duration,
+    ) -> Result<(), SmokeError> {
+        let stream = open_stream(device, flow)?;
+        let result = (|| {
+            let render = if flow == Flow::Render {
+                Some(
+                    unsafe { stream.client.GetService::<Audio::IAudioRenderClient>() }.map_err(
+                        |error| SmokeError::Failure(format!("get hold render service: {error}")),
+                    )?,
+                )
+            } else {
+                None
+            };
+            let capture = if flow == Flow::Capture {
+                Some(
+                    unsafe { stream.client.GetService::<Audio::IAudioCaptureClient>() }.map_err(
+                        |error| SmokeError::Failure(format!("get hold capture service: {error}")),
+                    )?,
+                )
+            } else {
+                None
+            };
+            unsafe {
+                stream.client.Start().map_err(|error| {
+                    SmokeError::Failure(format!(
+                        "could not start held {} client: {error}",
+                        flow.label()
+                    ))
+                })?;
+            }
+            let deadline = Instant::now() + duration.max(Duration::from_secs(1));
+            let mut phase = 0.0_f64;
+            let mut frames = 0_u64;
+            let mut peak = 0.0_f32;
+            let mut reported_active = false;
+            while Instant::now() < deadline {
+                let (serviced, observed_peak) = if let Some(client) = &render {
+                    (fill_render(&stream, client, &mut phase, APP_TONE_HZ)?, 0.0)
+                } else {
+                    drain_capture(&stream, capture.as_ref().expect("capture hold flow"), None)?
+                };
+                frames = frames.saturating_add(u64::from(serviced));
+                peak = peak.max(observed_peak);
+                if !reported_active && frames > 0 {
+                    println!(
+                        "QPWGRAPH_STREAM_ACTIVE pid={} flow={} frames={} peak={peak:.3}",
+                        std::process::id(),
+                        flow.label(),
+                        frames
+                    );
+                    reported_active = true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if frames == 0 {
+                return Err(SmokeError::Failure(format!(
+                    "held {} client serviced no PCM frames",
+                    flow.label()
+                )));
+            }
+            println!(
+                "  held {} client passed ({} frames, peak {:.3})",
+                flow.label(),
+                frames,
+                peak
+            );
+            Ok(())
+        })();
+        unsafe {
+            let _ = stream.client.Stop();
+            let _ = stream.client.Reset();
+        }
         result
     }
 
