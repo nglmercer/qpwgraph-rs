@@ -223,6 +223,13 @@ struct PinRequest {
     format: PcmFormat,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct JackDescriptionResponse {
+    multiple: KSMULTIPLE_ITEM,
+    description: KSJACK_DESCRIPTION,
+}
+
 fn pin_request(sample_rate: u32, channels: u16, bits: u16) -> PinRequest {
     let bytes_per_sample = bits.div_ceil(8);
     let block_align = channels.saturating_mul(bytes_per_sample);
@@ -527,6 +534,57 @@ fn verify_unsupported_format_is_rejected(
     Ok(())
 }
 
+fn verify_jack_metadata(paths: &[String], name: &str) -> Result<()> {
+    let filter = open_filter(owned_path(paths, name)?)?;
+    let response: JackDescriptionResponse = get(
+        filter.0,
+        &KSP_PIN {
+            Property: identifier(
+                KSPROPSETID_Jack,
+                KSPROPERTY_JACK_DESCRIPTION.0 as u32,
+                KSPROPERTY_TYPE_GET,
+            ),
+            PinId: 1,
+            ..Default::default()
+        },
+    )?;
+    if response.multiple.Count != 1
+        || response.multiple.Size < size_of::<JackDescriptionResponse>() as u32
+    {
+        return Err(format!(
+            "unexpected jack description array on {name}: size={}, count={}",
+            response.multiple.Size, response.multiple.Count
+        ));
+    }
+    let description = response.description;
+    if description.ChannelMapping != 3
+        || description.ConnectionType.0 != 3
+        || description.GeoLocation.0 != 2
+        || description.GenLocation.0 != 0
+        || description.PortConnection.0 != 1
+    {
+        return Err(format!(
+            "unexpected jack description on {name}: channel map={}, connection={}, geo={}, gen={}, port={}, connected={}",
+            description.ChannelMapping,
+            description.ConnectionType.0,
+            description.GeoLocation.0,
+            description.GenLocation.0,
+            description.PortConnection.0,
+            description.IsConnected.0,
+        ));
+    }
+    println!(
+        "direct jack metadata: {name}, channel map={}, connection={}, geo={}, gen={}, port={}, connected={}",
+        description.ChannelMapping,
+        description.ConnectionType.0,
+        description.GeoLocation.0,
+        description.GenLocation.0,
+        description.PortConnection.0,
+        description.IsConnected.0,
+    );
+    Ok(())
+}
+
 fn verify_pin_lifecycle(paths: &[String], name: &str, capture: bool) -> Result<()> {
     use std::time::Duration;
     println!("direct KS lifecycle: {name}, capture={capture}");
@@ -815,6 +873,19 @@ pub fn run() -> Result<()> {
         println!("Direct KS lifecycle checks passed on all four endpoints.");
         return Ok(());
     }
+    if args == ["--verify-jacks"] {
+        let paths = interfaces()?;
+        for name in [
+            "QPWGraphVirtualOutput",
+            "QPWGraphVirtualMonitor",
+            "QPWGraphRelaySink",
+            "QPWGraphRelayMicrophone",
+        ] {
+            verify_jack_metadata(&paths, name)?;
+        }
+        println!("Jack metadata checks passed on all four endpoints.");
+        return Ok(());
+    }
     if args == ["--open-pins"] {
         let paths = interfaces()?;
         for (name, capture) in [
@@ -831,7 +902,7 @@ pub fn run() -> Result<()> {
     }
     if args.iter().any(|arg| arg != "--inspect") {
         return Err(
-            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats | --verify-lifecycle]".into(),
+            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats | --verify-lifecycle | --verify-jacks]".into(),
         );
     }
     for path in interfaces()? {
