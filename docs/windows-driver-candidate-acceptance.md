@@ -117,6 +117,44 @@ Exit 0; `completed=true`, all three cable rows explicitly `passed`:
 This is ordinary driver stress, **not Driver Verifier evidence**. AudioSrv
 restart and device toggle were intentionally separate from this matrix.
 
+## Current-source ordinary stress matrix — passed September 13
+
+The installed `25ddbe6` source candidate was exercised again with the current
+smoke helper and the stricter two-capture silence check:
+
+```powershell
+& ./drivers/windows-audio/package/run-driver-stress.ps1 -SmokeProbe ./drivers/windows-audio/target/debug/qpwgraph-audio-smoke.exe -PackageRoot ./drivers/windows-audio/target/qpwgraph-audio-package -EvidencePath ./drivers/windows-audio/target/candidate-current-source-r8-ordinary-stress-20260913.json -Cycles 100 -DurationMilliseconds 250 -Execute -Verbose
+```
+
+Exit 0; `completed=true`, with 100/100 passed cycles in each row:
+
+- app cable: `2026-09-13T19:33:49.501277Z` to
+  `2026-09-13T19:34:22.1658795Z`;
+- relay cable: `2026-09-13T19:34:22.166695Z` to
+  `2026-09-13T19:34:54.6679885Z`;
+- two-cable isolation: `2026-09-13T19:34:54.668131Z` to
+  `2026-09-13T19:43:31.264974Z`.
+
+The smoke helper SHA-256 is
+`50CA81C05FCB785DD33BE7D8B0C8B18C3B0467D97AEB46F141115D55D5F2C237`; the
+package hashes match the installed candidate above. The matrix explicitly
+records AudioSrv restart and device toggle as `not-run`; those are separate
+lifecycle rows. This is ordinary driver stress, **not Driver Verifier
+evidence**.
+
+## Driver Verifier observation — no driver configured
+
+A read-only collection was saved at
+`drivers/windows-audio/target/candidate-current-source-r8-verifier-observation-20260913.json`.
+`verifier /querysettings` was available and reported `Verifier Flags:
+0x00000000`; `verifier /query` reported that no drivers are currently
+verified. The same record reports Secure Boot disabled and a non-elevated boot
+configuration query that could not be read. No Verifier setting, boot setting,
+service, device, or reboot was changed by this collection.
+
+This is an observation only. It does not prove Verifier cleanliness; the
+driver-scoped Verifier run and its recovery/event evidence remain open.
+
 ## Device disable/enable — passed
 
 Executed elevated:
@@ -257,10 +295,13 @@ These are deterministic project-helper checks, not Chrome/VLC client acceptance.
 
 ## Recommended next validation batch
 
-1. Verify driver packet/presentation timing and live EOS, then controlled
-   active-stream crash/recovery and sleep/resume (the accidental sleep is not a pass).
-2. Run driver-scoped Verifier with a recovery plan and retained crash/event
-   evidence; the normal 300-cycle stress run does not substitute for this.
+1. Run the explicit driver-scoped Verifier matrix with a recovery plan and
+   retained crash/event evidence; ordinary 300-cycle stress does not substitute
+   for it.
+2. On an isolated test window, cover qpwgraph backend crash recovery,
+   pre-existing active-stream sleep/resume, hibernate/reboot, and repeated
+   install/uninstall/upgrade rows. Do not treat the accidental host sleep in
+   the retained failure as sleep/resume acceptance.
 3. Complete MSIX/manual-override and Chrome/VLC/Discord client acceptance,
    then HLK and Microsoft signing/release gates on the required environments.
 

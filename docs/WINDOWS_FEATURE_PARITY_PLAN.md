@@ -49,9 +49,13 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   and 36 isolation cycles, then failed with zero silence-measurement frames
   across a host sleep/resume. Preserve that interrupted run as a failure,
   not a clean stress or sleep/resume acceptance result;
-- a fresh September 13 run passed all 100 app, 100 relay, and 100 isolation
-  cycles with the stricter two-capture silence probe. Idle-device disable/enable
-  and AudioSrv restart also passed with fresh roles/cables verified afterward;
+- a fresh September 13 ordinary stress matrix passed all 100 app, 100 relay,
+  and 100 two-cable isolation cycles with the stricter two-capture silence
+  probe. Its retained evidence is
+  `drivers/windows-audio/target/candidate-current-source-r8-ordinary-stress-20260913.json`;
+  that matrix intentionally did not restart AudioSrv or toggle the device.
+  Separate idle-device disable/enable and AudioSrv restart checks also passed
+  with fresh roles/cables verified afterward;
 - the live isolated-effects probe exposed and verified a fix for registered
   effect outputs being rejected by playback connection checks. Noise-gate
   suppression and bypass restoration now pass on the candidate endpoints;
@@ -542,11 +546,11 @@ Acceptance:
 [ ] no leaked stream context (17-cycle reuse passes; Verifier still required)
 ```
 
-Current evidence: `qpwgraph-audio-ks-probe --verify-lifecycle` completes two
-direct KS lifecycle cycles and one reopen for each owned render/capture
-endpoint. The shared-mode timing probe separately covers reset/start and
-stopped-position behavior; stream-leak freedom remains a Verifier and
-long-run lifecycle gate.
+Current evidence: `qpwgraph-audio-ks-probe --verify-lifecycle` completes 17
+direct KS lifecycle cycles—more than twice the driver's 8-slot stream
+registry—and one reopen for each owned render/capture endpoint. The
+shared-mode timing probe separately covers reset/start and stopped-position
+behavior; stream-leak freedom remains a Verifier and long-run lifecycle gate.
 
 ### Phase R6 — Realtime packet callbacks
 
@@ -998,6 +1002,13 @@ increasing paged pool
 CPU runaway
 DPC/ISR anomalies
 ```
+
+Current machine observation (read-only, September 13):
+`drivers/windows-audio/target/candidate-current-source-r8-verifier-observation-20260913.json`
+reports Verifier query settings available with `Verifier Flags: 0x00000000`
+and `No drivers are currently verified`. This is not a clean Verifier run and
+does not close the gate. The collection did not enable or disable Verifier,
+change boot settings, or reboot the PC.
 
 ---
 
