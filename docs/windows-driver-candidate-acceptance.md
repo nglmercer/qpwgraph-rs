@@ -6,18 +6,18 @@ does not transfer that baseline's client/policy acceptance to this candidate.
 
 ## Installed package
 
-- Driver source commit: `9c9484b` (single-packet EOS coverage and rollover-safe packet admission).
+- Driver source commit: `44cd376` (shared EOS argument validation and live non-EOS length coverage).
 - Windows 10 Pro; exact devnode `ROOT\DEVGEN\QPWGRAPH_AUDIO`.
-- Published INF: `oem22.inf`; INF DriverVer `09/13/2026,10.38.4.168`.
+- Published INF: `oem23.inf`; INF DriverVer `09/13/2026,10.52.9.455`.
 - Service `qpwgraph_audio` running, devnode problem code 0.
 - Existing development signer: `CN=QPWGraph Audio Test`, certificate
   `30D29DBE073E11B6308872DA7170B3371BE6C037`.
 - SYS SHA-256 (signed staged package and installed file agree):
-  `9D3F7B552F58643F6BB80E95F7EC0CBE50B98B3BFB86838D98822EBB1A192192`.
+  `CDA30204931C847E8E90C2FBB230A366053E7D0D46AE9B9DBCC19A1A2C1CC3D3`.
 - INF SHA-256:
-  `AF77AC7DB1A471D2233A131E676AF8C65AA6C73AF3F8AC58D2F4C9881C899A3B`.
+  `623C5270B8C94674EDA47E1D7999DBD561FAA3698D773970C02872F91F2B08D8`.
 - CAT SHA-256:
-  `DC8C5408419FF49D3F31D87B4B7FF1E8E5AB4DC78DAA675A38CE0548267A0FCC`.
+  `42121A24914934CCDD394AED322B55E3B929D2C15889872A81DF3F96A8DA40F1`.
 
 Signing, catalog membership verification, installation, active binding, and
 four-role enumeration succeeded. Local transcripts (ignored build outputs):
@@ -31,7 +31,7 @@ PC; full parity and readiness to disable Test Mode are **not complete**.
 
 The sections through the owned-client crash checks below retain the original
 `oem21.inf`/`20da4d7` evidence. They are historical, intentionally preserved
-for auditability; the currently installed `oem22.inf` package and its hashes
+for auditability; the currently installed `oem23.inf` package and its hashes
 are recorded above and its post-install checks are recorded in the direct KS
 section below.
 
@@ -349,7 +349,10 @@ host-pin direction before opening. Default `--inspect` does not create streams;
 cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-eos
 ```
 
-All 20 live cases passed on current candidate `9c9484b` (ten on each cable).
+All 20 live EOS cases passed on current candidate `44cd376` (ten on each
+cable). A separate check on each render endpoint also accepted packet 1 with
+flags clear and `EosPacketLength = u32::MAX`, proving that the non-EOS length
+field is ignored while the actual packet mapping remains bounded.
 The two-packet cases use 1920-byte packets at 48 kHz stereo PCM16 and final
 lengths 0, 4, 16, 960 and 1920 bytes. The one-notification cases request 1920
 bytes and verify the corrected 4096-byte page-aligned mapping, then reuse that
@@ -368,17 +371,19 @@ Polling gaps or a changed packet during inspection fail as inconclusive;
 the probe does not silently retry lost observations. Six unit tests cover the
 sample oracle, native request layout, and circuit identity. Unit tests and
 strict all-target clippy passed; both are included in Windows CI without live
-driver access. The core crate has 21 passing tests, including late/skipped
-admission and `u32::MAX -> 0` sequence cases. A post-install WASAPI
+driver access. The core crate has 22 passing tests, including shared EOS
+argument validation, late/skipped admission, and `u32::MAX -> 0` sequence
+cases. A post-install WASAPI
 `--verify-timing --duration-ms 2000` and `--verify-cables --duration-ms 1500`
 also passed with this current driver.
 
-Retained local logs: `drivers/windows-audio/target/candidate-current-source-ks-eos.log`,
-`candidate-current-source-timing.log`, and `candidate-current-source-cables.log`
-in the same directory. Current probe executable SHA-256:
-`EE939D84994A43134AEF8AE09B96439B15F7EA862A6AB4B2B1BF8B5267F7E689`.
+Retained local logs: `drivers/windows-audio/target/candidate-current-source-non-eos-eos.log`,
+`candidate-current-source-non-eos-timing.log`, and
+`candidate-current-source-non-eos-cables.log` in the same directory. Current
+probe executable SHA-256:
+`1C12055CCBE77CBA9C4DE97A5A00C49240EEE3A37E2F633FA4F280B2C236FAD8`.
 The staged and installed current SYS SHA-256 is
-`9D3F7B552F58643F6BB80E95F7EC0CBE50B98B3BFB86838D98822EBB1A192192`.
+`CDA30204931C847E8E90C2FBB230A366053E7D0D46AE9B9DBCC19A1A2C1CC3D3`.
 The package was installed without a reboot; no boot configuration or Secure
 Boot setting was changed.
 

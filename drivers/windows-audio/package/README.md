@@ -396,7 +396,9 @@ Each running phase lasts at least two seconds; short requested durations do
 not weaken the measurement. This is shared-mode client-visible evidence, not
 direct ACX packet timing or long-run counter-wrap/certification evidence.
 Direct one- and two-packet KS EOS coverage is available from the workspace
-probe: `cargo run -p qpwgraph-audio-ks-probe --locked -- --verify-eos`.
+probe: `cargo run -p qpwgraph-audio-ks-probe --locked -- --verify-eos`. The
+same run checks that a non-EOS packet may carry an oversized ignored
+`EosPacketLength` while EOS packets remain bounded and frame-aligned.
 
 For abrupt process death, use the default read-only plan first, then opt in:
 

@@ -38,9 +38,10 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   switching, replacement-PID rebind, and exact restoration on rule removal
   and backend shutdown. The earlier error is not a blanket routing blocker;
   MSIX, manual-override, and full restart/client coverage remain open;
-- Rust candidate `9c9484b` adds the rollover-safe packet admission rule and
-  monotonic scheduling counter. It is test-signed and installed as
-  `oem22.inf`; the running devnode reports problem code 0 and installed and
+- Rust candidate `44cd376` adds shared EOS argument validation, the
+  rollover-safe packet admission rule, and the monotonic scheduling counter.
+  It is test-signed and installed as `oem23.inf`; the running devnode reports
+  problem code 0 and installed and
   staged signed SYS hashes match;
 - all four provider-owned roles enumerate on that candidate. Both cables
   pass the 1.5-second tone/isolation and stopped-render silence probe;
@@ -62,7 +63,8 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   cases and ten one-notification/page-aligned cases, including empty, partial,
   half-packet and full-packet endings. The probe also rejects skipped/late
   submissions and checks ordered PCM, poisoned-tail suppression, continued
-  notifications, and explicit STOP;
+  notifications, and explicit STOP. It also verifies on both render endpoints
+  that a non-EOS packet accepts an oversized ignored EOS-length field;
 - the rollover-safe packet rule is integrated into the driver and covered by
   core tests, including `u32::MAX -> 0`; a real 32-bit counter-wrap run is not
   claimed because it would require billions of packets. Precise kernel timing,
@@ -573,8 +575,10 @@ non-EOS packet length ignored per ACX contract
 
 Current evidence: the direct KS probe passes empty/partial/full EOS in both
 one-notification (single page-aligned packet) and two-notification layouts on
-both owned cables, and live rejects late/skipped/malformed submissions. The
-shared packet-order helper and the monotonic scheduling counter cover the
+both owned cables, and live rejects late/skipped/malformed submissions. Both
+render endpoints also accept a non-EOS packet whose ignored length is
+`u32::MAX`; the shared core validator bounds the length only when EOS is set.
+The shared packet-order helper and the monotonic scheduling counter cover the
 `u32::MAX -> 0` transition in unit tests. A real long-run counter wrap and
 preroll-at-wrap run remain release-gate work; do not mark this phase complete
 from the bounded live cases alone.
@@ -606,7 +610,7 @@ After all live tests pass:
 [x] confirm the project-authored C runtime build path is absent
 [x] ensure `cargo check --features acx`
 [x] ensure package build
-[x] ensure test-signed live install (`9c9484b`, `oem22.inf`)
+[x] ensure test-signed live install (`44cd376`, `oem23.inf`)
 ```
 
 Do not delete the old C file before equivalent Rust live validation succeeds.
