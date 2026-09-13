@@ -379,3 +379,35 @@ workspace; the Rust ACX runtime consumes the result through a small
 FFI-shaped transport boundary and honors the final byte length while
 suppressing later circular-buffer data as required by the ACX render packet
 contract.
+
+## Client-visible timing and owned-client crash checks
+
+Run `qpwgraph-audio-smoke --verify-timing --duration-ms 2000` after installing
+the development driver. It selects all four provider-owned roles and runs each
+clock initially, after Stop/Start, and after Reset/Start. It checks monotonic
+position, declared-frequency agreement with correlated QPC timestamps,
+250 ms of unchanged position after Stop, and zero position after Reset.
+
+Device positions are converted using `IAudioClock::GetFrequency`, not assumed
+to be sample frames. The 50 ms maximum accumulated clock error is an explicit
+smoke-test bound, **not an HLK limit**. A polling gap over 250 ms, zero frames,
+insufficient observations, or an inaccurate `S_FALSE` reading fails the probe.
+Each running phase lasts at least two seconds; short requested durations do
+not weaken the measurement. This is shared-mode client-visible evidence, not
+direct ACX packet timing, single-packet mapping coverage, or kernel EOS proof.
+
+For abrupt process death, use the default read-only plan first, then opt in:
+
+```powershell
+./run-client-crash.ps1
+./run-client-crash.ps1 -Execute -Cycles 3 -SmokeProbe C:/path/to/qpwgraph-audio-smoke.exe -EvidencePath C:/path/to/new-client-crash.json
+```
+
+The crash script waits for its own newly launched helper to report active PCM
+and the matching PID, kills that process only, then verifies both cables without
+automatic retries. It preserves hashes, readiness, child exit status, and every
+recovery result. Existing evidence files are rejected instead of overwritten.
+It does not change Test Mode, services, devices, defaults, or existing apps.
+Both render and capture die together in each child: independent-client crashes,
+surviving-client behavior, qpwgraph backend crashes, and Verifier still need
+separate tests. Run on a quiet machine with no other virtual-cable producers.

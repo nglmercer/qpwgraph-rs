@@ -254,6 +254,86 @@ These are deterministic project-helper checks, not Chrome/VLC client acceptance.
 Keep the development PC in Test Mode throughout. Secure Boot validation belongs
 on the separate release-test environment, not a boot change on this machine.
 
+## Shared-mode clock validation — passed September 13
+
+Added `--verify-timing` to the smoke probe. It runs all four endpoints initially,
+after Stop/Start, and after Reset/Start. Each phase services audio continuously
+for a 100 ms startup period and at least two seconds of measurement, followed
+by 250 ms of stopped-position checks. Reset must report position zero.
+
+The probe follows the documented [IAudioClock position/frequency contract](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclock-getposition).
+Positions use the returned device frequency, not an assumed frame count; QPC
+timestamps are already in 100 ns units. It rejects non-monotonic observations,
+inaccurate readings, missing frames, and polling gaps exceeding 250 ms.
+The 50 ms maximum accumulated rate-error bound is a smoke-test choice, not
+an HLK requirement. Ten smoke unit tests and strict smoke clippy passed.
+
+```powershell
+& ./drivers/windows-audio/target/debug/qpwgraph-audio-smoke.exe --verify-timing --duration-ms 2000
+```
+
+Exit 0. Transcript `drivers/windows-audio/target/candidate-20da4d7-timing-initial.log`.
+Probe SHA-256 at that run:
+`FF7F702FDACC0CC94EBD5BC6889AF0F0317FA17B80BF5B523AA7983F11973831`.
+All clock frequencies were 384,000 units/second. Maximum accumulated error
+against correlated QPC, by phase:
+
+| Role | Initial | Resumed | After reset |
+| --- | ---: | ---: | ---: |
+| app-render | 686 us | 481 us | 362 us |
+| app-monitor | 10,683 us | 19,976 us | 10,273 us |
+| relay-render | 738 us | 791 us | 1,036 us |
+| relay-capture | 10,262 us | 20,130 us | 10,248 us |
+
+All stopped positions stayed fixed and resets returned zero; largest observed
+polling gap was 17 ms. These are shared-mode client clocks, which include the
+Windows audio engine. They cannot establish raw ACX presentation accuracy,
+single-packet timing behavior, or actual delivery of a kernel EOS flag.
+The driver SYS was not rebuilt or replaced during these checks.
+
+## Owned round-trip process crashes — passed September 13
+
+Added `package/run-client-crash.ps1`. It defaults to plan-only mode. Executed:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File drivers/windows-audio/package/run-client-crash.ps1 -Execute -Cycles 3 -EvidencePath drivers/windows-audio/target/candidate-20da4d7-client-crash.json
+```
+
+Exit 0; UTC interval approximately `2026-09-13T14:28:48Z` through
+`2026-09-13T14:29:25Z`. All six rows passed. Owned app-cable PIDs were 6212,
+3540, 10088; owned relay-cable PIDs were 11424, 11260, 13224. Each reported
+active non-silent round-trip PCM before termination and exited with code -1.
+Both cables then passed tone/isolation/stopped-silence checks, without retries.
+
+The JSON retains readiness lines, output, PID/exit status, UTC times, and hashes.
+Probe SHA-256 after adding the active-PCM handshake:
+`CF7610682B966199129425688FF646698D75316BD9D486DCA6F1C4449CAAACDB`.
+Installed SYS remained
+`5FBD69AE4A4C0C19965958BB11EA1E25A111F9AD386F42E5EC2462B48F9F6EB4`.
+
+Only processes created by this test were terminated. No boot, service, device,
+default endpoint, or user application configuration was changed. The handshake
+regressions reject wrong PIDs, zero frames, and unrelated output; WhatIf exits
+before process creation. The script refuses to overwrite existing evidence.
+Package staging includes it, and normal Windows CI checks its syntax/handshake
+without executing live crashes.
+
+These rows prove recovery after **both clients die together**. They do not
+prove render-only/capture-only crashes with another client surviving, qpwgraph
+backend crash recovery, sleep/resume, or Driver Verifier cleanliness.
+
+The final rebuilt probe also passed all four clock checks again after the six
+crashes (`candidate-20da4d7-timing-after-crashes.log`, exit 0). Maximum accumulated
+clock error was 20,314 us, and maximum polling gap was 40 ms. The installed
+devnode remained bound to `oem21.inf` with problem code 0; both `qpwgraph_audio`
+and `Audiosrv` were running. Reusing the existing crash evidence path was
+separately tested: it failed before spawning a child and preserved the JSON hash.
+
+Direct kernel EOS remains open: the six core EOS boundary tests pass, but the
+existing WASAPI stop/drain checks do not establish that AudioKSE sent an ACX
+EOS packet. A direct KS/ACX packet harness or suitable instrumented certification
+test is needed before marking the live EOS row complete.
+
 ## Remaining release gates
 
 Precise stream timing and EOS, controlled active-stream sleep/resume,

@@ -92,4 +92,14 @@ foreach ($failCheck in @('', 'Disabled endpoint absence verification', 'Post-ena
     }
     if (-not $failCheck -and $script:checks.Count -ne 5) { throw 'Lifecycle skipped a verification' }
 }
+Invoke-Expression (Import-TestFunction 'run-client-crash.ps1' 'Test-ActiveHandshake')
+foreach ($case in @(
+    @{ Line = 'QPWGRAPH_ROUND_TRIP_ACTIVE pid=42 frames=480'; Pass = $true },
+    @{ Line = 'QPWGRAPH_ROUND_TRIP_ACTIVE pid=43 frames=480'; Pass = $false },
+    @{ Line = 'QPWGRAPH_ROUND_TRIP_ACTIVE pid=42 frames=0'; Pass = $false },
+    @{ Line = 'opening render endpoint'; Pass = $false },
+    @{ Line = 'QPWGRAPH_ROUND_TRIP_ACTIVE pid=42 frames=480 extra'; Pass = $false }
+)) {
+    if ((Test-ActiveHandshake $case.Line 42) -ne $case.Pass) { throw 'Crash handshake accepted the wrong process or missing PCM' }
+}
 Write-Output 'Validation workflow regressions passed without opening audio clients or changing devices.'

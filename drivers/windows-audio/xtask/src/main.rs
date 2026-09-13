@@ -207,6 +207,7 @@ fn stage_package(
         "enable-verifier.ps1",
         "disable-verifier.ps1",
         "run-driver-stress.ps1",
+        "run-client-crash.ps1",
         "collect-verifier-evidence.ps1",
         "prepare-hlk.ps1",
         "secure-boot-audit.ps1",

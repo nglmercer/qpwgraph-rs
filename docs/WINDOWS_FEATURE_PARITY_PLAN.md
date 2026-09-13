@@ -53,6 +53,10 @@ The repository-level Windows work is ahead of the original bootstrap wording:
 - the live isolated-effects probe exposed and verified a fix for registered
   effect outputs being rejected by playback connection checks. Noise-gate
   suppression and bypass restoration now pass on the candidate endpoints;
+- all four shared-mode client clocks now pass initial/resumed/reset-start
+  progression and stopped-position checks. Six owned-process crash/reopen
+  cycles also pass (both render/capture clients die together). These do not
+  close direct kernel timing/EOS, independent-client, or Verifier gates;
 - live timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
   signing, and remaining ordinary-client acceptance are still release gates.
 

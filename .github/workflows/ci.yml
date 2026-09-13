@@ -311,6 +311,7 @@ jobs:
             'drivers/windows-audio/package/enable-verifier.ps1',
             'drivers/windows-audio/package/disable-verifier.ps1',
             'drivers/windows-audio/package/run-driver-stress.ps1',
+            'drivers/windows-audio/package/run-client-crash.ps1',
             'drivers/windows-audio/package/collect-verifier-evidence.ps1',
             'drivers/windows-audio/package/prepare-hlk.ps1',
             'drivers/windows-audio/package/secure-boot-audit.ps1',
@@ -351,7 +352,9 @@ jobs:
         run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-smoke --locked
       - name: Test Windows validation workflows with mocked devices
         shell: powershell
-        run: ./drivers/windows-audio/tests/validation-workflows.ps1
+        run: |
+          ./drivers/windows-audio/tests/validation-workflows.ps1
+          ./drivers/windows-audio/package/run-client-crash.ps1 -Execute -WhatIf
 
   # Kernel-driver compilation requires an eWDK environment and cannot run on
   # the ordinary GitHub-hosted Windows image. A repository variable enables a

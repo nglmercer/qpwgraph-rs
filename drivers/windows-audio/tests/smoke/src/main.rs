@@ -10,6 +10,8 @@
 
 #[cfg(any(windows, test))]
 mod signal;
+#[cfg(any(windows, test))]
+mod timing;
 
 #[cfg(not(windows))]
 fn main() {
@@ -20,10 +22,11 @@ fn main() {
 #[cfg(windows)]
 mod windows_smoke {
     use crate::signal::{SilenceProbe, ToneProbe, APP_TONE_HZ, RELAY_TONE_HZ};
+    use crate::timing::{ClockReading, ClockWindow};
     use std::ffi::c_void;
     use std::time::{Duration, Instant};
 
-    use windows::core::{Result as WindowsResult, GUID, PCWSTR};
+    use windows::core::{Interface, Result as WindowsResult, GUID, PCWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         CM_Get_DevNode_PropertyW, CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
     };
@@ -77,6 +80,7 @@ mod windows_smoke {
         verify_roles: bool,
         verify_absent: bool,
         verify_cables: bool,
+        verify_timing: bool,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +126,27 @@ mod windows_smoke {
             )?;
         let renders = enumerate(&enumerator, Flow::Render)?;
         let captures = enumerate(&enumerator, Flow::Capture)?;
+
+        if options.verify_timing {
+            verify_provider_endpoints(&renders, &captures, false)?;
+            for (flow, role) in [
+                (Flow::Render, "app-render"),
+                (Flow::Capture, "app-monitor"),
+                (Flow::Render, "relay-render"),
+                (Flow::Capture, "relay-capture"),
+            ] {
+                let endpoints = if flow == Flow::Render {
+                    &renders
+                } else {
+                    &captures
+                };
+                let endpoint = select(flow, endpoints, &Selector::Role(role.into()))?;
+                println!("verifying shared-mode clock: {role}");
+                verify_stream_timing(&endpoint.device, flow, options.duration)?;
+            }
+            println!("All four shared-mode clocks passed progression, stop/start, and reset checks (not kernel EOS/HLK evidence)");
+            return Ok(());
+        }
 
         if options.verify_roles || options.verify_absent {
             if options.verify_roles && options.verify_absent {
@@ -225,6 +250,7 @@ mod windows_smoke {
         let mut verify_roles = false;
         let mut verify_absent = false;
         let mut verify_cables = false;
+        let mut verify_timing = false;
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -246,6 +272,7 @@ mod windows_smoke {
                 "--verify-roles" => verify_roles = true,
                 "--verify-absent" => verify_absent = true,
                 "--verify-cables" => verify_cables = true,
+                "--verify-timing" => verify_timing = true,
                 "--render-name" => {
                     render = Selector::Name(next_value(&mut args, "--render-name")?);
                 }
@@ -274,6 +301,13 @@ mod windows_smoke {
                 }
             }
         }
+        if verify_timing
+            && (verify_roles || verify_absent || verify_cables || list || round_trip.is_some())
+        {
+            return Err(SmokeError::Failure(
+                "--verify-timing cannot be combined with another probe mode".into(),
+            ));
+        }
         Ok(Options {
             render,
             capture,
@@ -283,6 +317,7 @@ mod windows_smoke {
             verify_roles,
             verify_absent,
             verify_cables,
+            verify_timing,
         })
     }
 
@@ -308,6 +343,7 @@ mod windows_smoke {
              --verify-roles              require all four provider-owned QPWGraph endpoints\n\
              --verify-absent             require no provider-owned QPWGraph endpoints\n\
              --verify-cables             test both cables for cross-talk and silence after stop\n\
+             --verify-timing             check all four shared-mode clocks (minimum 2s per run phase)\n\
              --duration-ms N             start each client for N milliseconds (max 60000)"
         );
     }
@@ -871,6 +907,140 @@ mod windows_smoke {
         })
     }
 
+    fn read_clock(clock: &Audio::IAudioClock) -> Result<ClockReading, SmokeError> {
+        let mut position = 0;
+        let mut qpc_hns = 0;
+        // The generated Result<()> wrapper discards S_FALSE. Timing evidence
+        // requires an accurate S_OK reading, not a delayed successful call.
+        let result =
+            unsafe { (clock.vtable().GetPosition)(clock.as_raw(), &mut position, &mut qpc_hns) };
+        if result.0 != 0 {
+            return Err(SmokeError::Failure(format!(
+                "GetPosition did not return an accurate reading: HRESULT {:#010x}",
+                result.0 as u32
+            )));
+        }
+        Ok(ClockReading { position, qpc_hns })
+    }
+
+    fn verify_stream_timing(
+        device: &Audio::IMMDevice,
+        flow: Flow,
+        duration: Duration,
+    ) -> Result<(), SmokeError> {
+        let stream = open_stream(device, flow)?;
+        let clock = unsafe { stream.client.GetService::<Audio::IAudioClock>() }
+            .map_err(|error| SmokeError::Failure(format!("get audio clock: {error}")))?;
+        let frequency = unsafe { clock.GetFrequency() }
+            .map_err(|error| SmokeError::Failure(format!("get clock frequency: {error}")))?;
+        if frequency == 0 || read_clock(&clock)?.position != 0 {
+            return Err(SmokeError::Failure(
+                "new stream must have a nonzero clock frequency and zero position".into(),
+            ));
+        }
+        let render = if flow == Flow::Render {
+            Some(
+                unsafe { stream.client.GetService::<Audio::IAudioRenderClient>() }.map_err(
+                    |error| SmokeError::Failure(format!("get timing render service: {error}")),
+                )?,
+            )
+        } else {
+            None
+        };
+        let capture = if flow == Flow::Capture {
+            Some(
+                unsafe { stream.client.GetService::<Audio::IAudioCaptureClient>() }.map_err(
+                    |error| SmokeError::Failure(format!("get timing capture service: {error}")),
+                )?,
+            )
+        } else {
+            None
+        };
+        let mut phase = 0.0;
+        let mut service = || -> Result<u32, SmokeError> {
+            if let Some(client) = &render {
+                fill_render(&stream, client, &mut phase, APP_TONE_HZ)
+            } else {
+                drain_capture(&stream, capture.as_ref().expect("capture flow"), None)
+                    .map(|(frames, _)| frames)
+            }
+        };
+        let duration = duration.max(Duration::from_secs(2));
+        for (index, label) in ["initial", "resumed", "after-reset"]
+            .into_iter()
+            .enumerate()
+        {
+            let starting_position = read_clock(&clock)?.position;
+            if flow == Flow::Render {
+                service()?;
+            }
+            unsafe { stream.client.Start() }
+                .map_err(|error| SmokeError::Failure(format!("timing start: {error}")))?;
+            // Give new rendering streams time to leave their documented zero
+            // startup position, while keeping their buffers serviced.
+            let warmup = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < warmup {
+                service()?;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let first = read_clock(&clock)?;
+            if first.position < starting_position {
+                return Err(SmokeError::Failure(format!(
+                    "{label}: Start moved the clock backwards"
+                )));
+            }
+            let mut window = ClockWindow::new(frequency, first).map_err(SmokeError::Failure)?;
+            let deadline = Instant::now() + duration;
+            let mut last_poll = Instant::now();
+            let mut max_poll_gap = Duration::ZERO;
+            let mut frames = 0_u64;
+            let mut last_position = first.position;
+            while Instant::now() < deadline {
+                frames += u64::from(service()?);
+                let reading = read_clock(&clock)?;
+                window.observe(reading).map_err(SmokeError::Failure)?;
+                last_position = reading.position;
+                let now = Instant::now();
+                max_poll_gap = max_poll_gap.max(now.duration_since(last_poll));
+                last_poll = now;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            max_poll_gap = max_poll_gap.max(last_poll.elapsed());
+            if frames == 0 || max_poll_gap > Duration::from_millis(250) {
+                return Err(SmokeError::Failure(format!("{label}: insufficient/uninterrupted timing evidence: {frames} frames, maximum polling gap {} ms", max_poll_gap.as_millis())));
+            }
+            window.finish().map_err(SmokeError::Failure)?;
+            unsafe { stream.client.Stop() }
+                .map_err(|error| SmokeError::Failure(format!("timing stop: {error}")))?;
+            let stopped = read_clock(&clock)?.position;
+            if stopped < last_position {
+                return Err(SmokeError::Failure(format!(
+                    "{label}: Stop moved the clock backwards"
+                )));
+            }
+            for _ in 0..25 {
+                std::thread::sleep(Duration::from_millis(10));
+                let observed = read_clock(&clock)?.position;
+                if observed != stopped {
+                    return Err(SmokeError::Failure(format!(
+                        "{label}: stopped clock changed from {stopped} to {observed}"
+                    )));
+                }
+            }
+            println!("  {label}: frequency {frequency}, {} samples, {frames} serviced frames, maximum clock error {} us, maximum poll gap {} ms; stopped position {stopped} remained fixed", window.samples, window.max_error_hns / 10, max_poll_gap.as_millis());
+            if index != 0 {
+                unsafe { stream.client.Reset() }
+                    .map_err(|error| SmokeError::Failure(format!("timing reset: {error}")))?;
+                if read_clock(&clock)?.position != 0 {
+                    return Err(SmokeError::Failure(
+                        "Reset did not return the stream clock to zero".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn open_round_trip(
         render_device: &Audio::IMMDevice,
         capture_device: &Audio::IMMDevice,
@@ -901,11 +1071,25 @@ mod windows_smoke {
             let mut phase = 0.0_f64;
             let mut captured_frames = 0_u64;
             let mut captured_peak = 0.0_f32;
+            let mut reported_active = false;
             while Instant::now() < deadline {
                 fill_render(&render, &render_client, &mut phase, 440.0)?;
                 let (frames, peak) = drain_capture(&capture, &capture_client, None)?;
                 captured_frames += u64::from(frames);
                 captured_peak = captured_peak.max(peak);
+                if !reported_active
+                    && captured_frames > 0
+                    && captured_peak.is_finite()
+                    && captured_peak >= 0.01
+                {
+                    // A supervising crash test may terminate this exact helper
+                    // only after both streams have demonstrably carried PCM.
+                    println!(
+                        "QPWGRAPH_ROUND_TRIP_ACTIVE pid={} frames={captured_frames}",
+                        std::process::id()
+                    );
+                    reported_active = true;
+                }
                 std::thread::sleep(Duration::from_millis(2));
             }
             if captured_frames == 0 {
@@ -913,7 +1097,7 @@ mod windows_smoke {
                     "round-trip capture received no PCM packets".into(),
                 ));
             }
-            if captured_peak < 0.01 {
+            if !captured_peak.is_finite() || captured_peak < 0.01 {
                 return Err(SmokeError::Failure(format!(
                     "round-trip capture remained silent (peak {captured_peak:.4})"
                 )));
