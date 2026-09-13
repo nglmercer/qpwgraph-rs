@@ -42,9 +42,16 @@ pub(crate) fn load_node_icon(icon_name: Option<&str>) -> Option<Image> {
         if let Some(image) = cache.borrow().images.get(icon_name).cloned() {
             return image;
         }
-        let image = resolve_icon_path(icon_name)
-            .and_then(|path| Image::load_from_path(&path).ok())
-            .or_else(|| super::icons_windows::load_windows_icon(icon_name));
+        // Try the Windows extractor first: on Windows a session icon is a
+        // full `.exe` path. Probing it with the generic Slint image loader
+        // first makes Slint print `Error loading image from ... .exe` even
+        // though the error is discarded, before the Windows fallback
+        // (`SHGetFileInfoW`/`ExtractIconExW`) gets a chance. On other
+        // platforms `load_windows_icon` is a stub returning `None`, so this
+        // ordering is a no-op there.
+        let image = super::icons_windows::load_windows_icon(icon_name).or_else(|| {
+            resolve_icon_path(icon_name).and_then(|path| Image::load_from_path(&path).ok())
+        });
         cache
             .borrow_mut()
             .images
@@ -56,6 +63,16 @@ pub(crate) fn load_node_icon(icon_name: Option<&str>) -> Option<Image> {
 fn resolve_icon_path(icon_name: &str) -> Option<PathBuf> {
     let direct = Path::new(icon_name);
     if direct.is_file() {
+        // Never hand Windows binaries to the generic Slint image loader: an
+        // `.exe`/`.dll`/… is not an image file, and Slint logs
+        // `Error loading image from ...` to stderr even when the caller
+        // discards the error. These references belong to the Windows
+        // extractor (`SHGetFileInfoW`/`ExtractIconExW` in `icons_windows`).
+        // `.ico` is intentionally not filtered: it is a real image Slint
+        // can load directly.
+        if is_windows_binary_path(direct) {
+            return None;
+        }
         return Some(direct.to_owned());
     }
 
@@ -171,6 +188,21 @@ fn supported_icon_extension(path: &Path) -> bool {
         })
 }
 
+/// Executable/library modules whose icons must be extracted via Win32
+/// (`SHGetFileInfoW`/`ExtractIconExW`) rather than loaded as images.
+/// Kept in sync with `icons_windows::has_icon_module_extension`, minus
+/// `ico`, which is a directly loadable image format.
+fn is_windows_binary_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "exe" | "dll" | "mui" | "cpl" | "scr" | "ocx" | "ax"
+            )
+        })
+}
+
 fn current_icon_theme() -> Option<String> {
     if let Some(theme) = env::var_os("XDG_ICON_THEME").and_then(|theme| theme.into_string().ok()) {
         let theme = theme.trim().to_owned();
@@ -266,7 +298,7 @@ fn parse_icon_size(component: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{icon_path_score, parse_icon_size, resolve_icon_path};
+    use super::{icon_path_score, is_windows_binary_path, parse_icon_size, resolve_icon_path};
     use slint::Image;
     use std::path::Path;
 
@@ -296,5 +328,75 @@ mod tests {
             Image::load_from_path(&path).is_ok(),
             "failed to load resolved icon {path:?}"
         );
+    }
+
+    #[test]
+    fn windows_binaries_are_not_treated_as_direct_images() {
+        for name in [
+            "app.exe", "APP.EXE", "audio.dll", "res.mui", "setup.cpl", "splash.scr",
+            "codec.ocx", "filter.ax",
+        ] {
+            assert!(
+                is_windows_binary_path(Path::new(name)),
+                "{name} must be left to the Windows extractor"
+            );
+        }
+        for name in [
+            "icon.png",
+            "icon.svg",
+            "photo.jpg",
+            "icon.ico",
+            "no-extension",
+        ] {
+            assert!(
+                !is_windows_binary_path(Path::new(name)),
+                "{name} must stay eligible for the generic image loader"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_icon_path_skips_existing_windows_binaries_but_keeps_images() {
+        let dir = std::env::temp_dir().join(format!(
+            "qpwgraph-icon-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
+        let exe = dir.join("fake-app.exe");
+        let svg = dir.join("fake-image.svg");
+        // Minimal SVG; content does not matter for `resolve_icon_path`,
+        // only file existence and extension filtering. SVG avoids fragile
+        // hand-encoded PNGbytes.
+        const PIXEL_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="red"/></svg>"#;
+        std::fs::write(&exe, b"MZ fake executable").expect("exe stub must be writable");
+        std::fs::write(&svg, PIXEL_SVG).expect("svg stub must be writable");
+
+        assert_eq!(
+            resolve_icon_path(&exe.to_string_lossy()),
+            None,
+            "an existing .exe must not be offered to Image::load_from_path"
+        );
+        assert_eq!(
+            resolve_icon_path(&svg.to_string_lossy()),
+            Some(svg.clone()),
+            "an existing .svg must still resolve directly"
+        );
+        assert!(
+            Image::load_from_path(&svg).is_ok(),
+            "the svg stub must load via Slint"
+        );
+        // `load_node_icon` must return `None` for the exe stub without
+        // probing Slint's generic loader (which would log
+        // `Error loading image from ... .exe`); on non-Windows the Windows
+        // extractor is a stub, so this asserts the filtered path end to end.
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            super::load_node_icon(Some(&exe.to_string_lossy())).is_none(),
+            "exe stub must yield no icon instead of a loader error"
+        );
+
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_file(&svg);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
