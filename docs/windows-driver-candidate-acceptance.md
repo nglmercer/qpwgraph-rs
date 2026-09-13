@@ -64,7 +64,7 @@ Read-only System event-log correlation:
 - Kernel-General event 1: clock resynchronized from
   `2026-09-12T16:15:15.767045800Z` to `2026-09-12T17:33:12.500000000Z`.
 
-The fixed wall-clock measurement window was interrupted by host suspension.
+The fixed-duration measurement window was interrupted by host suspension.
 This explains why the run is unsuitable as uninterrupted stress evidence;
 it does not establish clean active-stream recovery from sleep or rule out
 a driver recovery defect. Do not erase or relabel this failure after a rerun.

@@ -347,6 +347,11 @@ jobs:
         run: ./drivers/windows-audio/tests/release-audit.ps1
       - name: Windows driver ring-core tests
         run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
+      - name: Windows driver smoke-probe unit tests (no audio clients)
+        run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-smoke --locked
+      - name: Test Windows validation workflows with mocked devices
+        shell: powershell
+        run: ./drivers/windows-audio/tests/validation-workflows.ps1
 
   # Kernel-driver compilation requires an eWDK environment and cannot run on
   # the ordinary GitHub-hosted Windows image. A repository variable enables a

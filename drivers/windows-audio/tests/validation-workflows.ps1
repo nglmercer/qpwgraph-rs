@@ -72,4 +72,24 @@ Set-QpwgraphRootDeviceEnabled $true
 if (($script:toggles -join ',') -ne 'disable,enable') { throw 'Function-based PnP commands not invoked' }
 Invoke-Expression (Import-TestFunction 'test-validation.ps1' 'Show-QpwgraphDeviceStatus')
 if ((Show-QpwgraphDeviceStatus).InstanceId -ne 'test-only') { throw 'Status ignored function-based PnpDevice' }
+
+Invoke-Expression (Import-TestFunction 'lifecycle-validation.ps1' 'Invoke-DisableEnable')
+function Wait-Smoke([string[]] $Arguments, [string] $Description) {
+    $script:checks += $Description
+    if ($Description -eq $script:failCheck) { throw 'injected lifecycle failure' }
+}
+foreach ($failCheck in @('', 'Disabled endpoint absence verification', 'Post-enable cable verification')) {
+    $script:failCheck = $failCheck
+    $script:toggles = @()
+    $script:checks = @()
+    $failure = $null
+    try { Invoke-DisableEnable } catch { $failure = $_ }
+    if (($script:toggles -join ',') -ne 'disable,enable') {
+        throw 'Lifecycle did not leave the exact test device enabled'
+    }
+    if ([bool]$failure -ne (-not [string]::IsNullOrEmpty($failCheck))) {
+        throw 'Lifecycle failure was suppressed or success failed'
+    }
+    if (-not $failCheck -and $script:checks.Count -ne 5) { throw 'Lifecycle skipped a verification' }
+}
 Write-Output 'Validation workflow regressions passed without opening audio clients or changing devices.'
