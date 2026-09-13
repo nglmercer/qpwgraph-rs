@@ -57,7 +57,11 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   progression and stopped-position checks. Six owned-process crash/reopen
   cycles also pass (both render/capture clients die together). These do not
   close direct kernel timing/EOS, independent-client, or Verifier gates;
-- live timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
+- direct two-packet KS EOS now passes ten cases across both cables: empty,
+  4-byte, 16-byte, half-packet and full-packet endings, ordered PCM without
+  poisoned-tail replay, continued packet progress, and explicit stream STOP.
+  Single-packet, wrapping/skipped EOS and precise kernel timing remain open;
+- remaining timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
   signing, and remaining ordinary-client acceptance are still release gates.
 
 See [candidate acceptance evidence](windows-driver-candidate-acceptance.md)

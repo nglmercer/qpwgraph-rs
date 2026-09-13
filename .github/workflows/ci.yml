@@ -350,6 +350,10 @@ jobs:
         run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
       - name: Windows driver smoke-probe unit tests (no audio clients)
         run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-smoke --locked
+      - name: Direct KS probe unit tests (no driver required)
+        run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked
+      - name: Direct KS probe lint
+        run: cargo clippy --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --all-targets --locked -- -D warnings
       - name: Test Windows validation workflows with mocked devices
         shell: powershell
         run: |

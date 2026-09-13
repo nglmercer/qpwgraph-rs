@@ -329,10 +329,46 @@ devnode remained bound to `oem21.inf` with problem code 0; both `qpwgraph_audio`
 and `Audiosrv` were running. Reusing the existing crash evidence path was
 separately tested: it failed before spawning a child and preserved the JSON hash.
 
-Direct kernel EOS remains open: the six core EOS boundary tests pass, but the
-existing WASAPI stop/drain checks do not establish that AudioKSE sent an ACX
-EOS packet. A direct KS/ACX packet harness or suitable instrumented certification
-test is needed before marking the live EOS row complete.
+The WASAPI checks above do not establish delivery of an ACX EOS packet.
+The subsequent direct KS probe supplies the bounded evidence below.
+
+## Direct two-packet KS EOS — September 13
+
+Added `tests/ks-probe` to the driver workspace. It enumerates interfaces only
+for `ROOT\DEVGEN\QPWGRAPH_AUDIO`, requires unique circuit names and verifies
+host-pin direction before opening. Default `--inspect` does not create streams;
+`--open-pins` exercises mapping and state transitions without RUN.
+
+```powershell
+cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-eos
+```
+
+All ten live cases passed on candidate `20da4d7`: both cables, each with final
+lengths 0, 4, 16, 960 and 1920 bytes. The probe maps two 1920-byte packets at
+48 kHz, stereo PCM16 and submits `KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM` directly
+through SETWRITEPACKET. It requires exactly 960 first-packet samples followed
+by the requested final prefix, rejects poisoned-tail/unknown/replayed/reordered
+samples, and requires at least ten subsequent silent capture packets with
+render packet count at least 20. All cases also passed explicit PAUSE/ACQUIRE/
+STOP cleanup. Oversized and unaligned EOS, undefined flags, and writes after
+EOS were rejected (specific rejection status codes are not asserted).
+
+Polling gaps or a changed packet during inspection fail as inconclusive;
+the probe does not silently retry lost observations. Four unit tests cover
+the sample oracle, native request layout and circuit identity. Unit tests and
+strict all-target clippy passed; both are included in Windows CI without live
+driver access. A subsequent WASAPI `--verify-cables --duration-ms 1500` passed
+both cable isolation and stopped-render silence checks.
+
+Retained local logs: `drivers/windows-audio/target/candidate-20da4d7-ks-eos-initial.log`
+and `candidate-20da4d7-ks-eos-ordered.log` in the same directory. Ordered-probe
+executable SHA-256:
+`0AA293939516C7B9026FF40F98936647B898BE6E1EBC28B7613C6A5BC07FD8F9`.
+No driver installation or boot configuration change was made.
+
+This establishes direct EOS for the tested two-packet configuration only,
+not single-packet operation, wrapping/skipped EOS, counter rollover, precise
+kernel presentation timing, or certification. The full EOS gate remains open.
 
 ## Remaining release gates
 

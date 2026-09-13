@@ -418,6 +418,13 @@ name = "qpwgraph-audio-core"
 version = "0.1.0"
 
 [[package]]
+name = "qpwgraph-audio-ks-probe"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "qpwgraph-audio-smoke"
 version = "0.1.0"
 dependencies = [
