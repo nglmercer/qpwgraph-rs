@@ -1400,8 +1400,11 @@ mod runtime {
                 result = status;
             }
         }
-        clear_cable(APP_CABLE);
-        clear_cable(RELAY_CABLE);
+        // Device release can race the final stream teardown on a power/PnP
+        // transition. Preserve the same rule used by circuit and D0
+        // callbacks: clear queued data only after both sides of a cable are
+        // inactive.
+        clear_idle_cables();
         result
     }
 
