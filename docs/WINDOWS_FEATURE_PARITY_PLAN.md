@@ -50,6 +50,9 @@ The repository-level Windows work is ahead of the original bootstrap wording:
 - a fresh September 13 run passed all 100 app, 100 relay, and 100 isolation
   cycles with the stricter two-capture silence probe. Idle-device disable/enable
   and AudioSrv restart also passed with fresh roles/cables verified afterward;
+- the live isolated-effects probe exposed and verified a fix for registered
+  effect outputs being rejected by playback connection checks. Noise-gate
+  suppression and bypass restoration now pass on the candidate endpoints;
 - live timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
   signing, and remaining ordinary-client acceptance are still release gates.
 
@@ -833,7 +836,7 @@ Live:
 [x] unpackaged Win32 app auto-moves (project tone helper)
 [ ] packaged MSIX app auto-moves
 [x] app route confirms isolation (project tone helper)
-[ ] app effects activate only after isolation
+[x] app effects activate only after isolation (helper live probe; ordinary-session guard regression)
 [x] app restart re-applies route (replacement helper PID)
 [ ] qpwgraph restart reconciles safely
 [x] disabling rule restores previous endpoint (all three roles)

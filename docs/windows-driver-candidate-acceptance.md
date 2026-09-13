@@ -201,6 +201,59 @@ The test now queues `EffectCreateRequest`, polls the matching ticket until
 connecting ports. This is a test migration, not a relaxation of the backend's
 asynchronous-creation requirement or its silence/tone acceptance thresholds.
 
+## Effect output routing correction — passed
+
+The asynchronous test first exposed a genuine backend rejection when connecting
+an activated effect output to a physical playback endpoint. Retained failure:
+`drivers/windows-audio/target/candidate-20da4d7-effects-async-recheck.log`.
+
+`WindowsAudioDriver::connection_support` now recognizes an output registered
+in the live effects routing table for playback destinations, as it already
+did for effect and recorder destinations. An `Effect` node label alone does
+not grant routing permission; ordinary non-isolated sessions remain blocked.
+
+The rerun passed (exit 0, 4.30 seconds): gate enabled delivered 87,759 frames
+with peak/tone amplitude 0; bypass delivered 88,200 frames, peak 0.2500 and
+1 kHz amplitude 0.2407. Transcript:
+`drivers/windows-audio/target/candidate-20da4d7-effects-routing-recheck.log`.
+
+The new backend regression test also passed on this PC. It checks registered
+effect-to-playback support, rejection of a fake unregistered effect, continued
+rejection of a capture-only session to playback/effect, and loss of support
+after effect removal. It queries synthetic graph ports without opening audio
+clients; like neighboring startup tests it may skip on headless Windows without
+Core Audio, so the explicit live probe remains necessary acceptance evidence.
+
+## Local-output preservation and isolated helper restart — passed
+
+Both tests ran explicitly, one at a time, after the effect routing fix:
+
+- `live::ordinary_application_relay_preserves_local_output`, with
+  `PW_GRAPH_TEST_RELAY_LOCAL_OUTPUT=1`: exit 0 in 4.23 seconds. Physical
+  output peak remained 0.2500 before and during ordinary application relay.
+- `live::isolated_application_route_rebinds_after_helper_restart`, with
+  `PW_GRAPH_TEST_WINDOWS_APP_ROUTE_RESTART=1`: exit 0 in 4.60 seconds.
+  The stable selector rebound from PID 10636 to PID 5180; observed 1 kHz
+  amplitudes were 0.2343 before restart and 0.2336 afterward.
+
+Local transcripts are respectively
+`drivers/windows-audio/target/candidate-20da4d7-ordinary_application_relay_preserves_local_output.log`
+and
+`drivers/windows-audio/target/candidate-20da4d7-isolated_application_route_rebinds_after_helper_restart.log`.
+These are deterministic project-helper checks, not Chrome/VLC client acceptance.
+
+## Recommended next validation batch
+
+1. Verify driver packet/presentation timing and live EOS, then controlled
+   active-stream crash/recovery and sleep/resume (the accidental sleep is not a pass).
+2. Run driver-scoped Verifier with a recovery plan and retained crash/event
+   evidence; the normal 300-cycle stress run does not substitute for this.
+3. Complete MSIX/manual-override and Chrome/VLC/Discord client acceptance,
+   then HLK and Microsoft signing/release gates on the required environments.
+
+Keep the development PC in Test Mode throughout. Secure Boot validation belongs
+on the separate release-test environment, not a boot change on this machine.
+
 ## Remaining release gates
 
 Precise stream timing and EOS, controlled active-stream sleep/resume,
