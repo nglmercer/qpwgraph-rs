@@ -365,6 +365,16 @@ cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-
 It rejected a valid 44.1 kHz stereo PCM16 request on all four owned endpoints
 with the current driver, confirming that unsupported formats fail closed.
 
+The endpoint jack metadata query also passed on all four circuits:
+
+```powershell
+cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-jacks
+```
+
+Each bridge pin returned one `KSJACK_DESCRIPTION` with stereo channel map 3,
+ATAPI-internal connection, front/primary-box location, and integrated-device
+port metadata.
+
 The direct lifecycle mode also passed on all four endpoints:
 
 ```powershell
@@ -404,10 +414,10 @@ also passed with this current driver.
 
 Retained local logs: `drivers/windows-audio/target/candidate-current-source-r8-formats.log`,
 `candidate-current-source-r8-eos.log`, `candidate-current-source-r8-lifecycle.log`,
-`candidate-current-source-r8-timing.log`, and
+`candidate-current-source-r8-jacks.log`, `candidate-current-source-r8-timing.log`, and
 `candidate-current-source-r8-cables.log` in the same directory. Current
 probe executable SHA-256:
-`B83B21120B05708F78AD16CC2742E332BA97DF4D5C069C8D24FDA6BE07883520`.
+`57ABF62FBF6C773A39457E33780933D7BEC7B4DF9A6E95C0D639E045C090D181`.
 The staged and installed current SYS SHA-256 is
 `099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
 The package was installed without a reboot; no boot configuration or Secure

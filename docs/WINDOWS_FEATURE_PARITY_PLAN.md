@@ -495,13 +495,16 @@ Acceptance:
 [x] render endpoints open shared mode
 [x] capture endpoints open shared mode
 [x] unsupported formats fail safely (direct 44.1 kHz KS rejection probe)
-[ ] jack metadata still appears
+[x] jack metadata still appears (direct KSPROPERTY_JACK_DESCRIPTION probe)
 ```
 
 Current evidence: `qpwgraph-audio-ks-probe --verify-formats` submits a valid
 44.1 kHz stereo PCM16 pin request and receives a rejection on all four owned
 endpoints. The canonical 48 kHz stereo PCM16 format remains the only format
-advertised by the driver; jack metadata still needs a separate property probe.
+advertised by the driver. The same endpoint pin returns one
+`KSJACK_DESCRIPTION` with the expected
+stereo channel map and configured connection/location fields on all four
+circuits.
 
 ### Phase R5 — Stream lifecycle
 
