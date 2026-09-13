@@ -24,6 +24,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Evidence paths are per-run identities. A later passing run must never erase
+# the failed run it replaces; fail before opening clients or changing devices.
+if (-not [string]::IsNullOrWhiteSpace($EvidencePath) -and
+    (Test-Path -LiteralPath $EvidencePath)) {
+    throw "Stress evidence already exists; choose a new EvidencePath to preserve the previous result: $EvidencePath"
+}
+
 Write-Output 'QPWGraph Driver Verifier stress matrix'
 Write-Output '  READ-ONLY: plan mode only inspects arguments and does not open audio clients.'
 Write-Output '  STATE-MUTATING: -Execute opens/stops audio streams; optional service/device switches mutate system state.'

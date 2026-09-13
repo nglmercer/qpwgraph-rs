@@ -12,6 +12,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if (-not [string]::IsNullOrWhiteSpace($OutputPath) -and
+    (Test-Path -LiteralPath $OutputPath)) {
+    throw "Verifier evidence already exists; choose a new OutputPath to preserve the previous observation: $OutputPath"
+}
+
 Write-Output 'Driver Verifier evidence collection'
 Write-Output '  READ-ONLY: queries Verifier, boot, PnP, and package state; event-log review is separate.'
 Write-Output '  STATE-MUTATING: none.'
