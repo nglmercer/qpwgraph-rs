@@ -340,23 +340,42 @@ fn audit_toolchain() {
         }
     }
 
-    match executable_on_path("clang.exe") {
-        Some(path) => match clang_version(&path) {
+    let mut supported_clang = None;
+    let mut first_clang_failure = None;
+    for path in clang_candidates() {
+        match clang_version(&path) {
             Some((major, version)) if (17..=21).contains(&major) => {
-                checks.push(Check::ok("clang.exe", format!("{path} (LLVM {version})")))
+                supported_clang = Some((path, version));
+                break;
             }
-            Some((_, version)) => checks.push(Check::missing(
-                "clang.exe",
-                format!("{path} reports LLVM {version}; use a released LLVM 17-21 toolchain"),
-            )),
-            None => checks.push(Check::missing(
-                "clang.exe",
-                format!("{path} did not report a parseable LLVM version"),
-            )),
-        },
+            Some((_, version)) => {
+                if first_clang_failure.is_none() {
+                    first_clang_failure = Some(format!(
+                        "{} reports LLVM {version}; use a released LLVM 17-21 toolchain",
+                        path.display()
+                    ));
+                }
+            }
+            None => {
+                if first_clang_failure.is_none() {
+                    first_clang_failure = Some(format!(
+                        "{} did not report a parseable LLVM version",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    match supported_clang {
+        Some((path, version)) => checks.push(Check::ok(
+            "clang.exe",
+            format!("{} (LLVM {version})", path.display()),
+        )),
         None => checks.push(Check::missing(
             "clang.exe",
-            "not found on PATH; use the matching VS/eWDK developer prompt",
+            first_clang_failure.unwrap_or_else(|| {
+                "no clang.exe was found on PATH or in LIBCLANG_PATH/standard LLVM directories; use a released LLVM 17-21 toolchain".to_owned()
+            }),
         )),
     }
 
@@ -417,7 +436,57 @@ fn executable_on_path(name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn clang_version(path: &str) -> Option<(u32, String)> {
+fn clang_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut add = |path: PathBuf| {
+        if path.is_file() && !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    };
+
+    if let Some(configured) = std::env::var_os("LIBCLANG_PATH") {
+        let configured = PathBuf::from(configured);
+        add(if configured.is_file() {
+            configured
+        } else {
+            configured.join("clang.exe")
+        });
+    }
+    if let Some(path) = executable_on_path("clang.exe") {
+        add(PathBuf::from(path));
+    }
+
+    if cfg!(windows) {
+        let mut roots = vec![PathBuf::from("C:\\")];
+        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(value) = std::env::var_os(variable) {
+                let root = PathBuf::from(value);
+                if !roots.iter().any(|existing| existing == &root) {
+                    roots.push(root);
+                }
+            }
+        }
+        for root in roots {
+            let Ok(entries) = fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let directory = entry.path();
+                if directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.to_ascii_lowercase().starts_with("llvm"))
+                {
+                    add(directory.join("bin").join("clang.exe"));
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn clang_version(path: &Path) -> Option<(u32, String)> {
     let output = Command::new(path).arg("--version").output().ok()?;
     if !output.status.success() {
         return None;

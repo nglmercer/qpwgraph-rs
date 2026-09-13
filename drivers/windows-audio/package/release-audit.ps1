@@ -154,6 +154,54 @@ function Find-FirstFile([string[]] $Candidates) {
     return $null
 }
 
+function Find-ClangCandidates {
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    $add = {
+        param([string] $Path)
+        if (-not [string]::IsNullOrWhiteSpace($Path) -and
+            (Test-Path -LiteralPath $Path -PathType Leaf) -and
+            -not $paths.Contains($Path)) {
+            $paths.Add((Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path)
+        }
+    }
+
+    $configured = [Environment]::GetEnvironmentVariable('LIBCLANG_PATH')
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        $configuredCandidate = if (Test-Path -LiteralPath $configured -PathType Leaf) {
+            $configured
+        } else {
+            Join-Path $configured 'clang.exe'
+        }
+        & $add $configuredCandidate
+    }
+
+    $pathCandidate = Find-Executable 'clang.exe'
+    & $add $pathCandidate
+
+    foreach ($base in @('C:\', ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+        if ([string]::IsNullOrWhiteSpace($base)) {
+            continue
+        }
+        $directories = @(Get-ChildItem -Path (Join-Path $base 'LLVM*') -Directory -ErrorAction SilentlyContinue)
+        foreach ($directory in $directories) {
+            & $add (Join-Path $directory.FullName 'bin\clang.exe')
+        }
+    }
+    return @($paths)
+}
+
+function Get-ClangVersion([string] $Path) {
+    $captured = Invoke-Captured $Path @('--version')
+    if ($captured.exit_code -ne 0) {
+        return $null
+    }
+    $text = (@($captured.output) -join ' ')
+    if ($text -match '(?i)(?:LLVM|clang) version\s+(\d+)(?:\.\d+)?') {
+        return [pscustomobject]@{ Major = [int]$Matches[1]; Text = $Matches[0] }
+    }
+    return $null
+}
+
 function Find-Client {
     param(
         [Parameter(Mandatory = $true)]
@@ -427,22 +475,29 @@ if ($null -ne $hlkStudioPath) {
     Add-Check 'HLK Studio' 'blocked' 'hlkstudio.exe was not found on PATH or in the standard Windows Kits path; install the Windows Hardware Lab Kit'
 }
 
-$clangPath = Find-Executable 'clang.exe'
-if ($null -eq $clangPath) {
-    Add-Check 'LLVM/clang toolchain' 'blocked' 'clang.exe was not found on PATH; use released LLVM 17-21'
-} else {
-    $versionOutput = @(Invoke-Captured $clangPath @('--version')).output
-    $versionText = $versionOutput -join ' '
-    if ($versionText -match '(?i)(?:LLVM|clang) version\s+(\d+)(?:\.\d+)?') {
-        $major = [int] $Matches[1]
-        if ($major -ge 17 -and $major -le 21) {
-            Add-Check 'LLVM/clang toolchain' 'pass' "$clangPath ($($Matches[0]))"
-        } else {
-            Add-Check 'LLVM/clang toolchain' 'blocked' "$clangPath reports $($Matches[0]); use released LLVM 17-21"
-        }
-    } else {
-        Add-Check 'LLVM/clang toolchain' 'blocked' "$clangPath did not report a parseable LLVM version"
+$clangCandidates = @(Find-ClangCandidates)
+$supportedClang = $null
+$firstClangFailure = $null
+foreach ($candidate in $clangCandidates) {
+    $version = Get-ClangVersion $candidate
+    if ($null -ne $version -and $version.Major -ge 17 -and $version.Major -le 21) {
+        $supportedClang = [pscustomobject]@{ Path = $candidate; Version = $version.Text }
+        break
     }
+    if ($null -eq $firstClangFailure) {
+        if ($null -eq $version) {
+            $firstClangFailure = "$candidate did not report a parseable LLVM version"
+        } else {
+            $firstClangFailure = "$candidate reports $($version.Text); use released LLVM 17-21"
+        }
+    }
+}
+if ($null -ne $supportedClang) {
+    Add-Check 'LLVM/clang toolchain' 'pass' "$($supportedClang.Path) ($($supportedClang.Version))"
+} elseif ($clangCandidates.Count -eq 0) {
+    Add-Check 'LLVM/clang toolchain' 'blocked' 'clang.exe was not found on PATH, LIBCLANG_PATH, or standard LLVM directories; use released LLVM 17-21'
+} else {
+    Add-Check 'LLVM/clang toolchain' 'blocked' $firstClangFailure
 }
 
 # Read-only machine state. A configured verifier with no rules is deliberately
