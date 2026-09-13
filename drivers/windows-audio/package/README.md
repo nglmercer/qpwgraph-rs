@@ -17,6 +17,10 @@ cargo run -p qpwgraph-audio-smoke -- --list
 Pop-Location
 ```
 
+The Rust tool audit and the release audit honor `LIBCLANG_PATH` and also
+search side-by-side `LLVM*\bin` installations, so an unsupported newer LLVM
+on the default PATH does not hide a usable released toolchain.
+
 `--build-package` builds the ACX-enabled release driver, stamps the INF,
 generates `qpwgraph-audio.cat`, and stages the installable file set under
 `drivers/windows-audio/target/qpwgraph-audio-package`. The source manifest in

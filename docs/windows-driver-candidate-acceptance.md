@@ -29,6 +29,13 @@ Test-signing was verified **True**, Secure Boot **False**. No boot settings
 or system default audio devices were changed. Keep Test Mode enabled on this
 PC; full parity and readiness to disable Test Mode are **not complete**.
 
+A read-only release audit against the refreshed staged package reported 20
+passes, 2 direct environment blocks, and 18 unproven gates. It now discovers
+the installed supported LLVM 21 at `C:\LLVM21\bin` even though the default
+shell also exposes LLVM 22. The remaining direct blocks are missing HLK
+Studio and intentionally disabled Secure Boot; the audit made no system
+changes.
+
 The sections through the owned-client crash checks below retain the original
 `oem21.inf`/`20da4d7` evidence. They are historical, intentionally preserved
 for auditability; the currently installed `oem23.inf` package and its hashes
