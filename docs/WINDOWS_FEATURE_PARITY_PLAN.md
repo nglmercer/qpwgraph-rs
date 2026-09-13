@@ -65,6 +65,9 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   submissions and checks ordered PCM, poisoned-tail suppression, continued
   notifications, and explicit STOP. It also verifies on both render endpoints
   that a non-EOS packet accepts an oversized ignored EOS-length field;
+- direct KS lifecycle now passes two start/pause/resume/stop cycles and a
+  reopen on all four endpoints, with packet counts frozen during pause and
+  reset on reopen;
 - the rollover-safe packet rule is integrated into the driver and covered by
   core tests, including `u32::MAX -> 0`; a real 32-bit counter-wrap run is not
   claimed because it would require billions of packets. Precise kernel timing,
@@ -518,15 +521,21 @@ Preserve the current one-render-producer / one-capture-consumer safety model per
 Acceptance:
 
 ```text
-[ ] open
-[ ] start
-[ ] pause
-[ ] resume
-[ ] stop
-[ ] reset
-[ ] reopen
+[x] open
+[x] start
+[x] pause
+[x] resume
+[x] stop
+[x] reset (shared-mode smoke)
+[x] reopen
 [ ] no leaked stream context
 ```
+
+Current evidence: `qpwgraph-audio-ks-probe --verify-lifecycle` completes two
+direct KS lifecycle cycles and one reopen for each owned render/capture
+endpoint. The shared-mode timing probe separately covers reset/start and
+stopped-position behavior; stream-leak freedom remains a Verifier and
+long-run lifecycle gate.
 
 ### Phase R6 — Realtime packet callbacks
 

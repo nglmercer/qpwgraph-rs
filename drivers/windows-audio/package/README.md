@@ -405,6 +405,8 @@ same run checks that a non-EOS packet may carry an oversized ignored
 `EosPacketLength` while EOS packets remain bounded and frame-aligned.
 Use `--verify-formats` to verify that the four canonical endpoints reject a
 valid but unsupported 44.1 kHz stereo PCM16 pin request.
+Use `--verify-lifecycle` to exercise direct KS start/pause/resume/stop and
+reopen behavior on all four endpoints.
 
 For abrupt process death, use the default read-only plan first, then opt in:
 
