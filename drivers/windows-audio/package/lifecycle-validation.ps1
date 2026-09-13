@@ -102,7 +102,7 @@ function Wait-Smoke([string[]] $Arguments, [string] $Description) {
 }
 
 function Get-QpwgraphRootDevice {
-    $getPnpDevice = Get-Command -Name 'Get-PnpDevice' -CommandType Cmdlet -ErrorAction SilentlyContinue
+    $getPnpDevice = Get-Command -Name 'Get-PnpDevice' -CommandType Cmdlet,Function -ErrorAction SilentlyContinue
     if ($null -eq $getPnpDevice) {
         throw 'Get-PnpDevice is unavailable; run lifecycle validation from Windows PowerShell with the PnpDevice module.'
     }
@@ -131,7 +131,7 @@ function Invoke-PnpTool([string[]] $Arguments, [string] $Description) {
 function Set-QpwgraphRootDeviceEnabled([bool] $Enabled) {
     $verb = if ($Enabled) { 'enable' } else { 'disable' }
     $cmdletName = if ($Enabled) { 'Enable-PnpDevice' } else { 'Disable-PnpDevice' }
-    $pnpCmdlet = Get-Command -Name $cmdletName -CommandType Cmdlet -ErrorAction SilentlyContinue
+    $pnpCmdlet = Get-Command -Name $cmdletName -CommandType Cmdlet,Function -ErrorAction SilentlyContinue
     if ($null -ne $pnpCmdlet) {
         if ($Enabled) {
             Enable-PnpDevice -InstanceId $rootDeviceInstanceId -Confirm:$false -ErrorAction Stop | Out-Null

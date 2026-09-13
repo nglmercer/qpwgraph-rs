@@ -5,6 +5,10 @@ what passed on the available Windows test machine; it is not evidence for a
 current WDK build, Microsoft signing, HLK, Secure Boot, or final release.
 Regenerate it after installing a package produced from the candidate commit.
 
+The newer Rust candidate was installed on September 12. See
+[candidate acceptance](windows-driver-candidate-acceptance.md) for its distinct
+package identity and live results; the historical evidence below is unchanged.
+
 ## September 12 recheck after Test Mode reboot
 
 The installed SYS still hashes to

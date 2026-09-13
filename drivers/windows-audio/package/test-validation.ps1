@@ -256,7 +256,7 @@ function Invoke-DisableTestMode {
 }
 
 function Show-QpwgraphDeviceStatus {
-    $getPnpDevice = Get-Command -Name 'Get-PnpDevice' -CommandType Cmdlet -ErrorAction SilentlyContinue
+    $getPnpDevice = Get-Command -Name 'Get-PnpDevice' -CommandType Cmdlet,Function -ErrorAction SilentlyContinue
     if ($null -ne $getPnpDevice) {
         Get-PnpDevice -InstanceId $rootDeviceInstanceId -ErrorAction SilentlyContinue |
             Select-Object Status, Problem, Class, FriendlyName, InstanceId

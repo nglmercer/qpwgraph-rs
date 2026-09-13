@@ -46,14 +46,44 @@ function Find-SmokeProbe([string] $RequestedPath) {
 }
 
 function Invoke-Smoke([string[]] $Arguments) {
-    $output = @(& $script:smokePath @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
+    $startedUtc = [DateTime]::UtcNow.ToString('o')
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $script:smokePath @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     if ($output.Count -gt 0) {
         Write-Verbose (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
     }
     if ($exitCode -ne 0) {
         $details = ($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
-        throw "Smoke probe $($Arguments -join ' ') failed with exit code $exitCode. $details"
+        throw "Smoke probe $($Arguments -join ' ') failed with exit code $exitCode (started $startedUtc; ended $([DateTime]::UtcNow.ToString('o'))). $details"
+    }
+}
+
+function Invoke-CableCycles([string] $RowName, [string] $Mode, [string] $Label) {
+    $row = $script:stressRows[$RowName]
+    $row.status = 'running'
+    $row.started_utc = [DateTime]::UtcNow.ToString('o')
+    try {
+        for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
+            Invoke-Smoke @($Mode, '--duration-ms', [string]$DurationMilliseconds)
+            $row.completed_cycles = $cycle
+            if (($cycle % 10) -eq 0 -or $cycle -eq $Cycles) {
+                Write-Output "${Label} cycles: $cycle/$Cycles"
+            }
+        }
+        $row.passed = $true
+        $row.status = 'passed'
+    } catch {
+        $row.status = 'failed'
+        $row.failed_cycle = $cycle
+        throw
+    } finally {
+        $row.completed_utc = [DateTime]::UtcNow.ToString('o')
     }
 }
 
@@ -135,6 +165,7 @@ function Write-StressEvidence([bool] $Completed, [string] $Failure) {
         cycles = $Cycles
         duration_milliseconds = $DurationMilliseconds
         smoke_probe = $script:smokePath
+        smoke_probe_sha256 = Get-Sha256 $script:smokePath
         package_files = @($script:packageEvidence)
         rows = $script:stressRows
         failure = $Failure
@@ -169,37 +200,12 @@ if ($WhatIfPreference) {
 try {
     Invoke-Smoke @('--verify-roles')
 
-    for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
-        Invoke-Smoke @('--round-trip', '--duration-ms', [string]$DurationMilliseconds)
-        $script:stressRows.app_cable.completed_cycles = $cycle
-        if (($cycle % 10) -eq 0 -or $cycle -eq $Cycles) {
-            Write-Output "render/app cable cycles: $cycle/$Cycles"
-        }
-    }
-    $script:stressRows.app_cable.passed = $true
-    $script:stressRows.app_cable.status = 'passed'
-
-    for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
-        Invoke-Smoke @('--relay-round-trip', '--duration-ms', [string]$DurationMilliseconds)
-        $script:stressRows.relay_cable.completed_cycles = $cycle
-        if (($cycle % 10) -eq 0 -or $cycle -eq $Cycles) {
-            Write-Output "render/relay cable cycles: $cycle/$Cycles"
-        }
-    }
-    $script:stressRows.relay_cable.passed = $true
-    $script:stressRows.relay_cable.status = 'passed'
-
-    for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
-        Invoke-Smoke @('--verify-cables', '--duration-ms', [string]$DurationMilliseconds)
-        $script:stressRows.two_cable_isolation.completed_cycles = $cycle
-        if (($cycle % 10) -eq 0 -or $cycle -eq $Cycles) {
-            Write-Output "two-cable isolation cycles: $cycle/$Cycles"
-        }
-    }
-    $script:stressRows.two_cable_isolation.passed = $true
-    $script:stressRows.two_cable_isolation.status = 'passed'
+    Invoke-CableCycles 'app_cable' '--round-trip' 'render/app cable'
+    Invoke-CableCycles 'relay_cable' '--relay-round-trip' 'render/relay cable'
+    Invoke-CableCycles 'two_cable_isolation' '--verify-cables' 'two-cable isolation'
 
     if ($AllowAudioServiceRestart) {
+        $script:stressRows.audio_service_restart.status = 'running'
         Restart-Service -Name 'Audiosrv' -Force
         Start-Sleep -Seconds 2
         Invoke-Smoke @('--verify-roles')
@@ -221,6 +227,9 @@ try {
     Write-Output 'Driver stress matrix completed. Preserve this output with Verifier and event-log evidence.'
     Write-StressEvidence $true $null
 } catch {
+    if ($script:stressRows.audio_service_restart.status -eq 'running') {
+        $script:stressRows.audio_service_restart.status = 'failed'
+    }
     $script:stressFailure = $_.Exception.Message
     Write-StressEvidence $false $script:stressFailure
     throw

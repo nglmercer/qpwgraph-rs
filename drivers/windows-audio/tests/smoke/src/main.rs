@@ -19,7 +19,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_smoke {
-    use crate::signal::{ToneProbe, APP_TONE_HZ, RELAY_TONE_HZ};
+    use crate::signal::{SilenceProbe, ToneProbe, APP_TONE_HZ, RELAY_TONE_HZ};
     use std::ffi::c_void;
     use std::time::{Duration, Instant};
 
@@ -1018,29 +1018,37 @@ mod windows_smoke {
         }
         // Drain in-flight engine/cable data for one second, then require an
         // additional half-second of actual silent packets (no packets fails).
-        let settle_until = Instant::now() + Duration::from_secs(1);
+        let silence_started = Instant::now();
+        let settle_until = silence_started + Duration::from_secs(1);
         let deadline = settle_until + Duration::from_millis(500);
-        let mut silent_frames = 0_u64;
-        let mut stopped_peak = 0.0_f32;
-        let mut stopped_other_peak = 0.0_f32;
+        let mut silence = SilenceProbe::default();
+        let mut last_poll = silence_started;
+        let mut max_poll_gap = Duration::ZERO;
         while Instant::now() < deadline {
-            let measuring = Instant::now() >= settle_until;
-            let (frames, peak) = drain_capture(&capture, &capture_client, None)?;
-            let (_, other_peak) = drain_capture(&other, &other_client, None)?;
+            let now = Instant::now();
+            max_poll_gap = max_poll_gap.max(now.duration_since(last_poll));
+            last_poll = now;
+            let measuring = now >= settle_until;
+            let target_packet = drain_capture(&capture, &capture_client, None)?;
+            let other_packet = drain_capture(&other, &other_client, None)?;
             if measuring {
-                silent_frames += u64::from(frames);
-                stopped_peak = stopped_peak.max(peak);
-                stopped_other_peak = stopped_other_peak.max(other_peak);
+                silence.record([target_packet, other_packet]);
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        if silent_frames == 0 || stopped_peak > 0.001 || stopped_other_peak > 0.001 {
+        // Include a suspension/descheduling gap that skips the entire measuring
+        // window. Never retry or accept a no-packet result as silence.
+        max_poll_gap = max_poll_gap.max(last_poll.elapsed());
+        let [silent_frames, other_silent_frames] = silence.frames;
+        let [stopped_peak, stopped_other_peak] = silence.peaks;
+        if !silence.passed() {
             return Err(SmokeError::Failure(format!(
-                "stopped-render silence failed: {silent_frames} frames, target peak {stopped_peak:.6}, other peak {stopped_other_peak:.6}"
+                "stopped-render silence failed: target {silent_frames} frames peak {stopped_peak:.6}, other {other_silent_frames} frames peak {stopped_other_peak:.6}; elapsed {} ms, maximum poll gap {} ms (check host sleep/power events for interrupted measurements)",
+                silence_started.elapsed().as_millis(), max_poll_gap.as_millis()
             )));
         }
         println!(
-            "  stopped-render silence passed: {silent_frames} frames, target peak {stopped_peak:.6}, other peak {stopped_other_peak:.6}"
+            "  stopped-render silence passed: target {silent_frames} frames peak {stopped_peak:.6}, other {other_silent_frames} frames peak {stopped_other_peak:.6}"
         );
         Ok(())
     }

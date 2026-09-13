@@ -6991,6 +6991,7 @@ dependencies = [
  "pw-graph-backend",
  "pw-graph-config",
  "pw-graph-core",
+ "pw-graph-effects",
  "windows",
 ]
 

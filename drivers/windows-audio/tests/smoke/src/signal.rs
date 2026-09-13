@@ -4,6 +4,30 @@
 pub const APP_TONE_HZ: f64 = 1000.0;
 pub const RELAY_TONE_HZ: f64 = 2000.0;
 
+/// Silence requires real packets from both live capture streams.
+#[derive(Default)]
+pub struct SilenceProbe {
+    pub frames: [u64; 2],
+    pub peaks: [f32; 2],
+}
+
+impl SilenceProbe {
+    pub fn record(&mut self, packets: [(u32, f32); 2]) {
+        for (index, (frames, peak)) in packets.into_iter().enumerate() {
+            self.frames[index] += u64::from(frames);
+            self.peaks[index] = self.peaks[index].max(if peak.is_finite() {
+                peak.abs()
+            } else {
+                f32::INFINITY
+            });
+        }
+    }
+
+    pub fn passed(&self) -> bool {
+        self.frames.iter().all(|frames| *frames > 0) && self.peaks.iter().all(|peak| *peak <= 0.001)
+    }
+}
+
 pub struct ToneProbe {
     rate: u32,
     count: u32,
@@ -50,6 +74,38 @@ impl ToneProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_silence_requires_packets_from_both_cables() {
+        for packets in [
+            [(0, 0.0), (0, 0.0)],
+            [(480, 0.0), (0, 0.0)],
+            [(0, 0.0), (480, 0.0)],
+        ] {
+            let mut probe = SilenceProbe::default();
+            probe.record(packets);
+            assert!(!probe.passed());
+        }
+        let mut probe = SilenceProbe::default();
+        probe.record([(480, 0.0), (0, 0.0)]);
+        probe.record([(0, 0.0), (480, 0.0)]);
+        assert!(probe.passed());
+        assert_eq!(probe.frames, [480, 480]);
+    }
+
+    #[test]
+    fn stopped_silence_rejects_signal_and_invalid_samples_on_either_cable() {
+        for index in 0..2 {
+            for peak in [0.002, -0.002, f32::NAN, f32::INFINITY] {
+                let mut packets = [(480, 0.0); 2];
+                packets[index].1 = peak;
+                let mut probe = SilenceProbe::default();
+                probe.record(packets);
+                probe.record([(480, 0.0); 2]);
+                assert!(!probe.passed());
+            }
+        }
+    }
 
     #[test]
     fn separates_current_tone_from_previous_cable_tone_at_any_phase() {

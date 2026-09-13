@@ -28,3 +28,4 @@ windows = { workspace = true, features = [
 pw-graph-backend = { path = "../pw-graph-backend" }
 pw-graph-config = { path = "../pw-graph-config" }
 pw-graph-core = { path = "../pw-graph-core" }
+pw-graph-effects = { path = "../pw-graph-effects" }

@@ -21,7 +21,7 @@ The implementation must preserve all already-working Windows functionality.
 
 ---
 
-## 0.1 Current verification snapshot (2026-09-12)
+## 0.1 Current verification snapshot (2026-09-13)
 
 The repository-level Windows work is ahead of the original bootstrap wording:
 
@@ -36,18 +36,21 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   build, but the first live `GetPersistedDefaultAudioEndpoint` call returns
   `E_INVALIDARG`; the backend therefore demotes automatic routing to
   `ManualOnly` and the automatic-switching acceptance rows remain open;
-- after the Test Mode reboot, the installed development devnode starts and
-  all four provider-owned roles enumerate. Both cables pass the 1.5-second
-  tone/isolation and stopped-render silence probe. The installed SYS hash
-  matches the September 6 baseline, not the newly built Rust candidate;
-- the Rust candidate now uses the ACX stream cleanup callback and separates
-  single-packet page-aligned allocation from two-packet allocation. Candidate
-  installation, live timing/stream tests, Verifier, lifecycle, HLK, Secure
-  Boot, Microsoft signing, and ordinary-client acceptance remain open.
+- Rust candidate `20da4d7`, including the stream cleanup and packet-layout
+  fixes, is test-signed and installed as `oem21.inf`. The running devnode
+  reports problem code 0; installed and staged signed SYS hashes match;
+- all four provider-owned roles enumerate on that candidate. Both cables
+  pass the 1.5-second tone/isolation and stopped-render silence probe;
+- the first candidate stress run passed 100 app cycles, 100 relay cycles,
+  and 36 isolation cycles, then failed with zero silence-measurement frames
+  across a host sleep/resume. Preserve that interrupted run as a failure,
+  not a clean stress or sleep/resume acceptance result;
+- live timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
+  signing, and remaining ordinary-client acceptance are still release gates.
 
-Candidate evidence remains limited to source/build and host-mode checks.
-The installed-baseline results do not mark the Rust candidate's live rows
-below complete.
+See [candidate acceptance evidence](windows-driver-candidate-acceptance.md)
+for package identity, retained failures, and subsequent validation. Historical
+September 6 results remain separate from candidate-specific live evidence.
 
 Development machine instruction: preserve Test Mode. Do not disable
 test-signing or change Secure Boot on this PC. Record readiness for the user
@@ -402,8 +405,8 @@ Port to Rust:
 Acceptance:
 
 ```text
-[ ] driver loads
-[ ] device starts
+[x] driver loads
+[x] device starts
 [ ] device stops
 [ ] device remove works
 [ ] no C runtime callback remains for these operations
@@ -432,8 +435,8 @@ For each:
 Acceptance:
 
 ```text
-[ ] four circuits enumerate
-[ ] semantic roles are preserved
+[x] four circuits enumerate
+[x] semantic roles are preserved
 [ ] duplicate roles fail closed
 [ ] wrong flow/role combinations fail closed
 ```
@@ -462,8 +465,8 @@ shared-mode compatible
 Acceptance:
 
 ```text
-[ ] render endpoints open shared mode
-[ ] capture endpoints open shared mode
+[x] render endpoints open shared mode
+[x] capture endpoints open shared mode
 [ ] unsupported formats fail safely
 [ ] jack metadata still appears
 ```
@@ -573,7 +576,7 @@ After all live tests pass:
 [x] confirm the project-authored C runtime build path is absent
 [x] ensure `cargo check --features acx`
 [x] ensure package build
-[ ] ensure test-signed live install
+[x] ensure test-signed live install (`20da4d7`, `oem21.inf`)
 ```
 
 Do not delete the old C file before equivalent Rust live validation succeeds.
