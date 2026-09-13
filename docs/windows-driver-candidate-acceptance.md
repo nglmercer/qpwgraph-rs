@@ -384,6 +384,20 @@ cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-
 Each endpoint completed two start/pause/resume/stop cycles; packet counts did
 not advance while paused, and a fresh reopen started with packet count zero.
 
+The direct presentation-position timing mode also passed on all four endpoints:
+
+```powershell
+cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-timing
+```
+
+It queried the driver's `KSPROPERTY_RTAUDIO_PRESENTATION_POSITION` response
+for 750 ms per endpoint, checked monotonic audio blocks and QPC timestamps,
+and compared the block slope with the declared 48 kHz format. The run
+observed 71–72 position samples and 74 packets per endpoint with a maximum
+error of one audio block. Pause held the position constant and explicit STOP
+passed. This closes the bounded direct timing check; long-run counter-wrap,
+preroll, Driver Verifier, and HLK timing evidence remain open.
+
 All 20 live EOS cases passed on current candidate `25ddbe6` (ten on each
 cable). A separate check on each render endpoint also accepted packet 1 with
 flags clear and `EosPacketLength = u32::MAX`, proving that the non-EOS length
@@ -415,22 +429,24 @@ also passed with this current driver.
 Retained local logs: `drivers/windows-audio/target/candidate-current-source-r8-formats.log`,
 `candidate-current-source-r8-eos.log`, `candidate-current-source-r8-lifecycle.log`,
 `candidate-current-source-r8-jacks.log`, `candidate-current-source-r8-timing.log`, and
-`candidate-current-source-r8-cables.log` in the same directory. Current
+`candidate-current-source-r8-cables.log` in the same directory. The direct KS timing
+output is retained in `drivers/windows-audio/target/candidate-current-source-r8-direct-timing.log`.
+Current
 probe executable SHA-256:
-`57ABF62FBF6C773A39457E33780933D7BEC7B4DF9A6E95C0D639E045C090D181`.
+`ADCD69B3813049B14AC9C3B0BB698FC2FF84EBBDDD596517D721C5AFFF624E14`.
 The staged and installed current SYS SHA-256 is
 `099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
 The package was installed without a reboot; no boot configuration or Secure
 Boot setting was changed.
 
 This establishes direct EOS for the tested one- and two-packet configurations,
-including live skipped/late rejection. It does not establish a real
-32-bit-counter wrap run, preroll/long-run wrap behavior, precise kernel
-presentation timing, or certification. The full EOS gate remains open.
+including live skipped/late rejection, and bounded direct presentation timing.
+It does not establish a real 32-bit-counter wrap run, preroll/long-run wrap
+behavior, or certification. The full EOS gate remains open.
 
 ## Remaining release gates
 
-Precise kernel stream timing and the remaining EOS wrap/preroll cases, controlled active-stream sleep/resume,
+The remaining EOS wrap/preroll cases, controlled active-stream sleep/resume,
 hibernate/reboot, client crashes, repeated upgrades/removals, Driver Verifier,
 HLK, Microsoft production signing, Secure Boot on a separate release-test
 environment, and remaining ordinary-client acceptance are not established by

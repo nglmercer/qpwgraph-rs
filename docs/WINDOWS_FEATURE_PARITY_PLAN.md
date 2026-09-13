@@ -68,11 +68,15 @@ The repository-level Windows work is ahead of the original bootstrap wording:
 - direct KS lifecycle now passes two start/pause/resume/stop cycles and a
   reopen on all four endpoints, with packet counts frozen during pause and
   reset on reopen;
+- direct KS presentation timing now passes on all four endpoints: the probe
+  correlates `KSPROPERTY_RTAUDIO_PRESENTATION_POSITION` block positions with
+  returned QPC timestamps, observed 71–72 position samples and 74 packets per
+  endpoint, and measured at most one-frame error; pause and STOP also pass;
 - the rollover-safe packet rule is integrated into the driver and covered by
   core tests, including `u32::MAX -> 0`; a real 32-bit counter-wrap run is not
-  claimed because it would require billions of packets. Precise kernel timing,
-  preroll/long-run wrap behavior, and the remaining release gates stay open;
-- remaining timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
+  claimed because it would require billions of packets. Preroll/long-run wrap
+  behavior and the remaining release gates stay open;
+- remaining long-run EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
   signing, and remaining ordinary-client acceptance are still release gates.
 
 See [candidate acceptance evidence](windows-driver-candidate-acceptance.md)
@@ -566,6 +570,13 @@ no unbounded loops
 
 All FFI entry points must be wrapped in a panic boundary or otherwise guarantee panic cannot unwind across the kernel ABI.
 
+Acceptance evidence: `qpwgraph-audio-ks-probe --verify-timing` queries the
+driver's direct presentation-position property on all four endpoints for at
+least 750 ms, correlates block positions with the returned QPC timestamps,
+checks monotonicity and packet progress, and verifies that pause freezes the
+position before STOP. This is direct kernel timing evidence; it does not
+replace long-run counter-wrap, preroll, Verifier, or HLK validation.
+
 ### Phase R7 — EOS
 
 Preserve the current EOS behavior.
@@ -633,7 +644,7 @@ After all live tests pass:
 [x] confirm the project-authored C runtime build path is absent
 [x] ensure `cargo check --features acx`
 [x] ensure package build
-[x] ensure test-signed live install (`44cd376`, `oem23.inf`)
+[x] ensure test-signed live install (`25ddbe6`, `oem24.inf`)
 ```
 
 Do not delete the old C file before equivalent Rust live validation succeeds.
@@ -1742,7 +1753,7 @@ Do NOT call Windows full parity complete until all required rows below are true.
 [x] no project-authored C/C++ runtime driver code (static source audit)
 [x] four ACX endpoints implemented in Rust
 [x] two independent Rust PCM cables
-[ ] correct stream timing
+[x] correct stream timing (bounded direct KS presentation-position check)
 [ ] EOS correct
 [ ] power transitions correct
 [ ] no cross-talk

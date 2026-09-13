@@ -5,6 +5,7 @@ use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDL
 use windows::Win32::Media::Audio::{WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0};
 use windows::Win32::Media::KernelStreaming::*;
 use windows::Win32::Storage::FileSystem::*;
+use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::Win32::System::IO::DeviceIoControl;
 
 type Result<T> = std::result::Result<T, String>;
@@ -313,6 +314,16 @@ impl Pin {
             ),
         )
     }
+    fn presentation_position(&self) -> Result<KSAUDIO_PRESENTATION_POSITION> {
+        get(
+            self.handle.0,
+            &identifier(
+                KSPROPSETID_RtAudio,
+                KSPROPERTY_RTAUDIO_PRESENTATION_POSITION.0 as u32,
+                KSPROPERTY_TYPE_GET,
+            ),
+        )
+    }
     fn write_packet(&self, packet: u32, flags: u32, bytes: u32) -> Result<()> {
         set(
             self.handle.0,
@@ -328,6 +339,96 @@ impl Pin {
             },
         )
     }
+}
+
+fn qpc_frequency() -> Result<u64> {
+    let mut frequency = 0_i64;
+    unsafe { QueryPerformanceFrequency(&mut frequency) }
+        .map_err(|error| format!("QueryPerformanceFrequency: {error}"))?;
+    u64::try_from(frequency).map_err(|_| format!("invalid QPC frequency {frequency}"))
+}
+
+fn verify_direct_timing(paths: &[String], name: &str, capture: bool) -> Result<()> {
+    use std::time::{Duration, Instant};
+    const SAMPLE_RATE: u64 = 48_000;
+    const MAX_ERROR_BLOCKS: u64 = SAMPLE_RATE / 20; // 50 ms
+    println!("direct KS timing: {name}, capture={capture}");
+    let pin = create_pin(owned_path(paths, name)?, capture, 2, 3840)?;
+    let initial = pin.presentation_position()?;
+    if initial.u64PositionInBlocks != 0 {
+        return Err(format!(
+            "new timing pin {name} started at {} blocks",
+            initial.u64PositionInBlocks
+        ));
+    }
+    let qpc_frequency = qpc_frequency()?;
+    pin.state(KSSTATE_RUN)?;
+    let deadline = Instant::now() + Duration::from_millis(750);
+    let mut first: Option<KSAUDIO_PRESENTATION_POSITION> = None;
+    let mut previous: Option<KSAUDIO_PRESENTATION_POSITION> = None;
+    let mut samples = 0_u32;
+    let mut max_error = 0_u64;
+    let mut last_packets = 0_u32;
+    while Instant::now() < deadline {
+        let reading = pin.presentation_position()?;
+        if let Some(previous) = previous {
+            if reading.u64PositionInBlocks < previous.u64PositionInBlocks
+                || reading.u64QPCPosition < previous.u64QPCPosition
+            {
+                return Err(format!(
+                    "non-monotonic direct position on {name}: blocks {} -> {}, qpc {} -> {}",
+                    previous.u64PositionInBlocks,
+                    reading.u64PositionInBlocks,
+                    previous.u64QPCPosition,
+                    reading.u64QPCPosition
+                ));
+            }
+        }
+        if let Some(first) = first {
+            let qpc_delta = reading.u64QPCPosition.saturating_sub(first.u64QPCPosition);
+            let expected = (u128::from(qpc_delta) * u128::from(SAMPLE_RATE))
+                .div_ceil(u128::from(qpc_frequency)) as u64;
+            let actual = reading
+                .u64PositionInBlocks
+                .saturating_sub(first.u64PositionInBlocks);
+            let error = actual.abs_diff(expected);
+            max_error = max_error.max(error);
+            if error > MAX_ERROR_BLOCKS {
+                return Err(format!(
+                    "direct timing drift on {name}: actual={actual} blocks, expected={expected}, error={error}"
+                ));
+            }
+            samples = samples.saturating_add(1);
+        } else {
+            first = Some(reading);
+        }
+        last_packets = pin.packets()?.max(last_packets);
+        previous = Some(reading);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if samples < 4 || last_packets < 4 {
+        return Err(format!(
+            "direct timing on {name} produced too little evidence: samples={samples}, packets={last_packets}"
+        ));
+    }
+    pin.state(KSSTATE_PAUSE)?;
+    let paused = pin.presentation_position()?;
+    std::thread::sleep(Duration::from_millis(20));
+    let paused_again = pin.presentation_position()?;
+    if paused_again.u64PositionInBlocks != paused.u64PositionInBlocks {
+        return Err(format!(
+            "paused direct timing position advanced on {name}: blocks {} -> {}, qpc {} -> {}",
+            paused.u64PositionInBlocks,
+            paused_again.u64PositionInBlocks,
+            paused.u64QPCPosition,
+            paused_again.u64QPCPosition
+        ));
+    }
+    pin.stop()?;
+    println!(
+        "  {name}: {samples} position samples, {last_packets} packets, max error {max_error} blocks; pause and STOP passed"
+    );
+    Ok(())
 }
 impl Drop for Pin {
     fn drop(&mut self) {
@@ -873,6 +974,19 @@ pub fn run() -> Result<()> {
         println!("Direct KS lifecycle checks passed on all four endpoints.");
         return Ok(());
     }
+    if args == ["--verify-timing"] {
+        let paths = interfaces()?;
+        for (name, capture) in [
+            ("QPWGraphVirtualOutput", false),
+            ("QPWGraphVirtualMonitor", true),
+            ("QPWGraphRelaySink", false),
+            ("QPWGraphRelayMicrophone", true),
+        ] {
+            verify_direct_timing(&paths, name, capture)?;
+        }
+        println!("Direct KS timing checks passed on all four endpoints.");
+        return Ok(());
+    }
     if args == ["--verify-jacks"] {
         let paths = interfaces()?;
         for name in [
@@ -902,7 +1016,7 @@ pub fn run() -> Result<()> {
     }
     if args.iter().any(|arg| arg != "--inspect") {
         return Err(
-            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats | --verify-lifecycle | --verify-jacks]".into(),
+            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats | --verify-lifecycle | --verify-timing | --verify-jacks]".into(),
         );
     }
     for path in interfaces()? {
