@@ -278,15 +278,10 @@ fn live_backend_startup_is_optional_for_headless_windows_ci() {
 }
 
 #[test]
+#[ignore = "requires a Windows machine without the optional QPWGraph virtual audio driver"]
 fn portable_backend_starts_without_the_optional_virtual_driver() {
-    if std::env::var_os("PW_GRAPH_TEST_PORTABLE_NO_DRIVER").is_none() {
-        return;
-    }
-    let Ok(mut driver) = WindowsAudioDriver::new() else {
-        // A headless machine cannot prove the portable path, so keep this
-        // opt-in smoke test harmless on CI without Core Audio.
-        return;
-    };
+    let mut driver = WindowsAudioDriver::new()
+        .expect("portable acceptance requires a working Windows Core Audio environment");
     assert!(matches!(
         driver.virtual_audio_driver_health(),
         VirtualAudioDriverHealth::NotInstalled | VirtualAudioDriverHealth::Incomplete { .. }
