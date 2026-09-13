@@ -13,6 +13,33 @@ pub struct RenderPayload {
     pub eos_state: i32,
 }
 
+/// The result of checking the next packet number supplied by an ACX render
+/// client. ACX exposes a ULONG packet sequence, so the public number wraps at
+/// `u32::MAX`; the exact next value is therefore compared with wrapping
+/// arithmetic rather than ordinary unsigned ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderPacketOrder {
+    Next,
+    Late,
+    Skipped,
+}
+
+/// Classify a render packet against the last completed packet.
+///
+/// Only the exact successor is accepted. For any other value, signed
+/// 32-bit distance preserves the usual half-range sequence-number rule when
+/// deciding whether the packet is late or skips ahead. The exact-successor
+/// check is performed first so `u32::MAX -> 0` is unambiguous.
+pub const fn classify_render_packet(current: u32, packet: u32) -> RenderPacketOrder {
+    if packet == current.wrapping_add(1) {
+        RenderPacketOrder::Next
+    } else if packet.wrapping_sub(current) as i32 <= 0 {
+        RenderPacketOrder::Late
+    } else {
+        RenderPacketOrder::Skipped
+    }
+}
+
 /// Apply the ACX render EOS boundary.
 ///
 /// eos_state is the ACX runtime's state machine: 0 means no EOS has been observed,
@@ -52,7 +79,20 @@ pub const fn render_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::{render_payload, RenderPayload};
+    use super::{classify_render_packet, render_payload, RenderPacketOrder, RenderPayload};
+
+    #[test]
+    fn render_packet_sequence_accepts_wrap_and_rejects_skip_or_late() {
+        assert_eq!(classify_render_packet(41, 42), RenderPacketOrder::Next);
+        assert_eq!(classify_render_packet(41, 41), RenderPacketOrder::Late);
+        assert_eq!(classify_render_packet(41, 43), RenderPacketOrder::Skipped);
+        assert_eq!(classify_render_packet(u32::MAX, 0), RenderPacketOrder::Next);
+        assert_eq!(
+            classify_render_packet(u32::MAX, 1),
+            RenderPacketOrder::Skipped
+        );
+        assert_eq!(classify_render_packet(0, u32::MAX), RenderPacketOrder::Late);
+    }
 
     #[test]
     fn ordinary_and_preceding_packets_keep_their_full_payload() {

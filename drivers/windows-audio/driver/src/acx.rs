@@ -57,6 +57,7 @@ mod runtime {
     use ffi::_ACX_PIN_TYPE::{AcxPinTypeSink, AcxPinTypeSource};
     use ffi::_WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive;
     use ffi::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone;
+    use qpwgraph_audio_core::render_eos::{classify_render_packet, RenderPacketOrder};
     use wdk_sys::ntddk::{
         ExAllocatePool2, ExFreePool, IoAllocateMdl, IoFreeMdl, KeFlushQueuedDpcs,
         KeQueryPerformanceCounter, MmBuildMdlForNonPagedPool,
@@ -254,6 +255,9 @@ mod runtime {
         current_packet_start: AtomicU64,
         last_packet_start: AtomicU64,
         performance_frequency: AtomicI64,
+        // Monotonic packet count used for scheduling. `current_packet` is the
+        // ACX-visible ULONG and intentionally wraps; this counter must not.
+        completed_packets: AtomicU64,
         packet_buffers: [AtomicPtr<u8>; 2],
         eos_state: AtomicI32,
         eos_packet: AtomicU32,
@@ -284,6 +288,7 @@ mod runtime {
                 current_packet_start: AtomicU64::new(0),
                 last_packet_start: AtomicU64::new(0),
                 performance_frequency: AtomicI64::new(0),
+                completed_packets: AtomicU64::new(0),
                 packet_buffers: [const { AtomicPtr::new(ptr::null_mut()) }; 2],
                 eos_state: AtomicI32::new(0),
                 eos_packet: AtomicU32::new(0),
@@ -312,6 +317,7 @@ mod runtime {
             self.current_packet_start.store(0, Ordering::SeqCst);
             self.last_packet_start.store(0, Ordering::SeqCst);
             self.performance_frequency.store(0, Ordering::SeqCst);
+            self.completed_packets.store(0, Ordering::SeqCst);
             self.packet_buffers[0].store(ptr::null_mut(), Ordering::SeqCst);
             self.packet_buffers[1].store(ptr::null_mut(), Ordering::SeqCst);
             self.eos_state.store(0, Ordering::SeqCst);
@@ -482,7 +488,7 @@ mod runtime {
         if timer.is_null() || packet_size == 0 || bytes_per_second == 0 {
             return;
         }
-        let current_packet = slot.current_packet.load(Ordering::SeqCst) as u64;
+        let current_packet = slot.completed_packets.load(Ordering::SeqCst);
         let next_position = (current_packet + 1).saturating_mul(packet_size as u64);
         let start_position = slot.start_position.load(Ordering::SeqCst);
         let position_from_pause = next_position.saturating_sub(start_position);
@@ -562,6 +568,7 @@ mod runtime {
             }
         }
         let completed_packet = slot.current_packet.fetch_add(1, Ordering::SeqCst);
+        slot.completed_packets.fetch_add(1, Ordering::SeqCst);
         let qpc_completed = unsafe { KeQueryPerformanceCounter(ptr::null_mut()) };
         slot.last_packet_start.store(
             slot.current_packet_start.load(Ordering::SeqCst),
@@ -765,6 +772,7 @@ mod runtime {
         slot.counted.store(false, Ordering::SeqCst);
         slot.eos_state.store(0, Ordering::SeqCst);
         slot.current_packet.store(0, Ordering::SeqCst);
+        slot.completed_packets.store(0, Ordering::SeqCst);
         slot.position.store(0, Ordering::SeqCst);
         slot.start_time.store(0, Ordering::SeqCst);
         slot.start_position.store(0, Ordering::SeqCst);
@@ -790,6 +798,7 @@ mod runtime {
         unsafe { KeFlushQueuedDpcs() };
         slot.state.store(0, Ordering::SeqCst);
         slot.current_packet.store(0, Ordering::SeqCst);
+        slot.completed_packets.store(0, Ordering::SeqCst);
         slot.position.store(0, Ordering::SeqCst);
         slot.start_time.store(0, Ordering::SeqCst);
         slot.start_position.store(0, Ordering::SeqCst);
@@ -894,11 +903,10 @@ mod runtime {
             return wdk_sys::STATUS_INVALID_DEVICE_STATE;
         }
         let current_packet = slot.current_packet.load(Ordering::SeqCst);
-        if packet <= current_packet {
-            return wdk_sys::STATUS_DATA_LATE_ERROR;
-        }
-        if packet > current_packet.saturating_add(1) {
-            return wdk_sys::STATUS_DATA_OVERRUN;
+        match classify_render_packet(current_packet, packet) {
+            RenderPacketOrder::Next => {}
+            RenderPacketOrder::Late => return wdk_sys::STATUS_DATA_LATE_ERROR,
+            RenderPacketOrder::Skipped => return wdk_sys::STATUS_DATA_OVERRUN,
         }
         if flags & EOS_FLAG != 0 {
             slot.eos_packet.store(packet, Ordering::SeqCst);
