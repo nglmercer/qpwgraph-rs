@@ -381,8 +381,8 @@ The direct lifecycle mode also passed on all four endpoints:
 cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-lifecycle
 ```
 
-Each endpoint completed 17 start/pause/resume/stop cycles—one beyond the
-driver's 16-slot stream registry—without slot exhaustion. Packet counts did
+Each endpoint completed 17 start/pause/resume/stop cycles—more than twice the
+driver's 8-slot stream registry—without slot exhaustion. Packet counts did
 not advance while paused, and a fresh reopen started with packet count zero.
 
 The direct presentation-position timing mode also passed on all four endpoints:

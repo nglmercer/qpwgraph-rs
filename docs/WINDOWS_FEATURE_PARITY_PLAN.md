@@ -69,8 +69,8 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   submissions and checks ordered PCM, poisoned-tail suppression, continued
   notifications, and explicit STOP. It also verifies on both render endpoints
   that a non-EOS packet accepts an oversized ignored EOS-length field;
-- direct KS lifecycle now passes 17 start/pause/resume/stop cycles—one beyond
-  the driver's 16-slot stream registry—and a reopen on all four endpoints,
+- direct KS lifecycle now passes 17 start/pause/resume/stop cycles—more than
+  twice the driver's 8-slot stream registry—and a reopen on all four endpoints,
   with packet counts frozen during pause and reset on reopen;
 - direct KS presentation timing now passes on all four endpoints: the probe
   correlates `KSPROPERTY_RTAUDIO_PRESENTATION_POSITION` block positions with

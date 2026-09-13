@@ -689,8 +689,8 @@ fn verify_jack_metadata(paths: &[String], name: &str) -> Result<()> {
 fn verify_pin_lifecycle(paths: &[String], name: &str, capture: bool) -> Result<()> {
     use std::time::Duration;
     println!("direct KS lifecycle: {name}, capture={capture}");
-    // The driver has a bounded 16-slot stream registry. Repeating more than
-    // that capacity makes a leaked slot observable without requiring a
+    // The driver has a bounded 8-slot stream registry. Repeating more than
+    // twice that capacity makes a leaked slot observable without requiring a
     // privileged or long-running stress harness.
     const CYCLES: u32 = 17;
     for cycle in 1..=CYCLES {
