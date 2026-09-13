@@ -223,6 +223,55 @@ struct PinRequest {
     format: PcmFormat,
 }
 
+fn pin_request(sample_rate: u32, channels: u16, bits: u16) -> PinRequest {
+    let bytes_per_sample = bits.div_ceil(8);
+    let block_align = channels.saturating_mul(bytes_per_sample);
+    PinRequest {
+        connect: KSPIN_CONNECT {
+            Interface: identifier(
+                KSINTERFACESETID_Standard,
+                KSINTERFACE_STANDARD_LOOPED_STREAMING.0 as u32,
+                0,
+            ),
+            Medium: identifier(KSMEDIUMSETID_Standard, KSMEDIUM_TYPE_ANYINSTANCE, 0),
+            PinId: 0,
+            Priority: KSPRIORITY {
+                PriorityClass: KSPRIORITY_NORMAL,
+                PrioritySubClass: 1,
+            },
+            ..Default::default()
+        },
+        format: PcmFormat {
+            data: KSDATAFORMAT {
+                Anonymous: KSDATAFORMAT_0 {
+                    FormatSize: size_of::<PcmFormat>() as u32,
+                    SampleSize: u32::from(block_align),
+                    MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
+                    SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
+                    Specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
+                    ..Default::default()
+                },
+            },
+            wave: WAVEFORMATEXTENSIBLE {
+                Format: WAVEFORMATEX {
+                    wFormatTag: 0xfffe,
+                    nChannels: channels,
+                    nSamplesPerSec: sample_rate,
+                    nAvgBytesPerSec: sample_rate.saturating_mul(u32::from(block_align)),
+                    nBlockAlign: block_align,
+                    wBitsPerSample: bits,
+                    cbSize: 22,
+                },
+                Samples: WAVEFORMATEXTENSIBLE_0 {
+                    wValidBitsPerSample: bits,
+                },
+                dwChannelMask: if channels == 2 { 3 } else { 0 },
+                SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
+            },
+        },
+    }
+}
+
 struct Pin {
     handle: OwnedHandle,
     buffer: KSRTAUDIO_BUFFER,
@@ -313,50 +362,7 @@ fn create_pin(
     {
         return Err("unexpected host pin contract".into());
     }
-    let request = PinRequest {
-        connect: KSPIN_CONNECT {
-            Interface: identifier(
-                KSINTERFACESETID_Standard,
-                KSINTERFACE_STANDARD_LOOPED_STREAMING.0 as u32,
-                0,
-            ),
-            Medium: identifier(KSMEDIUMSETID_Standard, KSMEDIUM_TYPE_ANYINSTANCE, 0),
-            PinId: 0,
-            Priority: KSPRIORITY {
-                PriorityClass: KSPRIORITY_NORMAL,
-                PrioritySubClass: 1,
-            },
-            ..Default::default()
-        },
-        format: PcmFormat {
-            data: KSDATAFORMAT {
-                Anonymous: KSDATAFORMAT_0 {
-                    FormatSize: size_of::<PcmFormat>() as u32,
-                    SampleSize: 4,
-                    MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
-                    SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-                    Specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
-                    ..Default::default()
-                },
-            },
-            wave: WAVEFORMATEXTENSIBLE {
-                Format: WAVEFORMATEX {
-                    wFormatTag: 0xfffe,
-                    nChannels: 2,
-                    nSamplesPerSec: 48_000,
-                    nAvgBytesPerSec: 192_000,
-                    nBlockAlign: 4,
-                    wBitsPerSample: 16,
-                    cbSize: 22,
-                },
-                Samples: WAVEFORMATEXTENSIBLE_0 {
-                    wValidBitsPerSample: 16,
-                },
-                dwChannelMask: 3,
-                SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-            },
-        },
-    };
+    let request = pin_request(48_000, 2, 16);
     let mut handle = HANDLE::default();
     let code = unsafe {
         KsCreatePin(
@@ -484,6 +490,40 @@ fn verify_non_eos_length_is_ignored(paths: &[String], render_name: &str) -> Resu
         .map_err(|e| format!("submit non-EOS packet with ignored length: {e}"))?;
     render.stop()?;
     println!("  non-EOS ignored length accepted; explicit STOP passed");
+    Ok(())
+}
+
+fn verify_unsupported_format_is_rejected(
+    paths: &[String],
+    name: &str,
+    capture: bool,
+) -> Result<()> {
+    const UNSUPPORTED_SAMPLE_RATE: u32 = 44_100;
+    println!(
+        "direct unsupported format: {name}, capture={capture}, sample rate={UNSUPPORTED_SAMPLE_RATE}"
+    );
+    let filter = open_filter(owned_path(paths, name)?)?;
+    let request = pin_request(UNSUPPORTED_SAMPLE_RATE, 2, 16);
+    let mut handle = HANDLE::default();
+    let code = unsafe {
+        KsCreatePin(
+            filter.0,
+            &request.connect,
+            if capture {
+                GENERIC_READ.0
+            } else {
+                GENERIC_WRITE.0
+            },
+            &mut handle,
+        )
+    };
+    if code == 0 {
+        let _handle = OwnedHandle(handle);
+        return Err(format!(
+            "driver accepted unsupported {UNSUPPORTED_SAMPLE_RATE} Hz format on {name}"
+        ));
+    }
+    println!("  unsupported format rejected with Win32 code {code}");
     Ok(())
 }
 
@@ -704,6 +744,19 @@ pub fn run() -> Result<()> {
         println!("Direct single- and two-packet KS EOS checks passed on both cables.");
         return Ok(());
     }
+    if args == ["--verify-formats"] {
+        let paths = interfaces()?;
+        for (name, capture) in [
+            ("QPWGraphVirtualOutput", false),
+            ("QPWGraphVirtualMonitor", true),
+            ("QPWGraphRelaySink", false),
+            ("QPWGraphRelayMicrophone", true),
+        ] {
+            verify_unsupported_format_is_rejected(&paths, name, capture)?;
+        }
+        println!("Unsupported 44.1 kHz format rejected on all four endpoints.");
+        return Ok(());
+    }
     if args == ["--open-pins"] {
         let paths = interfaces()?;
         for (name, capture) in [
@@ -720,7 +773,7 @@ pub fn run() -> Result<()> {
     }
     if args.iter().any(|arg| arg != "--inspect") {
         return Err(
-            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos]".into(),
+            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats]".into(),
         );
     }
     for path in interfaces()? {
