@@ -6,18 +6,18 @@ does not transfer that baseline's client/policy acceptance to this candidate.
 
 ## Installed package
 
-- Driver source commit: `44cd376` (shared EOS argument validation and live non-EOS length coverage).
+- Driver source commit: `25ddbe6` (guarded idle-cable clearing during device release).
 - Windows 10 Pro; exact devnode `ROOT\DEVGEN\QPWGRAPH_AUDIO`.
-- Published INF: `oem23.inf`; INF DriverVer `09/13/2026,10.52.9.455`.
+- Published INF: `oem24.inf`; INF DriverVer `09/13/2026,11.8.28.7`.
 - Service `qpwgraph_audio` running, devnode problem code 0.
 - Existing development signer: `CN=QPWGraph Audio Test`, certificate
   `30D29DBE073E11B6308872DA7170B3371BE6C037`.
 - SYS SHA-256 (signed staged package and installed file agree):
-  `CDA30204931C847E8E90C2FBB230A366053E7D0D46AE9B9DBCC19A1A2C1CC3D3`.
+  `099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
 - INF SHA-256:
-  `623C5270B8C94674EDA47E1D7999DBD561FAA3698D773970C02872F91F2B08D8`.
+  `2A6CFF5CB0EB9E8CAA938FC8F6763F182D13628CE00A07C5E2E712C9DA918D7D`.
 - CAT SHA-256:
-  `42121A24914934CCDD394AED322B55E3B929D2C15889872A81DF3F96A8DA40F1`.
+  `5149E53234FC0E9C200DAC946E0D455D9C4FEFCDF2D3F79F24F5738C87CE77BB`.
 
 Signing, catalog membership verification, installation, active binding, and
 four-role enumeration succeeded. Local transcripts (ignored build outputs):
@@ -38,7 +38,7 @@ changes.
 
 The sections through the owned-client crash checks below retain the original
 `oem21.inf`/`20da4d7` evidence. They are historical, intentionally preserved
-for auditability; the currently installed `oem23.inf` package and its hashes
+for auditability; the currently installed `oem24.inf` package and its hashes
 are recorded above and its post-install checks are recorded in the direct KS
 section below.
 
@@ -365,7 +365,7 @@ cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-
 It rejected a valid 44.1 kHz stereo PCM16 request on all four owned endpoints
 with the current driver, confirming that unsupported formats fail closed.
 
-All 20 live EOS cases passed on current candidate `44cd376` (ten on each
+All 20 live EOS cases passed on current candidate `25ddbe6` (ten on each
 cable). A separate check on each render endpoint also accepted packet 1 with
 flags clear and `EosPacketLength = u32::MAX`, proving that the non-EOS length
 field is ignored while the actual packet mapping remains bounded.
@@ -393,14 +393,13 @@ cases. A post-install WASAPI
 `--verify-timing --duration-ms 2000` and `--verify-cables --duration-ms 1500`
 also passed with this current driver.
 
-Retained local logs: `drivers/windows-audio/target/candidate-current-source-formats.log`,
-`candidate-current-source-non-eos-eos.log`,
-`candidate-current-source-non-eos-timing.log`, and
-`candidate-current-source-non-eos-cables.log` in the same directory. Current
+Retained local logs: `drivers/windows-audio/target/candidate-current-source-r8-formats.log`,
+`candidate-current-source-r8-eos.log`, `candidate-current-source-r8-timing.log`,
+and `candidate-current-source-r8-cables.log` in the same directory. Current
 probe executable SHA-256:
 `2CD7E58EE2F1A02B52EFCBDAC040C0BB122AE13BC00FFD0ED9B985B9D953A31D`.
 The staged and installed current SYS SHA-256 is
-`CDA30204931C847E8E90C2FBB230A366053E7D0D46AE9B9DBCC19A1A2C1CC3D3`.
+`099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
 The package was installed without a reboot; no boot configuration or Secure
 Boot setting was changed.
 

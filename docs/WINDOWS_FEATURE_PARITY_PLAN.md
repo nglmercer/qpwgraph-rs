@@ -38,9 +38,9 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   switching, replacement-PID rebind, and exact restoration on rule removal
   and backend shutdown. The earlier error is not a blanket routing blocker;
   MSIX, manual-override, and full restart/client coverage remain open;
-- Rust candidate `44cd376` adds shared EOS argument validation, the
+- Rust candidate `25ddbe6` adds shared EOS argument validation, the
   rollover-safe packet admission rule, and the monotonic scheduling counter.
-  It is test-signed and installed as `oem23.inf`; the running devnode reports
+  It is test-signed and installed as `oem24.inf`; the running devnode reports
   problem code 0 and installed and
   staged signed SYS hashes match;
 - all four provider-owned roles enumerate on that candidate. Both cables
@@ -605,6 +605,12 @@ if no active stream:
 if active stream exists:
     do not clear under an active realtime producer/consumer
 ```
+
+Implementation note: device D0, circuit power, stop, and device-release paths
+use the active-stream guard before clearing either cable. The device-release
+path was tightened in candidate `25ddbe6`; the live idle disable/enable and
+AudioSrv recovery checks remain separate lifecycle evidence, and controlled
+sleep/resume has not been run on this PC.
 
 ### Phase R9 — Remove C implementation
 
