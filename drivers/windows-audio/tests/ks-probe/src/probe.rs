@@ -475,6 +475,18 @@ fn owned_path<'a>(paths: &'a [String], name: &str) -> Result<&'a str> {
     Ok(matches[0])
 }
 
+fn verify_non_eos_length_is_ignored(paths: &[String], render_name: &str) -> Result<()> {
+    const IGNORED_LENGTH: u32 = u32::MAX;
+    println!("direct non-EOS length: {render_name}, ignored bytes={IGNORED_LENGTH}");
+    let render = create_pin(owned_path(paths, render_name)?, false, 2, 3840)?;
+    render
+        .write_packet(1, 0, IGNORED_LENGTH)
+        .map_err(|e| format!("submit non-EOS packet with ignored length: {e}"))?;
+    render.stop()?;
+    println!("  non-EOS ignored length accepted; explicit STOP passed");
+    Ok(())
+}
+
 fn verify_eos(
     paths: &[String],
     render_name: &str,
@@ -681,6 +693,7 @@ pub fn run() -> Result<()> {
             ("QPWGraphVirtualOutput", "QPWGraphVirtualMonitor"),
             ("QPWGraphRelaySink", "QPWGraphRelayMicrophone"),
         ] {
+            verify_non_eos_length_is_ignored(&paths, render)?;
             for bytes in [0, 4, 16, 960, 1920] {
                 verify_eos(&paths, render, capture, bytes)?;
             }

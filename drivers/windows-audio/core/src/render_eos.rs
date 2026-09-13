@@ -24,6 +24,26 @@ pub enum RenderPacketOrder {
     Skipped,
 }
 
+/// The only render packet flag currently consumed by this driver.
+pub const RENDER_EOS_FLAG: u32 = 0x0000_0200;
+
+/// Validate the flag/length pair passed to the ACX render callback.
+///
+/// ACX only interprets `eos_packet_length` when EOS is set. A non-EOS packet
+/// may carry any length value because that field is ignored by the contract;
+/// the transport callback still bounds the actual copied packet separately.
+pub const fn render_packet_arguments_valid(
+    flags: u32,
+    eos_packet_length: u32,
+    packet_bytes: u32,
+) -> bool {
+    if flags & !RENDER_EOS_FLAG != 0 {
+        return false;
+    }
+    flags & RENDER_EOS_FLAG == 0
+        || (eos_packet_length <= packet_bytes && eos_packet_length.is_multiple_of(4))
+}
+
 /// Classify a render packet against the last completed packet.
 ///
 /// Only the exact successor is accepted. For any other value, signed
@@ -79,7 +99,20 @@ pub const fn render_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_render_packet, render_payload, RenderPacketOrder, RenderPayload};
+    use super::{
+        classify_render_packet, render_packet_arguments_valid, render_payload, RenderPacketOrder,
+        RenderPayload, RENDER_EOS_FLAG,
+    };
+
+    #[test]
+    fn non_eos_length_is_ignored_but_eos_length_is_bounded() {
+        assert!(render_packet_arguments_valid(0, u32::MAX, 1920));
+        assert!(render_packet_arguments_valid(RENDER_EOS_FLAG, 0, 1920));
+        assert!(render_packet_arguments_valid(RENDER_EOS_FLAG, 1920, 1920));
+        assert!(!render_packet_arguments_valid(RENDER_EOS_FLAG, 1924, 1920));
+        assert!(!render_packet_arguments_valid(RENDER_EOS_FLAG, 3, 1920));
+        assert!(!render_packet_arguments_valid(0x400, 0, 1920));
+    }
 
     #[test]
     fn render_packet_sequence_accepts_wrap_and_rejects_skip_or_late() {

@@ -57,7 +57,9 @@ mod runtime {
     use ffi::_ACX_PIN_TYPE::{AcxPinTypeSink, AcxPinTypeSource};
     use ffi::_WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive;
     use ffi::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone;
-    use qpwgraph_audio_core::render_eos::{classify_render_packet, RenderPacketOrder};
+    use qpwgraph_audio_core::render_eos::{
+        classify_render_packet, render_packet_arguments_valid, RenderPacketOrder, RENDER_EOS_FLAG,
+    };
     use wdk_sys::ntddk::{
         ExAllocatePool2, ExFreePool, IoAllocateMdl, IoFreeMdl, KeFlushQueuedDpcs,
         KeQueryPerformanceCounter, MmBuildMdlForNonPagedPool,
@@ -67,7 +69,6 @@ mod runtime {
     const MAX_PACKET_COUNT: u32 = 2;
     const MAX_PACKET_BYTES: u32 = transport::MAX_PCM16_BYTES;
     const HNS_PER_SEC: u64 = 10_000_000;
-    const EOS_FLAG: u32 = 0x0000_0200;
     const DRIVER_TAG: ffi::ULONG = 0x5157_5061;
     const SPEAKER_FRONT_LEFT: ffi::ULONG = 0x1;
     const SPEAKER_FRONT_RIGHT: ffi::ULONG = 0x2;
@@ -892,11 +893,11 @@ mod runtime {
         let Some(slot) = find_stream(stream) else {
             return wdk_sys::STATUS_INVALID_PARAMETER;
         };
-        if flags & !EOS_FLAG != 0
-            || (flags & EOS_FLAG != 0
-                && (eos_packet_length > slot.packet_size.load(Ordering::SeqCst)
-                    || !eos_packet_length.is_multiple_of(4)))
-        {
+        if !render_packet_arguments_valid(
+            flags,
+            eos_packet_length,
+            slot.packet_size.load(Ordering::SeqCst),
+        ) {
             return wdk_sys::STATUS_INVALID_PARAMETER;
         }
         if slot.eos_state.load(Ordering::SeqCst) != 0 {
@@ -908,7 +909,7 @@ mod runtime {
             RenderPacketOrder::Late => return wdk_sys::STATUS_DATA_LATE_ERROR,
             RenderPacketOrder::Skipped => return wdk_sys::STATUS_DATA_OVERRUN,
         }
-        if flags & EOS_FLAG != 0 {
+        if flags & RENDER_EOS_FLAG != 0 {
             slot.eos_packet.store(packet, Ordering::SeqCst);
             slot.eos_bytes.store(eos_packet_length, Ordering::SeqCst);
             slot.eos_state.store(1, Ordering::SeqCst);
