@@ -399,6 +399,8 @@ Direct one- and two-packet KS EOS coverage is available from the workspace
 probe: `cargo run -p qpwgraph-audio-ks-probe --locked -- --verify-eos`. The
 same run checks that a non-EOS packet may carry an oversized ignored
 `EosPacketLength` while EOS packets remain bounded and frame-aligned.
+Use `--verify-formats` to verify that the four canonical endpoints reject a
+valid but unsupported 44.1 kHz stereo PCM16 pin request.
 
 For abrupt process death, use the default read-only plan first, then opt in:
 

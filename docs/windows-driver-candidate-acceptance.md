@@ -349,6 +349,15 @@ host-pin direction before opening. Default `--inspect` does not create streams;
 cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-eos
 ```
 
+The same probe source also provides a format-negotiation check:
+
+```powershell
+cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked -- --verify-formats
+```
+
+It rejected a valid 44.1 kHz stereo PCM16 request on all four owned endpoints
+with the current driver, confirming that unsupported formats fail closed.
+
 All 20 live EOS cases passed on current candidate `44cd376` (ten on each
 cable). A separate check on each render endpoint also accepted packet 1 with
 flags clear and `EosPacketLength = u32::MAX`, proving that the non-EOS length
@@ -377,11 +386,12 @@ cases. A post-install WASAPI
 `--verify-timing --duration-ms 2000` and `--verify-cables --duration-ms 1500`
 also passed with this current driver.
 
-Retained local logs: `drivers/windows-audio/target/candidate-current-source-non-eos-eos.log`,
+Retained local logs: `drivers/windows-audio/target/candidate-current-source-formats.log`,
+`candidate-current-source-non-eos-eos.log`,
 `candidate-current-source-non-eos-timing.log`, and
 `candidate-current-source-non-eos-cables.log` in the same directory. Current
 probe executable SHA-256:
-`1C12055CCBE77CBA9C4DE97A5A00C49240EEE3A37E2F633FA4F280B2C236FAD8`.
+`2CD7E58EE2F1A02B52EFCBDAC040C0BB122AE13BC00FFD0ED9B985B9D953A31D`.
 The staged and installed current SYS SHA-256 is
 `CDA30204931C847E8E90C2FBB230A366053E7D0D46AE9B9DBCC19A1A2C1CC3D3`.
 The package was installed without a reboot; no boot configuration or Secure
