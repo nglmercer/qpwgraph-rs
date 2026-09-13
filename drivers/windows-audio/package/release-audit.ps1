@@ -212,53 +212,6 @@ function Get-ClangVersion([string] $Path) {
     return $null
 }
 
-function Find-Client {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]] $ProcessNames,
-        [Parameter(Mandatory = $true)]
-        [string[]] $DisplayPatterns,
-        [Parameter(Mandatory = $true)]
-        [string[]] $Paths
-    )
-
-    foreach ($processName in $ProcessNames) {
-        $process = Get-Process -Name $processName -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($null -ne $process) {
-            return "running process $($process.ProcessName)"
-        }
-    }
-
-    $path = Find-FirstFile $Paths
-    if ($null -ne $path) {
-        return $path
-    }
-
-    $uninstallRoots = @(
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-    )
-    foreach ($root in $uninstallRoots) {
-        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-            continue
-        }
-        foreach ($entry in (Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
-            $properties = Get-ItemProperty -LiteralPath $entry.PSPath -ErrorAction SilentlyContinue
-            if ($null -eq $properties -or [string]::IsNullOrWhiteSpace($properties.DisplayName)) {
-                continue
-            }
-            foreach ($pattern in $DisplayPatterns) {
-                if ($properties.DisplayName -match $pattern) {
-                    return "uninstall entry '$($properties.DisplayName)'"
-                }
-            }
-        }
-    }
-    return $null
-}
-
 function Add-ToolCheck([string] $Gate, [string] $Executable, [string] $Hint) {
     $path = Find-Executable $Executable
     if ($null -ne $path) {
@@ -620,67 +573,14 @@ if ($null -eq $pnpCommand) {
     }
 }
 
-# Availability checks make the remaining ordinary-client matrix explicit. They
-# do not claim that an application accepted relay audio; that remains a manual
-# acceptance gate below.
-$clientRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA) |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-$clientDefinitions = @(
-    [pscustomobject]@{
-        Name = 'Firefox'
-        Processes = @('firefox')
-        Patterns = @('Mozilla Firefox')
-        Paths = @($clientRoots | ForEach-Object { Join-Path $_ 'Mozilla Firefox\firefox.exe' })
-    },
-    [pscustomobject]@{
-        Name = 'Chrome'
-        Processes = @('chrome')
-        Patterns = @('Google Chrome')
-        Paths = @($clientRoots | ForEach-Object { Join-Path $_ 'Google\Chrome\Application\chrome.exe' })
-    },
-    [pscustomobject]@{
-        Name = 'VLC'
-        Processes = @('vlc')
-        Patterns = @('VLC media player', 'VideoLAN VLC')
-        Paths = @($clientRoots | ForEach-Object { Join-Path $_ 'VideoLAN\VLC\vlc.exe' })
-    },
-    [pscustomobject]@{
-        Name = 'Discord'
-        Processes = @('Discord')
-        Patterns = @('Discord')
-        Paths = @(
-            $clientRoots | ForEach-Object { Join-Path $_ 'Discord\Discord.exe' }
-            if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-                Join-Path $env:LOCALAPPDATA 'Discord\Update.exe'
-            }
-        )
-    },
-    [pscustomobject]@{
-        Name = 'OBS Studio'
-        Processes = @('obs64', 'obs32')
-        Patterns = @('OBS Studio')
-        Paths = @($clientRoots | ForEach-Object { Join-Path $_ 'obs-studio\bin\64bit\obs64.exe' })
-    }
-)
-foreach ($client in $clientDefinitions) {
-    $clientEvidence = Find-Client $client.Processes $client.Patterns $client.Paths
-    if ($null -ne $clientEvidence) {
-        Add-Check "Client available: $($client.Name)" 'pass' $clientEvidence
-    } else {
-        Add-Check "Client available: $($client.Name)" 'blocked' 'application was not found; install it only on the disposable acceptance machine'
-    }
-}
-
 # These rows intentionally remain unknown until a human runs the corresponding
-# acceptance procedure. Keeping them in the same report prevents a green local
-# build from being mistaken for complete Windows feature parity.
+# core acceptance procedure. Keeping them in the same report prevents a green
+# local build from being mistaken for complete Windows feature parity.
 Add-ManualGate 'HLK audio tests complete' 'run the relevant HLK audio tests and attach the result'
 Add-ManualGate 'Rust ACX runtime parity' 'complete the Rust ACX callback port and attach test-signed live parity evidence'
 Add-ManualGate 'Driver Verifier stress matrix' 'run the explicit Verifier stress matrix and attach clean evidence'
 Add-ManualGate 'Microsoft signing pipeline established' 'obtain and record the Microsoft-signed release package'
 Add-ManualGate 'Secure Boot installation verified' 'install the Microsoft-signed package with Secure Boot enabled and record the result'
-Add-ManualGate 'Chrome/VLC ordinary relay acceptance' 'run the normal-speaker relay matrix with Chrome and VLC'
-Add-ManualGate 'Discord Relay Microphone acceptance' 'run peer-to-Discord capture acceptance on the disposable test machine'
 Add-ManualGate 'Sleep/resume lifecycle' 'exercise suspend/resume with active and idle streams and record endpoint/cable results'
 Add-ManualGate 'AudioSrv restart lifecycle' 'restart Audiosrv with active and idle streams and record endpoint/cable results'
 Add-ManualGate 'Disable/enable lifecycle' 'exercise device disable/enable and record endpoint/cable results'

@@ -139,7 +139,7 @@ Pop-Location
 
 Only after uninstalling should test signing be disabled and the machine
 rebooted with `bcdedit /set testsigning off`. Driver Verifier, HLK, Secure
-Boot, upgrade, and client-application tests remain separate release gates.
+Boot, upgrade, and core lifecycle tests remain separate release gates.
 
 The default driver build intentionally returns `STATUS_NOT_SUPPORTED` from
 device-add. The opt-in `acx` build now contains the ACX app and relay endpoint
@@ -169,8 +169,8 @@ sections remain on each interface for device-property consumers. The ACX
 runtime gives the app pair and relay pair independent bounded PCM cables. The
 recorded Windows 10 test-signed baseline verified all four roles and the app
 cable's non-silent round trip against the then-installed development package;
-it does not validate the newly staged candidate. Driver Verifier, HLK,
-release-signing, Secure Boot, and ordinary-client relay tests remain separate
+it does not validate the newly staged candidate. Driver Verifier, core
+lifecycle recovery, HLK, release signing, and Secure Boot remain separate
 release gates.
 
 The `--audit-toolchain` command is the explicit ACX gate. It checks
@@ -181,10 +181,10 @@ it is not evidence that an endpoint build succeeded.
 
 `release-audit.ps1` is a read-only release-gate report for a build or test
 machine. It checks the staged package shape and signatures, WDK/compiler/HLK
-availability, verifier and Secure Boot state, test-signing state, installed
-provider devices, and ordinary-client availability. It also lists the manual
-HLK, Microsoft-signing, lifecycle, and ordinary-client acceptance rows that
-cannot be proven by inspection. It never installs, signs, enables, disables,
+availability, Verifier and Secure Boot state, test-signing state, and installed
+provider devices. It also lists the manual HLK, Microsoft-signing, and core
+lifecycle rows that cannot be proven by inspection. It never installs, signs,
+enables, disables,
 restarts, or removes anything. By default it reports all findings and exits
 zero so it can be collected on an incomplete machine; `-Strict` exits nonzero
 when any row is blocked or unknown, and `-Json` emits a machine-readable report:
@@ -210,9 +210,9 @@ small and auditable:
       "status": "pass",
       "evidence": "HLK result bundle: \\share\\qpwgraph\\hlk-2026-09-06.zip"
     },
-    "Chrome/VLC ordinary relay acceptance": {
+    "Driver Verifier stress matrix": {
       "status": "pass",
-      "evidence": "client-matrix log: chrome-vlc-relay-2026-09-06.txt"
+      "evidence": "Verifier evidence bundle: \\share\\qpwgraph\\verifier-2026-09-06.zip"
     }
   }
 }
@@ -221,7 +221,7 @@ small and auditable:
 Run the report with that record using
 `.\release-audit.ps1 -EvidencePath .\acceptance-evidence.json -Strict -Json`.
 The script validates the status/evidence shape but does not claim to validate
-the truth of an externally supplied result; retain the referenced HLK, client,
+the truth of an externally supplied result; retain the referenced HLK, Verifier,
 power, and signing artifacts with the release record.
 
 When a staged package exists, the script audits it automatically; otherwise it
@@ -323,8 +323,8 @@ device/circuit/stream runtime can be compiled. The test-signed Windows pass
 also proves that the recorded installed development package loaded, enumerated
 all four roles, and passed the basic shared-mode round trip. A newly staged
 candidate still needs its own install/run record. The package remains
-development-only until Verifier, HLK, release-signing, Secure Boot, and
-ordinary-client gates pass.
+development-only until Verifier, core lifecycle, HLK, release signing, and
+Secure Boot gates pass.
 
 `install.ps1` creates the development-only `ROOT\DEVGEN\QPWGRAPH_AUDIO` devnode with
 WDK `devgen.exe`, then uses PnPUtil for package installation and removal while
@@ -366,7 +366,7 @@ so a failure can distinguish the active test signal from previous-cable audio.
 Non-finite PCM fails the probe. Tone analysis uses only the first channel;
 peak and silence checks cover all channels.
 This detects cross-talk and stale audio across stream restarts; it does not
-replace relay peer-disconnect or ordinary-client acceptance. Run live capture
+replace relay peer-disconnect or application policy/effect validation. Run live capture
 probes outside restricted process sandboxes: the restricted execution context
 can make WASAPI capture initialization fail with `0x80070057` even when the
 same binary succeeds in the normal user context.

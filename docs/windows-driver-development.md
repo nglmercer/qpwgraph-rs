@@ -21,7 +21,7 @@ transport and kernel callback runtime are Rust-owned, while the public package
 remains fail-closed until the live validation gates are complete. Before
 publishing, prove the Stage-0 checklist on a disposable Windows VM: load, enumerate, WASAPI
 open/start/stop, disable/enable, unload, and Driver Verifier. Then run the
-HLK, Secure Boot, signing, lifecycle, and ordinary-client gates.
+HLK, Secure Boot, signing, and core lifecycle gates.
 
 The last available development-package snapshot is recorded in
 [windows-driver-acceptance-baseline.md](windows-driver-acceptance-baseline.md).

@@ -226,7 +226,7 @@ function Invoke-Smoke {
         '--duration-ms', $RoundTripDurationMs.ToString()
     ) 'Cable isolation and stopped-render silence'
     Write-Output 'ACX app cable and independent Relay Sink/Microphone cable smoke validation passed.'
-    Write-Output 'Next: test Relay Microphone with OBS/browser/Discord, then run Verifier and lifecycle tests.'
+    Write-Output 'Next: run the core Verifier and lifecycle validation rows.'
 }
 
 function Invoke-Uninstall {

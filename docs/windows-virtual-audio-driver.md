@@ -10,7 +10,7 @@ bounded PCM packets:
 | QPWGraph Virtual Output | render | application audio sink |
 | QPWGraph Virtual Monitor | capture | monitor for that sink |
 | QPWGraph Relay Sink | render | receiver input to the driver |
-| QPWGraph Relay Microphone | capture | microphone visible to OBS/Discord/etc. |
+| QPWGraph Relay Microphone | capture | microphone visible to ordinary WASAPI clients |
 
 Endpoint ownership is not inferred from these display names. The provider must
 publish the `qpwgraph_audio` service identity and the project-owned endpoint
@@ -37,7 +37,7 @@ enumeration, role ownership, shared-mode streaming, and the app cable's
 non-silent round trip against the then-installed development package; it does
 not prove that a newly built Rust candidate has been installed. The
 source/default package remains fail-closed, and a public release still
-requires Verifier, HLK, Microsoft signing, Secure Boot, and ordinary-client
+requires Verifier, HLK, Microsoft signing, Secure Boot, and core lifecycle
 validation.
 
 Build/package commands require a real eWDK/WDK developer prompt, KMDF 1.31 or

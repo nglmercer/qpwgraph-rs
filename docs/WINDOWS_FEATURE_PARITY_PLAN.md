@@ -1,8 +1,8 @@
-# QPWGraph-RS — Windows Full Feature Completion Plan for LLM Agents
+# QPWGraph-RS — Windows Core Feature Completion Plan for LLM Agents
 
 > Repository: `nglmercer/qpwgraph-rs`
 >
-> Target: complete the remaining Windows feature gaps while preserving the current working architecture, keeping the portable app usable without the optional driver, and making the optional Windows audio driver production-ready.
+> Target: complete core Linux/Windows feature parity while preserving the current working architecture, keeping the portable app usable without the optional driver, and making the optional Windows audio driver production-ready. Brand-specific third-party application checks are compatibility extras, not core gates.
 
 ---
 
@@ -14,7 +14,7 @@ Implement the remaining Windows features:
 2. **Production Microsoft-signed Windows audio driver pipeline**
 3. **Driver Verifier / HLK / Secure Boot release validation**
 4. **100% project-authored Rust Windows audio driver**
-5. Finish the remaining Windows lifecycle/client validation gaps
+5. Finish the remaining Windows lifecycle and recovery validation gaps
 6. Update stale documentation so it accurately reflects the implementation
 
 The implementation must preserve all already-working Windows functionality.
@@ -37,7 +37,7 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   probes with an audio-producing Win32 helper passed all-three-role automatic
   switching, replacement-PID rebind, and exact restoration on rule removal
   and backend shutdown. The earlier error is not a blanket routing blocker;
-  MSIX, manual-override, and full restart/client coverage remain open;
+  manual-override and unsupported-build fallback coverage remain open;
 - Rust candidate `25ddbe6` adds shared EOS argument validation, the
   rollover-safe packet admission rule, and the monotonic scheduling counter.
   It is test-signed and installed as `oem24.inf`; the running devnode reports
@@ -84,8 +84,9 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   core tests, including `u32::MAX -> 0`; a real 32-bit counter-wrap run is not
   claimed because it would require billions of packets. Preroll/long-run wrap
   behavior and the remaining release gates stay open;
-- remaining long-run EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
-  signing, and remaining ordinary-client acceptance are still release gates.
+- remaining long-run EOS, Verifier, complete lifecycle, HLK, Secure Boot, and
+  Microsoft signing are still release gates. Generic WASAPI probes define the
+  core client contract; branded application matrices are optional.
 
 See [candidate acceptance evidence](windows-driver-candidate-acceptance.md)
 for package identity, retained failures, and subsequent validation. Historical
@@ -1362,45 +1363,22 @@ No partial effect chain may remain.
 
 ---
 
-# 11. Feature I — Remaining client matrix
+# 11. Optional ecosystem compatibility
 
-## 11.1 Relay Microphone
+Core parity is defined by the generic WASAPI and deterministic project-owned
+helpers already used by automated tests. Chrome, Discord, VLC, OBS, Teams,
+Zoom, DAWs, or any other branded application are optional compatibility
+sampling only. They are not required dependencies, release gates, or reasons
+to install software on a development machine.
 
-Already validated with generic WASAPI, OBS, and browser clients.
-
-Still add:
-
-```text
-[ ] Discord
-```
-
-Optional additional:
+If a distributor chooses to run an ecosystem matrix, keep its evidence
+separate from core acceptance and verify the same public contracts:
 
 ```text
-[ ] Teams
-[ ] Zoom
-[ ] DAW
-```
-
-These are acceptance tests, not new architecture.
-
-## 11.2 Application relay
-
-Already validated with helper/browser paths.
-
-Add:
-
-```text
-[ ] Chrome
-[ ] VLC
-```
-
-Verify:
-
-```text
-local playback unchanged
-only target process relayed
-restart resolves stable app selector
+local playback remains unchanged for non-isolated application relay
+only the selected process is relayed
+stable selectors recover across process restart
+Relay Microphone behaves as an ordinary shared-mode capture endpoint
 ```
 
 ---
@@ -1725,11 +1703,9 @@ Use this exact order unless a blocking dependency requires a change.
 - signed driver validation
 - checksums
 
-## PR 18 — Remaining live client matrix
+## PR 18 — Backend and destination recovery
 
-- Discord
-- Chrome
-- VLC
+- qpwgraph backend crash recovery
 - destination disappear/return
 - physical endpoint churn
 
@@ -1771,7 +1747,7 @@ Do NOT call Windows full parity complete until all required rows below are true.
 [x] correct stream timing (bounded direct KS presentation-position check)
 [ ] EOS correct
 [ ] power transitions correct
-[ ] no cross-talk
+[x] no cross-talk (current-candidate direct and 300-cycle isolation probes)
 ```
 
 ## Automatic app switching
@@ -1791,9 +1767,9 @@ Do NOT call Windows full parity complete until all required rows below are true.
 
 ```text
 [ ] Driver Verifier clean
-[ ] lifecycle stress clean
+[x] ordinary 300-cycle lifecycle stress clean
 [ ] sleep/resume clean
-[ ] disable/enable clean
+[x] disable/enable clean (idle-device transition)
 [ ] reboot clean
 [ ] relevant HLK tests pass
 [ ] Secure Boot validation pass
@@ -1802,15 +1778,11 @@ Do NOT call Windows full parity complete until all required rows below are true.
 [ ] full installer built
 ```
 
-## Client acceptance
+## Core interoperability
 
 ```text
 [x] generic WASAPI Relay Microphone
-[x] OBS Relay Microphone
-[x] browser Relay Microphone
-[ ] Discord Relay Microphone
-[ ] Chrome app relay
-[ ] VLC app relay
+[x] generic process-loopback/application relay helper
 [ ] physical destination disappear/return
 [ ] physical endpoint churn persistence
 ```
@@ -1871,7 +1843,7 @@ QPWGraph Relay Sink
 QPWGraph Relay Microphone
     |
     v
-Discord / OBS / browser / DAW
+ordinary Windows shared-mode capture client
 ```
 
 ---

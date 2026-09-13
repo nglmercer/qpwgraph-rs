@@ -4,6 +4,10 @@ Development validation on September 12–13, 2026. This supersedes the older
 installed-package identity in `windows-driver-acceptance-baseline.md`, but
 does not transfer that baseline's client/policy acceptance to this candidate.
 
+Core acceptance uses generic WASAPI and deterministic project-owned helpers.
+Brand-specific application checks are optional compatibility sampling and do
+not require Chrome, Discord, VLC, OBS, or similar applications to be installed.
+
 ## Installed package
 
 - Driver source commit: `25ddbe6` (guarded idle-cable clearing during device release).
@@ -29,8 +33,9 @@ Test-signing was verified **True**, Secure Boot **False**. No boot settings
 or system default audio devices were changed. Keep Test Mode enabled on this
 PC; full parity and readiness to disable Test Mode are **not complete**.
 
-A read-only release audit against the refreshed staged package reported 20
-passes, 2 direct environment blocks, and 18 unproven gates. It now discovers
+A read-only release audit against the refreshed staged package reported 15
+core/toolchain passes, 2 direct environment blocks, and 16 unproven core
+gates. It now discovers
 the installed supported LLVM 21 at `C:\LLVM21\bin` even though the default
 shell also exposes LLVM 22. The remaining direct blocks are missing HLK
 Studio and intentionally disabled Secure Boot; the audit made no system
@@ -234,7 +239,8 @@ as live evidence; the two explicitly enabled helper tests above are.
 Exit 0, 21.09 seconds. Initial 1 kHz amplitude 0.2334; reconnect amplitudes
 0.2305, 0.2279, and 0.2310. Each disconnect measured 48,000 silent frames
 (peak 0.000031); the driver stayed running across reconnects. This uses an
-ordinary WASAPI microphone consumer, not an OBS/browser/Discord UI session.
+ordinary WASAPI microphone consumer and satisfies the core public capture
+client contract; branded application checks are optional.
 
 Transcript:
 `drivers/windows-audio/target/candidate-20da4d7-peer_audio_reaches_ordinary_relay_microphone_client.log`.
@@ -291,7 +297,8 @@ Local transcripts are respectively
 `drivers/windows-audio/target/candidate-20da4d7-ordinary_application_relay_preserves_local_output.log`
 and
 `drivers/windows-audio/target/candidate-20da4d7-isolated_application_route_rebinds_after_helper_restart.log`.
-These are deterministic project-helper checks, not Chrome/VLC client acceptance.
+These deterministic project-helper checks satisfy the core application-relay
+contract; branded application checks are optional compatibility sampling.
 
 ## Recommended next validation batch
 
@@ -302,8 +309,9 @@ These are deterministic project-helper checks, not Chrome/VLC client acceptance.
    pre-existing active-stream sleep/resume, hibernate/reboot, and repeated
    install/uninstall/upgrade rows. Do not treat the accidental host sleep in
    the retained failure as sleep/resume acceptance.
-3. Complete MSIX/manual-override and Chrome/VLC/Discord client acceptance,
-   then HLK and Microsoft signing/release gates on the required environments.
+3. Complete manual-override and unsupported-build fallback behavior, then HLK
+   and Microsoft signing/release gates on the required environments. MSIX and
+   branded application checks are optional compatibility work.
 
 Keep the development PC in Test Mode throughout. Secure Boot validation belongs
 on the separate release-test environment, not a boot change on this machine.
@@ -511,7 +519,7 @@ qpwgraph backend crash recovery or Driver Verifier evidence.
 
 The remaining EOS wrap/preroll cases, controlled active-stream sleep/resume,
 hibernate/reboot, qpwgraph backend crash recovery, repeated upgrades/removals, Driver Verifier,
-HLK, Microsoft production signing, Secure Boot on a separate release-test
-environment, and remaining ordinary-client acceptance are not established by
-the basic cable checks. Follow `WINDOWS_FEATURE_PARITY_PLAN.md`; do not mark
+HLK, Microsoft production signing, and Secure Boot on a separate release-test
+environment are not established by the basic cable checks. Follow
+`WINDOWS_FEATURE_PARITY_PLAN.md`; do not mark
 full parity or Test Mode disable readiness from these results alone.

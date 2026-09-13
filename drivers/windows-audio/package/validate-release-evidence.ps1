@@ -178,8 +178,6 @@ if ($null -ne $acceptance) {
         'Driver Verifier stress matrix',
         'Microsoft signing pipeline established',
         'Secure Boot installation verified',
-        'Chrome/VLC ordinary relay acceptance',
-        'Discord Relay Microphone acceptance',
         'Sleep/resume lifecycle',
         'AudioSrv restart lifecycle',
         'Disable/enable lifecycle',

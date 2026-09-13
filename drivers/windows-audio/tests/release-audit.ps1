@@ -36,9 +36,9 @@ $evidence = @'
       "status": "pass",
       "evidence": "test-hlk-record"
     },
-    "Chrome/VLC ordinary relay acceptance": {
+    "Driver Verifier stress matrix": {
       "status": "pass",
-      "evidence": "test-client-record"
+      "evidence": "test-verifier-record"
     }
   }
 }
@@ -51,12 +51,12 @@ try {
         '-Json'
     )
     $hlk = @($withEvidence.checks | Where-Object { $_.Gate -eq 'HLK audio tests complete' })
-    $clients = @($withEvidence.checks | Where-Object { $_.Gate -eq 'Chrome/VLC ordinary relay acceptance' })
+    $verifier = @($withEvidence.checks | Where-Object { $_.Gate -eq 'Driver Verifier stress matrix' })
     if ($hlk.Count -ne 1 -or $hlk[0].Status -ne 'pass') {
         throw 'The evidence overlay did not mark the HLK gate as pass.'
     }
-    if ($clients.Count -ne 1 -or $clients[0].Status -ne 'pass') {
-        throw 'The evidence overlay did not mark the client gate as pass.'
+    if ($verifier.Count -ne 1 -or $verifier[0].Status -ne 'pass') {
+        throw 'The evidence overlay did not mark the Verifier gate as pass.'
     }
     if ($withEvidence.summary.EvidencePath -ne (Resolve-Path -LiteralPath $tempPath).Path) {
         throw 'The audit summary did not retain the evidence path.'
