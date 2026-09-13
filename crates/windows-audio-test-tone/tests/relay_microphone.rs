@@ -23,10 +23,10 @@
 #[cfg(feature = "relay-tests")]
 mod live {
     use pw_graph_backend::{
-        AppRoutePolicy, AudioFlow, AudioRole, EffectDriver, EffectNodeRequest, GraphDriver,
-        ProcessIdentity, RelayCodecKind, RelayDirection, RelayDriver, RelayHostRequest, RelayMode,
-        RelayReceiveSink, RelaySendSource, RelayTransportPreference, VerifiedAudioPolicyConfig,
-        WindowsAudioDriver,
+        AppRoutePolicy, AudioFlow, AudioRole, EffectCreateRequest, EffectDriver, EffectEvent,
+        EffectTarget, GraphDriver, ProcessIdentity, RelayCodecKind, RelayDirection, RelayDriver,
+        RelayHostRequest, RelayMode, RelayReceiveSink, RelaySendSource, RelayTransportPreference,
+        VerifiedAudioPolicyConfig, WindowsAudioDriver,
     };
     use pw_graph_config::WindowsApplicationRoute;
     use std::collections::BTreeMap;
@@ -934,17 +934,54 @@ mod live {
             parameters.insert("attack-ms".into(), 0.0);
             parameters.insert("hold-ms".into(), 0.0);
             parameters.insert("release-ms".into(), 0.0);
-            let instance = driver
-                .create_effect_node(EffectNodeRequest {
+            let ticket = driver
+                .begin_create_effect(EffectCreateRequest {
                     instance_id: "live-isolated-gate".into(),
                     effect_id: "builtin.noise-gate".into(),
                     module_path: None,
                     enabled: true,
                     parameters,
                     channel_policy: pw_graph_effects::ChannelPolicy::Auto,
-                    position: [240.0, 160.0],
+                    target: EffectTarget::Standalone {
+                        position: [240.0, 160.0],
+                    },
                 })
-                .map_err(|error| format!("create live noise gate: {error}"))?;
+                .map_err(|error| format!("queue live noise gate: {error}"))?;
+            // Windows prepares effects off the control thread. Do not connect
+            // graph ports until the matching request has actually activated.
+            let activation_deadline = Instant::now() + Duration::from_secs(10);
+            let instance = 'activation: loop {
+                for event in driver
+                    .poll_effect_events()
+                    .map_err(|error| format!("poll live noise gate: {error}"))?
+                {
+                    match event {
+                        EffectEvent::Ready {
+                            ticket: ready,
+                            instance,
+                        } if ready == ticket => {
+                            break 'activation *instance;
+                        }
+                        EffectEvent::Failed {
+                            ticket: failed,
+                            error,
+                        } if failed == ticket => {
+                            return Err(format!("prepare live noise gate: {error}"));
+                        }
+                        EffectEvent::Cancelled { ticket: cancelled } if cancelled == ticket => {
+                            return Err("live noise gate preparation was cancelled".into());
+                        }
+                        _ => {}
+                    }
+                }
+                if Instant::now() >= activation_deadline {
+                    driver
+                        .cancel_effect(ticket)
+                        .map_err(|error| format!("cancel timed-out noise gate: {error}"))?;
+                    return Err("live noise gate did not activate before the timeout".into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
             let input_link = driver
                 .connect(source, instance.input_port)
                 .map_err(|error| format!("connect isolated process to effect: {error}"))?;

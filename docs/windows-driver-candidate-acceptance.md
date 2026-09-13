@@ -83,6 +83,124 @@ a driver recovery defect. Do not erase or relabel this failure after a rerun.
 - The application/relay integration test now declares its direct effects
   dependency, fixing the observed unresolved-crate build error.
 
+## Uninterrupted stress recheck — passed
+
+The rebuilt probe used the stricter two-capture silence check. Command:
+
+```powershell
+& ./drivers/windows-audio/package/run-driver-stress.ps1 -Execute -Cycles 100 -DurationMilliseconds 250 -PackageRoot ./drivers/windows-audio/target/qpwgraph-audio-package -EvidencePath ./drivers/windows-audio/target/candidate-20da4d7-stress-recheck.json
+```
+
+Exit 0; `completed=true`, all three cable rows explicitly `passed`:
+
+- UTC start `2026-09-13T09:27:59.8276433Z`.
+- UTC completion `2026-09-13T09:37:49.2177875Z`.
+- 100/100 app round trips, 100/100 relay round trips, 100/100 two-cable checks.
+- Probe SHA-256 `969AEBC93D5DCCCA1B2F02205477CE178675F3CA96B0F33B52E33A08430A7E1F`.
+- Package hashes still match the installed candidate above.
+- No Kernel-Power or Power-Troubleshooter events were returned from the
+  System log for this interval.
+
+This is ordinary driver stress, **not Driver Verifier evidence**. AudioSrv
+restart and device toggle were intentionally separate from this matrix.
+
+## Device disable/enable — passed
+
+Executed elevated:
+
+```powershell
+& ./drivers/windows-audio/package/lifecycle-validation.ps1 -Phase DisableEnable -Execute -PackageRoot ./drivers/windows-audio/target/qpwgraph-audio-package -Verbose
+```
+
+Exit 0; completed at `2026-09-13T09:38:22.4650395Z`. Transcript:
+`drivers/windows-audio/target/candidate-20da4d7-lifecycle-DisableEnable.log`.
+
+Pre-toggle roles/cables passed. Only `ROOT\DEVGEN\QPWGRAPH_AUDIO` was
+disabled. Endpoint disappearance and reappearance each needed one normal
+poll retry while PnP notifications settled; those transient failures remain
+visible in the transcript. All four roles and both cables passed afterward,
+including 24,000 silent frames on each capture in each stopped-render check.
+Binding remained `oem21.inf`, problem code 0, with the same installed SYS hash.
+Read-only boot verification still reported `testsigning Yes`.
+
+This covers an idle-device lifecycle transition with fresh clients before and
+afterward, not client survival during a device removal or a repeated toggle soak.
+
+## Windows Audio service restart — passed
+
+Executed elevated with explicit service-restart opt-in:
+
+```powershell
+& ./drivers/windows-audio/package/lifecycle-validation.ps1 -Phase AudioService -Execute -AllowAudioServiceRestart -PackageRoot ./drivers/windows-audio/target/qpwgraph-audio-package -Verbose
+```
+
+Exit 0; completed at `2026-09-13T09:38:49.4807770Z`. Transcript:
+`drivers/windows-audio/target/candidate-20da4d7-lifecycle-AudioService.log`.
+All four roles and both cable/isolation/silence checks passed before and after
+restarting `Audiosrv`. The installed binding/hash stayed unchanged, problem
+code remained 0, and boot verification still reported `testsigning Yes`.
+This verifies fresh-client recovery, not survival of a pre-existing app stream.
+
+## Automatic Win32 helper routing — passed
+
+After fixing the test's missing direct effects dependency, built with
+`cargo test -p windows-audio-test-tone --features relay-tests --test relay_microphone --no-run --locked`.
+Both following tests actually ran with their named opt-in variable set to `1`,
+`--exact --nocapture --test-threads=1`, and exited 0:
+
+| Test in `relay_microphone::live` | Opt-in environment variable | Observed result |
+| --- | --- | --- |
+| `experimental_application_route_restores_on_driver_shutdown` | `PW_GRAPH_TEST_WINDOWS_AUTO_APP_ROUTE_DROP` | All three roles moved to AppRender; replacement PID rebound; 1 kHz amplitude 0.2154; dropping backend restored original role values. |
+| `experimental_application_route_rebinds_default_helper_and_restores` | `PW_GRAPH_TEST_WINDOWS_AUTO_APP_ROUTE` | All three roles moved to AppRender; replacement PID rebound; 1 kHz amplitude 0.2162; removing rule restored original role values. |
+
+Initial snapshots were `None` for Console, Multimedia, and Communications.
+The tests mutated only their disposable helper's policy and stopped their
+children afterward. Test flags were scoped to the invoking shell, not enabled
+in the user's application configuration. Local logs:
+
+- `drivers/windows-audio/target/candidate-20da4d7-policy-shutdown.log`
+- `drivers/windows-audio/target/candidate-20da4d7-policy-rule-removal.log`
+
+The earlier standalone `E_INVALIDARG` did not recur with a real audio-producing
+helper. These live results supersede the claim that automatic switching is
+universally blocked on this PC; they do not explain every unsupported-process
+case or establish MSIX, user-override, or full application restart acceptance.
+
+Focused smoke clippy passed with warnings denied. Application integration-test
+clippy passed with `--no-deps`; the broader invocation still reports the
+existing `clippy::too_many_arguments` warning in backend `routing.rs::walk`.
+
+Policy unit tests (`cargo test -p pw-graph-backend --lib audio_policy_config::tests --locked -- --test-threads=1`):
+10 passed, 1 opt-in standalone live probe ignored. Coverage includes build/IID
+gating, interface layout, endpoint-ID round trips, display-name-only rejection,
+manual-override ownership, and failure demotion. The ignored test is not counted
+as live evidence; the two explicitly enabled helper tests above are.
+
+## Relay Microphone reconnect — passed
+
+`live::peer_audio_reaches_ordinary_relay_microphone_client` ran with
+`PW_GRAPH_TEST_RELAY_MICROPHONE=1` and `PW_GRAPH_TEST_RELAY_MICROPHONE_CYCLES=3`.
+Exit 0, 21.09 seconds. Initial 1 kHz amplitude 0.2334; reconnect amplitudes
+0.2305, 0.2279, and 0.2310. Each disconnect measured 48,000 silent frames
+(peak 0.000031); the driver stayed running across reconnects. This uses an
+ordinary WASAPI microphone consumer, not an OBS/browser/Discord UI session.
+
+Transcript:
+`drivers/windows-audio/target/candidate-20da4d7-peer_audio_reaches_ordinary_relay_microphone_client.log`.
+
+## Initial effects probe — retained test-API failure
+
+The next live probe failed before effect activation because it called the old
+synchronous `create_effect_node` API. The backend correctly rejected this with
+`Windows effects must be created asynchronously with begin_create_effect`.
+The helper was stopped on failure. Preserve the original transcript:
+`drivers/windows-audio/target/candidate-20da4d7-isolated_application_effect_applies_and_bypass_restores_audio.log`.
+
+The test now queues `EffectCreateRequest`, polls the matching ticket until
+`Ready`, rejects failure/cancellation, and cancels on a bounded timeout before
+connecting ports. This is a test migration, not a relaxation of the backend's
+asynchronous-creation requirement or its silence/tone acceptance thresholds.
+
 ## Remaining release gates
 
 Precise stream timing and EOS, controlled active-stream sleep/resume,

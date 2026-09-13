@@ -1089,8 +1089,16 @@ impl GraphDriver for WindowsAudioDriver {
             };
         }
 
+        // A registered effect output is already qpwgraph-owned PCM, just as
+        // it is in the effect/recorder destination branches above. Requiring
+        // an endpoint/session node here prevented effect -> playback routes.
+        // Consult the live routing table, not just the node's Effect label.
+        let effect_source = self
+            .routing
+            .as_ref()
+            .is_some_and(|routing| routing.carries_effect_output(output));
         if self.capabilities().connect
-            && self.node_supports_routing(output_node.id)
+            && (self.node_supports_routing(output_node.id) || effect_source)
             && self.node_supports_routing(input_node.id)
         {
             ConnectionSupport::Route

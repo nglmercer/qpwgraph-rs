@@ -4,6 +4,130 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[test]
+fn effect_playback_support_requires_a_registered_output_without_enabling_plain_sessions() {
+    use crate::api::{EffectCreateRequest, EffectDriver, EffectEvent, EffectTarget};
+    use std::time::{Duration, Instant};
+
+    let Ok(mut driver) = WindowsAudioDriver::new() else {
+        // Consistent with the other headless Windows startup tests. No audio
+        // clients are opened: all assertions below query a synthetic graph.
+        return;
+    };
+    let sink_node = NodeId(graph_id(endpoint_node_local_id("test-effect-playback")));
+    let sink_port = PortId(graph_id(endpoint_port_local_id("test-effect-playback")));
+    driver
+        .graph
+        .add_node(Node::new(
+            sink_node,
+            "test sink",
+            NodeType::WindowsAudioEndpoint,
+        ))
+        .unwrap();
+    driver
+        .graph
+        .add_port(Port::new(
+            sink_port,
+            sink_node,
+            "in",
+            Direction::Sink,
+            PortType::Audio,
+        ))
+        .unwrap();
+
+    let fake_node = NodeId(graph_id(endpoint_node_local_id("unregistered-effect-test")));
+    let fake_output = PortId(graph_id(endpoint_port_local_id("unregistered-effect-test")));
+    driver
+        .graph
+        .add_node(Node::new(fake_node, "unregistered", NodeType::Effect))
+        .unwrap();
+    driver
+        .graph
+        .add_port(Port::new(
+            fake_output,
+            fake_node,
+            "out",
+            Direction::Source,
+            PortType::Audio,
+        ))
+        .unwrap();
+    assert_eq!(
+        driver.connection_support(fake_output, sink_port),
+        ConnectionSupport::Unsupported
+    );
+
+    let session_node = NodeId(graph_id(endpoint_node_local_id("test-plain-session")));
+    let session_port = PortId(graph_id(endpoint_port_local_id("test-plain-session")));
+    driver
+        .graph
+        .add_node(Node::new(
+            session_node,
+            "plain session",
+            NodeType::WindowsAudioSession,
+        ))
+        .unwrap();
+    driver
+        .graph
+        .add_port(Port::new(
+            session_port,
+            session_node,
+            "out",
+            Direction::Source,
+            PortType::Audio,
+        ))
+        .unwrap();
+    driver
+        .process_audio_capabilities
+        .insert(session_node, ProcessAudioCapabilities::capture_only());
+    assert_eq!(
+        driver.connection_support(session_port, sink_port),
+        ConnectionSupport::Unsupported
+    );
+
+    let ticket = driver
+        .begin_create_effect(EffectCreateRequest {
+            instance_id: "registered-effect-test".into(),
+            effect_id: pw_graph_effects::NOISE_GATE_ID.into(),
+            module_path: None,
+            enabled: true,
+            parameters: BTreeMap::new(),
+            channel_policy: pw_graph_effects::ChannelPolicy::Auto,
+            target: EffectTarget::Standalone {
+                position: [0.0, 0.0],
+            },
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let instance = 'ready: loop {
+        for event in driver.poll_effect_events().unwrap() {
+            match event {
+                EffectEvent::Ready {
+                    ticket: ready,
+                    instance,
+                } if ready == ticket => break 'ready *instance,
+                EffectEvent::Failed { error, .. } => panic!("effect preparation failed: {error}"),
+                EffectEvent::Cancelled { .. } => panic!("effect preparation cancelled"),
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "effect preparation timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(
+        driver.connection_support(instance.output_port, sink_port),
+        ConnectionSupport::Route
+    );
+    assert_eq!(
+        driver.connection_support(session_port, instance.input_port),
+        ConnectionSupport::Unsupported
+    );
+    driver.remove_effect("registered-effect-test").unwrap();
+    assert_eq!(
+        driver.connection_support(instance.output_port, sink_port),
+        ConnectionSupport::Unsupported
+    );
+}
+
+#[test]
 fn stable_ids_are_deterministic_and_namespaced() {
     let endpoint = graph_id(endpoint_node_local_id("speaker-id"));
     let port = graph_id(endpoint_port_local_id("speaker-id"));

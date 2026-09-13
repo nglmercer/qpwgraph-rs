@@ -32,10 +32,12 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   package staging, and Rust transport/EOS tests pass on the available PC;
 - process-loopback recovery and application-relay restart/session probes pass
   without a virtual driver;
-- private AudioPolicyConfig activation succeeds on the current Windows 10
-  build, but the first live `GetPersistedDefaultAudioEndpoint` call returns
-  `E_INVALIDARG`; the backend therefore demotes automatic routing to
-  `ManualOnly` and the automatic-switching acceptance rows remain open;
+- an earlier isolated policy probe returned `E_INVALIDARG` and correctly
+  demoted that policy instance to `ManualOnly`. September 13 end-to-end
+  probes with an audio-producing Win32 helper passed all-three-role automatic
+  switching, replacement-PID rebind, and exact restoration on rule removal
+  and backend shutdown. The earlier error is not a blanket routing blocker;
+  MSIX, manual-override, and full restart/client coverage remain open;
 - Rust candidate `20da4d7`, including the stream cleanup and packet-layout
   fixes, is test-signed and installed as `oem21.inf`. The running devnode
   reports problem code 0; installed and staged signed SYS hashes match;
@@ -45,6 +47,9 @@ The repository-level Windows work is ahead of the original bootstrap wording:
   and 36 isolation cycles, then failed with zero silence-measurement frames
   across a host sleep/resume. Preserve that interrupted run as a failure,
   not a clean stress or sleep/resume acceptance result;
+- a fresh September 13 run passed all 100 app, 100 relay, and 100 isolation
+  cycles with the stricter two-capture silence probe. Idle-device disable/enable
+  and AudioSrv restart also passed with fresh roles/cables verified afterward;
 - live timing/EOS, Verifier, complete lifecycle, HLK, Secure Boot, Microsoft
   signing, and remaining ordinary-client acceptance are still release gates.
 
@@ -407,7 +412,7 @@ Acceptance:
 ```text
 [x] driver loads
 [x] device starts
-[ ] device stops
+[x] device stops (idle disable/enable)
 [ ] device remove works
 [ ] no C runtime callback remains for these operations
 ```
@@ -813,25 +818,25 @@ No route should become broken merely because automatic switching is unavailable.
 Unit:
 
 ```text
-[ ] unsupported build -> ManualOnly
-[ ] unknown IID -> ManualOnly
+[x] unsupported build -> ManualOnly
+[x] unknown IID -> ManualOnly
 [ ] ABI mismatch -> ManualOnly
 [ ] stale PID -> reject
-[ ] display-name-only selector -> reject
+[x] display-name-only selector -> reject
 [ ] duplicate live selector match -> reject
-[ ] user manual override prevents unsafe restore
+[x] user manual override prevents unsafe restore (unit ownership model)
 ```
 
 Live:
 
 ```text
-[ ] unpackaged Win32 app auto-moves
+[x] unpackaged Win32 app auto-moves (project tone helper)
 [ ] packaged MSIX app auto-moves
-[ ] app route confirms isolation
+[x] app route confirms isolation (project tone helper)
 [ ] app effects activate only after isolation
-[ ] app restart re-applies route
+[x] app restart re-applies route (replacement helper PID)
 [ ] qpwgraph restart reconciles safely
-[ ] disabling rule restores previous endpoint
+[x] disabling rule restores previous endpoint (all three roles)
 [ ] user manual override is preserved
 [ ] unsupported Windows build falls back to manual mode
 ```
@@ -1225,8 +1230,8 @@ Close these live rows:
 ```text
 [ ] sleep/resume
 [ ] hibernate/resume if supported
-[ ] device disable/enable
-[ ] AudioSrv restart
+[x] device disable/enable (idle-device transition; September 13 candidate)
+[x] AudioSrv restart (fresh-client recovery; September 13 candidate)
 [ ] qpwgraph crash during active stream
 [ ] render client crash
 [ ] capture client crash
@@ -1683,8 +1688,8 @@ Do NOT call Windows full parity complete until all required rows below are true.
 
 ```text
 [x] no project-authored C/C++ runtime driver code (static source audit)
-[ ] four ACX endpoints implemented in Rust
-[ ] two independent Rust PCM cables
+[x] four ACX endpoints implemented in Rust
+[x] two independent Rust PCM cables
 [ ] correct stream timing
 [ ] EOS correct
 [ ] power transitions correct
