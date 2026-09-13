@@ -154,6 +154,16 @@ function Find-FirstFile([string[]] $Candidates) {
     return $null
 }
 
+function Find-FirstDirectory([string[]] $Candidates) {
+    foreach ($candidate in $Candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and
+            (Test-Path -LiteralPath $candidate -PathType Container)) {
+            return (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
+        }
+    }
+    return $null
+}
+
 function Find-ClangCandidates {
     $paths = New-Object 'System.Collections.Generic.List[string]'
     $add = {
@@ -356,7 +366,11 @@ Add-SignatureCheck 'Catalog Authenticode signature' (Join-Path $packageRootPath 
 # The release gate must say explicitly whether the driver implementation has
 # completed the Rust port. This is intentionally a source audit, not an
 # inference from a successful package build.
-$driverSourceRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'driver\src'
+$driverSourceCandidates = @(
+    (Join-Path (Split-Path -Parent $PSScriptRoot) 'driver\src'),
+    (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'driver\src')
+)
+$driverSourceRoot = Find-FirstDirectory $driverSourceCandidates
 if (Test-Path -LiteralPath $driverSourceRoot -PathType Container) {
     $runtimeSources = @(Get-ChildItem -LiteralPath $driverSourceRoot -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in @('.c', '.cc', '.cpp') })
