@@ -903,9 +903,7 @@ fn verify_sustained_eos(
         max_render_count = max_render_count.max(render_count);
         // SetRenderPacket accepts the exact successor of the last completed
         // packet. Do not infer multi-packet queueing from the double mapping.
-        while next_packet <= config.packets
-            && next_packet <= render_count.saturating_add(1)
-        {
+        while next_packet <= config.packets && next_packet <= render_count.saturating_add(1) {
             let final_packet = next_packet == config.packets;
             fill_sustained_render_packet(
                 &render,
