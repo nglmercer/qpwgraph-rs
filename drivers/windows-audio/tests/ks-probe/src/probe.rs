@@ -23,7 +23,7 @@ struct Samples {
 const SUSTAINED_EOS_MARKER_BASE: i16 = 1_000;
 const SUSTAINED_EOS_DEFAULT_PACKETS: u32 = 128;
 const SUSTAINED_EOS_DEFAULT_TIMEOUT_MS: u64 = 20_000;
-const SUSTAINED_EOS_DEFAULT_PREROLL: u32 = 2;
+const SUSTAINED_EOS_DEFAULT_PREROLL: u32 = 1;
 const SUSTAINED_EOS_DEFAULT_FINAL_BYTES: u32 = 960;
 const SUSTAINED_EOS_MIN_PACKETS: u32 = 4;
 const SUSTAINED_EOS_MAX_PACKETS: u32 = 20_000;
@@ -100,8 +100,8 @@ fn parse_sustained_eos_args(args: &[String]) -> Result<SustainedEosConfig> {
             "sustained EOS timeout must be {SUSTAINED_EOS_MIN_TIMEOUT_MS}..={SUSTAINED_EOS_MAX_TIMEOUT_MS} ms"
         ));
     }
-    if !matches!(config.preroll, 1..=2) {
-        return Err("sustained EOS preroll must be 1 or 2 packets".into());
+    if config.preroll != 1 {
+        return Err("sustained EOS preroll must be exactly 1 packet".into());
     }
     if config.final_bytes == 0
         || config.final_bytes > 1_920
@@ -901,10 +901,10 @@ fn verify_sustained_eos(
         }
         previous_render_count = render_count;
         max_render_count = max_render_count.max(render_count);
-        // Keep both mapped notifications occupied. At the first observation
-        // after RUN, this also fills the second slot for a one-packet preroll.
+        // SetRenderPacket accepts the exact successor of the last completed
+        // packet. Do not infer multi-packet queueing from the double mapping.
         while next_packet <= config.packets
-            && next_packet <= render_count.saturating_add(render.notification_count)
+            && next_packet <= render_count.saturating_add(1)
         {
             let final_packet = next_packet == config.packets;
             fill_sustained_render_packet(
