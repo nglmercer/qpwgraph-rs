@@ -60,6 +60,35 @@ function Test-NonEmpty([object] $Value) {
     return $null -ne $Value -and -not [string]::IsNullOrWhiteSpace([string]$Value)
 }
 
+function Get-CapturedText($Capture) {
+    return (@(Get-ObjectProperty $Capture 'output') | ForEach-Object { [string]$_ }) -join "`n"
+}
+
+function Test-VerifierConfiguration($Settings, $Query, [string] $DriverName) {
+    if (-not [bool](Get-ObjectProperty $Settings 'available') -or
+        [int](Get-ObjectProperty $Settings 'exit_code') -ne 0 -or
+        -not [bool](Get-ObjectProperty $Query 'available') -or
+        [int](Get-ObjectProperty $Query 'exit_code') -ne 0) {
+        return $false
+    }
+    $settingsText = Get-CapturedText $Settings
+    $queryText = Get-CapturedText $Query
+    $flags = [regex]::Match($settingsText, '(?im)Verifier\s+Flags:\s*0x([0-9a-f]+)')
+    if (-not $flags.Success -or [Convert]::ToUInt32($flags.Groups[1].Value, 16) -eq 0) {
+        return $false
+    }
+    return $settingsText -match [regex]::Escape($DriverName) -or
+        $queryText -match [regex]::Escape($DriverName)
+}
+
+function Get-PackageFileHash($EvidenceDocument, [string] $Name) {
+    $record = @((Get-ObjectProperty $EvidenceDocument 'package_files') |
+        Where-Object { [string](Get-ObjectProperty $_ 'name') -eq $Name } |
+        Select-Object -First 1)
+    if ($record.Count -ne 1) { return '' }
+    return ([string](Get-ObjectProperty $record[0] 'sha256')).ToUpperInvariant()
+}
+
 $evidence = (Resolve-Path -LiteralPath $EvidenceRoot -ErrorAction Stop).Path
 $package = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path
 $checks = New-Object 'System.Collections.Generic.List[object]'
@@ -155,6 +184,9 @@ if ($null -ne $verifier) {
     $queryAvailable = [bool](Get-ObjectProperty $query 'available')
     Add-Check $checks 'Driver Verifier settings were collected' ($settingsAvailable -and [int](Get-ObjectProperty $settings 'exit_code') -eq 0) "available=$settingsAvailable; exit_code=$(Get-ObjectProperty $settings 'exit_code')"
     Add-Check $checks 'Driver Verifier query was collected' ($queryAvailable -and [int](Get-ObjectProperty $query 'exit_code') -eq 0) "available=$queryAvailable; exit_code=$(Get-ObjectProperty $query 'exit_code')"
+    $driverName = [string](Get-ObjectProperty $verifier 'driver')
+    $active = Test-NonEmpty $driverName -and (Test-VerifierConfiguration $settings $query $driverName)
+    Add-Check $checks 'Driver Verifier was active for the candidate driver' $active "driver=$driverName"
 }
 
 if ($null -ne $stress) {
@@ -292,6 +324,19 @@ if ($null -ne $release) {
     Add-Check $checks 'Release candidate Rust-only runtime marker' ([string](Get-ObjectProperty $release 'driver_runtime') -eq 'rust-only') ([string](Get-ObjectProperty $release 'driver_runtime'))
     $implementationStatus = [string](Get-ObjectProperty $release 'implementation_status')
     Add-Check $checks 'Release candidate implementation marker' ($implementationStatus -eq 'ready') $implementationStatus
+    foreach ($name in @('qpwgraph_audio.sys', 'qpwgraph-audio.inf', 'qpwgraph-audio.cat')) {
+        $releaseRecord = Get-ObjectProperty (Get-ObjectProperty $release 'artifacts') $name
+        $releaseHash = ([string](Get-ObjectProperty $releaseRecord 'sha256')).ToUpperInvariant()
+        foreach ($source in @(
+                @{ Label = 'Verifier'; Document = $verifier },
+                @{ Label = 'Stress'; Document = $stress }
+            )) {
+            $observed = Get-PackageFileHash $source.Document $name
+            Add-Check $checks "$($source.Label)/release hash: $name" (
+                (Test-NonEmpty $releaseHash) -and $observed -eq $releaseHash
+            ) "observed=$observed; release=$releaseHash"
+        }
+    }
 }
 
 $resultPackage = $evidencePaths['hlk-result-package.zip']
