@@ -54,7 +54,11 @@ pub struct VerifiedAudioPolicyAbi {
 pub const VERIFIED_AUDIO_POLICY_ABIS: &[VerifiedAudioPolicyAbi] = &[VerifiedAudioPolicyAbi {
     interface_version: "audio-policy-config-win10-v1",
     iid: AUDIO_POLICY_CONFIG_FACTORY_IID_WIN10,
-    minimum_build: 19_041,
+    // Build 19045 is the only Windows build on which this exact private
+    // vtable has been exercised.  Do not widen this range from a single live
+    // observation: an ABI-compatible-looking build must remain ManualOnly
+    // until its own interface layout is verified.
+    minimum_build: 19_045,
     maximum_build: Some(19_045),
 }];
 
@@ -543,10 +547,10 @@ impl AppRoutePolicy for VerifiedAudioPolicyConfig {
         flow: AudioFlow,
         role: AudioRole,
     ) -> BackendResult<Option<String>> {
-        let pid = self.require_stable_identity(process)?;
         if self.diagnostics().interface_version.is_none() {
             return Err(self.record_rejection("get_persisted_endpoint", None));
         }
+        let pid = self.require_stable_identity(process)?;
         match get_endpoint(pid, flow, role) {
             Ok(endpoint) => {
                 self.record_success("get_persisted_endpoint");
@@ -563,10 +567,10 @@ impl AppRoutePolicy for VerifiedAudioPolicyConfig {
         role: AudioRole,
         endpoint: Option<&str>,
     ) -> BackendResult<()> {
-        let pid = self.require_stable_identity(process)?;
         if self.diagnostics().interface_version.is_none() {
             return Err(self.record_rejection("set_persisted_endpoint", None));
         }
+        let pid = self.require_stable_identity(process)?;
         match set_endpoint(pid, flow, role, endpoint) {
             Ok(()) => {
                 self.record_success("set_persisted_endpoint");
@@ -613,7 +617,15 @@ impl AutomaticAppRouteLease {
     }
 
     pub fn can_restore(&self, current: Option<&WindowsEndpointSelector>) -> bool {
-        self.owned && current == Some(&self.applied_endpoint)
+        self.owned
+            && current.is_some_and(|current| {
+                current.data_flow == self.applied_endpoint.data_flow
+                    && current
+                        .current_mmdevice_id
+                        .as_deref()
+                        .zip(self.applied_endpoint.current_mmdevice_id.as_deref())
+                        .is_some_and(|(current, applied)| current.eq_ignore_ascii_case(applied))
+            })
     }
 
     pub fn mark_user_override(&mut self) {
@@ -655,7 +667,47 @@ mod tests {
 
     #[test]
     fn unsupported_build_is_manual_only() {
+        assert!(verified_abi_for_build(19_041).is_none());
+        assert!(verified_abi_for_build(19_044).is_none());
         assert!(verified_abi_for_build(22_000).is_none());
+    }
+
+    #[test]
+    fn only_the_live_validated_build_is_eligible_for_the_private_abi() {
+        let abi = verified_abi_for_build(19_045).expect("the live validation build is allowlisted");
+        assert_eq!(abi.minimum_build, 19_045);
+        assert_eq!(abi.maximum_build, Some(19_045));
+        assert_eq!(abi.iid, AUDIO_POLICY_CONFIG_FACTORY_IID_WIN10);
+    }
+
+    #[test]
+    fn disabled_policy_rejects_before_inspecting_process_identity() {
+        let policy = VerifiedAudioPolicyConfig::new(false);
+        let process = ProcessIdentity {
+            executable_path_hash: None,
+            executable_name: None,
+            package_family_name: None,
+            app_user_model_id: None,
+            display_name: Some("Player".into()),
+            process_id: None,
+        };
+
+        assert!(policy
+            .set_persisted_endpoint(
+                &process,
+                AudioFlow::Render,
+                AudioRole::Multimedia,
+                Some("virtual")
+            )
+            .is_err());
+        let diagnostics = policy.diagnostics();
+        assert_eq!(
+            diagnostics.last_operation.as_deref(),
+            Some("set_persisted_endpoint")
+        );
+        assert!(diagnostics
+            .fallback_reason
+            .contains("experimental automatic application routing is disabled"));
     }
 
     #[test]
@@ -734,6 +786,28 @@ mod tests {
         lease.mark_user_override();
         assert!(!lease.can_restore(Some(&applied)));
         assert_eq!(lease.restore_if_owned(Some(&applied)), None);
+    }
+
+    #[test]
+    fn route_metadata_churn_does_not_look_like_a_manual_override() {
+        let original = endpoint("physical");
+        let applied = endpoint("virtual");
+        let mut observed = applied.clone();
+        observed.stable_id = Some("new-stable-id".into());
+        observed.friendly_name = Some("QPWGraph Virtual Output (2)".into());
+        let mut lease = AutomaticAppRouteLease::new(
+            selector("sha256:player"),
+            4242,
+            Some(original),
+            applied,
+            7,
+        );
+
+        assert!(lease.can_restore(Some(&observed)));
+        assert_eq!(
+            lease.restore_if_owned(Some(&observed)),
+            lease.original_endpoint
+        );
     }
 
     #[test]
