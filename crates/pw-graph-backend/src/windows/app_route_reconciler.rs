@@ -639,6 +639,32 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_os_fails_closed_before_isolation_or_capture() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_endpoint_id: Some("speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        reconciler.reconcile(&ApplicationRouteEnvironment {
+            os_supported: false,
+            virtual_driver_ready: true,
+            applications: vec![app("sha256:player", 42, true)],
+            endpoints: vec![endpoint("speaker", "Speakers")],
+            captures: BTreeMap::from([(
+                ("sha256:player".into(), 42),
+                ProcessCaptureReadiness::Ready,
+            )]),
+            ..ApplicationRouteEnvironment::default()
+        });
+
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::UnsupportedOs);
+        assert!(plan.activation.is_none());
+        assert!(reconciler.capture_requests().is_empty());
+    }
+
+    #[test]
     fn missing_destination_degrades_and_returning_endpoint_restores() {
         let route = WindowsApplicationRoute {
             application: app("sha256:player", 1, true).selector,
