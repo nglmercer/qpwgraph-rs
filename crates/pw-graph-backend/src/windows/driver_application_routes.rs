@@ -6,6 +6,13 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyEndpointObservation {
+    Applied,
+    Overridden,
+    Unknown,
+}
+
 impl WindowsAudioDriver {
     pub fn reconcile_application_routes(
         &mut self,
@@ -636,6 +643,95 @@ impl WindowsAudioDriver {
             .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
     }
 
+    fn retain_application_route_lease(
+        &mut self,
+        rule_index: usize,
+        role: AudioRole,
+        candidate: &ApplicationRouteCandidate,
+        original: Option<&str>,
+        applied: &WindowsEndpointSelector,
+    ) {
+        self.application_route_policy_generation =
+            self.application_route_policy_generation.wrapping_add(1);
+        let generation = self.application_route_policy_generation;
+        let original_endpoint = self.selector_for_policy_endpoint(original);
+        self.application_route_leases.insert(
+            (rule_index, role),
+            AutomaticAppRouteLease::new(
+                candidate.selector.clone(),
+                candidate.pid,
+                original_endpoint,
+                applied.clone(),
+                generation,
+            ),
+        );
+    }
+
+    /// Observe a role immediately after a private policy transaction.  An
+    /// explicit endpoint mismatch means that the user (or another policy
+    /// owner) won the race, so restoring that role would clobber their choice.
+    /// An unavailable read leaves ownership uncertain and is retained for a
+    /// later ownership-checked restore.
+    fn policy_endpoint_observation(
+        &self,
+        identity: &ProcessIdentity,
+        role: AudioRole,
+        applied: &WindowsEndpointSelector,
+    ) -> PolicyEndpointObservation {
+        match self
+            .app_route_policy
+            .get_persisted_endpoint(identity, AudioFlow::Render, role)
+        {
+            Ok(current) if Self::endpoint_id_matches(applied, current.as_deref()) => {
+                PolicyEndpointObservation::Applied
+            }
+            Ok(_) => PolicyEndpointObservation::Overridden,
+            Err(_) => PolicyEndpointObservation::Unknown,
+        }
+    }
+
+    /// Roll back only roles that are still observed at qpwgraph's applied
+    /// endpoint.  This closes the readback/set race where a user changes one
+    /// role while the other roles are being committed.  A role whose value
+    /// cannot be read remains represented by an ownership lease; a later
+    /// restore will verify the value again before writing anything.
+    fn rollback_application_route_transaction(
+        &mut self,
+        rule_index: usize,
+        candidate: &ApplicationRouteCandidate,
+        identity: &ProcessIdentity,
+        originals: &BTreeMap<AudioRole, Option<String>>,
+        applied: &WindowsEndpointSelector,
+        roles: &[AudioRole],
+    ) {
+        for role in roles {
+            match self.policy_endpoint_observation(identity, *role, applied) {
+                PolicyEndpointObservation::Applied => {
+                    let original = originals.get(role).and_then(|endpoint| endpoint.as_deref());
+                    if self
+                        .app_route_policy
+                        .rollback_persisted_endpoint(identity, AudioFlow::Render, *role, original)
+                        .is_err()
+                    {
+                        self.retain_application_route_lease(
+                            rule_index, *role, candidate, original, applied,
+                        );
+                    }
+                }
+                PolicyEndpointObservation::Overridden => {
+                    // Preserve an explicit user/third-party endpoint and drop
+                    // qpwgraph ownership for this role.
+                }
+                PolicyEndpointObservation::Unknown => {
+                    let original = originals.get(role).and_then(|endpoint| endpoint.as_deref());
+                    self.retain_application_route_lease(
+                        rule_index, *role, candidate, original, applied,
+                    );
+                }
+            }
+        }
+    }
+
     pub(super) fn restore_automatic_application_route_policies(&mut self, force: bool) {
         let lease_keys: Vec<_> = self.application_route_leases.keys().copied().collect();
         let virtual_output = self.app_render_endpoint_selector();
@@ -900,51 +996,22 @@ impl WindowsAudioDriver {
             // treat isolation as complete. A mismatch uses the same
             // ownership-safe rollback as a setter failure.
             if Self::AUTOMATIC_APP_ROUTE_ROLES.iter().any(|role| {
-                !self
-                    .app_route_policy
-                    .get_persisted_endpoint(&identity, AudioFlow::Render, *role)
-                    .is_ok_and(|current| {
-                        Self::endpoint_id_matches(&virtual_output, current.as_deref())
-                    })
+                !matches!(
+                    self.policy_endpoint_observation(&identity, *role, &virtual_output),
+                    PolicyEndpointObservation::Applied
+                )
             }) {
                 set_failed = true;
             }
             if set_failed {
-                let mut rollback_failed_roles = Vec::new();
-                for role in Self::AUTOMATIC_APP_ROUTE_ROLES {
-                    let original = originals
-                        .get(&role)
-                        .and_then(|endpoint| endpoint.as_deref());
-                    if self
-                        .app_route_policy
-                        .rollback_persisted_endpoint(&identity, AudioFlow::Render, role, original)
-                        .is_err()
-                    {
-                        rollback_failed_roles.push(role);
-                    }
-                }
-                if !rollback_failed_roles.is_empty() {
-                    self.application_route_policy_generation =
-                        self.application_route_policy_generation.wrapping_add(1);
-                    let generation = self.application_route_policy_generation;
-                    for role in rollback_failed_roles {
-                        let original_endpoint = self.selector_for_policy_endpoint(
-                            originals
-                                .get(&role)
-                                .and_then(|endpoint| endpoint.as_deref()),
-                        );
-                        self.application_route_leases.insert(
-                            (rule_index, role),
-                            AutomaticAppRouteLease::new(
-                                candidate.selector.clone(),
-                                candidate.pid,
-                                original_endpoint,
-                                virtual_output.clone(),
-                                generation,
-                            ),
-                        );
-                    }
-                }
+                self.rollback_application_route_transaction(
+                    rule_index,
+                    &candidate,
+                    &identity,
+                    &originals,
+                    &virtual_output,
+                    &Self::AUTOMATIC_APP_ROUTE_ROLES,
+                );
                 continue;
             }
 

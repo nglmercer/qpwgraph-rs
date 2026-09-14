@@ -333,8 +333,14 @@ mod tests {
     #[test]
     fn windows_binaries_are_not_treated_as_direct_images() {
         for name in [
-            "app.exe", "APP.EXE", "audio.dll", "res.mui", "setup.cpl", "splash.scr",
-            "codec.ocx", "filter.ax",
+            "app.exe",
+            "APP.EXE",
+            "audio.dll",
+            "res.mui",
+            "setup.cpl",
+            "splash.scr",
+            "codec.ocx",
+            "filter.ax",
         ] {
             assert!(
                 is_windows_binary_path(Path::new(name)),
@@ -357,10 +363,7 @@ mod tests {
 
     #[test]
     fn resolve_icon_path_skips_existing_windows_binaries_but_keeps_images() {
-        let dir = std::env::temp_dir().join(format!(
-            "qpwgraph-icon-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("qpwgraph-icon-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
         let exe = dir.join("fake-app.exe");
         let svg = dir.join("fake-image.svg");
