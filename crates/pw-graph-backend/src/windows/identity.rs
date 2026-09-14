@@ -68,7 +68,10 @@ fn resolve_endpoint_candidate_index(
             .map(|(index, _)| index)
             .collect();
         match matches.as_slice() {
-            [] => {}
+            // A durable selector is the caller's identity proof. Once one
+            // exists, falling through to a stale MMDevice ID or a reused
+            // friendly name could bind a different endpoint after churn.
+            [] => return Ok(None),
             [index] => return Ok(Some(*index)),
             _ => {
                 return Err(BackendError::unsupported(
@@ -660,6 +663,46 @@ mod tests {
     }
 
     #[test]
+    fn missing_durable_selector_does_not_bind_saved_mmdevice_or_name() {
+        let selector = selector(
+            Some("stable-original"),
+            Some("reused-mmdevice"),
+            Some("Speakers"),
+        );
+        let candidates = vec![candidate(
+            Some("stable-other"),
+            "reused-mmdevice",
+            Some("Speakers"),
+        )];
+
+        assert_eq!(
+            resolve_endpoint_candidate_index(&selector, &candidates).unwrap(),
+            None,
+            "a durable selector must not fall back to another endpoint's current ID or name"
+        );
+    }
+
+    #[test]
+    fn matching_durable_selector_returns_same_device_after_id_and_name_churn() {
+        let selector = selector(
+            Some("stable-original"),
+            Some("stale-mmdevice"),
+            Some("Original name"),
+        );
+        let candidates = vec![candidate(
+            Some("stable-original"),
+            "new-mmdevice",
+            Some("Renamed device"),
+        )];
+
+        assert_eq!(
+            resolve_endpoint_candidate_index(&selector, &candidates).unwrap(),
+            Some(0),
+            "the durable identity should still resolve the same endpoint after churn"
+        );
+    }
+
+    #[test]
     fn provider_selector_fallback_requires_verified_identity_and_preserves_pkey() {
         let mut selector_without_identity = selector(None, Some("mmdevice"), Some("Relay"));
         apply_provider_selector_fallback(&mut selector_without_identity, None);
@@ -779,12 +822,8 @@ mod tests {
     }
 
     #[test]
-    fn current_mmdevice_id_is_the_second_choice() {
-        let selector = selector(
-            Some("stale-stable"),
-            Some("current-mmdevice"),
-            Some("Speakers"),
-        );
+    fn current_mmdevice_id_is_the_first_fallback_without_durable_selector() {
+        let selector = selector(None, Some("current-mmdevice"), Some("Speakers"));
         let candidates = vec![
             candidate(
                 Some("new-stable"),
