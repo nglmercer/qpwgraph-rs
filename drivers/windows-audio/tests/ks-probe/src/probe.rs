@@ -818,7 +818,9 @@ fn fill_sustained_render_packet(
 ) -> Result<()> {
     use std::sync::atomic::{fence, Ordering};
     let samples = render.packet_bytes / 2;
-    let base = ((packet - 1) % render.notification_count) * samples;
+    // Render PacketNumber is the driver's next completion number. Packet 1
+    // occupies mapped slot 1 because slot 0 is the current packet at RUN.
+    let base = (packet % render.notification_count) * samples;
     let marker = SustainedEosOracle::marker(packet);
     let buffer = render.buffer.BufferAddress.cast::<i16>();
     for index in 0..samples {
