@@ -19,6 +19,199 @@ struct Samples {
     first_packet: Option<u32>,
     final_packet: Option<u32>,
 }
+
+const SUSTAINED_EOS_MARKER_BASE: i16 = 1_000;
+const SUSTAINED_EOS_DEFAULT_PACKETS: u32 = 128;
+const SUSTAINED_EOS_DEFAULT_TIMEOUT_MS: u64 = 20_000;
+const SUSTAINED_EOS_DEFAULT_PREROLL: u32 = 2;
+const SUSTAINED_EOS_DEFAULT_FINAL_BYTES: u32 = 960;
+const SUSTAINED_EOS_MIN_PACKETS: u32 = 4;
+const SUSTAINED_EOS_MAX_PACKETS: u32 = 20_000;
+const SUSTAINED_EOS_MIN_TIMEOUT_MS: u64 = 1_000;
+const SUSTAINED_EOS_MAX_TIMEOUT_MS: u64 = 600_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SustainedEosConfig {
+    packets: u32,
+    timeout_ms: u64,
+    preroll: u32,
+    final_bytes: u32,
+}
+
+impl Default for SustainedEosConfig {
+    fn default() -> Self {
+        Self {
+            packets: SUSTAINED_EOS_DEFAULT_PACKETS,
+            timeout_ms: SUSTAINED_EOS_DEFAULT_TIMEOUT_MS,
+            preroll: SUSTAINED_EOS_DEFAULT_PREROLL,
+            final_bytes: SUSTAINED_EOS_DEFAULT_FINAL_BYTES,
+        }
+    }
+}
+
+fn parse_sustained_eos_args(args: &[String]) -> Result<SustainedEosConfig> {
+    let mut config = SustainedEosConfig::default();
+    if args.first().map(String::as_str) != Some("--verify-sustained-eos") {
+        return Err("sustained EOS mode requires --verify-sustained-eos".into());
+    }
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        index += 1;
+        let value = args
+            .get(index)
+            .ok_or_else(|| format!("missing value for {option}"))?;
+        index += 1;
+        match option {
+            "--packets" => {
+                config.packets = value
+                    .parse()
+                    .map_err(|_| format!("invalid sustained EOS packet count {value:?}"))?;
+            }
+            "--timeout-ms" => {
+                config.timeout_ms = value
+                    .parse()
+                    .map_err(|_| format!("invalid sustained EOS timeout {value:?}"))?;
+            }
+            "--preroll" => {
+                config.preroll = value
+                    .parse()
+                    .map_err(|_| format!("invalid sustained EOS preroll count {value:?}"))?;
+            }
+            "--eos-bytes" => {
+                config.final_bytes = value
+                    .parse()
+                    .map_err(|_| format!("invalid sustained EOS final length {value:?}"))?;
+            }
+            _ => {
+                return Err(format!(
+                    "unknown sustained EOS option {option}; expected --packets, --timeout-ms, --preroll, or --eos-bytes"
+                ));
+            }
+        }
+    }
+    if !(SUSTAINED_EOS_MIN_PACKETS..=SUSTAINED_EOS_MAX_PACKETS).contains(&config.packets) {
+        return Err(format!(
+            "sustained EOS packet count must be {SUSTAINED_EOS_MIN_PACKETS}..={SUSTAINED_EOS_MAX_PACKETS}"
+        ));
+    }
+    if !(SUSTAINED_EOS_MIN_TIMEOUT_MS..=SUSTAINED_EOS_MAX_TIMEOUT_MS).contains(&config.timeout_ms) {
+        return Err(format!(
+            "sustained EOS timeout must be {SUSTAINED_EOS_MIN_TIMEOUT_MS}..={SUSTAINED_EOS_MAX_TIMEOUT_MS} ms"
+        ));
+    }
+    if !matches!(config.preroll, 1..=2) {
+        return Err("sustained EOS preroll must be 1 or 2 packets".into());
+    }
+    if config.final_bytes == 0
+        || config.final_bytes > 1_920
+        || !config.final_bytes.is_multiple_of(4)
+    {
+        return Err("sustained EOS final length must be 4..=1920 and 4-byte aligned".into());
+    }
+    Ok(config)
+}
+
+struct SustainedEosOracle {
+    total_packets: u32,
+    final_samples: u32,
+    payload_packets: u32,
+    leading_silence_packets: u32,
+    trailing_silence_packets: u32,
+    final_seen: bool,
+}
+
+impl SustainedEosOracle {
+    fn new(total_packets: u32, final_bytes: u32) -> Result<Self> {
+        if !(SUSTAINED_EOS_MIN_PACKETS..=SUSTAINED_EOS_MAX_PACKETS).contains(&total_packets)
+            || final_bytes == 0
+            || final_bytes > 1_920
+            || !final_bytes.is_multiple_of(4)
+        {
+            return Err("invalid sustained EOS oracle geometry".into());
+        }
+        Ok(Self {
+            total_packets,
+            final_samples: final_bytes / 2,
+            payload_packets: 0,
+            leading_silence_packets: 0,
+            trailing_silence_packets: 0,
+            final_seen: false,
+        })
+    }
+
+    fn marker(packet: u32) -> i16 {
+        SUSTAINED_EOS_MARKER_BASE + packet as i16
+    }
+
+    fn observe(&mut self, packet: u32, values: &[i16]) -> Result<()> {
+        if values.is_empty() {
+            return Err("sustained EOS capture packet was empty".into());
+        }
+        if self.final_seen {
+            if values.iter().any(|value| *value != 0) {
+                return Err(format!(
+                    "non-silent sustained EOS packet {packet} after final packet"
+                ));
+            }
+            self.trailing_silence_packets = self.trailing_silence_packets.saturating_add(1);
+            return Ok(());
+        }
+        if self.payload_packets == 0 && values.iter().all(|value| *value == 0) {
+            self.leading_silence_packets = self.leading_silence_packets.saturating_add(1);
+            return Ok(());
+        }
+        let expected_packet = self.payload_packets.saturating_add(1);
+        if expected_packet > self.total_packets {
+            return Err(format!(
+                "sustained EOS produced payload packet {packet} after expected {} packets",
+                self.total_packets
+            ));
+        }
+        let expected_marker = Self::marker(expected_packet);
+        let expected_samples = if expected_packet == self.total_packets {
+            self.final_samples
+        } else {
+            values.len() as u32
+        };
+        for (index, value) in values.iter().enumerate() {
+            let expected =
+                if expected_packet == self.total_packets && index as u32 >= expected_samples {
+                    0
+                } else {
+                    expected_marker
+                };
+            if *value != expected {
+                return Err(format!(
+                    "unexpected sustained EOS PCM {value} at capture packet {packet} sample {index}; expected {expected} for payload packet {expected_packet}"
+                ));
+            }
+        }
+        self.payload_packets = expected_packet;
+        if expected_packet == self.total_packets {
+            self.final_seen = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&self, trailing_silence_required: u32) -> Result<()> {
+        if self.payload_packets != self.total_packets || !self.final_seen {
+            return Err(format!(
+                "sustained EOS ended before final payload: payload packets={}, expected={}, leading silence={}",
+                self.payload_packets,
+                self.total_packets,
+                self.leading_silence_packets
+            ));
+        }
+        if self.trailing_silence_packets < trailing_silence_required {
+            return Err(format!(
+                "sustained EOS trailing silence too short: {}, expected at least {} packets",
+                self.trailing_silence_packets, trailing_silence_required
+            ));
+        }
+        Ok(())
+    }
+}
 impl Samples {
     fn new(first_expected: u32, final_expected: u32) -> Self {
         Self {
@@ -571,6 +764,213 @@ fn observe_capture_packet(capture: &Pin, count: u32, samples: &mut Samples) -> R
     Ok(nonzero)
 }
 
+fn observe_sustained_capture_packet(
+    capture: &Pin,
+    count: u32,
+    oracle: &mut SustainedEosOracle,
+) -> Result<bool> {
+    use std::sync::atomic::{fence, Ordering};
+    let read: KSRTAUDIO_GETREADPACKET_INFO = get(
+        capture.handle.0,
+        &identifier(
+            KSPROPSETID_RtAudio,
+            KSPROPERTY_RTAUDIO_GETREADPACKET.0 as u32,
+            KSPROPERTY_TYPE_GET,
+        ),
+    )?;
+    if read.PacketNumber != count - 1 {
+        return Err(format!(
+            "sustained EOS capture packet index disagrees with completed count: {} vs {count}",
+            read.PacketNumber
+        ));
+    }
+    fence(Ordering::SeqCst);
+    let base = ((count - 1) % capture.notification_count) * (capture.packet_bytes / 2);
+    let mut values = Vec::with_capacity((capture.packet_bytes / 2) as usize);
+    for index in 0..capture.packet_bytes / 2 {
+        let value = unsafe {
+            capture
+                .buffer
+                .BufferAddress
+                .cast::<i16>()
+                .add((base + index) as usize)
+                .read_volatile()
+        };
+        values.push(value);
+    }
+    fence(Ordering::SeqCst);
+    if capture.packets()? != count {
+        return Err(
+            "sustained EOS capture packet changed during inspection; evidence is inconclusive"
+                .into(),
+        );
+    }
+    let nonzero = values.iter().any(|value| *value != 0);
+    oracle.observe(count - 1, &values)?;
+    Ok(nonzero)
+}
+
+fn fill_sustained_render_packet(
+    render: &Pin,
+    packet: u32,
+    final_packet: bool,
+    final_samples: u32,
+) -> Result<()> {
+    use std::sync::atomic::{fence, Ordering};
+    let samples = render.packet_bytes / 2;
+    let base = ((packet - 1) % render.notification_count) * samples;
+    let marker = SustainedEosOracle::marker(packet);
+    let buffer = render.buffer.BufferAddress.cast::<i16>();
+    for index in 0..samples {
+        let value = if final_packet && index >= final_samples {
+            // A nonzero poison tail makes an EOS implementation that copies
+            // past the declared prefix observable in the capture oracle.
+            3_030
+        } else {
+            marker
+        };
+        unsafe {
+            buffer.add((base + index) as usize).write_volatile(value);
+        }
+    }
+    fence(Ordering::SeqCst);
+    Ok(())
+}
+
+fn verify_sustained_eos(
+    paths: &[String],
+    render_name: &str,
+    capture_name: &str,
+    config: SustainedEosConfig,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+    const PACKET_BYTES: u32 = 1_920;
+    const EOS: u32 = KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM;
+    const TRAILING_SILENCE_PACKETS: u32 = 10;
+    println!(
+        "sustained direct EOS: {render_name} -> {capture_name}, packets={}, timeout={} ms, preroll={}, final bytes={}",
+        config.packets, config.timeout_ms, config.preroll, config.final_bytes
+    );
+    let render = create_pin(owned_path(paths, render_name)?, false, 2, 3_840)?;
+    let capture = create_pin(owned_path(paths, capture_name)?, true, 2, 3_840)?;
+    if render.packet_bytes != PACKET_BYTES || capture.packet_bytes != PACKET_BYTES {
+        return Err(format!(
+            "sustained EOS requires 1920-byte packets: render={}, capture={}",
+            render.packet_bytes, capture.packet_bytes
+        ));
+    }
+    let mut oracle = SustainedEosOracle::new(config.packets, config.final_bytes)?;
+    for packet in 1..=config.preroll {
+        fill_sustained_render_packet(
+            &render,
+            packet,
+            packet == config.packets,
+            config.final_bytes / 2,
+        )?;
+        render
+            .write_packet(
+                packet,
+                if packet == config.packets { EOS } else { 0 },
+                if packet == config.packets {
+                    config.final_bytes
+                } else {
+                    0
+                },
+            )
+            .map_err(|error| format!("submit preroll packet {packet}: {error}"))?;
+    }
+
+    // Start capture first so any initial engine underflow is explicitly
+    // recorded by the oracle rather than hiding a dropped packet.
+    capture.state(KSSTATE_RUN)?;
+    render.state(KSSTATE_RUN)?;
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(config.timeout_ms);
+    let mut next_packet = config.preroll + 1;
+    let mut previous_render_count = 0_u32;
+    let mut previous_capture_count = 0_u32;
+    let mut max_render_count = 0_u32;
+    let mut max_capture_count = 0_u32;
+    while Instant::now() < deadline {
+        let render_count = render.packets()?;
+        if render_count < previous_render_count {
+            return Err(format!(
+                "sustained EOS render packet counter regressed: {} -> {}",
+                previous_render_count, render_count
+            ));
+        }
+        previous_render_count = render_count;
+        max_render_count = max_render_count.max(render_count);
+        // Keep both mapped notifications occupied. At the first observation
+        // after RUN, this also fills the second slot for a one-packet preroll.
+        while next_packet <= config.packets
+            && next_packet <= render_count.saturating_add(render.notification_count)
+        {
+            let final_packet = next_packet == config.packets;
+            fill_sustained_render_packet(
+                &render,
+                next_packet,
+                final_packet,
+                config.final_bytes / 2,
+            )?;
+            render
+                .write_packet(
+                    next_packet,
+                    if final_packet { EOS } else { 0 },
+                    if final_packet { config.final_bytes } else { 0 },
+                )
+                .map_err(|error| format!("submit sustained packet {next_packet}: {error}"))?;
+            next_packet += 1;
+        }
+
+        let capture_count = capture.packets()?;
+        if capture_count < previous_capture_count {
+            return Err(format!(
+                "sustained EOS capture packet counter regressed: {} -> {}",
+                previous_capture_count, capture_count
+            ));
+        }
+        if capture_count > previous_capture_count + 1 {
+            return Err(format!(
+                "sustained EOS observation lost capture packets: {} -> {}",
+                previous_capture_count, capture_count
+            ));
+        }
+        if capture_count == previous_capture_count + 1 {
+            let _ = observe_sustained_capture_packet(&capture, capture_count, &mut oracle)?;
+            previous_capture_count = capture_count;
+        }
+        max_capture_count = max_capture_count.max(capture_count);
+        if next_packet > config.packets
+            && oracle.final_seen
+            && oracle.trailing_silence_packets >= TRAILING_SILENCE_PACKETS
+            && max_render_count >= config.packets
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let elapsed_ms = started.elapsed().as_millis();
+    oracle.finish(TRAILING_SILENCE_PACKETS)?;
+    if next_packet <= config.packets || max_render_count < config.packets {
+        return Err(format!(
+            "sustained EOS did not queue/consume all packets: next={}, render={}/{}",
+            next_packet, max_render_count, config.packets
+        ));
+    }
+    render.stop()?;
+    capture.stop()?;
+    println!(
+        "  sustained EOS passed: elapsed={} ms, render packets={max_render_count}, capture packets={max_capture_count}, payload packets={}, leading silence={}, trailing silence={}; preroll={} and explicit STOP passed",
+        elapsed_ms,
+        oracle.payload_packets,
+        oracle.leading_silence_packets,
+        oracle.trailing_silence_packets,
+        config.preroll
+    );
+    Ok(())
+}
+
 fn owned_path<'a>(paths: &'a [String], name: &str) -> Result<&'a str> {
     let suffix = format!("\\{name}");
     let matches: Vec<_> = paths
@@ -937,6 +1337,21 @@ fn verify_single_packet_eos(
 
 pub fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--verify-sustained-eos") {
+        let config = parse_sustained_eos_args(&args)?;
+        let paths = interfaces()?;
+        for (render, capture) in [
+            ("QPWGraphVirtualOutput", "QPWGraphVirtualMonitor"),
+            ("QPWGraphRelaySink", "QPWGraphRelayMicrophone"),
+        ] {
+            verify_sustained_eos(&paths, render, capture, config)?;
+        }
+        println!(
+            "Bounded sustained direct KS EOS/preroll checks passed on both cables: {} packets per cable, {} ms timeout; this run does not exercise 32-bit counter wrap.",
+            config.packets, config.timeout_ms
+        );
+        return Ok(());
+    }
     if args == ["--verify-eos"] {
         let paths = interfaces()?;
         for (render, capture) in [
@@ -1022,7 +1437,7 @@ pub fn run() -> Result<()> {
     }
     if args.iter().any(|arg| arg != "--inspect") {
         return Err(
-            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-formats | --verify-lifecycle | --verify-timing | --verify-jacks]".into(),
+            "usage: qpwgraph-audio-ks-probe [--inspect | --open-pins | --verify-eos | --verify-sustained-eos [--packets N] [--timeout-ms N] [--preroll N] [--eos-bytes N] | --verify-formats | --verify-lifecycle | --verify-timing | --verify-jacks]".into(),
         );
     }
     for path in interfaces()? {
@@ -1145,5 +1560,92 @@ mod tests {
         samples.observe(3, 2, 0).unwrap();
         assert!(samples.observe(3, 3, 2020).is_err());
         samples.finish().unwrap();
+    }
+
+    #[test]
+    fn sustained_eos_defaults_are_bounded_and_configurable() {
+        let defaults = parse_sustained_eos_args(&["--verify-sustained-eos".into()]).unwrap();
+        assert_eq!(defaults, SustainedEosConfig::default());
+        let configured = parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--packets".into(),
+            "64".into(),
+            "--timeout-ms".into(),
+            "7000".into(),
+            "--preroll".into(),
+            "1".into(),
+            "--eos-bytes".into(),
+            "1920".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            configured,
+            SustainedEosConfig {
+                packets: 64,
+                timeout_ms: 7000,
+                preroll: 1,
+                final_bytes: 1920,
+            }
+        );
+        assert!(parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--packets".into(),
+            "3".into(),
+        ])
+        .is_err());
+        assert!(parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--eos-bytes".into(),
+            "1922".into(),
+        ])
+        .is_err());
+        assert!(parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--packets".into(),
+            "20001".into(),
+        ])
+        .is_err());
+        assert!(parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--timeout-ms".into(),
+            "600001".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn sustained_eos_oracle_tracks_preroll_and_final_tail() {
+        let mut oracle = SustainedEosOracle::new(4, 4).unwrap();
+        oracle.observe(0, &[0, 0, 0, 0]).unwrap();
+        oracle.observe(1, &[1001, 1001, 1001, 1001]).unwrap();
+        oracle.observe(2, &[1002, 1002, 1002, 1002]).unwrap();
+        oracle.observe(3, &[1003, 1003, 1003, 1003]).unwrap();
+        oracle.observe(4, &[1004, 1004, 0, 0]).unwrap();
+        oracle.observe(5, &[0, 0, 0, 0]).unwrap();
+        oracle.observe(6, &[0, 0, 0, 0]).unwrap();
+        oracle.finish(2).unwrap();
+        assert_eq!(oracle.leading_silence_packets, 1);
+        assert_eq!(oracle.payload_packets, 4);
+        assert_eq!(oracle.trailing_silence_packets, 2);
+    }
+
+    #[test]
+    fn sustained_eos_oracle_rejects_gap_poison_and_post_final_audio() {
+        let mut gap = SustainedEosOracle::new(4, 4).unwrap();
+        gap.observe(0, &[1001, 1001, 1001, 1001]).unwrap();
+        assert!(gap.observe(1, &[0, 0, 0, 0]).is_err());
+
+        let mut poison = SustainedEosOracle::new(4, 4).unwrap();
+        poison.observe(0, &[1001, 1001, 1001, 1001]).unwrap();
+        poison.observe(1, &[1002, 1002, 1002, 1002]).unwrap();
+        poison.observe(2, &[1003, 1003, 1003, 1003]).unwrap();
+        assert!(poison.observe(3, &[1004, 1004, 0, 1004]).is_err());
+
+        let mut after_final = SustainedEosOracle::new(4, 4).unwrap();
+        after_final.observe(0, &[1001, 1001, 1001, 1001]).unwrap();
+        after_final.observe(1, &[1002, 1002, 1002, 1002]).unwrap();
+        after_final.observe(2, &[1003, 1003, 1003, 1003]).unwrap();
+        after_final.observe(3, &[1004, 1004, 0, 0]).unwrap();
+        assert!(after_final.observe(4, &[1001, 0, 0, 0]).is_err());
     }
 }
