@@ -11,6 +11,52 @@ use windows::Win32::System::IO::DeviceIoControl;
 type Result<T> = std::result::Result<T, String>;
 const ROOT: &str = r"ROOT\DEVGEN\QPWGRAPH_AUDIO";
 
+/// Holds 1 ms system timer resolution while a live probe runs.
+///
+/// The sustained EOS loop polls the driver's completed-packet counter and
+/// must submit the exact-successor packet inside the driver's ~10 ms packet
+/// cadence. With the default ~15.6 ms Windows timer granularity, a
+/// `sleep(1)` can oversleep past a whole packet, letting the driver consume
+/// silence for the slot and reject the late submission. This only tightens
+/// probe pacing; it does not change what the probe verifies.
+struct TimerResolution;
+
+impl TimerResolution {
+    fn request() -> Self {
+        unsafe {
+            windows::Win32::Media::timeBeginPeriod(1);
+        }
+        Self
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
+
+/// Runs the probe above normal user-mode contention.
+///
+/// Sustained streaming must submit each packet inside the driver's ~10 ms
+/// cadence; a single 12+ ms descheduling lets the driver consume payload
+/// slots as silence and turns the next submit into a fatal late packet.
+/// Real audio clients run at elevated priority; the probe does the same so
+/// a busy desktop does not fail the run. Best effort: a failure keeps the
+/// previous behavior and the jump guard still reports stalls explicitly.
+fn boost_scheduling() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority,
+        HIGH_PRIORITY_CLASS, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    unsafe {
+        let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
+}
+
 struct Samples {
     first_expected: u32,
     final_expected: u32,
@@ -768,46 +814,65 @@ fn observe_sustained_capture_packet(
     capture: &Pin,
     count: u32,
     oracle: &mut SustainedEosOracle,
-) -> Result<bool> {
+) -> Result<(bool, u32)> {
     use std::sync::atomic::{fence, Ordering};
-    let read: KSRTAUDIO_GETREADPACKET_INFO = get(
-        capture.handle.0,
-        &identifier(
-            KSPROPSETID_RtAudio,
-            KSPROPERTY_RTAUDIO_GETREADPACKET.0 as u32,
-            KSPROPERTY_TYPE_GET,
-        ),
-    )?;
-    if read.PacketNumber != count - 1 {
-        return Err(format!(
-            "sustained EOS capture packet index disagrees with completed count: {} vs {count}",
-            read.PacketNumber
-        ));
+    // The completed count and the read index are two separate driver
+    // queries; the driver may complete a packet between them. Reconcile the
+    // pair (bounded) so a query-boundary completion retries instead of
+    // failing. A genuine skip advances past count + 1 and still fails.
+    // The observed slot is always count - 1 (the newly completed packet the
+    // caller asked about); a reconciled fresh == count + 1 only proves the
+    // pair is consistent, it must not skip ahead.
+    let mut last_read = 0_u32;
+    let mut last_fresh = 0_u32;
+    for _ in 0..4 {
+        let read: KSRTAUDIO_GETREADPACKET_INFO = get(
+            capture.handle.0,
+            &identifier(
+                KSPROPSETID_RtAudio,
+                KSPROPERTY_RTAUDIO_GETREADPACKET.0 as u32,
+                KSPROPERTY_TYPE_GET,
+            ),
+        )?;
+        let fresh = capture.packets()?;
+        last_read = read.PacketNumber;
+        last_fresh = fresh;
+        if fresh > count + 1 {
+            return Err(format!(
+                "sustained EOS capture completions jumped {count} -> {fresh} during observation; a packet went unobserved"
+            ));
+        }
+        if read.PacketNumber + 1 != fresh {
+            continue;
+        }
+        fence(Ordering::SeqCst);
+        let base = ((count - 1) % capture.notification_count) * (capture.packet_bytes / 2);
+        let mut values = Vec::with_capacity((capture.packet_bytes / 2) as usize);
+        for index in 0..capture.packet_bytes / 2 {
+            let value = unsafe {
+                capture
+                    .buffer
+                    .BufferAddress
+                    .cast::<i16>()
+                    .add((base + index) as usize)
+                    .read_volatile()
+            };
+            values.push(value);
+        }
+        fence(Ordering::SeqCst);
+        if capture.packets()? != fresh {
+            return Err(
+                "sustained EOS capture packet changed during inspection; evidence is inconclusive"
+                    .into(),
+            );
+        }
+        let nonzero = values.iter().any(|value| *value != 0);
+        oracle.observe(count - 1, &values)?;
+        return Ok((nonzero, count));
     }
-    fence(Ordering::SeqCst);
-    let base = ((count - 1) % capture.notification_count) * (capture.packet_bytes / 2);
-    let mut values = Vec::with_capacity((capture.packet_bytes / 2) as usize);
-    for index in 0..capture.packet_bytes / 2 {
-        let value = unsafe {
-            capture
-                .buffer
-                .BufferAddress
-                .cast::<i16>()
-                .add((base + index) as usize)
-                .read_volatile()
-        };
-        values.push(value);
-    }
-    fence(Ordering::SeqCst);
-    if capture.packets()? != count {
-        return Err(
-            "sustained EOS capture packet changed during inspection; evidence is inconclusive"
-                .into(),
-        );
-    }
-    let nonzero = values.iter().any(|value| *value != 0);
-    oracle.observe(count - 1, &values)?;
-    Ok(nonzero)
+    Err(format!(
+        "sustained EOS capture read index never agreed with the completed count after 4 attempts (last read={last_read}, count={last_fresh}); evidence is inconclusive"
+    ))
 }
 
 fn fill_sustained_render_packet(
@@ -893,12 +958,21 @@ fn verify_sustained_eos(
     let mut previous_capture_count = 0_u32;
     let mut max_render_count = 0_u32;
     let mut max_capture_count = 0_u32;
+    let mut last_poll = Instant::now();
     while Instant::now() < deadline {
         let render_count = render.packets()?;
+        let poll_gap = last_poll.elapsed();
+        last_poll = Instant::now();
         if render_count < previous_render_count {
             return Err(format!(
                 "sustained EOS render packet counter regressed: {} -> {}",
                 previous_render_count, render_count
+            ));
+        }
+        if render_count > previous_render_count + 1 {
+            return Err(format!(
+                "sustained EOS render completions jumped {} -> {} after {:?} without a poll; the driver consumed payload slots as silence during a host scheduling stall",
+                previous_render_count, render_count, poll_gap
             ));
         }
         previous_render_count = render_count;
@@ -919,7 +993,12 @@ fn verify_sustained_eos(
                     if final_packet { EOS } else { 0 },
                     if final_packet { config.final_bytes } else { 0 },
                 )
-                .map_err(|error| format!("submit sustained packet {next_packet}: {error}"))?;
+                .map_err(|error| {
+                    format!(
+                        "submit sustained packet {next_packet} (render completed={render_count}, run elapsed={} ms): {error}",
+                        started.elapsed().as_millis()
+                    )
+                })?;
             next_packet += 1;
         }
 
@@ -937,8 +1016,9 @@ fn verify_sustained_eos(
             ));
         }
         if capture_count == previous_capture_count + 1 {
-            let _ = observe_sustained_capture_packet(&capture, capture_count, &mut oracle)?;
-            previous_capture_count = capture_count;
+            let (_, observed) =
+                observe_sustained_capture_packet(&capture, capture_count, &mut oracle)?;
+            previous_capture_count = observed;
         }
         max_capture_count = max_capture_count.max(capture_count);
         if next_packet > config.packets
@@ -1336,6 +1416,8 @@ fn verify_single_packet_eos(
 }
 
 pub fn run() -> Result<()> {
+    boost_scheduling();
+    let _timer_resolution = TimerResolution::request();
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--verify-sustained-eos") {
         let config = parse_sustained_eos_args(&args)?;

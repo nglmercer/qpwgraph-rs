@@ -410,6 +410,9 @@ Use `--verify-sustained-eos` (defaults: 128 packets, 20 s timeout, 1 preroll
 packet, 960 final bytes) for bounded multi-packet EOS with preroll on both
 cables; `--packets`, `--timeout-ms`, `--preroll`, and `--eos-bytes` stay
 within hard-coded bounds. It does not exercise 32-bit counter wrap.
+The probe runs above normal user-mode contention (as real audio clients
+do) and reports a host scheduling stall explicitly instead of failing on
+the resulting late submit.
 Use `--verify-formats` to verify that the four canonical endpoints reject a
 valid but unsupported 44.1 kHz stereo PCM16 pin request.
 Use `--verify-jacks` to query one `KSJACK_DESCRIPTION` for each bridge pin and

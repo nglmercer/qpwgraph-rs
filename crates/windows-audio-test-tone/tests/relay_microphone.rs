@@ -28,7 +28,7 @@ mod live {
         RelayHostRequest, RelayMode, RelayReceiveSink, RelaySendSource, RelayTransportPreference,
         VerifiedAudioPolicyConfig, WindowsAudioDriver,
     };
-    use pw_graph_config::WindowsApplicationRoute;
+    use pw_graph_config::{AppConfig, WindowsApplicationRoute};
     use std::collections::BTreeMap;
     use std::ffi::c_void;
     use std::process::{Child, Command};
@@ -322,6 +322,24 @@ mod live {
         let result = run_backend_crash_test();
         unsafe { Com::CoUninitialize() };
         result.expect("backend crash during active stream did not recover");
+    }
+
+    #[test]
+    fn gui_crash_during_active_stream_recovers() {
+        if std::env::var("PW_GRAPH_TEST_WINDOWS_GUI_CRASH")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let initialized = unsafe { Com::CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if initialized.is_err() {
+            panic!("could not initialize COM: {initialized:?}");
+        }
+        let result = run_gui_crash_test();
+        unsafe { Com::CoUninitialize() };
+        result.expect("GUI crash during active stream did not recover");
     }
 
     #[test]
@@ -1608,6 +1626,262 @@ mod live {
             (Err(test), Ok(())) => Err(test),
             (Ok(()), Err(cleanup)) => Err(cleanup),
             (Err(test), Err(cleanup)) => Err(format!("{test}; cleanup also failed: {cleanup}")),
+        }
+    }
+
+    /// Byte snapshot of the GUI-owned config files, restored in all paths.
+    struct GuiConfigSnapshot {
+        files: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+    }
+
+    impl GuiConfigSnapshot {
+        fn capture() -> Result<Self, String> {
+            let dir = pw_graph_config::config_dir("qpwgraph-rs");
+            let mut files = Vec::new();
+            for name in [
+                "config.toml",
+                "default.qpwgraph",
+                "default.qpwgraph.qpwgraph-rs-selectors.json",
+            ] {
+                let path = dir.join(name);
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(format!("snapshot {}: {error}", path.display()));
+                    }
+                };
+                files.push((path, bytes));
+            }
+            Ok(Self { files })
+        }
+
+        fn restore(&self) -> Result<(), String> {
+            for (path, bytes) in &self.files {
+                match bytes {
+                    Some(bytes) => std::fs::write(path, bytes)
+                        .map_err(|error| format!("restore {}: {error}", path.display()))?,
+                    None => match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!("remove test {}: {error}", path.display()));
+                        }
+                    },
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn ensure_no_gui_running() -> Result<(), String> {
+        let output = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq qpwgraph-rs.exe", "/FO", "CSV", "/NH"])
+            .output()
+            .map_err(|error| format!("tasklist probe: {error}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.to_ascii_lowercase().contains("qpwgraph-rs.exe") {
+            return Err(
+                "a qpwgraph-rs GUI instance is already running; stop it before the GUI crash test"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn gui_binary_path() -> Result<std::path::PathBuf, String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/qpwgraph-rs.exe");
+        if !path.is_file() {
+            return Err(format!(
+                "GUI binary not found (build the workspace release first): {}",
+                path.display()
+            ));
+        }
+        Ok(path)
+    }
+
+    fn spawn_gui_process(gui: &std::path::Path) -> Result<Child, String> {
+        let mut child = Command::new(gui)
+            .arg("--minimized")
+            .spawn()
+            .map_err(|error| format!("spawn GUI: {error}"))?;
+        std::thread::sleep(Duration::from_secs(2));
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll GUI: {error}"))?
+        {
+            return Err(format!("GUI exited immediately with status {status}"));
+        }
+        Ok(child)
+    }
+
+    fn wait_for_audible_loopback(
+        stream: &AudioStream,
+        client: &Audio::IAudioCaptureClient,
+        timeout: Duration,
+    ) -> Result<f32, String> {
+        let deadline = Instant::now() + timeout;
+        let mut last = String::from("no loopback observation");
+        while Instant::now() < deadline {
+            match observe_loopback_tone(stream, client, Duration::from_secs(1)) {
+                Ok(amplitude) => return Ok(amplitude),
+                Err(error) => last = error,
+            }
+        }
+        Err(format!("route never became audible: {last}"))
+    }
+
+    /// Full GUI app-process kill during an audible route.
+    ///
+    /// Unlike `run_backend_crash_test` (minimal crash host), the killed
+    /// process is the real `qpwgraph-rs.exe` GUI. The test pre-seeds the app
+    /// config so the GUI restores the route at startup, kills it mid-stream,
+    /// asserts the stuck AppRender remnant, relaunches, and requires an
+    /// audible route plus all four virtual endpoints again.
+    fn run_gui_crash_test() -> Result<(), String> {
+        ensure_no_gui_running()?;
+        let helper = std::env::var_os("CARGO_BIN_EXE_windows-audio-test-tone")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "Cargo did not provide the tone helper executable".to_owned())?;
+        let gui = gui_binary_path()?;
+        let enumerator: Audio::IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|error| format!("create MMDeviceEnumerator: {error}"))?;
+        let app_render = wait_for_role(
+            &enumerator,
+            Flow::Render,
+            APP_RENDER_ROLE,
+            Duration::from_secs(8),
+        )?;
+        let physical_render = choose_external_render(&enumerator)?;
+        let loopback = open_loopback_stream(&physical_render.device)?;
+        let loopback_client = unsafe { loopback.client.GetService::<Audio::IAudioCaptureClient>() }
+            .map_err(|error| format!("get physical render loopback service: {error}"))?;
+        unsafe {
+            loopback
+                .client
+                .Start()
+                .map_err(|error| format!("start physical render loopback: {error}"))?;
+        }
+
+        let mut tone = spawn_default_helper(&helper)?;
+        let first = ProcessIdentity::from_pid(tone.id())
+            .map_err(|error| format!("read helper identity: {error}"))?;
+        let roles = [
+            AudioRole::Console,
+            AudioRole::Multimedia,
+            AudioRole::Communications,
+        ];
+        let (policy, original) = wait_for_readable_policy(&first, roles, Duration::from_secs(10))?;
+        let route = WindowsApplicationRoute {
+            application: first.application_selector(),
+            destination_mmdevice_id: Some(physical_render.id.clone()),
+            virtualization_required: true,
+            gain: 1.0,
+            enabled: true,
+            ..WindowsApplicationRoute::default()
+        };
+        let expected_virtual: BTreeMap<_, _> = roles
+            .iter()
+            .map(|role| (*role, Some(app_render.id.clone())))
+            .collect();
+
+        let snapshot = GuiConfigSnapshot::capture()?;
+        let config_file = pw_graph_config::config_path("qpwgraph-rs");
+        if let Some(dir) = config_file.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("create GUI config dir: {error}"))?;
+        }
+        let mut config = AppConfig::default();
+        config.windows.experimental_app_routing = true;
+        config.windows_application_routes = vec![route];
+        if let Err(error) = config.save_to(&config_file) {
+            let _ = snapshot.restore();
+            return Err(format!("write GUI test config: {error}"));
+        }
+
+        let mut gui_child: Option<Child> = None;
+        let result = (|| -> Result<(), String> {
+            gui_child = Some(spawn_gui_process(&gui)?);
+            println!(
+                "GUI started (pid {}) with test config; waiting for route",
+                gui_child.as_ref().map(|child| child.id()).unwrap_or(0)
+            );
+            wait_for_policy_snapshot(
+                &policy,
+                &first,
+                &roles,
+                &expected_virtual,
+                Duration::from_secs(60),
+            )?;
+            let amplitude =
+                wait_for_audible_loopback(&loopback, &loopback_client, Duration::from_secs(30))?;
+            println!("GUI route audible before kill: amplitude={amplitude:.4}");
+
+            // Crash: terminate without cleanup, so no Drop-time restore runs.
+            let mut killed = gui_child.take().expect("GUI child tracked");
+            let kill_result = killed.kill().map_err(|error| format!("kill GUI: {error}"));
+            let _ = killed.wait();
+            kill_result?;
+            let stuck = read_policy_endpoints(&policy, &first, roles)
+                .map_err(|error| format!("read post-kill endpoints: {error}"))?;
+            if !policy_endpoints_match(&expected_virtual, &stuck) {
+                return Err(format!(
+                    "GUI kill remnant did not stick at AppRender: expected={expected_virtual:?}, actual={stuck:?}"
+                ));
+            }
+            println!("GUI kill remnant stuck at AppRender as expected; relaunching");
+
+            gui_child = Some(spawn_gui_process(&gui)?);
+            wait_for_policy_snapshot(
+                &policy,
+                &first,
+                &roles,
+                &expected_virtual,
+                Duration::from_secs(60),
+            )?;
+            let recovered =
+                wait_for_audible_loopback(&loopback, &loopback_client, Duration::from_secs(30))?;
+            println!("GUI route audible after relaunch: amplitude={recovered:.4}");
+            let renders = enumerate(&enumerator, Flow::Render)?;
+            let captures = enumerate(&enumerator, Flow::Capture)?;
+            let virtual_renders = renders
+                .iter()
+                .filter(|endpoint| endpoint.name.to_ascii_lowercase().contains("qpwgraph"))
+                .count();
+            let virtual_captures = captures
+                .iter()
+                .filter(|endpoint| endpoint.name.to_ascii_lowercase().contains("qpwgraph"))
+                .count();
+            if virtual_renders != 2 || virtual_captures != 2 {
+                return Err(format!(
+                    "virtual endpoints degraded after GUI relaunch: {virtual_renders} render + {virtual_captures} capture"
+                ));
+            }
+            Ok(())
+        })();
+
+        if let Some(mut child) = gui_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let mut failures = Vec::new();
+        if let Err(error) = snapshot.restore() {
+            failures.push(format!("config restore: {error}"));
+        }
+        if let Err(error) = restore_policy_explicit(&policy, tone.id(), &roles, &original) {
+            failures.push(format!("policy restore: {error}"));
+        }
+        stop_child(&mut tone);
+        match (result, failures.is_empty()) {
+            (Ok(()), true) => Ok(()),
+            (Ok(()), false) => Err(format!("cleanup failed: {}", failures.join("; "))),
+            (Err(test), true) => Err(test),
+            (Err(test), false) => Err(format!(
+                "{test}; cleanup also failed: {}",
+                failures.join("; ")
+            )),
         }
     }
 

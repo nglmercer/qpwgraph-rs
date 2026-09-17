@@ -617,6 +617,86 @@ active-stream sleep/resume, hibernate/reboot, backend crash recovery,
 Verifier, HLK, signing, or Secure Boot acceptance. The §18 EOS and
 power rows stay open.
 
+## Sustained-EOS transient root cause and extended soak — September 17, 2026
+
+Same installed candidate (`oem24.inf`, `09/13/2026,11.8.28.7`, source
+`25ddbe6`, SYS SHA-256
+`099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`,
+re-verified before and after). Windows 10 Pro build 19045.6466.
+Rebuilt probe binary SHA-256
+`C44C7F143EBE89C51FF04093C8D3D7C84FB828884C9C2F0E7AE621328F2DB079`
+(timer resolution + scheduling priority + render jump guard + capture
+query-pair reconcile). No boot, service, device, or default-endpoint
+setting was changed.
+
+The earlier "transient off-sequence submit rejection" reproduced (first
+128-packet run failed at `submit sustained packet 27` with `0x8007045D`;
+transcript
+`drivers/windows-audio/target/candidate-current-source-sustained-eos-default-20260917.log`,
+retained as a failure) and was root-caused with an added render
+completion-jump guard: the user-mode probe thread was descheduled for
+12–23 ms mid-run (4 of 6 reps: jumps 68→71, 6→9, 59→61, 83→85 with
+measured poll gaps; transcripts
+`candidate-current-source-sustained-eos-diag{2,3,4,5}-20260917.log`),
+during which the driver's free-running 10 ms timer consumed payload
+slots as silence, so the next exact-successor submit was correctly
+rejected as late. The driver behaved per design; the failures were host
+scheduling artifacts, and no poisoned, replayed, or reordered sample
+was observed in any run.
+
+With the probe at elevated scheduling priority (as real audio clients
+run), 6 of 6 128-packet reps passed clean on both cables (transcripts
+`candidate-current-source-sustained-eos-prio1..6-20260917.log`), plus
+extended soaks: 2048 packets per cable (~20.6 s per cable, exact
+2060/2060 render/capture counts) and 8192 packets per cable (~82 s per
+cable, exact 8204/8204 counts), all payloads oracle-verified with
+preroll 1, 960-byte poisoned-tail final prefix, 10 trailing silent
+packets, and explicit STOP (transcripts
+`candidate-current-source-sustained-eos-p2048b-20260917.log` and
+`candidate-current-source-sustained-eos-p8192-20260917.log`).
+
+This extends bounded multi-packet EOS with preroll to 8192 packets per
+cable. It does not establish a real 32-bit-counter wrap run,
+long-run/preroll-at-wrap behavior, Verifier, HLK, signing, or
+power-transition acceptance. The §18 EOS and power rows stay open.
+
+## Version-bump upgrade — September 17, 2026
+
+A pure version-bump package was staged from the installed candidate:
+identical SYS bytes (SHA-256 `099F48...`, same test certificate
+`30D29DBE073E11B6308872DA7170B3371BE6C037`, Inf2Cat 0 errors) with INF
+DriverVer raised to `09/17/2026,11.8.28.8`. Full Smoke passed before
+the upgrade on `oem24.inf`/`11.8.28.7`; the bumped package installed
+live as `oem25.inf` with 0 errors and no reboot (no 3010), binding
+`oem25.inf`/`11.8.28.8`/problem 0; full Smoke passed after; all six
+default audio endpoints were byte-identical before and after (0 diffs).
+The machine was then restored by uninstalling `oem25.inf` and
+reinstalling the retained candidate, which reclaimed `oem24.inf` with
+identical SYS hash and another green full Smoke; `oem25.inf` is absent
+from the driver store and defaults still show 0 diffs. Transcripts:
+`candidate-upgrade-smoke-before-20260917.log`,
+`candidate-upgrade-install-20260917.log`,
+`candidate-upgrade-smoke-after-20260917.log`,
+`candidate-upgrade-restore-20260917.log`,
+`candidate-upgrade-defaults-{before,after,restored}-20260917.txt`.
+This closes the §10.1 version-bump upgrade sub-item. Reboot-required
+upgrade behavior was not exercised (no 3010 occurred).
+
+## Full GUI app-process kill — September 17, 2026
+
+New test `live::gui_crash_during_active_stream_recovers`
+(`PW_GRAPH_TEST_WINDOWS_GUI_CRASH=1`) kills the real
+`target/release/qpwgraph-rs.exe` GUI (September 13 build, pre-seeded
+config restores the route at startup) mid-stream instead of the minimal
+crash host. Passed twice: route audible before kill (amplitude 0.0454 /
+0.0458), kill remnant stuck at AppRender, GUI relaunch audible again
+(0.0475 both runs), all four virtual endpoints enumerating. No GUI
+process remained and the user's config files were verified byte-identical
+to an independent backup after each run (0 diffs). Transcripts:
+`drivers/windows-audio/target/candidate-gui-crash-20260917.log` and
+`candidate-gui-crash-rerun-20260917.log`. This closes the §10.1 full
+GUI app-process kill sub-item.
+
 ## Remaining release gates
 
 The remaining EOS wrap/preroll cases, controlled active-stream sleep/resume,

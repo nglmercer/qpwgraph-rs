@@ -642,7 +642,13 @@ The shared packet-order helper and the monotonic scheduling counter cover the
 (`--verify-sustained-eos`, 128 packets per cable, preroll 1) passed live on
 the installed `25ddbe6` candidate on September 17, 2026, with one retained
 transient off-sequence submit rejection; see
-`windows-driver-candidate-acceptance.md`. The 20-case `--verify-eos`,
+`windows-driver-candidate-acceptance.md`. Later that day the transient was
+root-caused to 12–23 ms host scheduling stalls (render jump guard proof;
+driver correctly rejected late submits after consuming the slots as
+silence), the probe was hardened (elevated scheduling priority, 1 ms
+timer resolution, capture query-pair reconcile), and extended soaks of
+2048 and 8192 oracle-verified packets per cable passed on both cables
+(6/6 clean 128-packet reps). The 20-case `--verify-eos`,
 17-cycle `--verify-lifecycle`, and `--verify-timing` probes were re-run
 against the same candidate later that day with the current probe binary
 (exit 0 on all four endpoints); transcripts are recorded in the same
@@ -1392,8 +1398,13 @@ Close these live rows:
     terminated mid-stream with an audible route; stuck AppRender remnant
     documented; fresh backend reconciled to an audible route with all four
     virtual endpoints enumerating;
-    `backend_crash_during_active_stream_recovers`; full GUI app-process
-    kill remains unrun)
+    `backend_crash_during_active_stream_recovers`; September 17 full GUI
+    app-process kill also passed twice via
+    `gui_crash_during_active_stream_recovers`
+    (`PW_GRAPH_TEST_WINDOWS_GUI_CRASH=1`): real release GUI killed
+    mid-stream with an audible route (0.0454/0.0458), remnant stuck at
+    AppRender, relaunch audible (0.0475), four endpoints enumerating, no
+    GUI residue and user config byte-identical afterwards)
 [x] render client crash (independent survivor probe; one cycle per cable)
 [x] capture client crash (independent survivor probe; one cycle per cable)
 [ ] reboot
@@ -1403,8 +1414,12 @@ Close these live rows:
     before and after; transcripts
     `candidate-current-source-reinstall-20260917-*.log`)
 [x] repeated upgrade (same-bits reinstall over the installed candidate
-    twice with 0 errors and unchanged defaults; a version-bump upgrade
-    with distinct driver versions remains unrun)
+    twice with 0 errors and unchanged defaults; September 17 version-bump
+    upgrade with distinct driver versions passed: identical-SYS package
+    with INF DriverVer 09/17/2026,11.8.28.8 installed live as oem25.inf
+    with 0 errors and no reboot, Smoke green before and after, six
+    default endpoints byte-identical (0 diffs); oem24.inf/11.8.28.7
+    restored afterwards with identical SYS hash and green Smoke)
 ```
 
 ## 10.2 Endpoint churn
