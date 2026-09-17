@@ -1614,6 +1614,41 @@ mod tests {
     }
 
     #[test]
+    fn sustained_eos_rejects_bad_preroll_and_malformed_options() {
+        for preroll in ["0", "2", "1x"] {
+            assert!(parse_sustained_eos_args(&[
+                "--verify-sustained-eos".into(),
+                "--preroll".into(),
+                preroll.into(),
+            ])
+            .is_err());
+        }
+        assert!(
+            parse_sustained_eos_args(&["--verify-sustained-eos".into(), "--packets".into()])
+                .is_err()
+        );
+        assert!(parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--packets".into(),
+            "many".into(),
+        ])
+        .is_err());
+        assert!(parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--wrap".into(),
+            "1".into(),
+        ])
+        .is_err());
+        assert!(parse_sustained_eos_args(&[
+            "--verify-sustained-eos".into(),
+            "--eos-bytes".into(),
+            "0".into(),
+        ])
+        .is_err());
+        assert!(parse_sustained_eos_args(&["--verify-eos".into()]).is_err());
+    }
+
+    #[test]
     fn sustained_eos_oracle_tracks_preroll_and_final_tail() {
         let mut oracle = SustainedEosOracle::new(4, 4).unwrap();
         oracle.observe(0, &[0, 0, 0, 0]).unwrap();

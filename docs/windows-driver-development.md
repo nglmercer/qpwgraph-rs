@@ -8,6 +8,7 @@ drivers/windows-audio/
   driver/     no_std KMDF/ACX cdylib
   package/    INF/INX, release gates, and package notes
   tests/smoke/ endpoint smoke-test entry point
+  tests/ks-probe/ direct-KS EOS/lifecycle/timing/format/jack probes
   xtask/      WDK environment/package checks
 ```
 

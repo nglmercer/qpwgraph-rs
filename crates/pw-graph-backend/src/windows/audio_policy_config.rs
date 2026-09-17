@@ -717,6 +717,17 @@ mod tests {
     }
 
     #[test]
+    fn abi_mismatch_is_manual_only_on_the_validated_build() {
+        // The Windows 11 IID names a real but unverified interface revision.
+        // Presenting it on the Windows 10 validation build must not select
+        // the Windows 10 declaration: no ABI is verified for that pairing.
+        assert!(
+            verified_abi_for_build_and_iid(19_045, AUDIO_POLICY_CONFIG_FACTORY_IID_WIN11).is_none()
+        );
+        assert!(verified_abi_for_build(19_045).is_some());
+    }
+
+    #[test]
     fn supported_build_requires_activation_before_experimental_support() {
         let policy = VerifiedAudioPolicyConfig::new(true);
         if verified_abi_for_build(current_os_build()).is_some() {
@@ -848,6 +859,75 @@ mod tests {
         );
     }
 
+    fn activated_policy_for_identity_tests() -> VerifiedAudioPolicyConfig {
+        // Bypass COM activation so identity re-verification is exercised on
+        // every build, including ones without a verified private ABI.
+        VerifiedAudioPolicyConfig {
+            diagnostics: Mutex::new(AudioPolicyDiagnostics {
+                enabled: true,
+                os_build: 19_045,
+                interface_version: Some("audio-policy-config-win10-v1".into()),
+                last_hresult: Some(0),
+                last_operation: Some("activate".into()),
+                fallback_reason: "activation succeeded".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn dead_pid_is_rejected_as_a_stale_process_identity() {
+        let policy = activated_policy_for_identity_tests();
+        let process = ProcessIdentity {
+            executable_path_hash: Some("sha256:player".into()),
+            executable_name: Some("player.exe".into()),
+            package_family_name: None,
+            app_user_model_id: None,
+            display_name: Some("Player".into()),
+            // No live Windows process can carry this PID, so the boundary
+            // must reject it without touching the private interface.
+            process_id: Some(u32::MAX),
+        };
+        assert!(policy
+            .set_persisted_endpoint(
+                &process,
+                AudioFlow::Render,
+                AudioRole::Multimedia,
+                Some("virtual")
+            )
+            .is_err());
+        assert_eq!(
+            policy.diagnostics().last_operation.as_deref(),
+            Some("reject_stale_process_identity")
+        );
+    }
+
+    #[test]
+    fn live_pid_with_a_changed_identity_is_rejected_as_stale() {
+        let policy = activated_policy_for_identity_tests();
+        let process = ProcessIdentity {
+            executable_path_hash: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            ),
+            executable_name: Some("definitely-not-the-test-runner.exe".into()),
+            package_family_name: None,
+            app_user_model_id: None,
+            display_name: Some("Impostor".into()),
+            process_id: Some(std::process::id()),
+        };
+        assert!(policy
+            .set_persisted_endpoint(
+                &process,
+                AudioFlow::Render,
+                AudioRole::Multimedia,
+                Some("virtual")
+            )
+            .is_err());
+        assert_eq!(
+            policy.diagnostics().last_operation.as_deref(),
+            Some("reject_stale_process_identity")
+        );
+    }
+
     #[test]
     fn private_call_failure_demotes_the_policy_to_manual_only() {
         let policy = VerifiedAudioPolicyConfig {
@@ -873,8 +953,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires QPWGRAPH_TEST_AUDIO_POLICY=1 and changes only this test process while restoring it"]
-    fn live_policy_roundtrip_restores_the_original_endpoint() {
+    #[ignore = "requires QPWGRAPH_TEST_AUDIO_POLICY=1 and a verified Windows build; read-only"]
+    fn live_policy_demotes_to_manual_only_for_process_without_audio() {
+        // The test runner itself renders no audio, so the private interface
+        // rejects its PID (observed HRESULT 0x80070057/E_INVALIDARG on build
+        // 19045). The policy must fail closed to ManualOnly without touching
+        // any persisted route. The positive roundtrip against an
+        // audio-producing helper lives in the windows-audio-test-tone
+        // integration tests, which can locate the helper binary.
         if std::env::var("QPWGRAPH_TEST_AUDIO_POLICY").as_deref() != Ok("1") {
             return;
         }
@@ -883,68 +969,19 @@ mod tests {
             policy.support(),
             AppRoutePolicySupport::Experimental { .. }
         ));
-        let com = unsafe {
-            windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_MULTITHREADED,
-            )
-        };
-        assert!(com.0 >= 0);
-        let pid = std::env::var("QPWGRAPH_TEST_AUDIO_POLICY_PID")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(std::process::id);
-        let process = ProcessIdentity::from_pid(pid).unwrap();
-        let roles = [
-            AudioRole::Console,
-            AudioRole::Multimedia,
-            AudioRole::Communications,
-        ];
-        let before: Vec<_> = roles
-            .iter()
-            .map(|role| {
-                policy
-                    .get_persisted_endpoint(&process, AudioFlow::Render, *role)
-                    .unwrap()
-            })
-            .collect();
-        let enumerator: Audio::IMMDeviceEnumerator = unsafe {
-            windows::Win32::System::Com::CoCreateInstance(
-                &Audio::MMDeviceEnumerator,
-                None,
-                windows::Win32::System::Com::CLSCTX_ALL,
-            )
-        }
-        .unwrap();
-        let endpoints =
-            unsafe { enumerator.EnumAudioEndpoints(Audio::eRender, Audio::DEVICE_STATE_ACTIVE) }
-                .unwrap();
-        let device = unsafe { endpoints.Item(0) }.unwrap();
-        let endpoint = super::super::identity::take_pwstr(unsafe { device.GetId() }.unwrap());
-
-        for role in roles {
-            policy
-                .set_persisted_endpoint(&process, AudioFlow::Render, role, Some(&endpoint))
-                .unwrap();
-        }
-        for role in roles {
-            let after = policy
-                .get_persisted_endpoint(&process, AudioFlow::Render, role)
-                .unwrap();
-            assert_eq!(after.as_deref(), Some(endpoint.as_str()));
-        }
-
-        for (role, original) in roles.iter().zip(&before) {
-            policy
-                .set_persisted_endpoint(&process, AudioFlow::Render, *role, original.as_deref())
-                .unwrap();
-        }
-        for (role, original) in roles.iter().zip(&before) {
-            let restored = policy
-                .get_persisted_endpoint(&process, AudioFlow::Render, *role)
-                .unwrap();
-            assert_eq!(restored, *original);
-        }
-        unsafe { windows::Win32::System::Com::CoUninitialize() };
+        let process = ProcessIdentity::from_pid(std::process::id()).unwrap();
+        let result =
+            policy.get_persisted_endpoint(&process, AudioFlow::Render, AudioRole::Multimedia);
+        assert!(result.is_err());
+        assert!(matches!(
+            policy.support(),
+            AppRoutePolicySupport::ManualOnly { .. }
+        ));
+        let diagnostics = policy.diagnostics();
+        assert_eq!(
+            diagnostics.last_operation.as_deref(),
+            Some("get_persisted_endpoint")
+        );
+        assert!(diagnostics.last_hresult.is_some_and(|code| code < 0));
     }
 }

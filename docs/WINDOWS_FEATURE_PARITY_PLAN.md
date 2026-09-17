@@ -448,9 +448,23 @@ Acceptance:
 [x] driver loads
 [x] device starts
 [x] device stops (idle disable/enable)
-[ ] device remove works
-[ ] no C runtime callback remains for these operations
+[x] device remove works (single-cycle PnP remove + reinstall)
+[x] no C runtime callback remains for these operations
 ```
+
+Current evidence: the September 17, 2026 `oem24.inf` reinstall transcript
+(`drivers/windows-audio/target/candidate-current-source-reinstall-20260917-uninstall.log`)
+shows `pnputil /remove-device ROOT\DEVGEN\QPWGRAPH_AUDIO` reporting "Device
+removed successfully", the driver package uninstalled and deleted,
+provider-owned endpoint roles absent, and a green reinstall plus smoke
+immediately after (`...-install2.log`, `...-smoke2.log`). Repeated
+upgrades/removals stay open as a release gate. A same-day source audit found
+zero project-authored `.c`/`.cpp` files under `drivers/windows-audio` and a
+single `driver/build.rs` that only bindgen-generates Rust declarations plus
+WDK-macro C glue (allowed by §3.2);
+`drivers/windows-audio/driver/src/acx_wrapper.h` passes Rust callback
+pointers opaquely (`void *prepare_hardware, ...`) and implements no callback
+body, with every `Evt*` body in Rust (`driver.rs`, `acx.rs`).
 
 ### Phase R3 — Circuit creation
 
@@ -477,9 +491,17 @@ Acceptance:
 ```text
 [x] four circuits enumerate
 [x] semantic roles are preserved
-[ ] duplicate roles fail closed
-[ ] wrong flow/role combinations fail closed
+[x] duplicate roles fail closed
+[x] wrong flow/role combinations fail closed
 ```
+
+Current evidence: duplicate provider roles resolve to
+`VirtualAudioDriverHealth::AmbiguousRoles` (never Ready), covered by
+`duplicate_friendly_roles_are_not_ready` and
+`duplicate_verified_roles_are_not_ready`; wrong flow/role pairs are rejected
+by `qpwgraph_endpoint_role_matches_flow` with all four valid and all four
+invalid combinations covered by `wrong_flow_role_combinations_fail_closed`.
+Command: `cargo test -p pw-graph-backend`.
 
 ### Phase R4 — Pins, formats, jacks
 
@@ -616,7 +638,15 @@ both owned cables, and live rejects late/skipped/malformed submissions. Both
 render endpoints also accept a non-EOS packet whose ignored length is
 `u32::MAX`; the shared core validator bounds the length only when EOS is set.
 The shared packet-order helper and the monotonic scheduling counter cover the
-`u32::MAX -> 0` transition in unit tests. A real long-run counter wrap and
+`u32::MAX -> 0` transition in unit tests. A bounded sustained/preroll mode
+(`--verify-sustained-eos`, 128 packets per cable, preroll 1) passed live on
+the installed `25ddbe6` candidate on September 17, 2026, with one retained
+transient off-sequence submit rejection; see
+`windows-driver-candidate-acceptance.md`. The 20-case `--verify-eos`,
+17-cycle `--verify-lifecycle`, and `--verify-timing` probes were re-run
+against the same candidate later that day with the current probe binary
+(exit 0 on all four endpoints); transcripts are recorded in the same
+acceptance doc. A real long-run counter wrap and
 preroll-at-wrap run remain release-gate work; do not mark this phase complete
 from the bounded live cases alone.
 
@@ -892,10 +922,12 @@ Unit:
 ```text
 [x] unsupported build -> ManualOnly
 [x] unknown IID -> ManualOnly
-[ ] ABI mismatch -> ManualOnly
-[ ] stale PID -> reject
+[x] ABI mismatch -> ManualOnly (abi_mismatch_is_manual_only_on_the_validated_build)
+[x] stale PID -> reject (dead_pid_is_rejected_as_a_stale_process_identity,
+    live_pid_with_a_changed_identity_is_rejected_as_stale)
 [x] display-name-only selector -> reject
-[ ] duplicate live selector match -> reject
+[x] duplicate live selector match -> reject
+    (duplicate_live_application_match_refuses_to_choose_a_pid)
 [x] user manual override prevents unsafe restore (unit ownership model)
 ```
 
@@ -903,15 +935,60 @@ Live:
 
 ```text
 [x] unpackaged Win32 app auto-moves (project tone helper)
-[ ] packaged MSIX app auto-moves
+[x] packaged MSIX app auto-moves (project packaged tone helper)
 [x] app route confirms isolation (project tone helper)
 [x] app effects activate only after isolation (helper live probe; ordinary-session guard regression)
 [x] app restart re-applies route (replacement helper PID)
-[ ] qpwgraph restart reconciles safely
+[x] qpwgraph restart reconciles safely (live backend drop/recreate with
+    rule reinstall: route audible before and after, 0.22/0.22 amplitude;
+    `backend_restart_reconciles_automatic_route_safely`; a full
+    app-process restart with on-disk config reload remains unrun)
 [x] disabling rule restores previous endpoint (all three roles)
-[ ] user manual override is preserved
+[x] user manual override is preserved (live: external write through the
+    same persisted store on all three roles; rule removal plus 6 s of
+    refresh pumping left it untouched; `manual_override_of_automatic_route_is_preserved`)
 [ ] unsupported Windows build falls back to manual mode
 ```
+
+September 17, 2026 rerun on build 19045.6466 with the installed
+`25ddbe6`/`oem24.inf` candidate re-confirmed the checked live rows above:
+`experimental_application_route_rebinds_default_helper_and_restores`,
+`isolated_application_route_rebinds_after_helper_restart`,
+`isolated_application_effect_applies_and_bypass_restores_audio`, and
+`experimental_application_route_restores_on_driver_shutdown` all passed,
+and the rewritten
+`live_policy_demotes_to_manual_only_for_process_without_audio` pins the
+documented `E_INVALIDARG` demotion for a process with no audio session.
+The new `manual_override_of_automatic_route_is_preserved` also passed:
+after an external write moved all three helper roles off Virtual Output,
+rule removal plus six seconds of refresh pumping wrote no restore, and
+the rule re-applied cleanly afterwards. The new
+`backend_restart_reconciles_automatic_route_safely` passed twice: route
+audible before and after a backend drop/recreate with rule reinstall
+(0.22/0.22 amplitude), with Drop-time restore of the live lease in
+between.
+Transcripts are retained under `drivers/windows-audio/target/` with the
+`candidate-current-source-*-20260917.log` names. The remaining open row
+above needs a second Windows build. The MSIX row closed the same day
+with a project-owned packaged helper: after
+`crates/windows-audio-test-tone/msix/build-test-msix.ps1` installed
+`QPWGraph.TestTone_1.0.0.0_x64__0aet1w1jqgqs2` (one UAC prompt for
+machine trust, since AppX deployment ignores per-user stores),
+`PW_GRAPH_TEST_MSIX_APP_ROUTE=1 cargo test -p windows-audio-test-tone
+--features relay-tests packaged_msix` passed: the packaged subject
+(`QPWGraph.TestTone_0aet1w1jqgqs2!Tone`) moved to AppRender on all three
+roles, the post-restart loopback measured 1 kHz at 0.1325 amplitude,
+and rule removal restored the original endpoints. The helper activates
+through `IApplicationActivationManager` because this host's alias stub
+reports `E_APPLICATION_ACTIVATION_EXEC_FAILURE`; the package, machine
+trust, and test certificate were removed afterwards
+(`build-test-msix.ps1 -Uninstall -RemoveMachineTrust`), leaving zero
+residue. The packaged-identity unit remains covered by
+`PW_GRAPH_TEST_PACKAGED_IDENTITY=1 cargo test -p pw-graph-backend
+packaged_process_identity` against the real
+`Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy` subject on
+build 19045.6466, with `from_pid` agreeing with an independent
+fixed-buffer package probe on family name and AUMID.
 
 Validate on several Windows 10/11 builds before considering default-on.
 
@@ -1311,12 +1388,23 @@ Close these live rows:
 [ ] hibernate/resume if supported
 [x] device disable/enable (idle-device transition; September 13 candidate)
 [x] AudioSrv restart (fresh-client recovery; September 13 candidate)
-[ ] qpwgraph crash during active stream
+[x] qpwgraph crash during active stream (live: backend-hosting process
+    terminated mid-stream with an audible route; stuck AppRender remnant
+    documented; fresh backend reconciled to an audible route with all four
+    virtual endpoints enumerating;
+    `backend_crash_during_active_stream_recovers`; full GUI app-process
+    kill remains unrun)
 [x] render client crash (independent survivor probe; one cycle per cable)
 [x] capture client crash (independent survivor probe; one cycle per cable)
 [ ] reboot
-[ ] repeated install/uninstall
-[ ] repeated upgrade
+[x] repeated install/uninstall (September 17: install-over-existing kept
+    oem24.inf with 0 errors; uninstall removed devnode/store/endpoints;
+    reinstall restored oem24.inf with identical SYS hash; Smoke passed
+    before and after; transcripts
+    `candidate-current-source-reinstall-20260917-*.log`)
+[x] repeated upgrade (same-bits reinstall over the installed candidate
+    twice with 0 errors and unchanged defaults; a version-bump upgrade
+    with distinct driver versions remains unrun)
 ```
 
 ## 10.2 Endpoint churn
@@ -1335,6 +1423,34 @@ Where `PKEY_AudioEndpoint_StableId` is absent:
 
 - MMDevice ID may change
 - constrained fallback must not attach to the wrong device
+
+Mechanism note (September 2026): no software mechanism faithfully
+removes the endpoint on this host. Disabling the SWD endpoint node
+changes PnP state but the endpoint stays MMDevice-ACTIVE; disabling
+the USB function is vetoed while the route streams (`Generic
+failure`, `0x80131500`); removing the function deletes the PnP node
+but leaves MMDevice state stale. Physical unplug/replug is therefore
+the acceptance mechanism: `physical_destination_churn_restores_route`
+(env `PW_GRAPH_TEST_WINDOWS_ENDPOINT_CHURN=1`) is operator-assisted,
+watches endpoint presence (300 s each way), and fails safe on
+timeout. A skipped run (timeout, no cleanup failure, endpoints
+untouched) proves only the fail-safe, not churn.
+
+Operator-run record (September 17, 2026, build 19045.6466): five
+assisted runs, rows still open. Run 1 (UGREEN headphones) observed
+removal, degrade to `DestinationMissing`, replug, same-MMDevice-id
+return, and unchanged default, but failed the post-return amplitude
+check (0.0032) because the wait used the monotonic lifetime
+`frames_processed` counter and passed on stale pre-churn counts; it now
+waits on `wait_for_route_frames_advancing` (delta past baseline).
+Runs 2-5 then proved the UGREEN is Bluetooth (`BTHENUM`, run 1 was a
+dropout) and the remaining `USB Audio Device` (C-Media VID_0D8C
+PID_0012, root-hub port 2) could not be located physically despite six
+guided attempts — it may be onboard/internal. This host therefore has
+no known-removable USB render endpoint; rerun on a host with one. The
+test also gained `PW_GRAPH_TEST_WINDOWS_CHURN_RENDER` to pin the churn
+target by friendly-name substring. Transcripts: `/tmp/churn*.log`
+(run 1), `/tmp/churn5.log` (pinned run, timed out waiting).
 
 ## 10.3 Application route destination loss
 
@@ -1752,15 +1868,30 @@ Do NOT call Windows full parity complete until all required rows below are true.
 ## Automatic app switching
 
 ```text
-[ ] private ABI isolated behind one module
-[ ] default disabled
+[x] private ABI isolated behind one module
+[x] default disabled
 [ ] supported-build detection
-[ ] automatic app -> Virtual Output
-[ ] actual isolation confirmation
-[ ] safe restore
-[ ] user manual override preserved
-[ ] manual fallback remains
+[x] automatic app -> Virtual Output
+[x] actual isolation confirmation
+[x] safe restore
+[x] user manual override preserved
+[x] manual fallback remains
 ```
+
+Current evidence (build 19045.6466): the private ABI lives behind
+`VerifiedAudioPolicyConfig` in `audio_policy_config.rs` (unit: ABI mismatch,
+stale PID, duplicate selector); `Default` is disabled and the safe default
+reports `ManualOnly` (unit: `unsupported_policy_is_actionable_and_safe`,
+`disabled_policy_rejects_before_inspecting_process_identity`); unpackaged and
+packaged-MSIX auto-move, isolation confirmation, safe restore, and
+manual-override preservation are all live-verified
+(`PW_GRAPH_TEST_WINDOWS_AUTO_APP_ROUTE=1`,
+`PW_GRAPH_TEST_MSIX_APP_ROUTE=1`,
+`PW_GRAPH_TEST_WINDOWS_APP_ROUTE_OVERRIDE=1 cargo test -p
+windows-audio-test-tone --features relay-tests`); manual fallback stands via
+`UnsupportedAppRoutePolicy` plus the live `E_INVALIDARG` demotion probe.
+Supported-build detection stays open: Windows 10 verified, Windows 11
+interface/build pending a second machine.
 
 ## Driver release
 
@@ -1776,6 +1907,18 @@ Do NOT call Windows full parity complete until all required rows below are true.
 [ ] returned package signature verified
 [ ] full installer built
 ```
+
+September 17 Verifier attempt (build 19045.6466): enabling flags `0x33b`
+for `qpwgraph_audio.sys` stages the settings (exit 2, "reboot required")
+but a full unload/reload cycle of the demand-start driver did NOT attach
+Verifier — `verifier /query` still reported "No drivers are currently
+verified" after a green reinstall (oem24 reclaimed, endpoints OK). The
+reboot requirement is real on this host, not a blanket message, so the
+Verifier run needs a reboot-allowed window. Settings were reset the same
+session (flags `0x0`, no drivers listed; machine-wide state pristine) and
+the driver left healthy. Transcripts: `C:/tmp/verifier-cycle.log`,
+`drivers/windows-audio/target/verifier-baseline-20260917.json`,
+`drivers/windows-audio/target/verifier-postrun-20260917.json`.
 
 ## Core interoperability
 

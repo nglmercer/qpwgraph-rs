@@ -327,4 +327,130 @@ mod tests {
         assert!(selector.matches(&candidate));
         assert_eq!(selector.selector_key().as_deref(), Some("sha256:abc"));
     }
+
+    /// Opt-in: verifies `ProcessIdentity` against a genuinely packaged
+    /// (MSIX/AppX) process running on this machine, so it is not part of a
+    /// default run. Subject selection uses a fixed-buffer package probe that
+    /// is deliberately different from the length-query protocol inside
+    /// `from_pid`, so the test exercises the production buffer handling
+    /// instead of repeating it.
+    #[test]
+    fn packaged_process_identity_matches_the_os_package_record() {
+        if std::env::var_os("PW_GRAPH_TEST_PACKAGED_IDENTITY").is_none() {
+            return;
+        }
+        let subjects = packaged_processes_running_now();
+        assert!(
+            !subjects.is_empty(),
+            "expected a running packaged process (MSIX/AppX) on this machine"
+        );
+        let mut opened = None;
+        for subject in &subjects {
+            match ProcessIdentity::from_pid(subject.pid) {
+                Ok(identity) => {
+                    opened = Some((subject, identity));
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        let Some((subject, identity)) = opened else {
+            panic!(
+                "could not query any of the {} packaged candidates",
+                subjects.len()
+            );
+        };
+        println!(
+            "packaged identity subject: pid={} family={}",
+            subject.pid, subject.package_family_name
+        );
+        assert_eq!(
+            identity.package_family_name.as_deref(),
+            Some(subject.package_family_name.as_str()),
+            "from_pid must report the OS package family"
+        );
+        assert_eq!(
+            identity.app_user_model_id, subject.app_user_model_id,
+            "AUMID must match the independent probe"
+        );
+        assert!(identity.is_stable());
+        let selector = identity
+            .selector_key()
+            .expect("a packaged identity must produce a selector");
+        let reread = ProcessIdentity::from_pid(subject.pid)
+            .expect("the packaged subject should stay queryable");
+        assert_eq!(reread.selector_key().as_deref(), Some(selector.as_str()));
+        assert!(identity.matches(&reread));
+    }
+
+    struct PackagedSubject {
+        pid: u32,
+        package_family_name: String,
+        app_user_model_id: Option<String>,
+    }
+
+    fn packaged_processes_running_now() -> Vec<PackagedSubject> {
+        use windows::Win32::System::ProcessStatus::EnumProcesses;
+
+        let mut capacity = 4096usize;
+        let pids = loop {
+            let mut pids = vec![0u32; capacity];
+            let mut returned = 0u32;
+            let bytes = (capacity * size_of::<u32>()) as u32;
+            unsafe { EnumProcesses(pids.as_mut_ptr(), bytes, &mut returned) }
+                .expect("EnumProcesses should list running PIDs");
+            let count = returned as usize / size_of::<u32>();
+            if count < capacity || capacity >= 65_536 {
+                pids.truncate(count);
+                break pids;
+            }
+            capacity *= 2;
+        };
+        let mut subjects = Vec::new();
+        for pid in pids {
+            let opened = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+            let Ok(process) = opened else { continue };
+            let family = fixed_buffer_probe(process, GetPackageFamilyName);
+            let aumid = family
+                .as_ref()
+                .and(fixed_buffer_probe(process, GetApplicationUserModelId));
+            let _ = unsafe { CloseHandle(process) };
+            if let Some(package_family_name) = family {
+                subjects.push(PackagedSubject {
+                    pid,
+                    package_family_name,
+                    app_user_model_id: aumid,
+                });
+            }
+        }
+        subjects
+    }
+
+    type PackageQuery = unsafe fn(
+        windows::Win32::Foundation::HANDLE,
+        *mut u32,
+        Option<PWSTR>,
+    ) -> windows::Win32::Foundation::WIN32_ERROR;
+
+    /// Fixed-buffer variant of the package-string protocol: no length query,
+    /// one large retry. Success requires `ERROR_SUCCESS`, so an unpackaged
+    /// process (`APPMODEL_ERROR_NO_PACKAGE`) selects nothing.
+    fn fixed_buffer_probe(
+        process: windows::Win32::Foundation::HANDLE,
+        query: PackageQuery,
+    ) -> Option<String> {
+        for capacity in [4096usize, 32768usize] {
+            let mut buffer = vec![0u16; capacity];
+            let mut length = capacity as u32;
+            let result = unsafe { query(process, &mut length, Some(PWSTR(buffer.as_mut_ptr()))) };
+            if result == ERROR_SUCCESS && length >= 2 {
+                let chars = (length as usize).saturating_sub(1).min(buffer.len());
+                return Some(String::from_utf16_lossy(&buffer[..chars]));
+            }
+            if result != ERROR_INSUFFICIENT_BUFFER {
+                return None;
+            }
+        }
+        None
+    }
 }

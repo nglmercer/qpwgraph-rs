@@ -406,6 +406,10 @@ Direct one- and two-packet KS EOS coverage is available from the workspace
 probe: `cargo run -p qpwgraph-audio-ks-probe --locked -- --verify-eos`. The
 same run checks that a non-EOS packet may carry an oversized ignored
 `EosPacketLength` while EOS packets remain bounded and frame-aligned.
+Use `--verify-sustained-eos` (defaults: 128 packets, 20 s timeout, 1 preroll
+packet, 960 final bytes) for bounded multi-packet EOS with preroll on both
+cables; `--packets`, `--timeout-ms`, `--preroll`, and `--eos-bytes` stay
+within hard-coded bounds. It does not exercise 32-bit counter wrap.
 Use `--verify-formats` to verify that the four canonical endpoints reject a
 valid but unsupported 44.1 kHz stereo PCM16 pin request.
 Use `--verify-jacks` to query one `KSJACK_DESCRIPTION` for each bridge pin and

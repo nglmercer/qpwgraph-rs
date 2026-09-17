@@ -868,4 +868,32 @@ mod tests {
 
         assert!(resolve_endpoint_candidate_index(&selector, &candidates).is_err());
     }
+
+    #[test]
+    fn wrong_flow_role_combinations_fail_closed() {
+        use QpwVirtualEndpointRole::*;
+
+        for (flow, role) in [
+            (Audio::eRender, AppRender),
+            (Audio::eRender, RelayRender),
+            (Audio::eCapture, AppMonitor),
+            (Audio::eCapture, RelayCapture),
+        ] {
+            assert!(
+                qpwgraph_endpoint_role_matches_flow(flow, role),
+                "{flow:?}/{role:?} must match"
+            );
+        }
+        for (flow, role) in [
+            (Audio::eRender, AppMonitor),
+            (Audio::eRender, RelayCapture),
+            (Audio::eCapture, AppRender),
+            (Audio::eCapture, RelayRender),
+        ] {
+            assert!(
+                !qpwgraph_endpoint_role_matches_flow(flow, role),
+                "{flow:?}/{role:?} must fail closed"
+            );
+        }
+    }
 }

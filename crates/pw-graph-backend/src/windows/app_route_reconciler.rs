@@ -752,6 +752,100 @@ mod tests {
     }
 
     #[test]
+    fn destination_disappear_and_return_restores_the_route() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_stable_id: Some("stable-speaker".into()),
+            destination_mmdevice_id: Some("old-mmdevice-id".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        let applications = vec![app("sha256:player", 42, true)];
+        let captures =
+            BTreeMap::from([(("sha256:player".into(), 42), ProcessCaptureReadiness::Ready)]);
+        let mut returned_endpoint = endpoint("new-mmdevice-id", "Speakers");
+        returned_endpoint.stable_id = Some("stable-speaker".into());
+
+        // Destination present: the route activates.
+        let mut environment = ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            applications: applications.clone(),
+            endpoints: vec![endpoint("old-mmdevice-id", "Speakers")],
+            captures: captures.clone(),
+            ..ApplicationRouteEnvironment::default()
+        };
+        // The helper assigns stable ids per endpoint id; align the first
+        // observation with the persisted stable selector.
+        environment.endpoints[0].stable_id = Some("stable-speaker".into());
+        reconciler.reconcile(&environment);
+        assert_eq!(
+            reconciler.plan(0).map(|plan| plan.state),
+            Some(ApplicationRouteState::Active)
+        );
+
+        // Destination disappears: no activation may survive.
+        environment.endpoints = Vec::new();
+        reconciler.reconcile(&environment);
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::DestinationMissing);
+        assert!(plan.activation.is_none());
+        assert!(reconciler.capture_requests().is_empty());
+
+        // Same stable endpoint returns under a churned MMDevice id: the
+        // route restores against the new current id.
+        environment.endpoints = vec![returned_endpoint];
+        reconciler.reconcile(&environment);
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::Active);
+        assert_eq!(
+            plan.activation
+                .as_ref()
+                .and_then(|activation| activation.destination.current_mmdevice_id.as_deref()),
+            Some("new-mmdevice-id")
+        );
+    }
+
+    #[test]
+    fn restarted_reconciler_reproduces_plans_from_persisted_rules() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_stable_id: Some("stable-speaker".into()),
+            destination_mmdevice_id: Some("speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let environment = ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            applications: vec![app("sha256:player", 42, true)],
+            endpoints: vec![endpoint("speaker", "Speakers")],
+            captures: BTreeMap::from([(
+                ("sha256:player".into(), 42),
+                ProcessCaptureReadiness::Ready,
+            )]),
+            ..ApplicationRouteEnvironment::default()
+        };
+        let mut first = ApplicationRouteReconciler::new(vec![route]);
+        first.reconcile(&environment);
+        let before: Vec<ApplicationRoutePlan> = first.plans().cloned().collect();
+        assert_eq!(
+            before.iter().map(|plan| plan.state).collect::<Vec<_>>(),
+            vec![ApplicationRouteState::Active]
+        );
+
+        // Simulate a qpwgraph restart: rules cross the config-file boundary
+        // into a fresh reconciler with no in-memory history.
+        let persisted = serde_json::to_string(first.rules()).expect("rules serialize");
+        let restored: Vec<WindowsApplicationRoute> =
+            serde_json::from_str(&persisted).expect("rules deserialize");
+        assert_eq!(restored, first.rules());
+        let mut second = ApplicationRouteReconciler::new(restored);
+        second.reconcile(&environment);
+        let after: Vec<ApplicationRoutePlan> = second.plans().cloned().collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn a_restarted_application_reuses_the_rule_with_its_new_pid() {
         let route = WindowsApplicationRoute {
             application: app("sha256:player", 1, true).selector,
@@ -843,6 +937,40 @@ mod tests {
         let plan = reconciler.plan(0).expect("a plan is always produced");
         assert_eq!(plan.state, ApplicationRouteState::ActivatingCapture);
         assert!(plan.activation.is_none());
+    }
+
+    #[test]
+    fn duplicate_live_application_match_refuses_to_choose_a_pid() {
+        let route = WindowsApplicationRoute {
+            application: app("sha256:player", 1, true).selector,
+            destination_endpoint_id: Some("speaker".into()),
+            ..WindowsApplicationRoute::default()
+        };
+        let mut reconciler = ApplicationRouteReconciler::new(vec![route]);
+        let environment = ApplicationRouteEnvironment {
+            os_supported: true,
+            virtual_driver_ready: true,
+            applications: vec![
+                app("sha256:player", 41, true),
+                app("sha256:player", 42, true),
+            ],
+            endpoints: vec![endpoint("speaker", "Speakers")],
+            captures: BTreeMap::from([
+                (("sha256:player".into(), 41), ProcessCaptureReadiness::Ready),
+                (("sha256:player".into(), 42), ProcessCaptureReadiness::Ready),
+            ]),
+            ..ApplicationRouteEnvironment::default()
+        };
+        reconciler.reconcile(&environment);
+
+        let plan = reconciler.plan(0).expect("a plan is always produced");
+        assert_eq!(plan.state, ApplicationRouteState::Degraded);
+        assert!(plan.activation.is_none());
+        assert!(plan
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("refusing to choose a PID")));
+        assert!(reconciler.capture_requests().is_empty());
     }
 
     #[test]

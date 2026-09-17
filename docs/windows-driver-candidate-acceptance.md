@@ -222,6 +222,14 @@ helper. These live results supersede the claim that automatic switching is
 universally blocked on this PC; they do not explain every unsupported-process
 case or establish MSIX, user-override, or full application restart acceptance.
 
+September 17 addendum: the three gaps named above have since closed on the
+`25ddbe6`/`oem24.inf` candidate — MSIX auto-move
+(`packaged_msix_application_route_rebinds_and_restores`, post-restart 1 kHz
+at 0.1325 amplitude), manual-override preservation
+(`PW_GRAPH_TEST_WINDOWS_APP_ROUTE_OVERRIDE=1`), and application restart
+re-application (replacement-PID flow inside the auto-route tests). Only
+unsupported-process explanation and unsupported-build fallback remain open.
+
 Focused smoke clippy passed with warnings denied. Application integration-test
 clippy passed with `--no-deps`; the broader invocation still reports the
 existing `clippy::too_many_arguments` warning in backend `routing.rs::walk`.
@@ -514,6 +522,100 @@ the smoke probe hash
 `099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
 This closes the bounded independent render/capture client-crash rows, but not
 qpwgraph backend crash recovery or Driver Verifier evidence.
+
+## Bounded sustained EOS/preroll — September 17
+
+The installed candidate is unchanged: `oem24.inf`, INF DriverVer
+`09/13/2026,11.8.28.7`, source commit `25ddbe6`, SYS SHA-256
+`099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`
+(re-verified with `Get-FileHash` before these runs). Windows 10 Pro build
+19045. The probe binary was built from source commit `783a867` (sustained
+mode plus parser-rejection unit tests); probe SHA-256
+`776AB7AC47F0CDAE48A3DE036254B6EAD76939AC8486378FF7A1CD44CDED73D3`.
+No boot, service, device, or default-endpoint setting was changed.
+
+From repository root, with the prebuilt probe:
+
+```powershell
+./drivers/windows-audio/target/debug/qpwgraph-audio-ks-probe.exe --verify-sustained-eos
+```
+
+Defaults are 128 packets per cable, 20 s timeout, 1 preroll packet, and
+960 final bytes. The first full run failed at `submit sustained packet 48`
+with `0x8007045D` (`ERROR_IO_DEVICE`): the driver rejected one off-sequence
+`SETWRITEPACKET` submit while the normal-priority probe chased the
+free-running 10 ms timer. That rejection is the specified R7 late/skipped
+behavior, not an EOS audio defect; no poisoned, replayed, or reordered
+sample was observed. The failure transcript is retained unmodified at
+`drivers/windows-audio/target/candidate-current-source-sustained-eos-live-run1-submit-rejected.log`
+and must not be relabeled as a pass.
+
+Two reruns passed on both cables (exit 0, ~1,400 ms per cable, 128 payload
+packets with per-packet markers, 2 leading underflow-silence packets, exact
+960-byte final prefix with poisoned tail rejected, 10 trailing silent
+packets, preroll 1, explicit STOP):
+
+- `drivers/windows-audio/target/candidate-current-source-sustained-eos-live-run2.log`
+- `drivers/windows-audio/target/candidate-current-source-sustained-eos-live-run3.log`
+
+A 16-packet run (`--verify-sustained-eos --packets 16`) also passed on both
+cables
+(`drivers/windows-audio/target/candidate-current-source-sustained-eos-16-live.log`),
+and the 20-case `--verify-eos` plus both `u32::MAX` non-EOS ignored-length
+checks passed again with this probe binary
+(`drivers/windows-audio/target/candidate-current-source-eos-20case-live.log`).
+
+This establishes bounded multi-packet EOS with preroll. It does not
+establish a real 32-bit-counter wrap run, long-run-at-wrap behavior,
+Driver Verifier, HLK, signing, or power-transition acceptance. The §18 EOS
+and power rows stay open.
+
+## EOS/lifecycle/timing rerun — September 17, 2026 (UTC)
+
+Independent rerun on the unchanged installed candidate (`oem24.inf`, INF
+DriverVer `09/13/2026,11.8.28.7`, source commit `25ddbe6`). SYS SHA-256
+re-verified before the runs with `Get-FileHash`:
+`099F48379B892913BA6F585E253B07EA7DC7D9A0E48183BA579088A49D3259C2`.
+Windows 10 Pro build 19045.6466. Probe binary SHA-256
+`776AB7AC47F0CDAE48A3DE036254B6EAD76939AC8486378FF7A1CD44CDED73D3`
+(same binary as the sustained-EOS section above). No boot, service,
+device, or default-endpoint setting was changed.
+
+From repository root:
+
+```powershell
+./drivers/windows-audio/target/debug/qpwgraph-audio-ks-probe.exe --verify-eos
+./drivers/windows-audio/target/debug/qpwgraph-audio-ks-probe.exe --verify-lifecycle
+./drivers/windows-audio/target/debug/qpwgraph-audio-ks-probe.exe --verify-timing
+```
+
+All three exited 0:
+
+- `--verify-eos`: 20 direct-KS cases passed on both cables (five
+  two-packet layouts with final bytes 0/4/16/960/1920 plus five
+  one-notification page-aligned layouts with final bytes
+  0/4/16/2048/4096 per cable), poisoned tail 0 everywhere, at least 10
+  later capture packets silent, explicit STOP passed; both
+  `u32::MAX` non-EOS ignored-length checks accepted.
+  Transcript:
+  `drivers/windows-audio/target/candidate-current-source-eos-20case-rerun-20260917.log`.
+- `--verify-lifecycle`: 17 start/pause/resume/stop cycles plus a reopen
+  passed on all four endpoints; packet counts frozen during pause, reset
+  on reopen; explicit STOP passed.
+  Transcript:
+  `drivers/windows-audio/target/candidate-current-source-lifecycle-rerun-20260917.log`.
+- `--verify-timing`: presentation-position correlation passed on all
+  four endpoints (71–73 position samples, 74 packets per endpoint, at
+  most one-block error); pause and STOP passed.
+  Transcript:
+  `drivers/windows-audio/target/candidate-current-source-timing-rerun-20260917.log`.
+
+This confirms the September 13 direct-KS EOS, lifecycle, and timing
+evidence with the current probe binary. It does not establish a real
+32-bit-counter wrap run, long-run/preroll-at-wrap behavior, controlled
+active-stream sleep/resume, hibernate/reboot, backend crash recovery,
+Verifier, HLK, signing, or Secure Boot acceptance. The §18 EOS and
+power rows stay open.
 
 ## Remaining release gates
 
