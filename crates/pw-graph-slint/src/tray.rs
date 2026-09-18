@@ -115,15 +115,21 @@ pub(crate) mod support {
             let Some(command) = command else {
                 break;
             };
-            match command {
-                Command::Show => {
-                    let _ = window.show();
-                    window.window().set_minimized(false);
-                }
-                Command::Hide => window.window().set_minimized(true),
-                Command::Quit => {
-                    let _ = slint::quit_event_loop();
-                }
+            apply_command(window, command);
+        }
+    }
+
+    fn apply_command(window: &MainWindow, command: Command) {
+        match command {
+            Command::Show => {
+                let _ = window.show();
+                window.window().set_minimized(false);
+            }
+            Command::Hide => {
+                let _ = window.hide();
+            }
+            Command::Quit => {
+                let _ = slint::quit_event_loop();
             }
         }
     }
@@ -131,6 +137,30 @@ pub(crate) mod support {
     impl State {
         pub(crate) fn shutdown(&self) {
             self.handle.shutdown().wait();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Hide-to-tray contract: Hide hides the window (it does not merely
+        /// minimize it), and Show restores the same window.
+        #[test]
+        fn tray_hide_hides_and_show_restores_the_window() {
+            i_slint_backend_testing::init_no_event_loop();
+            let window = MainWindow::new().expect("test window");
+            window.show().expect("show test window");
+            assert!(window.window().is_visible());
+
+            apply_command(&window, Command::Hide);
+            assert!(!window.window().is_visible(), "tray Hide hides the window");
+
+            apply_command(&window, Command::Show);
+            assert!(
+                window.window().is_visible(),
+                "tray Show restores the window"
+            );
         }
     }
 }

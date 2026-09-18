@@ -218,6 +218,15 @@ impl UiBridge {
                 application.t("tray.quit"),
             )))
         };
+        // With a working tray, closing the window hides it instead of quitting:
+        // close request != application quit. Only an explicit tray Quit ends
+        // the event loop.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "tray"))]
+        if tray.borrow().is_some() {
+            self.window
+                .window()
+                .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+        }
         let timer = Timer::default();
         let weak_window = self.window.as_weak();
         let app = self.app.clone();
@@ -248,6 +257,22 @@ impl UiBridge {
                 &geometry_version,
             );
         });
+        // `ComponentHandle::run` ends the event loop when the last window
+        // closes, but the custom native tray is not a Slint-owned tray object
+        // and cannot keep the loop alive. With a tray, run until an explicit
+        // quit request so hiding the window keeps the app and tray running.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "tray"))]
+        let result = {
+            self.window.show()?;
+            let result = if tray.borrow().is_some() {
+                slint::run_event_loop_until_quit()
+            } else {
+                slint::run_event_loop()
+            };
+            let _ = self.window.hide();
+            result
+        };
+        #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "tray")))]
         let result = self.window.run();
         {
             let mut application = self.app.borrow_mut();
