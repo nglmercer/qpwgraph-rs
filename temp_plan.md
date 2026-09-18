@@ -1,1636 +1,2454 @@
-# QPWGraph Recorder Implementation Plan
+# QPWGraph Windows PipeWire-like Audio Routing Implementation
 
-## Goal
-
-Add a first-class audio **Recorder node** to `qpwgraph-rs`.
-
-The recorder should:
-
-* Appear as a node in the audio graph.
-* Accept audio connections from compatible sources.
-* Record one or multiple sources.
-* Support Linux/PipeWire and Windows/Core Audio.
-* Support Windows application capture when process-loopback is available.
-* Write recordings without blocking realtime audio threads.
-* Default to asking where to save after recording stops.
-* Remember the previously selected recording directory.
-* Optionally support automatic saving to a configured folder.
-* Preserve unfinished recordings when the user cancels the Save dialog or the application crashes.
-
-The first supported file format should be **WAV 32-bit float**.
-
----
-
-# 1. Existing Architecture to Reuse
-
-Do not build an independent audio subsystem.
-
-Reuse the existing architecture:
+Repository:
 
 ```text
-crates/pw-graph-core
-    graph types / nodes / ports
-
-crates/pw-graph-backend
-    backend APIs
-    PipeWire backend
-    Windows audio backend
-
-crates/pw-graph-backend/src/router
-    platform-neutral PCM router
-    AudioSource
-    AudioSink
-    RingSink
-    RingSinkDrain
-    mixing
-    resampling
-    effects
-    meters
-
-crates/pw-graph-backend/src/windows
-    WASAPI
-    process loopback
-    ProcessCaptureManager
-
-crates/pw-graph-config
-    persistent application settings
-
-crates/pw-graph-slint
-    UI
-    native file dialogs through rfd
+https://github.com/nglmercer/qpwgraph-rs
 ```
 
-The Windows router already owns PCM for routes and supports arbitrary `AudioSink` implementations.
+## Objective
 
-The recorder should therefore behave primarily as another audio destination.
+Implement a complete Windows audio-routing architecture for `qpwgraph-rs` that provides a PipeWire-like user experience as far as Windows permits.
 
----
-
-# 2. Desired User Experience
-
-## Creating a recorder
-
-Provide an action such as:
+The primary target use case is:
 
 ```text
-Add → Recorder
+Music application ─┐
+                   ├──> qpwgraph mixer/effects ──> Virtual Microphone ──> Discord
+Physical microphone┘
 ```
 
-or:
+The implementation must also support:
 
 ```text
-+ Recorder
+Application audio
+    │
+    ├──> normal physical playback
+    │
+    └──> qpwgraph capture/mix
 ```
 
-The graph should display:
+when Windows process-loopback capture is available, and:
 
 ```text
-┌────────────────────┐
-│ Recorder           │
-│                    │
-│ ○ input L          │
-│ ○ input R          │
-│                    │
-│ ● 00:00:00         │
-│ [ Record ]         │
-└────────────────────┘
+Application
+    │
+    ▼
+QPWGraph Virtual Output
+    │
+    ▼
+QPWGraph Virtual Monitor
+    │
+    ▼
+qpwgraph RouterCore
 ```
 
-Possible states:
+as the isolation/fallback path.
+
+The final architecture should behave conceptually like:
 
 ```text
-Idle
-Armed
-Recording
-Stopping
-Unsaved
-Saved
-Error
-```
+                       QPWGraph Windows Audio Graph
 
-Minimum implementation only needs:
-
-```text
-Idle
-Recording
-Unsaved
-Error
+ ┌─────────────────── SOURCES ─────────────────────┐
+ │                                                 │
+ │ Physical microphone ─────── WASAPI capture ──┐  │
+ │                                              │  │
+ │ Spotify ─── process loopback ────────────────┤  │
+ │                                              │  │
+ │ Firefox ─── process loopback ────────────────┤  │
+ │                                              │  │
+ │ Virtual Monitor ─────────────────────────────┤  │
+ │                                              │  │
+ └──────────────────────────────────────────────┼──┘
+                                                │
+                                                ▼
+                                      ┌──────────────────┐
+                                      │    RouterCore    │
+                                      │                  │
+                                      │ mix              │
+                                      │ gain             │
+                                      │ resampling       │
+                                      │ channel mapping  │
+                                      │ effects          │
+                                      │ metering         │
+                                      │ limiter          │
+                                      └────────┬─────────┘
+                                               │
+                  ┌────────────────────────────┼───────────────────────┐
+                  │                            │                       │
+                  ▼                            ▼                       ▼
+             Headphones                Relay Sink             other endpoints
+                  │                            │
+                  │                      virtual cable
+                  │                            │
+                  │                            ▼
+                  │                  Relay Microphone
+                  │                            │
+                  │                            ▼
+                  │                    Discord / OBS /
+                  │                    Zoom / Teams
+                  │
+                  └────────────────────────────────────
 ```
 
 ---
 
-# 3. Graph Semantics
+# 1. Important architectural rule
 
-Add:
+Do **not** attempt to reproduce PipeWire inside the Windows kernel.
+
+Windows Core Audio is not a mutable arbitrary patchbay equivalent to PipeWire.
+
+The architecture must instead be:
+
+```text
+Windows APIs / virtual endpoints
+              │
+              ▼
+        qpwgraph owns PCM
+              │
+              ▼
+          RouterCore
+```
+
+All meaningful DSP and routing logic must remain in user mode.
+
+## Kernel driver responsibilities
+
+The optional virtual audio driver should only provide standard Windows audio endpoints and bounded PCM transport.
+
+The driver may be responsible for:
+
+* publishing audio endpoint devices;
+* render/capture endpoint lifecycle;
+* transporting PCM between paired virtual endpoints;
+* timing/packet handling required by ACX/WaveRT;
+* bounded buffers;
+* device lifecycle;
+* exposing endpoint identity and role metadata.
+
+The driver must **not** implement:
+
+* graph routing policy;
+* application selection;
+* arbitrary mixing;
+* effect chains;
+* user-configurable gain;
+* EQ;
+* noise reduction;
+* limiter;
+* application policy;
+* graph persistence;
+* routing decisions;
+* resampling unless fundamentally required at the device boundary.
+
+Those belong in user mode.
+
+---
+
+# 2. Preserve the existing architecture
+
+Before modifying anything, inspect the existing implementation.
+
+Relevant areas currently include:
+
+```text
+crates/pw-graph-backend/src/router/
+crates/pw-graph-backend/src/windows/
+crates/pw-graph-backend/src/windows_relay.rs
+
+drivers/windows-audio/
+drivers/windows-audio/core/
+drivers/windows-audio/driver/
+drivers/windows-audio/package/
+drivers/windows-audio/tests/
+```
+
+Existing Windows files include concepts such as:
+
+```text
+windows/app_route_policy.rs
+windows/app_route_reconciler.rs
+windows/audio_policy_config.rs
+windows/driver.rs
+windows/driver_application_routes.rs
+windows/driver_relay.rs
+windows/effects.rs
+windows/identity.rs
+windows/process_capture.rs
+windows/process_loopback.rs
+windows/routing.rs
+windows/virtual_device.rs
+windows/worker.rs
+```
+
+The router already includes:
+
+```text
+router/buffer.rs
+router/diagnostics.rs
+router/endpoints.rs
+router/engine.rs
+router/format.rs
+router/meter.rs
+router/resample.rs
+router/thread.rs
+router/wasapi.rs
+```
+
+The virtual audio driver already includes:
+
+```text
+driver/src/acx.rs
+driver/src/driver.rs
+driver/src/ffi.rs
+driver/src/transport.rs
+```
+
+Do not duplicate an existing subsystem under a new name.
+
+Extend/refactor existing components where appropriate.
+
+---
+
+# 3. Do not regress Linux
+
+Linux/PipeWire behavior is the reference for graph semantics.
+
+Changes to shared APIs must preserve:
+
+```text
+PipeWire routing
+PipeWire metering
+effects
+patchbay persistence
+MIDI
+relay
+graph UI
+node capabilities
+```
+
+Windows-specific behavior must remain behind appropriate platform boundaries.
+
+Shared abstractions should only be introduced where there is genuinely shared behavior.
+
+Do not force Windows-specific concepts into the PipeWire backend.
+
+---
+
+# 4. Desired virtual endpoint topology
+
+Retain the four-endpoint design.
+
+## Application isolation cable
+
+```text
+QPWGraph Virtual Output
+        │
+        │ virtual PCM cable A
+        ▼
+QPWGraph Virtual Monitor
+```
+
+Roles:
+
+```text
+Virtual Output
+    Windows type: render endpoint
+    purpose: application sends audio into qpwgraph
+
+Virtual Monitor
+    Windows type: capture endpoint
+    purpose: qpwgraph reads audio written to Virtual Output
+```
+
+## Relay/output cable
+
+```text
+QPWGraph Relay Sink
+        │
+        │ virtual PCM cable B
+        ▼
+QPWGraph Relay Microphone
+```
+
+Roles:
+
+```text
+Relay Sink
+    Windows type: render endpoint
+    purpose: qpwgraph writes final mixed PCM
+
+Relay Microphone
+    Windows type: capture endpoint
+    purpose: Discord/OBS/etc. see qpwgraph mix as microphone
+```
+
+The two cables must be completely independent.
+
+Conceptually:
+
+```text
+Cable A:
+
+APP
+ │
+ ▼
+Virtual Output
+ │
+ ▼
+Virtual Monitor
+ │
+ ▼
+QPWGraph
+
+
+Cable B:
+
+QPWGraph
+ │
+ ▼
+Relay Sink
+ │
+ ▼
+Relay Microphone
+ │
+ ▼
+Discord
+```
+
+---
+
+# 5. Primary routing use case
+
+Implement this exact scenario end-to-end:
+
+```text
+Spotify audio
+        │
+        ▼
+ProcessLoopbackSource
+        │
+        │
+        ├──────────────────────────────┐
+        │                              │
+        ▼                              │
+    RouterCore                         │
+        ▲                              │
+        │                              │
+Physical Microphone                    │
+via WASAPI capture                     │
+                                       │
+RouterCore mix                         │
+        │                              │
+        ▼                              │
+QPWGraph Relay Sink                    │
+        │                              │
+        ▼                              │
+QPWGraph Relay Microphone              │
+        │                              │
+        ▼                              │
+Discord                                │
+                                       │
+Spotify must still be independently ───┘
+audible through its normal output
+when using process loopback.
+```
+
+The user should eventually be able to construct this visually through the graph.
+
+---
+
+# 6. Process-loopback capture
+
+Use the supported Windows process-loopback mechanism when available.
+
+The existing Windows implementation already contains:
+
+```text
+process_capture.rs
+process_loopback.rs
+```
+
+Audit those implementations before writing new code.
+
+The logical abstraction should look approximately like:
 
 ```rust
-NodeType::Recorder
+struct ProcessLoopbackSource {
+    process_id: u32,
+    include_process_tree: bool,
+    // COM/audio state
+    // bounded PCM producer
+    // diagnostics
+}
 ```
 
-A recorder node is a graph destination.
+The implementation should activate an audio client using process-loopback activation and capture PCM belonging to a target process.
+
+Prefer:
+
+```text
+PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+```
+
+for normal application capture.
+
+Do not capture unrelated system audio.
+
+## Requirements
+
+Process capture must:
+
+* identify the correct target PID;
+* optionally include the child process tree;
+* survive normal buffer starvation;
+* produce silence instead of replaying stale buffers;
+* use bounded buffering;
+* never block the router thread;
+* detect target-process exit;
+* report unsupported activation cleanly;
+* report capture failures cleanly;
+* expose useful diagnostics;
+* cleanly stop and release COM objects;
+* avoid leaking activation callbacks;
+* handle device/audio-service changes.
+
+## Threading
+
+All COM interfaces must respect COM apartment/thread ownership.
+
+A worker that creates a COM audio interface should normally own/use/release it from the appropriate worker thread.
+
+Do not casually move COM interfaces across unrelated threads.
+
+---
+
+# 7. Runtime capability detection
+
+Do not make application behavior depend only on hardcoded Windows-version strings.
+
+Implement capability detection.
+
+Conceptually:
+
+```rust
+enum ProcessCaptureCapability {
+    Available,
+    UnsupportedOs,
+    ActivationFailed(HResult),
+    TargetUnavailable,
+}
+```
+
+The application should be able to distinguish:
+
+```text
+API not supported
+target application disappeared
+temporary WASAPI failure
+invalid PID
+audio service unavailable
+capture active
+```
+
+Capability probes may be cached, but caches must be invalidatable following significant audio-service/device changes.
+
+---
+
+# 8. Application identity
+
+Do not use PID as the persistent application identity.
+
+PIDs are ephemeral.
+
+Use the existing Windows identity infrastructure.
+
+A stable application selector should prefer, when available:
+
+```text
+package identity
+application/user model identity
+executable path
+process image identity
+session metadata
+```
+
+PID should only identify the currently running process instance.
+
+Conceptually:
+
+```rust
+struct ApplicationSelector {
+    stable_identity: ...,
+}
+
+struct LiveApplication {
+    selector: ApplicationSelector,
+    pid: u32,
+}
+```
+
+If a stable selector can no longer resolve to a live process:
+
+```text
+DO NOT silently attach to another unrelated process.
+```
+
+Fail closed.
+
+---
+
+# 9. Physical microphone capture
+
+Physical capture endpoints should use the existing WASAPI abstraction.
+
+Do not implement a second capture engine specifically for microphone mixing.
+
+Reuse or extend:
+
+```text
+router/wasapi.rs
+router/endpoints.rs
+windows/routing.rs
+```
+
+A microphone route must become an ordinary router source.
 
 Example:
 
 ```text
-Microphone ──────────────┐
-                         │
-Browser ─────────────────┼──> Recorder
-                         │
-Speaker Monitor ─────────┘
+Physical Microphone
+        │
+        ▼
+WasapiCaptureSource
+        │
+        ▼
+bounded ring
+        │
+        ▼
+RouterCore
 ```
-
-Multiple connections should mix naturally.
-
-Do not implement separate mixer logic inside Recorder if the existing router can mix sources into one sink.
-
-The recorder should normally expose one logical audio input.
-
-The UI may display stereo channel ports where required by the backend:
-
-```text
-record_FL
-record_FR
-```
-
-but internal recording should operate on negotiated audio frames rather than relying on port names.
 
 ---
 
-# 4. Important Windows Semantics
+# 10. RouterCore remains the audio engine
 
-Do not make ordinary Windows application sessions generally routable just to support recording.
+All sources should converge into the existing router.
 
-Currently, these are different operations:
-
-```text
-Application → Speaker
-```
-
-means:
+Conceptual source types:
 
 ```text
-reroute application
+PhysicalCaptureSource
+RenderLoopbackSource
+ProcessLoopbackSource
+VirtualMonitorSource
+RelaySource
 ```
 
-while:
+Conceptual sinks:
 
 ```text
-Application → Recorder
+PhysicalRenderSink
+VirtualRenderSink
+RelaySink
 ```
 
-means:
+Do not create a special mixer solely for Discord.
+
+Discord should simply consume an ordinary qpwgraph route through the virtual microphone.
+
+---
+
+# 11. Internal PCM format
+
+The router may preserve its existing internal format strategy.
+
+If normalization is useful, prefer a predictable float representation such as:
 
 ```text
-read-only process capture
+PCM: f32
+typical graph rate: 48 kHz
+channel representation: explicit
 ```
 
-These must remain semantically different.
+Do not assume all endpoints use:
 
-Introduce a destination-aware connection capability.
+```text
+48 kHz
+stereo
+float
+```
 
-Example API:
+Inputs may be:
+
+```text
+44.1 kHz stereo
+48 kHz mono
+48 kHz 5.1
+integer PCM
+float PCM
+different channel masks
+```
+
+Use the existing router conversion path.
+
+Do not add format conversions inside arbitrary feature code.
+
+---
+
+# 12. Mixing
+
+Support many-to-one routing.
+
+Example:
+
+```text
+Spotify ────────┐
+                │
+Firefox ────────┼──> QPWGraph Relay Microphone
+                │
+Microphone ─────┘
+```
+
+Each source needs independent:
+
+```text
+gain
+mute
+metering
+effects where applicable
+```
+
+Summation must not cause undefined overflow/NaN behavior.
+
+Sanitize non-finite samples.
+
+A final optional limiter/soft protection stage may be added if it integrates cleanly with the existing effect architecture.
+
+Do not silently normalize every source.
+
+User-selected gain must remain deterministic.
+
+---
+
+# 13. Fan-out
+
+One source must be usable by multiple destinations.
+
+Example:
+
+```text
+Spotify capture
+     │
+     ├──> headphones
+     │
+     ├──> Discord mix
+     │
+     └──> recorder
+```
+
+Do not capture the same process independently for every destination if a single source can feed multiple router branches.
+
+Pull a logical source once per processing cycle and fan out inside the router.
+
+---
+
+# 14. Effects
+
+Effects belong in the user-mode route graph.
+
+Example:
+
+```text
+Microphone
+    │
+    ▼
+Noise reduction
+    │
+    ▼
+EQ
+    │
+    ├──> headphones monitor
+    │
+    └──> Discord microphone
+```
+
+Effects must never move into the kernel driver.
+
+Preserve existing per-branch effect semantics.
+
+An effect inserted in one branch must not unintentionally modify sibling routes.
+
+---
+
+# 15. Metering
+
+Use actual PCM whenever qpwgraph owns the samples.
+
+For owned PCM calculate at least:
+
+```text
+peak
+RMS
+```
+
+Do not pretend Windows Core Audio peak meters provide true RMS.
+
+Metering must correctly identify whether the value came from:
+
+```text
+native endpoint/session peak meter
+
+or
+
+actual router PCM
+```
+
+When the router owns PCM, router measurements should be authoritative for that route.
+
+---
+
+# 16. Virtual Output isolation path
+
+Implement/support the following flow:
+
+```text
+Spotify
+    │
+    ▼
+QPWGraph Virtual Output
+    │
+    ▼
+virtual cable A
+    │
+    ▼
+QPWGraph Virtual Monitor
+    │
+    ▼
+RouterCore
+```
+
+Then allow:
+
+```text
+Virtual Monitor
+      │
+      ├──> physical headphones
+      │
+      └──> Relay mix
+```
+
+This provides true isolation because qpwgraph owns the stream after the application renders into the virtual endpoint.
+
+This path is required for scenarios where:
+
+* process-loopback capture is unavailable;
+* the user wants complete rerender ownership;
+* local effects must replace the dry application path;
+* automatic/manual per-application endpoint assignment is used.
+
+---
+
+# 17. Avoid dry + processed duplication
+
+For application effects such as:
+
+```text
+Spotify -> EQ -> headphones
+```
+
+do not create:
+
+```text
+original Spotify -> headphones
+
+PLUS
+
+captured Spotify -> EQ -> headphones
+```
+
+which would produce doubled/echoing audio.
+
+Application rerender/effects must only be activated once isolation has been established.
+
+Preferred isolation:
+
+```text
+Spotify
+    │
+    ▼
+Virtual Output
+    │
+    ▼
+Virtual Monitor
+    │
+    ▼
+EQ
+    │
+    ▼
+headphones
+```
+
+Process loopback alone is suitable for:
+
+```text
+read-only capture
+recording
+metering
+relay mixing
+Discord mix
+```
+
+but not necessarily replacing the application's original playback path.
+
+---
+
+# 18. Application routing policy
+
+The repository already contains:
+
+```text
+app_route_policy.rs
+app_route_reconciler.rs
+audio_policy_config.rs
+driver_application_routes.rs
+```
+
+Audit this code before changing it.
+
+Automatic reassignment of an application's Windows output device must remain optional and fail closed.
+
+Do not make undocumented/private Windows audio-policy APIs a requirement for normal operation.
+
+The hierarchy should be:
+
+```text
+1. Process loopback when read-only application capture is enough.
+
+2. User manually selects:
+   QPWGraph Virtual Output
+   in Windows application audio settings.
+
+3. Optional automatic application reassignment where the existing
+   policy backend is explicitly verified and enabled.
+```
+
+The user must always have a supported/manual fallback.
+
+---
+
+# 19. Automatic application isolation transaction
+
+If automatic endpoint assignment is enabled, treat it as a transaction.
+
+Pseudo-flow:
+
+```text
+resolve stable application identity
+        │
+        ▼
+find live process/session
+        │
+        ▼
+confirm QPWGraph Virtual Output exists
+        │
+        ▼
+request app endpoint change
+        │
+        ▼
+refresh Core Audio sessions
+        │
+        ▼
+verify application is actually isolated
+        │
+        ├── no ──> rollback / ManualOnly
+        │
+        ▼
+start Virtual Monitor route
+        │
+        ▼
+enable effects/rerender
+```
+
+Never report the route as active before verifying isolation.
+
+On failure:
+
+```text
+preserve original playback
+do not create duplicate processed audio
+show useful diagnostic
+fall back to manual routing
+```
+
+---
+
+# 20. Route leases and restoration
+
+If qpwgraph automatically changes application output assignment, it must know which changes it owns.
+
+Implement/retain route ownership/lease semantics.
+
+Example:
+
+```text
+original:
+Spotify -> Speakers
+
+qpwgraph:
+Spotify -> Virtual Output
+
+on cleanup:
+restore Spotify -> Speakers
+```
+
+But only restore settings that qpwgraph itself changed.
+
+If the user manually changes the application output while qpwgraph is running, do not blindly overwrite the user's choice during shutdown.
+
+---
+
+# 21. Relay Sink integration
+
+The user-mode router must be able to render into:
+
+```text
+QPWGraph Relay Sink
+```
+
+through normal WASAPI rendering.
+
+Conceptually:
+
+```text
+RouterCore
+    │
+    ▼
+WasapiRenderSink
+    │
+    ▼
+QPWGraph Relay Sink
+```
+
+The application should discover the endpoint by stable provider identity/role rather than fragile display-name matching wherever possible.
+
+Display names may be used as diagnostics/UI labels, not as the sole identity.
+
+---
+
+# 22. Relay Microphone
+
+The driver must expose:
+
+```text
+QPWGraph Relay Microphone
+```
+
+as a standard Windows capture endpoint.
+
+Third-party applications must be able to use it without special SDKs.
+
+Examples:
+
+```text
+Discord
+OBS
+Zoom
+Teams
+DAWs
+browsers
+games
+```
+
+From their perspective it is an ordinary microphone.
+
+They must not need to know that qpwgraph exists.
+
+---
+
+# 23. Driver transport
+
+The driver currently contains bounded Rust PCM transport infrastructure.
+
+Preserve the minimal two-cable concept.
+
+Conceptually:
+
+```text
+Cable A:
+render endpoint -> capture endpoint
+
+Cable B:
+render endpoint -> capture endpoint
+```
+
+Required properties:
+
+```text
+bounded memory
+no unbounded allocation
+predictable packet timing
+clear underrun behavior
+clear overrun behavior
+silence when data is absent
+no stale sample replay
+independent cable state
+safe lifecycle reset
+```
+
+The two cables must not share audio accidentally.
+
+---
+
+# 24. Driver endpoint roles
+
+Preserve explicit provider-owned endpoint role metadata.
+
+Expected logical roles:
+
+```text
+app-render
+app-monitor
+relay-render
+relay-capture
+```
+
+The user-mode application should use these roles to locate the correct devices.
+
+Do not rely exclusively on localized endpoint display names.
+
+---
+
+# 25. Driver failure isolation
+
+A driver issue must not corrupt RouterCore state.
+
+If a virtual endpoint disappears:
+
+```text
+route remains represented
+route enters degraded state
+diagnostic is recorded
+worker stops safely
+backend attempts reconciliation later
+```
+
+Do not silently delete user patchbay intent merely because a device temporarily disappeared.
+
+---
+
+# 26. Device invalidation
+
+Handle:
+
+```text
+AUDCLNT_E_DEVICE_INVALIDATED
+device removal
+audio service restart
+endpoint disable/enable
+default device changes
+sleep/resume
+driver reinstall
+virtual endpoint disappearance
+```
+
+Audio workers should notify the control plane.
+
+Do not attempt complex graph reconstruction inside an audio callback.
+
+Expected flow:
+
+```text
+audio worker detects invalidation
+        │
+        ▼
+publish lightweight fault
+        │
+        ▼
+control/backend refresh
+        │
+        ▼
+tear down affected worker
+        │
+        ▼
+re-resolve endpoint identity
+        │
+        ▼
+recreate worker
+        │
+        ▼
+reset buffers/effects across discontinuity
+```
+
+---
+
+# 27. Real-time rules
+
+The router audio thread must remain real-time friendly.
+
+Inside audio processing:
+
+Do not:
+
+```text
+allocate dynamically
+block on mutexes
+perform filesystem operations
+perform COM enumeration
+format strings
+log synchronously
+perform network operations
+wait on UI
+sleep
+```
+
+Use:
+
+```text
+bounded queues
+preallocated buffers
+atomics
+lock-free/single-producer-single-consumer structures where appropriate
+control messages between blocks
+```
+
+Keep existing real-time invariants.
+
+---
+
+# 28. Buffering
+
+Every boundary must use bounded buffering.
+
+Never solve underruns by allowing latency to grow forever.
+
+Required behavior:
+
+```text
+source too slow:
+    output silence for unavailable samples
+    count underrun/starvation
+
+consumer too slow:
+    drop according to existing bounded-buffer policy
+    count overrun/drop
+
+never:
+    infinitely grow memory
+```
+
+---
+
+# 29. Clock drift
+
+Physical devices do not share a perfect clock.
+
+Example:
+
+```text
+mic: nominal 48000 Hz
+headphones: nominal 48000 Hz
+actual clocks differ slightly
+```
+
+Retain/use router drift compensation.
+
+Do not assume equal nominal sample rates imply synchronous clocks.
+
+Expose diagnostics such as:
+
+```text
+resampler ratio
+buffer fill
+clock drift ppm
+underruns
+overruns
+```
+
+---
+
+# 30. UI/graph model
+
+The Windows graph should distinguish:
+
+```text
+observed Core Audio relationship
+
+versus
+
+qpwgraph-owned mutable route
+```
+
+Observed Windows application session relationships must not falsely appear fully mutable.
+
+Nodes should expose accurate per-node capabilities.
+
+Examples:
+
+```text
+ordinary app session:
+    process capture: maybe yes
+    direct native reroute: no
+    qpwgraph virtual isolation: maybe
+    peak meter: maybe
+    true RMS: only when PCM captured
+
+physical microphone:
+    source route: yes
+
+physical speakers:
+    destination route: yes
+    loopback source: yes
+
+Virtual Monitor:
+    source: yes
+
+Relay Sink:
+    destination: yes
+
+Relay Microphone:
+    externally consumable capture endpoint
+```
+
+---
+
+# 31. Application node routing UX
+
+An application session should expose enough information for the graph to offer meaningful actions.
+
+Possible conceptual ports:
+
+```text
+Spotify
+ ├── observed playback -> Speakers
+ └── capture output -> process loopback
+```
+
+If isolated:
+
+```text
+Spotify
+    │
+    ▼
+Virtual Output
+    │
+    ▼
+Virtual Monitor
+```
+
+Do not represent an unsupported drag operation as if Windows will natively rewire it.
+
+---
+
+# 32. Desired Discord workflow
+
+The ideal user workflow should become:
+
+```text
+1. Start qpwgraph.
+
+2. qpwgraph discovers:
+   Spotify
+   microphone
+   headphones
+   Relay Microphone
+
+3. User connects:
+   Spotify capture -> Relay Sink
+   microphone -> Relay Sink
+
+4. Optional:
+   Spotify -> headphones
+   microphone -> effects -> Relay Sink
+
+5. In Discord:
+   Input Device = QPWGraph Relay Microphone
+```
+
+No external mixer should be required once the qpwgraph virtual driver is installed.
+
+---
+
+# 33. Development fallback without custom driver
+
+The application architecture must remain testable before the custom driver is production-ready.
+
+Permit testing using an external virtual cable during development.
+
+Conceptually:
+
+```text
+ProcessLoopbackSource
+        │
+        │
+PhysicalMic
+        │
+        ▼
+RouterCore
+        │
+        ▼
+generic WASAPI render endpoint
+        │
+        ▼
+external virtual cable
+        │
+        ▼
+Discord
+```
+
+Do not make such third-party cable software a production dependency.
+
+It is only useful for isolating user-mode bugs from driver bugs.
+
+---
+
+# 34. Routing abstraction
+
+Prefer generic source/sink interfaces.
+
+Example shape:
 
 ```rust
-pub enum ConnectionSupport {
-    Route,
-    CaptureOnly,
+trait AudioSource {
+    fn format(&self) -> AudioFormat;
+    fn read(&mut self, dst: &mut [f32]) -> SourceRead;
+}
+
+trait AudioSink {
+    fn format(&self) -> AudioFormat;
+    fn write(&mut self, src: &[f32]) -> SinkWrite;
+}
+```
+
+Do not necessarily introduce these exact traits if equivalent abstractions already exist.
+
+Reuse the existing architecture.
+
+The important requirement is that RouterCore should not care whether audio came from:
+
+```text
+physical mic
+process loopback
+render loopback
+virtual monitor
+network relay
+```
+
+---
+
+# 35. Diagnostics
+
+Every active route/source/sink should have useful diagnostics.
+
+At minimum consider:
+
+```text
+frames processed
+source underruns
+source overruns
+sink underruns
+sink overruns
+dropped frames
+discontinuities
+restarts
+buffer depth
+sample rate
+channel count
+resampler ratio
+clock drift
+last HRESULT / fault category
+router processing time
+effect processing time
+process PID
+stable app identity
+endpoint ID
+```
+
+Do not pass formatted diagnostic strings through real-time paths.
+
+Use enums/codes/atomics and format on the control/UI side.
+
+---
+
+# 36. Error model
+
+Avoid generic string-only errors for audio lifecycle.
+
+Prefer typed errors.
+
+Example:
+
+```rust
+enum ProcessCaptureError {
     Unsupported,
+    ActivationFailed(HRESULT),
+    ProcessGone,
+    AudioServiceUnavailable,
+    ClientInitializeFailed(HRESULT),
+    CaptureClientFailed(HRESULT),
 }
 ```
 
-Possible API:
+And route faults such as:
 
 ```rust
-fn connection_support(
-    &self,
-    output: PortId,
-    input: PortId,
-) -> ConnectionSupport;
-```
-
-Expected Windows behavior:
-
-```text
-Microphone endpoint → Recorder
-    Route / Capture
-
-Speaker monitor → Recorder
-    Route / Capture
-
-QPWGraph-owned routed source → Recorder
-    Route
-
-Application session → Recorder
-    CaptureOnly
-
-Application session → normal playback endpoint
-    Unsupported unless existing virtualization/routing path supports it
-
-Application session → effect
-    Unsupported unless qpwgraph owns/isolate the route
-```
-
-Do not simply change:
-
-```rust
-node_supports_routing()
-```
-
-to return `true` for Windows application sessions.
-
-That would incorrectly expose unsupported application rerouting.
-
----
-
-# 5. Recorder Backend API
-
-Add a separate recorder contract instead of overloading unrelated graph APIs.
-
-Suggested types:
-
-```rust
-pub type RecorderId = u64;
-
-pub enum RecorderState {
-    Idle,
-    Recording,
-    Unsaved,
-    Error,
-}
-
-pub struct RecorderStatus {
-    pub id: RecorderId,
-    pub state: RecorderState,
-    pub elapsed_frames: u64,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub temporary_path: Option<PathBuf>,
-    pub final_path: Option<PathBuf>,
-    pub dropped_frames: u64,
-    pub error: Option<String>,
+enum RouteFault {
+    None,
+    SourceStarved,
+    SourceInvalidated,
+    SinkInvalidated,
+    ProcessExited,
+    Unsupported,
+    FormatNegotiationFailed,
+    DriverUnavailable,
 }
 ```
 
-Suggested trait:
-
-```rust
-pub trait RecorderDriver {
-    fn supports_recorders(&self) -> bool;
-
-    fn create_recorder(
-        &mut self,
-        request: RecorderCreateRequest,
-    ) -> BackendResult<RecorderInstance>;
-
-    fn remove_recorder(
-        &mut self,
-        id: RecorderId,
-    ) -> BackendResult<()>;
-
-    fn start_recording(
-        &mut self,
-        id: RecorderId,
-    ) -> BackendResult<()>;
-
-    fn stop_recording(
-        &mut self,
-        id: RecorderId,
-    ) -> BackendResult<RecorderResult>;
-
-    fn recorder_status(
-        &self,
-        id: RecorderId,
-    ) -> BackendResult<RecorderStatus>;
-}
-```
-
-Keep recording lifecycle separate from topology lifecycle.
+Reuse existing error types where possible instead of duplicating them.
 
 ---
 
-# 6. Realtime Architecture
+# 37. Do not silently fall back to system-loopback
 
-Never perform filesystem writes directly from:
-
-* PipeWire callbacks
-* WASAPI callbacks
-* `RouterCore::process`
-* any realtime audio callback
-
-Use a bounded ring.
-
-Architecture:
+If the user selects:
 
 ```text
-Audio source
-    │
-    ▼
-Router / PipeWire callback
-    │
-    ▼
-RingSink / bounded queue
-    │
-    ▼
-Recorder writer thread
-    │
-    ▼
-temporary .wav.part file
+Spotify
 ```
 
-The realtime side should only:
+but process capture fails, do not silently capture:
 
 ```text
-copy PCM into bounded memory
-update atomic diagnostics
-return immediately
+all system audio
 ```
 
-The writer thread should:
+That would violate routing intent.
+
+Instead:
 
 ```text
-pull PCM
-encode/write WAV
-flush/finalize outside realtime path
-handle filesystem errors
+show process capture unavailable
+
+offer/use Virtual Output isolation
+
+or require explicit user fallback selection
+```
+
+Fail closed.
+
+---
+
+# 38. Privacy semantics
+
+Application capture must always correspond to an explicit graph/user selection.
+
+Do not automatically capture all process audio simply because the API allows it.
+
+Routing state must clearly identify what process/application is being captured.
+
+---
+
+# 39. Patchbay persistence
+
+Persist logical intent using stable identities.
+
+Do not persist transient values such as:
+
+```text
+PID
+MMDevice numeric enumeration index
+WinMM transient index
+```
+
+Persist:
+
+```text
+stable endpoint ID
+provider role
+stable app identity
+effect instance identity
+logical route
+```
+
+On restore:
+
+```text
+resolve currently available devices/apps
+restore what can be restored
+leave unavailable intent visible/degraded where appropriate
+never attach to a different app merely because an identifier was reused
 ```
 
 ---
 
-# 7. Reuse Existing Router Ring Infrastructure
+# 40. Startup behavior
 
-The existing router already has:
-
-```rust
-RingSink
-RingSinkDrain
-ring_sink(...)
-```
-
-Use it.
-
-Recommended flow:
-
-```rust
-let (sink, drain) = ring_sink(format, capacity_frames);
-```
-
-Then:
+Recommended initialization sequence:
 
 ```text
-Router owns:
-    RingSink
+initialize backend
 
-Recorder writer owns:
-    RingSinkDrain
+enumerate physical endpoints
+
+enumerate virtual endpoint roles
+
+enumerate application sessions
+
+resolve stable identities
+
+probe process-loopback capability
+
+initialize router thread
+
+restore owned routes
+
+restore patchbay intent
+
+start required source/sink workers
+
+publish graph snapshot
 ```
 
-Avoid introducing another unbounded channel.
+Driver absence must not prevent the rest of qpwgraph from starting.
 
-Recommended capacity:
-
-```text
-100–500 ms
-```
-
-Initially choose something conservative, for example:
-
-```text
-250 ms
-```
-
-The queue must remain bounded.
-
-If the writer cannot keep up:
-
-```text
-increment dropped_frames
-surface recorder warning
-never allow memory growth without bound
-```
+Without the driver, features requiring third-party-visible virtual endpoints should simply be unavailable.
 
 ---
 
-# 8. Windows Device Recording
+# 41. Shutdown behavior
 
-For physical capture devices:
+Shutdown order must be deterministic.
 
-```text
-WASAPI capture
-    ↓
-existing router source
-    ↓
-Recorder sink
-```
-
-For playback-device recording:
+Preferred conceptual order:
 
 ```text
-WASAPI render loopback
-    ↓
-existing router source
-    ↓
-Recorder sink
+stop accepting new graph mutations
+
+remove router routes
+
+stop process capture workers
+
+stop WASAPI workers
+
+stop virtual endpoint workers
+
+restore application route leases owned by qpwgraph
+
+drop router resources
+
+unregister callbacks
+
+release COM resources
+
+exit
 ```
 
-No Windows kernel driver should be required for these cases.
-
-The optional virtual-audio driver is unrelated to writing qpwgraph-owned PCM to a local file.
+Do not allow worker threads to outlive state they reference.
 
 ---
 
-# 9. Windows Per-Application Recording
+# 42. Testing strategy
 
-Use the existing process-loopback infrastructure.
+Implement tests in layers.
 
-Do not create an entirely independent process-loopback implementation.
+## Router tests
 
-Current relevant code:
-
-```text
-crates/pw-graph-backend/src/windows/process_loopback.rs
-crates/pw-graph-backend/src/windows/process_capture.rs
-```
-
-Extend:
-
-```rust
-ProcessCaptureConsumer
-```
-
-with:
-
-```rust
-Recorder(RecorderId)
-```
-
-Example:
-
-```rust
-pub enum ProcessCaptureConsumer {
-    Meter(NodeId),
-    Relay,
-    OwnedRoute,
-    Recorder(RecorderId),
-    Diagnostics,
-}
-```
-
-Long term, one process-loopback stream should be able to fan out to:
-
-```text
-Meter
-Relay
-Recorder
-Diagnostics
-```
-
-without opening duplicate Windows process-loopback activations.
-
-Important:
-
-Windows process-loopback may reject or behave poorly with duplicate simultaneous activations for the same process.
-
-Prefer shared capture ownership.
-
----
-
-# 10. Windows Version Limitation
-
-Per-application process-loopback should be runtime capability-gated.
-
-Do not report it as universally supported.
-
-Behavior:
-
-```text
-Windows version supports process loopback:
-    Application → Recorder available
-
-Windows version does not support process loopback:
-    Application → Recorder disabled
-```
-
-Provide a useful explanation:
-
-```text
-Recording an individual application is unavailable on this version of Windows.
-You can still record an input device or playback-device monitor.
-```
-
-Do not silently fall back to recording the entire system mix.
-
-Recording a different source than the one selected is unacceptable.
-
----
-
-# 11. Linux / PipeWire Recorder
-
-Implement Recorder as a normal PipeWire capture destination/node.
-
-Preferred behavior:
-
-```text
-Source node
-    ↓
-PipeWire link
-    ↓
-Recorder capture stream
-    ↓
-bounded queue
-    ↓
-writer thread
-```
-
-The recorder's graph representation should make the connection visible like other graph links.
-
-Where possible, keep recorder semantics consistent between Linux and Windows.
-
----
-
-# 12. Recording File Lifecycle
-
-Do not wait until recording ends before writing audio.
-
-Do not buffer an entire recording in RAM.
-
-When recording begins:
-
-```text
-create temporary file
-write audio continuously
-```
-
-Suggested path:
-
-```text
-<app-data>/recordings/pending/
-    recording-<uuid>.wav.part
-```
-
-Example:
-
-```text
-recording-c6c8c056.wav.part
-```
-
-When Stop is pressed:
-
-```text
-stop accepting PCM
-drain remaining queued PCM
-finalize WAV header
-close writer
-mark recording Unsaved
-open Save dialog
-```
-
-After successful save:
-
-```text
-move/copy temporary file to selected path
-mark Saved
-delete temporary file if copied
-```
-
----
-
-# 13. Never Lose Recording on Save Dialog Cancel
-
-If the user presses Cancel in the save dialog:
-
-Do not delete the recording.
-
-State becomes:
-
-```text
-Unsaved
-```
-
-Show:
-
-```text
-Recording finished — not saved
-
-[ Save… ]
-[ Discard ]
-```
-
-The recording should remain in the application's pending/recovery directory.
-
-Only delete it after explicit:
-
-```text
-Discard
-```
-
-or after a successful final save.
-
----
-
-# 14. Crash Recovery
-
-At application startup inspect:
-
-```text
-recordings/pending/
-```
-
-for recoverable files.
-
-If valid unfinished/finalized recordings exist, show:
-
-```text
-Recovered recordings
-
-Recording from 2026-09-11 20:14
-03:42
-18.4 MB
-
-[ Save… ]
-[ Discard ]
-```
-
-Prefer making `.part` files independently recoverable.
-
-For WAV this means either:
-
-1. periodically maintaining a valid WAV header, or
-2. repairing the header using file length during recovery.
-
-Avoid creating recordings that become completely useless after an application crash.
-
----
-
-# 15. Initial File Format
-
-Implement first:
-
-```text
-WAV
-32-bit IEEE float
-interleaved PCM
-```
-
-Reason:
-
-The router already uses:
-
-```rust
-f32
-```
-
-audio.
-
-This avoids an additional sample conversion on the writer path.
-
-Suggested dependency:
-
-```toml
-hound = "..."
-```
-
-or a very small internal WAV writer if dependency minimization is preferred.
-
-The writer must finalize:
-
-```text
-RIFF length
-data chunk length
-```
-
-after recording stops.
-
----
-
-# 16. Future Formats
-
-Do not implement these in the first pass unless trivial:
-
-```text
-WAV 24-bit PCM
-FLAC
-Opus
-AAC
-MP3
-```
-
-Recommended future priority:
-
-```text
-1. WAV float32
-2. FLAC
-3. WAV PCM24
-```
-
-Lossy formats can come later.
-
----
-
-# 17. Large WAV Files
-
-Classic RIFF WAV has practical size limitations around 4 GiB.
-
-The first implementation can detect approaching the limit.
-
-Possible behavior:
-
-```text
-if predicted file size approaches WAV limit:
-    stop recording with clear warning
-```
-
-Future implementation:
-
-```text
-RF64
-```
-
-or:
-
-```text
-automatic file splitting
-```
-
-Example:
-
-```text
-Recording 001.wav
-Recording 002.wav
-```
-
-Do not silently overflow WAV chunk sizes.
-
----
-
-# 18. Default Save UX
-
-Default behavior:
-
-```text
-Ask where to save after recording
-```
-
-Flow:
-
-```text
-Record
-↓
-temporary recording is written
-↓
-Stop
-↓
-native Save dialog
-↓
-user chooses destination
-```
-
-Use the existing:
-
-```rust
-rfd::FileDialog
-```
-
-pattern already used by patchbay files.
-
-Example:
-
-```rust
-FileDialog::new()
-    .set_directory(last_recording_dir)
-    .set_file_name(default_name)
-    .add_filter("WAV audio", &["wav"])
-    .save_file();
-```
-
----
-
-# 19. Remember Last Recording Folder
-
-Add configuration:
-
-```rust
-pub recording_dir: Option<PathBuf>,
-```
-
-After a successful save:
-
-```rust
-config.recording_dir = final_path.parent().map(PathBuf::from);
-```
-
-The next Save dialog opens there.
-
-This should be enabled by default.
-
-There is no need for a special checkbox inside the native file picker.
-
----
-
-# 20. Optional Auto-Save Mode
-
-Add:
-
-```rust
-pub enum RecordingSaveMode {
-    AskOnStop,
-    AutoSave,
-}
-```
-
-Config representation may simply use a string:
-
-```toml
-recording_save_mode = "ask"
-```
-
-or:
-
-```toml
-recording_save_mode = "auto"
-```
-
-For automatic mode require:
-
-```rust
-recording_dir: Some(...)
-```
-
-Behavior:
-
-```text
-Record
-↓
-Stop
-↓
-Recording automatically finalized to configured folder
-```
-
-If the folder is unavailable:
-
-```text
-fall back to Unsaved
-keep temporary file
-display error
-```
-
-Do not discard the recording.
-
----
-
-# 21. Filename Generation
-
-Default template:
-
-```text
-Recording YYYY-MM-DD HH-MM-SS.wav
-```
-
-Example:
-
-```text
-Recording 2026-09-11 20-18-42.wav
-```
-
-Avoid characters invalid on Windows.
-
-Do not use:
-
-```text
-:
-*
-?
-"
-<
->
-|
-```
-
-If the file already exists:
-
-```text
-Recording 2026-09-11 20-18-42 (2).wav
-```
-
-Never overwrite an existing recording silently.
-
----
-
-# 22. Suggested Configuration Fields
-
-Add to `AppConfig`:
-
-```rust
-pub recording_dir: Option<PathBuf>,
-
-pub recording_save_mode: String,
-
-pub recording_filename_template: String,
-
-pub recording_format: String,
-```
-
-Defaults:
-
-```rust
-recording_dir = None
-
-recording_save_mode = "ask"
-
-recording_filename_template = "Recording {date} {time}"
-
-recording_format = "wav-f32"
-```
-
-Do not persist active recordings as if they were normal configuration.
-
-Runtime recording sessions belong to application/backend state.
-
----
-
-# 23. UI Controls
-
-Recorder node:
-
-```text
-Recorder
-
-Input: Stereo
-00:03:21
-
-● Recording
-
-[ Stop ]
-```
-
-Idle:
-
-```text
-Recorder
-
-Input: Stereo
-
-[ Record ]
-```
-
-Unsaved:
-
-```text
-Recorder
-
-03:21 recorded
-Not saved
-
-[ Save… ]
-[ Discard ]
-```
-
-Possible status indicators:
-
-```text
-● red      Recording
-● orange   Unsaved
-● green    Saved
-⚠          Dropped audio / Error
-```
-
----
-
-# 24. Recorder Preferences
-
-Add a Recorder section to Preferences.
-
-Suggested controls:
-
-```text
-Recording format
-    WAV 32-bit float
-
-After recording
-    ○ Ask where to save
-    ○ Automatically save
-
-Recording folder
-    C:\Users\...\Music\Recordings
-    [ Choose… ]
-
-Remember last folder
-    enabled implicitly for Ask mode
-```
-
-Avoid too many options in the initial implementation.
-
----
-
-# 25. Stop Semantics
-
-`Stop` should be asynchronous from the UI perspective.
-
-Do not block the UI while:
-
-```text
-draining queue
-finalizing WAV
-flushing file
-```
-
-Possible state:
-
-```text
-Stopping…
-```
-
-Writer thread reports completion back to control thread.
-
-Then show Save dialog.
-
----
-
-# 26. Application Exit While Recording
-
-If application shutdown is requested during recording:
-
-Preferred behavior:
-
-```text
-Recording is in progress.
-
-[ Stop and Quit ]
-[ Cancel ]
-```
-
-If implementing confirmation is difficult initially:
-
-At minimum:
-
-```text
-stop recording
-finalize temporary file
-leave it recoverable
-then exit
-```
-
-Never intentionally truncate/delete the recording during normal application shutdown.
-
----
-
-# 27. Recorder Diagnostics
-
-Expose:
-
-```rust
-frames_written
-dropped_frames
-queue_depth
-queue_capacity
-sample_rate
-channels
-writer_state
-file_bytes
-last_error
-```
-
-Example diagnostic:
-
-```text
-Recorder 1
-State: Recording
-Format: 48000 Hz / 2 ch / float32
-Frames written: 18,432,000
-Dropped frames: 0
-Queue: 1920 / 12000 frames
-File: .../recording-uuid.wav.part
-Writer: Active
-```
-
-This should not require touching the realtime thread.
-
-Use atomics / control-thread snapshots consistent with existing router diagnostics.
-
----
-
-# 28. Error Handling
-
-Handle explicitly:
-
-```text
-disk full
-permission denied
-folder removed
-file handle lost
-writer thread failure
-queue overrun
-source disappears
-process exits
-unsupported Windows process capture
-```
-
-If disk writing fails during recording:
-
-```text
-stop accepting new audio
-mark recorder Error
-preserve file already written
-show exact error
-```
-
-Do not continue displaying:
-
-```text
-Recording
-```
-
-when nothing is being written.
-
----
-
-# 29. Source Disappearance
-
-If the source disappears during recording:
-
-For a single-source recording:
-
-```text
-insert silence or stop depending on existing router semantics
-```
-
-Preferred behavior:
-
-```text
-keep timeline continuous
-count discontinuity
-show warning
-```
-
-For multi-source recording:
-
-```text
-remaining sources continue
-missing source contributes silence
-```
-
-Reuse router behavior where possible.
-
----
-
-# 30. Testing Strategy
-
-## Platform-neutral tests
-
-Add tests with:
-
-```rust
-BufferSource
-RingSink
-RecorderWriter
-```
+No Windows audio hardware required.
 
 Test:
 
 ```text
-known f32 samples → WAV → decode → samples match
+mixing two sources
+fan-out
+gain
+mute
+channel mapping
+resampling
+effects
+branch effects
+metering
+RMS
+peak
+source starvation
+sink backpressure
+NaN/Inf sanitization
+transactional route updates
+device loss simulation
+clock drift behavior
 ```
-
-Test stereo ordering.
-
-Test duration.
-
-Test mixed sources.
-
-Test sample-rate conversion path.
-
-Test queue overflow.
-
-Test writer error.
 
 ---
 
-# 31. WAV Tests
+# 43. Process-capture tests
 
-Generate:
+Where possible, separate:
 
 ```text
-1 kHz tone
-48 kHz
-2 channels
-1 second
+activation parameter construction
+lifecycle state machine
+stable selector resolution
+buffer handoff
+worker shutdown
+fault propagation
 ```
+
+from actual live Windows audio activation.
+
+These parts should be unit-testable.
+
+Live tests must be opt-in where needed.
+
+---
+
+# 44. Virtual driver tests
+
+Preserve and extend existing smoke tests.
+
+Test:
+
+```text
+all four endpoint roles exist
+
+app-render -> app-monitor round trip
+
+relay-render -> relay-capture round trip
+
+the two cables are isolated from each other
+
+silence behavior
+
+non-silent PCM integrity
+
+format setup
+
+client disconnect
+
+client reconnect
+
+audio service restart
+
+endpoint disable/enable
+
+device uninstall
+
+device reinstall
+
+sleep/resume
+
+client crash
+
+driver stress
+```
+
+---
+
+# 45. End-to-end acceptance test: Discord-style mix
+
+Create a reproducible test scenario equivalent to:
+
+```text
+source A:
+    generated stereo sine or test process audio
+
+source B:
+    generated microphone-like mono signal
+
+route:
+    A + B -> Relay Sink
+
+capture:
+    Relay Microphone
+
+verify:
+    both signals exist in captured stream
+    expected gain relationship
+    no unrelated system audio
+    no stale frames
+```
+
+This test should not require Discord itself.
+
+Discord is only a real-world compatibility client.
+
+---
+
+# 46. End-to-end application capture acceptance test
+
+Create an application/process that renders a known test signal.
+
+Then verify:
+
+```text
+target process
+    │
+    ▼
+ProcessLoopbackSource
+    │
+    ▼
+RouterCore
+    │
+    ▼
+test sink
+```
+
+Requirements:
+
+```text
+known tone is captured
+
+unrelated process tone is not captured
+
+process exit is detected
+
+restart can resolve the application again through stable identity
+```
+
+---
+
+# 47. Isolation acceptance test
 
 Verify:
 
 ```text
-sample_rate == 48000
-channels == 2
-frames == 48000
-duration == 1 second
-peak approximately expected amplitude
+test application
+    │
+    ▼
+QPWGraph Virtual Output
+    │
+    ▼
+QPWGraph Virtual Monitor
+    │
+    ▼
+RouterCore
+    │
+    ▼
+physical/test sink
 ```
 
-Verify header finalization.
-
-Verify `.part` recovery.
+Confirm there is no duplicate dry path produced by qpwgraph.
 
 ---
 
-# 32. Windows Tests
+# 48. No-driver mode
 
-Where available test:
-
-```text
-microphone → recorder
-render loopback → recorder
-process loopback → recorder
-```
-
-Tests requiring actual devices should remain opt-in.
-
-Example environment variable:
-
-```text
-PW_GRAPH_TEST_RECORDER=1
-```
-
-Headless CI should skip native audio-device tests safely.
-
----
-
-# 33. Linux Tests
-
-Where PipeWire is available:
-
-```text
-test tone / source
-    ↓
-Recorder
-```
-
-Validate output.
-
-Keep live-session tests opt-in if they alter the user's graph.
-
----
-
-# 34. Process Capture Tests
-
-Test that the same process capture can logically have multiple consumers:
-
-```text
-Meter
-Recorder
-```
+Explicitly test qpwgraph without the custom virtual driver installed.
 
 Expected:
 
 ```text
-one underlying capture identity
-two consumers
+physical endpoint routing works
+
+process-loopback capture works when supported
+
+relay/network features that do not require virtual microphone remain usable
+
+virtual endpoint features show unavailable state
+
+application does not crash
+
+graph does not expose fake endpoints
 ```
-
-Also test:
-
-```text
-remove Recorder
-```
-
-while Meter remains.
-
-The capture must stay active until its last consumer is removed.
 
 ---
 
-# 35. Implementation Order
+# 49. CI requirements
 
-## Phase 1 — File writer
-
-Implement platform-neutral:
+Do not require:
 
 ```text
-RecorderWriter
-WAV float32
-temporary file
-finalization
-status/diagnostics
+physical audio hardware
+installed virtual driver
+interactive desktop
+Discord
 ```
 
-No UI yet.
+for ordinary CI.
+
+Separate:
+
+```text
+unit tests
+compile tests
+live Windows audio smoke tests
+driver validation
+HLK/Verifier/release gates
+```
+
+Live hardware/driver tests should remain explicit opt-in acceptance tests.
 
 ---
 
-## Phase 2 — Router recorder sink
+# 50. Driver release gates
+
+Do not treat:
+
+```text
+cargo build succeeded
+```
+
+as proof that the driver is production-ready.
+
+Preserve/enforce appropriate driver validation including the existing workflow around:
+
+```text
+test signing
+install/uninstall
+smoke tests
+Driver Verifier
+lifecycle validation
+HLK
+Microsoft signing
+Secure Boot
+upgrade behavior
+client crash behavior
+audio service restart
+```
+
+Development packages must fail closed when required validation state is absent.
+
+---
+
+# 51. Implementation phases
+
+Implement incrementally.
+
+## Phase 0 — baseline
+
+Before changing code:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Record existing failures separately.
+
+Do not blame pre-existing failures on new work.
+
+---
+
+## Phase 1 — audit existing Windows audio code
+
+Inspect:
+
+```text
+process_loopback.rs
+process_capture.rs
+routing.rs
+router/wasapi.rs
+virtual_device.rs
+driver_relay.rs
+driver_application_routes.rs
+app_route_policy.rs
+app_route_reconciler.rs
+```
+
+Document internally what already works before replacing anything.
+
+Delete no working code merely because a new abstraction looks cleaner.
+
+---
+
+## Phase 2 — complete ProcessLoopbackSource
+
+Ensure single-application PCM capture works end-to-end.
+
+Definition of done:
+
+```text
+live PID can be captured
+process tree mode works
+bounded PCM reaches RouterCore
+process exit is detected
+clean cancellation works
+unsupported systems fail cleanly
+diagnostics work
+tests exist
+```
+
+---
+
+## Phase 3 — physical mic + process audio mixing
 
 Implement:
 
 ```text
-RingSink
-writer drain thread
-router sink registration
+Physical mic ─┐
+              ├──> RouterCore
+Process app ──┘
 ```
 
-Test entirely with in-memory sources.
-
----
-
-## Phase 3 — Recorder backend API
-
-Add:
+Definition of done:
 
 ```text
-RecorderDriver
-RecorderInstance
-RecorderState
-RecorderStatus
-```
-
-Implement in demo/in-memory backend first where useful.
-
----
-
-## Phase 4 — Windows device recording
-
-Support:
-
-```text
-capture endpoint → Recorder
-playback monitor → Recorder
-existing qpwgraph-owned route → Recorder
+both streams audible in test sink
+independent gain
+independent mute
+metering works
+sample-rate mismatch works
+mono/stereo mapping works
 ```
 
 ---
 
-## Phase 5 — Windows application recording
+## Phase 4 — Relay Sink output
 
-Extend:
-
-```text
-ProcessCaptureManager
-ProcessCaptureConsumer
-```
-
-with Recorder consumers.
-
-Implement:
+Route RouterCore into:
 
 ```text
-Application → Recorder
+QPWGraph Relay Sink
 ```
 
-as `CaptureOnly`.
+Definition of done:
 
-Do not enable general application rewiring.
+```text
+WASAPI can open relay-render
+router continuously writes PCM
+device loss propagates correctly
+```
+
+If custom driver is not available on the development machine, first validate this layer against a generic WASAPI render endpoint.
 
 ---
 
-## Phase 6 — PipeWire recording
+## Phase 5 — Relay Microphone cable
 
-Implement PipeWire recorder stream/node and connect it to the same writer infrastructure.
-
----
-
-## Phase 7 — Graph/UI
-
-Add:
+Finish/validate:
 
 ```text
-NodeType::Recorder
-Create Recorder
-Record
-Stop
-elapsed time
-Save
-Discard
+Relay Sink
+    │
+    ▼
+Relay Microphone
+```
+
+Definition of done:
+
+```text
+standard Windows capture clients can open Relay Microphone
+PCM written to Relay Sink is captured correctly
+no unbounded latency
+two independent client lifecycles work
 ```
 
 ---
 
-## Phase 8 — Save dialog and config
+## Phase 6 — Virtual Output isolation cable
 
-Add:
+Finish/validate:
 
 ```text
-recording_dir
-recording_save_mode
-recording_format
-filename template
+Virtual Output
+    │
+    ▼
+Virtual Monitor
 ```
 
-Reuse `rfd::FileDialog`.
-
----
-
-## Phase 9 — Recovery
-
-Add:
+Definition of done:
 
 ```text
-pending recording directory
-startup recovery detection
-Save / Discard UI
+standard Windows render clients can select Virtual Output
+qpwgraph can capture corresponding PCM from Virtual Monitor
+app and relay cables remain independent
 ```
 
 ---
 
-# 36. Files Likely to Change
+## Phase 7 — graph integration
 
-Expected areas:
+Expose appropriate Windows graph nodes and ports.
+
+Definition of done:
 
 ```text
-crates/pw-graph-core/src/lib.rs
+process source appears
+virtual monitor appears
+relay sink appears
+physical mic appears
+physical outputs appear
 
-crates/pw-graph-backend/src/api.rs
-crates/pw-graph-backend/src/lib.rs
+valid links are draggable
+invalid Windows-native rewires are not falsely advertised
+```
 
-crates/pw-graph-backend/src/router/
-    endpoints.rs
-    engine.rs
-    mod.rs
-    tests.rs
-    recorder.rs          # suggested new module
+---
 
-crates/pw-graph-backend/src/windows/
-    process_capture.rs
-    process_loopback.rs
-    routing-related files
-    recorder.rs          # optional platform adapter
+## Phase 8 — patchbay persistence
 
-crates/pw-graph-backend/src/pipewire/
-    recorder.rs
+Persist and restore Windows-owned routes using stable identities.
 
-crates/pw-graph-config/src/lib.rs
+Definition of done:
 
-crates/pw-graph-slint/src/source.rs
+```text
+restart qpwgraph
+owned routes restore
+missing endpoints do not bind incorrectly
+missing apps remain unresolved instead of attaching to another process
+```
 
-crates/pw-graph-slint/src/bridge/
-    callbacks.rs
-    actions.rs
-    config.rs
-    recorder.rs          # suggested
+---
 
-Slint UI files
-i18n strings
+## Phase 9 — optional automatic application routing
+
+Only after the manual isolation path works.
+
+Definition of done:
+
+```text
+explicit opt-in
+supported configuration detected
+assignment verified after request
+failure becomes ManualOnly
+owned changes restored safely
+never required for core routing
+```
+
+---
+
+## Phase 10 — resilience
+
+Validate:
+
+```text
+device removal
+audio service restart
+app exit
+app restart
+default-device switch
+virtual driver restart
+sleep/resume
+```
+
+No deadlocks.
+
+No stale audio loops.
+
+No orphan worker threads.
+
+---
+
+# 52. Expected final functional scenarios
+
+All of the following should work.
+
+## Scenario A
+
+```text
+Microphone -> Discord
+```
+
+through:
+
+```text
+Mic -> RouterCore -> Relay Sink -> Relay Microphone -> Discord
+```
+
+---
+
+## Scenario B
+
+```text
+Spotify + Microphone -> Discord
+```
+
+through:
+
+```text
+Spotify ProcessLoopback ─┐
+                         ├──> RouterCore
+Physical Mic ────────────┘
+                              │
+                              ▼
+                         Relay Sink
+                              │
+                              ▼
+                       Relay Microphone
+                              │
+                              ▼
+                           Discord
+```
+
+---
+
+## Scenario C
+
+Spotify remains audible locally while being sent to Discord:
+
+```text
+Spotify normal playback ─────────────> headphones
+      │
+      └── process loopback copy
+                    │
+                    ▼
+               RouterCore
+                    │
+                    ▼
+                 Discord
+```
+
+---
+
+## Scenario D
+
+Application effects replacing original output:
+
+```text
+Spotify
+    │
+    ▼
+Virtual Output
+    │
+    ▼
+Virtual Monitor
+    │
+    ▼
+EQ / effects
+    │
+    ▼
+headphones
+```
+
+---
+
+## Scenario E
+
+Application effects plus Discord:
+
+```text
+Spotify
+    │
+    ▼
+Virtual Output
+    │
+    ▼
+Virtual Monitor
+    │
+    ├──> EQ -> headphones
+    │
+    └──> gain -> Relay mix -> Discord
+```
+
+---
+
+## Scenario F
+
+Multiple applications:
+
+```text
+Spotify ─┐
+Firefox ─┼──> Discord
+Game ────┤
+Mic ─────┘
+```
+
+Each with independent routing/gain.
+
+---
+
+# 53. Code-quality requirements
+
+Do not produce placeholder implementations such as:
+
+```rust
+todo!()
+unimplemented!()
+panic!("not implemented")
+```
+
+for runtime code that is part of a completed phase.
+
+Do not hide errors using:
+
+```rust
+let _ = dangerous_operation();
+```
+
+unless intentionally ignoring an error is justified and documented.
+
+Avoid unnecessary `unsafe`.
+
+Every `unsafe` block should have a clear invariant.
+
+For COM/Win32 FFI:
+
+```text
+validate pointer lifetime
+validate structure size
+validate buffer ownership
+validate async callback ownership
+validate thread/apartment ownership
+```
+
+---
+
+# 54. Do not rewrite the whole backend
+
+Prefer focused changes.
+
+Do not replace the current router.
+
+Do not replace the graph model.
+
+Do not replace the effects system.
+
+Do not replace working Windows Core Audio enumeration.
+
+Do not replace the driver workspace unless a concrete defect requires it.
+
+This task is primarily about completing/integrating the architecture already present.
+
+---
+
+# 55. Documentation changes
+
+Update relevant documentation after implementation.
+
+At minimum review:
+
+```text
 docs/platform-parity.md
+docs/audio-router.md
 docs/features.md
+docs/building.md
+docs/configuration.md
+drivers/windows-audio/package/README.md
 ```
 
-Do not force all recorder implementation into `source.rs` or UI bridge files.
+Documentation must distinguish:
 
-Keep audio/file lifecycle in backend/domain code.
+```text
+works without driver
+works with driver
+process-loopback capability
+manual application isolation
+automatic experimental isolation
+driver release validation state
+```
+
+Do not claim a feature has been live validated unless corresponding evidence exists.
 
 ---
 
-# 37. Architectural Rules
+# 56. Required final agent report
 
-The implementation must preserve these rules.
+When implementation is complete, report:
 
-## Rule 1
+```text
+1. Architecture implemented
 
-No filesystem I/O on realtime audio threads.
+2. Files changed
 
-## Rule 2
+3. Existing code reused
 
-No unbounded audio queues.
+4. New abstractions introduced
 
-## Rule 3
+5. Process-loopback status
 
-Never silently discard a completed recording.
+6. Virtual Output/Monitor status
 
-## Rule 4
+7. Relay Sink/Microphone status
 
-Never silently record a different source if the requested source is unavailable.
+8. App routing-policy status
 
-## Rule 5
+9. Windows versions/capabilities tested
 
-Windows application recording is capture, not arbitrary application rerouting.
+10. Tests added
 
-## Rule 6
+11. Tests executed
 
-Do not require the optional Windows virtual-audio driver merely to record qpwgraph-owned PCM.
+12. Driver validation executed
 
-## Rule 7
+13. Remaining live-validation requirements
 
-Recorder errors must be visible.
+14. Known limitations
+```
 
-## Rule 8
+Do not merely say:
 
-Canceling Save must preserve the recording.
+```text
+"implemented successfully"
+```
 
-## Rule 9
-
-Source identity must remain stable enough that Windows PID reuse cannot record an unrelated application.
-
-Reuse the existing stable process selector/generation logic.
-
-## Rule 10
-
-Tests should cover the platform-neutral recorder without requiring real audio devices.
+Provide evidence.
 
 ---
 
-# 38. Definition of Done
+# 57. Validation commands
 
-The first recorder release is complete when all of the following work:
+At repository root run:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Also run relevant Windows-specific tests.
+
+For the nested driver workspace, use the repository's documented driver commands and validation workflow.
+
+Do not claim kernel-driver validation from ordinary Cargo tests alone.
+
+---
+
+# 58. Critical invariants
+
+These are mandatory.
 
 ```text
-Linux:
-    microphone/source → Recorder → WAV
+1. RouterCore owns application-level routing.
 
-Windows:
-    microphone → Recorder → WAV
+2. DSP stays in user mode.
 
-Windows:
-    playback device monitor → Recorder → WAV
+3. Kernel driver remains minimal.
 
-Supported Windows versions:
-    application → Recorder → WAV
+4. All PCM queues are bounded.
 
-Both platforms:
-    multiple compatible sources → Recorder
-    resulting file contains mixed audio
+5. Audio threads do not block.
 
-UI:
-    create recorder
-    connect source
-    start
-    elapsed time updates
-    stop
+6. No stale sample replay after starvation.
 
-After Stop:
-    native Save dialog appears
+7. Application identity is not persisted by PID.
 
-Save dialog:
-    opens in previously used directory
+8. Process-capture failure never silently becomes whole-system capture.
 
-Cancel Save:
-    recording remains recoverable
+9. Effects that replace app playback require isolation.
 
-Save:
-    final WAV exists at selected path
+10. Automatic app reassignment is optional.
 
-Crash/startup:
-    pending recording can be recovered
+11. Manual routing remains a valid fallback.
 
-Realtime:
-    no filesystem writes occur on audio callback/router thread
+12. Driver absence does not prevent qpwgraph startup.
 
-Tests:
-    deterministic WAV writer tests pass
-    router recorder tests pass
+13. Linux behavior is not regressed.
+
+14. Observed Windows session relationships are not falsely represented
+    as arbitrary mutable PipeWire links.
+
+15. User-owned Windows settings are not blindly overwritten on cleanup.
+
+16. Device loss is recoverable.
+
+17. Virtual app and relay cables remain independent.
+
+18. Third-party clients see Relay Microphone as an ordinary Windows mic.
+
+19. Real-time processing does not allocate or perform blocking control work.
+
+20. Tests prove behavior rather than merely proving compilation.
 ```
 
 ---
 
-# 39. Recommended First PR Scope
+# 59. Preferred final architecture
 
-Keep the first PR relatively narrow.
-
-Implement:
+The implementation should converge on this:
 
 ```text
-Recorder writer
-WAV float32
-RingSink integration
-Recorder backend contract
-one Recorder graph node
-device/router-source recording
-Stop → Save As
-remember last directory
-Cancel → Unsaved
+                            WINDOWS APPLICATIONS
+
+      Spotify               Firefox               Game
+         │                     │                    │
+         ├──── Process Loopback┼────────────────────┤
+         │                     │                    │
+         │                     │                    │
+         │ optional isolation  │                    │
+         ▼                     ▼                    ▼
+   Virtual Output         Virtual Output       Virtual Output
+         │
+         ▼
+   Virtual Monitor
+         │
+         │
+         ├────────────────────────────┐
+         │                            │
+         ▼                            │
+ ┌──────────────────────────────────────────────┐
+ │                   RouterCore                 │
+ │                                              │
+ │ sources                                      │
+ │   process loopback                           │
+ │   physical capture                          │
+ │   render loopback                            │
+ │   virtual monitor                            │
+ │                                              │
+ │ processing                                   │
+ │   gain                                       │
+ │   mute                                       │
+ │   channel map                                │
+ │   resampling                                 │
+ │   effects                                    │
+ │   peak/RMS                                   │
+ │   mix                                        │
+ │                                              │
+ │ routing                                      │
+ │   fan-in                                     │
+ │   fan-out                                    │
+ │   branches                                   │
+ └──────┬──────────────────────┬────────────────┘
+        │                      │
+        ▼                      ▼
+  Physical output        Relay Sink
+                               │
+                               │ virtual cable
+                               ▼
+                         Relay Microphone
+                               │
+             ┌─────────────────┼────────────────┐
+             ▼                 ▼                ▼
+          Discord             OBS             Zoom
 ```
-
-Leave for later PRs:
-
-```text
-FLAC
-RF64
-advanced filename templates
-multiple recorder instances if complexity is high
-automatic recording
-scheduled recording
-recording history
-waveform preview
-markers
-editing
-pause/resume
-```
-
-Per-application Windows recording may be included in the first PR if the existing process-capture manager can be extended cleanly without destabilizing relay/meter behavior.
-
-Otherwise make it the second PR.
 
 ---
 
-# 40. Final Design Principle
+# 60. Agent execution instruction
 
-Recorder should be treated as:
+Do not stop after producing an implementation plan.
+
+Inspect the repository and implement the changes.
+
+Work incrementally and keep the repository compiling between logical phases where practical.
+
+Before creating a new subsystem, search the repository for an existing equivalent.
+
+When existing code partially implements a requirement:
 
 ```text
-a normal graph destination
+complete it
+test it
+integrate it
+```
+
+rather than duplicating it.
+
+If live Windows driver validation cannot be performed in the current environment:
+
+```text
+implement everything that can be implemented statically/unit-tested,
+run all available checks,
+clearly mark only the live validation as unresolved,
+and do not weaken fail-closed driver behavior just to make tests pass.
+```
+
+The desired outcome is not merely a Windows visualization of audio sessions.
+
+The desired outcome is a real qpwgraph-owned Windows PCM routing system capable of:
+
+```text
+application audio
 +
-a bounded asynchronous file writer
+microphone
++
+effects
++
+mixing
++
+fan-out
++
+virtual microphone output
 ```
 
-not as:
-
-```text
-a special UI command that directly opens and captures an audio device
-```
-
-Keeping Recorder inside the graph model preserves the strongest part of `qpwgraph-rs`: users can see exactly what audio is being recorded, connect effects before the recorder, mix sources deliberately, and use the same mental model on Linux and Windows.
+with a user experience as close as reasonably possible to PipeWire while respecting Windows audio architecture.

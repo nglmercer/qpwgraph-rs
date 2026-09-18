@@ -880,13 +880,16 @@ impl WindowsRouting {
 
         let mut specs = Vec::with_capacity(self.sources.len());
         let mut link_routes: BTreeMap<LinkId, BTreeSet<RouteId>> = BTreeMap::new();
+        let graph = WalkGraph {
+            forward: &forward,
+            sinks: &self.sinks,
+            effects: &self.effects,
+        };
         for (output, (source, _)) in &self.sources {
             let mut chains: BTreeMap<Vec<ProcessorId>, Vec<DestinationSpec>> = BTreeMap::new();
             let route = RouteId(output.0);
             walk(
-                &forward,
-                &self.sinks,
-                &self.effects,
+                &graph,
                 *output,
                 route,
                 &mut Vec::new(),
@@ -1133,22 +1136,26 @@ fn aggregate_route_metrics(
 /// with links of its own. `chain` is the effects passed through to get here,
 /// and it doubles as the cycle guard — an effect already in the chain would
 /// otherwise be re-entered forever.
+struct WalkGraph<'a> {
+    forward: &'a BTreeMap<PortId, Vec<(LinkId, PortId)>>,
+    sinks: &'a BTreeMap<PortId, (SinkId, Device)>,
+    effects: &'a BTreeMap<PortId, Effect>,
+}
+
 fn walk(
-    forward: &BTreeMap<PortId, Vec<(LinkId, PortId)>>,
-    sinks: &BTreeMap<PortId, (SinkId, Device)>,
-    effects: &BTreeMap<PortId, Effect>,
+    graph: &WalkGraph,
     port: PortId,
     route: RouteId,
     chain: &mut Vec<ProcessorId>,
     chains: &mut BTreeMap<Vec<ProcessorId>, Vec<DestinationSpec>>,
     link_routes: &mut BTreeMap<LinkId, BTreeSet<RouteId>>,
 ) -> bool {
-    let Some(next) = forward.get(&port) else {
+    let Some(next) = graph.forward.get(&port) else {
         return false;
     };
     let mut reached_sink = false;
     for &(link_id, input) in next {
-        if let Some((sink, _)) = sinks.get(&input) {
+        if let Some((sink, _)) = graph.sinks.get(&input) {
             let destinations = chains.entry(chain.clone()).or_default();
             if !destinations
                 .iter()
@@ -1160,7 +1167,7 @@ fn walk(
             reached_sink = true;
             continue;
         }
-        let Some(effect) = effects.get(&input) else {
+        let Some(effect) = graph.effects.get(&input) else {
             continue;
         };
         if chain.len() >= MAX_CHAIN || chain.contains(&effect.processor) {
@@ -1169,16 +1176,7 @@ fn walk(
             continue;
         }
         chain.push(effect.processor);
-        if walk(
-            forward,
-            sinks,
-            effects,
-            effect.output_port,
-            route,
-            chain,
-            chains,
-            link_routes,
-        ) {
+        if walk(graph, effect.output_port, route, chain, chains, link_routes) {
             link_routes.entry(link_id).or_default().insert(route);
             reached_sink = true;
         }
@@ -1275,11 +1273,14 @@ mod tests {
         let mut chains = BTreeMap::new();
         let mut link_routes = BTreeMap::new();
         let route = RouteId(source_port.0);
+        let graph = WalkGraph {
+            forward: &forward,
+            sinks: &sinks,
+            effects: &effects,
+        };
 
         assert!(walk(
-            &forward,
-            &sinks,
-            &effects,
+            &graph,
             source_port,
             route,
             &mut Vec::new(),
