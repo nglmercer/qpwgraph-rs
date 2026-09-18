@@ -19,6 +19,20 @@ fn bound_process_meter_targets(
         .collect()
 }
 
+/// Whether a Core Audio session may be published as a graph application node.
+///
+/// qpwgraph creates audio sessions of its own while rendering routes, feeding
+/// virtual endpoints, relaying, and monitoring. Those sessions must not appear
+/// as ordinary `WindowsAudioSession` nodes, or the application shows up inside
+/// its own graph. Identity is the process id, never the executable or session
+/// display name: names can be renamed and need not match the process. PID 0 is
+/// a system session without an owning process, so it is never classified as
+/// qpwgraph itself. Only the exact current PID is hidden; child or helper
+/// processes remain independently observable.
+fn should_expose_audio_session(process_id: u32, own_process_id: u32) -> bool {
+    process_id == 0 || process_id != own_process_id
+}
+
 fn process_meter_levels(
     process_meter: Option<&ProcessMeterReading>,
     native_peak: Option<f32>,
@@ -1034,6 +1048,13 @@ impl CoreAudioWorker {
                 Err(_) => continue,
             };
             let process_id = unsafe { control2.GetProcessId() }.unwrap_or(0);
+            // Filter at the enumeration boundary, before identity resolution,
+            // node/port/link creation, meter registration, and SessionRecord
+            // insertion, so the self session cannot reach any downstream
+            // application-source or candidate collection.
+            if !should_expose_audio_session(process_id, std::process::id()) {
+                continue;
+            }
             let process_identity = (process_id != 0)
                 .then(|| ProcessIdentity::from_pid(process_id).ok())
                 .flatten();
@@ -1408,5 +1429,48 @@ mod tests {
             process_meter_levels(Some(&process_meter), Some(0.9)),
             Some((0.25, 0.5, 17))
         );
+    }
+
+    #[test]
+    fn own_process_session_is_hidden_from_the_graph() {
+        let own = std::process::id();
+        assert_ne!(own, 0);
+        assert!(!should_expose_audio_session(own, own));
+    }
+
+    #[test]
+    fn other_process_sessions_remain_visible() {
+        let own = std::process::id();
+        assert_ne!(own, 0);
+        // An unrelated PID is never the current process, whatever the test
+        // runner's PID happens to be.
+        let other = if own == u32::MAX { own - 1 } else { own + 1 };
+        assert!(should_expose_audio_session(other, own));
+    }
+
+    #[test]
+    fn system_session_is_not_classified_as_qpwgraph_itself() {
+        assert!(should_expose_audio_session(0, std::process::id()));
+        // PID 0 stays visible even in the degenerate case where the caller
+        // passes 0 as the owner; a system session has no owning process.
+        assert!(should_expose_audio_session(0, 0));
+    }
+
+    #[test]
+    fn self_session_filtering_applies_before_downstream_collections() {
+        // Every downstream application collection (graph session nodes,
+        // process_audio_capabilities, application_route_candidates,
+        // application_route_ports, relay sources, metering targets) is built
+        // from sessions that passed the enumeration-boundary filter in
+        // `add_sessions`. Simulate that boundary over a mixed PID set: only
+        // the self PID must be dropped.
+        let own = std::process::id();
+        let other = if own == u32::MAX { own - 1 } else { own + 1 };
+        let sessions = [0u32, own, other];
+        let exposed: Vec<u32> = sessions
+            .into_iter()
+            .filter(|pid| should_expose_audio_session(*pid, own))
+            .collect();
+        assert_eq!(exposed, vec![0, other]);
     }
 }
