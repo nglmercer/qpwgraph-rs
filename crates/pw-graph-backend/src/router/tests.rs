@@ -233,6 +233,74 @@ fn several_sources_into_one_destination_are_summed_not_raced() {
 }
 
 #[test]
+fn process_and_microphone_mix_with_independent_gain_mute_and_fan_out() {
+    let mut core = core();
+    // These in-memory sources stand at the RouterCore boundary used by the
+    // bounded process-loopback and physical WASAPI capture rings.
+    add_source(&mut core, 1, MONO, vec![0.2; 4]);
+    add_source(&mut core, 2, MONO, vec![0.4; 4]);
+    let relay_microphone = add_sink(&mut core, 1, MONO);
+    let recorder = add_sink(&mut core, 2, MONO);
+    let destinations = vec![
+        DestinationSpec::new(SinkId(1)),
+        DestinationSpec::new(SinkId(2)),
+    ];
+    core.set_routes(&[
+        RouteSpec {
+            id: RouteId(1),
+            source: SourceId(1),
+            gain: 0.5,
+            branches: vec![BranchSpec::to(destinations.clone())],
+        },
+        RouteSpec {
+            id: RouteId(2),
+            source: SourceId(2),
+            gain: 0.25,
+            branches: vec![BranchSpec::to(destinations.clone())],
+        },
+    ])
+    .expect("process and microphone may share both destinations");
+
+    core.process();
+    assert_eq!(recorded(&relay_microphone), vec![0.2; 4]);
+    assert_eq!(recorded(&recorder), vec![0.2; 4]);
+
+    // Muting the captured application is a zero route gain, not a mutation of
+    // the application's independent Windows session volume.
+    core.set_routes(&[
+        RouteSpec {
+            id: RouteId(1),
+            source: SourceId(1),
+            gain: 0.0,
+            branches: vec![BranchSpec::to(destinations.clone())],
+        },
+        RouteSpec {
+            id: RouteId(2),
+            source: SourceId(2),
+            gain: 0.25,
+            branches: vec![BranchSpec::to(destinations)],
+        },
+    ])
+    .expect("muting one source keeps the other source routed");
+
+    core.process();
+    assert_eq!(
+        recorded(&relay_microphone),
+        vec![0.2; 4]
+            .into_iter()
+            .chain(vec![0.1; 4])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        recorded(&recorder),
+        vec![0.2; 4]
+            .into_iter()
+            .chain(vec![0.1; 4])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_destination_is_written_once_per_block_however_many_routes_feed_it() {
     let mut core = core();
     add_source(&mut core, 1, MONO, vec![0.25; 4]);

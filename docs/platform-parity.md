@@ -66,13 +66,13 @@ about what they cover:
 | --- | --- | --- |
 | a recording endpoint | a playback endpoint | a real route |
 | a playback endpoint's monitor | another playback endpoint | a real route |
-| an ordinary application session | read-only process capture/relay | mutable reroute refused, with an explanation |
-| a session already on QPWGraph Virtual Output | physical endpoint/effect | process-loopback PCM route |
+| an ordinary stable application session | playback/effect/recorder | read-only process-loopback PCM route; original playback continues |
+| QPWGraph Virtual Monitor | playback/effect/recorder | isolated virtual-output PCM route |
 
-The ordinary-session row is why `node_supports_routing` exists. A backend-wide capability
-is a union across what the backend owns, so asking it alone would light up a
-connect gesture on a session pin that could only ever fail. The canvas asks
-per node instead, and a session pin simply does not offer the gesture.
+`node_supports_routing` remains destination-aware: a session pin offers a
+gesture only when it has a stable identity and operational process-loopback
+capture. This does not make the observed Windows session-to-endpoint link
+mutable; it creates a separate qpwgraph-owned link for the captured copy.
 
 `is_link_mutable` stays false for every observed session link and true only
 for the routes qpwgraph is carrying, so a relationship Windows merely reports
@@ -209,8 +209,9 @@ session to be moved first. The `ProcessLoopbackSource` activation owns the
 blob, PROPVARIANT, completion handler, and async operation until the callback
 finishes, then feeds the same bounded router source used by physical endpoints.
 Capability probes are cached by PID/mode and can be cleared after an
-audio-service or device change. Mutable rerendering and effects still require
-the separate Virtual Output isolation proof.
+audio-service or device change. The captured copy can feed RouterCore effects
+and destinations directly; Virtual Output is the separate proof used when the
+original application dry path must be replaced rather than preserved.
 
 Metering is intentionally conservative on PipeWire. Measuring a node means
 attaching a real capture stream, which the session manager links like any other
@@ -297,9 +298,10 @@ The relay selector also exposes live `application:<selector>` sources for
 ordinary render sessions. Those entries use process-loopback PCM and disappear
 when the target session exits; they never fall back to another process. The
 same source is available to qpwgraph-owned capture/relay routes, where it can
-provide true RMS. Local effects and rerendering remain restricted to an
-isolated Virtual Output session. Automatic reassignment through the
-undocumented Windows audio-policy interface remains disabled and manual-only.
+feed local effects, destinations, and true RMS while the application's normal
+playback continues. Automatic reassignment through the undocumented Windows
+audio-policy interface remains disabled and manual-only; Virtual Output can be
+selected through supported Windows UI when an isolated path is wanted.
 
 ### Refresh and notification behavior
 

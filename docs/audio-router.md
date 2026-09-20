@@ -32,11 +32,12 @@ workspace contains an opt-in ACX endpoint runtime and bounded Rust transport,
 but its Rust-driver port, WDK/eWDK build, Verifier, HLK, signing, Secure Boot,
 and third-party-client evidence remain release-gated.
 
-Capturing a single application is now represented by the Windows
-`ProcessLoopbackSource`. It can capture an ordinary session read-only for
-relay and RMS. Local effects and rerendering are activated only after the
-session is assigned to QPWGraph Virtual Output, so a processed copy cannot be
-played alongside the original dry path.
+Capturing a single application is represented by the Windows
+`ProcessLoopbackSource`. An ordinary stable session is a read-only source for
+local routes, effects, relay, recording, and RMS without changing its Windows
+output assignment. Its existing local playback continues. Assigning the app
+to QPWGraph Virtual Output instead selects the isolated virtual-output
+workflow, in which Virtual Monitor replaces the original dry path.
 
 ## The block cycle
 

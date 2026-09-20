@@ -27,11 +27,11 @@ RMS meter, gain, and route diagnostics.
 Process loopback is capability-detected by trying the operation and handling
 its HRESULT. A missing or restricted API is a capability transition, not an
 application-startup failure. Applications on ordinary endpoints remain
-observed, immutable session links for graph editing, but their PCM can still
-be captured read-only for RMS, relay, and other explicitly capture-only
-consumers. A session becomes locally routable or effect-processable only after
-it is already attached to `QPWGraph Virtual Output`, which is the proof that
-the original dry path has been isolated.
+observed through immutable Windows session links, while their PCM is available
+as a separate read-only graph source for routing, effects, recording, RMS, and
+relay. Drawing such a route does not move the application, so its local
+playback continues. Assigning it to `QPWGraph Virtual Output` instead is the
+explicit isolated workflow for replacing the original dry path.
 
 The Windows relay reuses the same process-loopback implementation, but its
 Emitter source list is intentionally independent of virtual-output isolation:
@@ -41,24 +41,22 @@ executable path; the current PID is resolved from the live worker snapshot and
 is never persisted. Process-loopback capture then feeds the relay's bounded
 PCM hand-off with the same negotiated format as physical sources. If the
 session disappears or activation is unsupported, the relay reports an error
-and does not substitute another process. When used as a capture-only relay or
-meter source, the same source feeds the router's conversion and diagnostics.
-The route reconciler enables effects and local rerendering only for a session
-that has independently passed the QPWGraph Virtual Output isolation check.
+and does not substitute another process. Graph routes share one bounded
+fan-out activation with metering and recording consumers, then use the
+router's existing conversion, effects, mixing, and diagnostics.
 
-The persisted Windows policy reserves an explicit opt-in switch for frontends
-that want to expose process capture:
+The persisted Windows policy includes a frontend preference for showing
+application sources in the network-relay source picker:
 
 ```toml
 [windows]
 enable_process_loopback = true
 ```
 
-The low-level backend still fails closed on unsupported activation. The
-`enable_process_loopback` setting does not grant mutable application routing:
-that remains behind the isolated route reconciler and requires the application
-to be on QPWGraph Virtual Output. Automatic policy restoration is not implied
-by this setting.
+The low-level graph remains capability-driven and still fails closed on an
+unsupported activation. This preference does not grant permission to change
+an application's Windows endpoint. Automatic policy restoration remains a
+separate experimental opt-in.
 
 The low-level source is covered by layout/lifetime unit tests. End-to-end
 activation is an opt-in test on a Windows 10 build 20348+ host with
@@ -150,6 +148,18 @@ cargo test -p windows-audio-test-tone --features relay-tests --test process_loop
 Set `PW_GRAPH_TEST_RELAY_APPLICATION_SESSION=1` as well to run the local
 authenticated host/client variant; it verifies that target exit stops only the
 capture worker while the relay control session remains active.
+
+With the signed virtual-audio package and a physical capture endpoint
+installed, the full local mixer path has its own opt-in probe. It starts the
+deterministic tone on an ordinary playback endpoint, connects both that live
+process and a physical microphone to Relay Sink, reads the result from Relay
+Microphone through a normal WASAPI client, and verifies that the original
+playback endpoint continues carrying the tone:
+
+```powershell
+$env:PW_GRAPH_TEST_PROCESS_ROUTER_RELAY = '1'
+cargo xtask test -p windows-audio-test-tone --features relay-tests --test relay_microphone --locked -- --nocapture --test-threads=1
+```
 
 The repository includes a deterministic target-process helper. Build and run
 it for a manual smoke test (the first line prints the PID to capture):

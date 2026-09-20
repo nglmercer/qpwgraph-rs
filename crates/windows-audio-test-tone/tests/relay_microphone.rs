@@ -17,16 +17,19 @@
 //! the three-role persisted route transaction, and checks restoration. A
 //! separate opt-in probe leaves that lease active while the backend is dropped
 //! to verify qpwgraph-shutdown restoration.
+//! `PW_GRAPH_TEST_PROCESS_ROUTER_RELAY=1` mixes an ordinary process-loopback
+//! source and a physical capture endpoint through Relay Sink, verifies the
+//! Relay Microphone output, and keeps the process' local playback active.
 
 #![cfg(target_os = "windows")]
 
 #[cfg(feature = "relay-tests")]
 mod live {
     use pw_graph_backend::{
-        AppRoutePolicy, AudioFlow, AudioRole, EffectCreateRequest, EffectDriver, EffectEvent,
-        EffectTarget, GraphDriver, ProcessIdentity, RelayCodecKind, RelayDirection, RelayDriver,
-        RelayHostRequest, RelayMode, RelayReceiveSink, RelaySendSource, RelayTransportPreference,
-        VerifiedAudioPolicyConfig, WindowsAudioDriver,
+        AppRoutePolicy, AudioFlow, AudioRole, ConnectionSupport, EffectCreateRequest, EffectDriver,
+        EffectEvent, EffectTarget, GraphDriver, ProcessIdentity, QpwVirtualEndpointRole,
+        RelayCodecKind, RelayDirection, RelayDriver, RelayHostRequest, RelayMode, RelayReceiveSink,
+        RelaySendSource, RelayTransportPreference, VerifiedAudioPolicyConfig, WindowsAudioDriver,
     };
     use pw_graph_config::{AppConfig, WindowsApplicationRoute};
     use std::collections::BTreeMap;
@@ -214,6 +217,24 @@ mod live {
         let result = run_local_output_test();
         unsafe { Com::CoUninitialize() };
         result.expect("ordinary application relay changed local output");
+    }
+
+    #[test]
+    fn process_and_microphone_graph_routes_reach_relay_microphone() {
+        if std::env::var("PW_GRAPH_TEST_PROCESS_ROUTER_RELAY")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let initialized = unsafe { Com::CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if initialized.is_err() {
+            panic!("could not initialize COM: {initialized:?}");
+        }
+        let result = run_process_and_microphone_router_relay_test();
+        unsafe { Com::CoUninitialize() };
+        result.expect("process graph route did not reach Relay Microphone");
     }
 
     #[test]
@@ -2518,6 +2539,248 @@ mod live {
         result
     }
 
+    fn run_process_and_microphone_router_relay_test() -> Result<(), String> {
+        let helper = std::env::var_os("CARGO_BIN_EXE_windows-audio-test-tone")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "Cargo did not provide the tone helper executable".to_owned())?;
+        let enumerator: Audio::IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&Audio::MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|error| format!("create MMDeviceEnumerator: {error}"))?;
+        let physical_render = choose_external_render(&enumerator)?;
+        let physical_capture = choose_external_capture(&enumerator)?;
+        let relay_capture = wait_for_role(
+            &enumerator,
+            Flow::Capture,
+            RELAY_CAPTURE_ROLE,
+            Duration::from_secs(8),
+        )?;
+        let mut tone = Command::new(&helper)
+            .args([
+                "--duration-ms",
+                "60000",
+                "--frequency",
+                "1000",
+                "--amplitude",
+                "0.25",
+                "--render-id",
+                physical_render.id.as_str(),
+            ])
+            .spawn()
+            .map_err(|error| format!("start deterministic WASAPI tone: {error}"))?;
+
+        let result = (|| -> Result<(), String> {
+            let physical_loopback = open_loopback_stream(&physical_render.device)?;
+            let physical_client = unsafe {
+                physical_loopback
+                    .client
+                    .GetService::<Audio::IAudioCaptureClient>()
+            }
+            .map_err(|error| format!("get physical render loopback service: {error}"))?;
+            let relay_stream = open_stream(&relay_capture.device, Flow::Capture)?;
+            let relay_client = unsafe {
+                relay_stream
+                    .client
+                    .GetService::<Audio::IAudioCaptureClient>()
+            }
+            .map_err(|error| format!("get Relay Microphone capture service: {error}"))?;
+            unsafe {
+                physical_loopback
+                    .client
+                    .Start()
+                    .map_err(|error| format!("start physical render loopback: {error}"))?;
+                relay_stream
+                    .client
+                    .Start()
+                    .map_err(|error| format!("start Relay Microphone capture: {error}"))?;
+            }
+
+            let baseline = observe_loopback_tone(
+                &physical_loopback,
+                &physical_client,
+                Duration::from_secs(2),
+            )?;
+            let mut driver = WindowsAudioDriver::new().map_err(|error| error.to_string())?;
+            let (process_source, microphone_source, destination) = wait_for_process_relay_ports(
+                &mut driver,
+                &physical_capture.name,
+                QpwVirtualEndpointRole::RelayRender.stable_name(),
+                Duration::from_secs(10),
+            )?;
+            if driver.connection_support(process_source, destination)
+                != ConnectionSupport::CaptureOnly
+            {
+                return Err(
+                    "ordinary process route was not classified as read-only capture".into(),
+                );
+            }
+            if driver.connection_support(microphone_source, destination) != ConnectionSupport::Route
+            {
+                return Err("physical microphone route was not classified as routable".into());
+            }
+            let process_link = driver
+                .connect(process_source, destination)
+                .map_err(|error| format!("connect process source to Relay Sink: {error}"))?;
+            let microphone_link = driver
+                .connect(microphone_source, destination)
+                .map_err(|error| format!("connect physical microphone to Relay Sink: {error}"))?;
+
+            let mut relay_probe = ToneProbe::new(relay_stream.sample_rate);
+            let mut local_probe = ToneProbe::new(physical_loopback.sample_rate);
+            let mut relay_frames = 0_u64;
+            let mut local_frames = 0_u64;
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                driver.refresh().map_err(|error| error.to_string())?;
+                relay_frames += u64::from(drain_capture(
+                    &relay_stream,
+                    &relay_client,
+                    Some(&mut relay_probe),
+                )?);
+                local_frames += u64::from(drain_capture(
+                    &physical_loopback,
+                    &physical_client,
+                    Some(&mut local_probe),
+                )?);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let meters = driver
+                .audio_meters()
+                .map_err(|error| format!("read routed source meters: {error}"))?;
+            let process_meter = meters
+                .iter()
+                .find(|meter| meter.port_id == Some(process_source))
+                .cloned();
+            let microphone_meter = meters
+                .iter()
+                .find(|meter| meter.port_id == Some(microphone_source))
+                .cloned();
+            let metrics = driver.route_metrics();
+            let process_metrics = metrics
+                .iter()
+                .find(|(id, _)| *id == process_link.id)
+                .map(|(_, metrics)| *metrics);
+            let microphone_metrics = metrics
+                .iter()
+                .find(|(id, _)| *id == microphone_link.id)
+                .map(|(_, metrics)| *metrics);
+            driver
+                .disconnect(process_link.id)
+                .map_err(|error| format!("disconnect process route: {error}"))?;
+            driver
+                .disconnect(microphone_link.id)
+                .map_err(|error| format!("disconnect microphone route: {error}"))?;
+
+            if relay_frames == 0
+                || relay_probe.invalid_samples != 0
+                || relay_probe.amplitude(0) < 0.01
+                || process_meter
+                    .as_ref()
+                    .is_none_or(|meter| !meter.available || meter.rms < 0.05)
+                || microphone_meter
+                    .as_ref()
+                    .is_none_or(|meter| !meter.available)
+                || process_metrics.is_none_or(|metrics| metrics.frames_processed == 0)
+                || microphone_metrics.is_none_or(|metrics| metrics.frames_processed == 0)
+            {
+                return Err(format!(
+                    "mixed routes did not reach Relay Microphone: capture_frames={relay_frames}, capture_peak={:.6}, capture_1khz={:.6}, capture_invalid={}, process_meter={process_meter:?}, microphone_meter={microphone_meter:?}, process_metrics={process_metrics:?}, microphone_metrics={microphone_metrics:?}",
+                    relay_probe.peak,
+                    relay_probe.amplitude(0),
+                    relay_probe.invalid_samples,
+                ));
+            }
+            if local_frames == 0
+                || local_probe.invalid_samples != 0
+                || local_probe.amplitude(0) < baseline * 0.5
+                || local_probe.amplitude(0) < 0.01
+            {
+                return Err(format!(
+                    "local process playback changed during graph routing: baseline={baseline:.6}, frames={local_frames}, peak={:.6}, 1 kHz={:.6}, invalid={}",
+                    local_probe.peak,
+                    local_probe.amplitude(0),
+                    local_probe.invalid_samples,
+                ));
+            }
+            println!(
+                "process + microphone router relay: microphone={:?}, relay_frames={relay_frames}, relay_1khz={:.4}, local_frames={local_frames}, local_1khz={:.4}",
+                physical_capture.name,
+                relay_probe.amplitude(0),
+                local_probe.amplitude(0),
+            );
+            Ok(())
+        })();
+        stop_child(&mut tone);
+        result
+    }
+
+    fn wait_for_process_relay_ports(
+        driver: &mut WindowsAudioDriver,
+        physical_capture_name: &str,
+        relay_render_name: &str,
+        timeout: Duration,
+    ) -> Result<
+        (
+            pw_graph_core::PortId,
+            pw_graph_core::PortId,
+            pw_graph_core::PortId,
+        ),
+        String,
+    > {
+        let deadline = Instant::now() + timeout;
+        loop {
+            driver.refresh().map_err(|error| error.to_string())?;
+            let source = driver.graph().nodes.values().find_map(|node| {
+                if !node.name.eq_ignore_ascii_case("windows-audio-test-tone")
+                    || !driver
+                        .process_audio_capabilities(node.id)
+                        .is_some_and(|capabilities| capabilities.capture_readonly)
+                {
+                    return None;
+                }
+                node.ports.iter().copied().find(|port| {
+                    driver
+                        .graph()
+                        .port(*port)
+                        .is_some_and(|port| port.direction.is_source())
+                })
+            });
+            let destination = driver.graph().nodes.values().find_map(|node| {
+                if !node.name.eq_ignore_ascii_case(relay_render_name) {
+                    return None;
+                }
+                node.ports.iter().copied().find(|port| {
+                    driver
+                        .graph()
+                        .port(*port)
+                        .is_some_and(|port| port.direction.is_sink())
+                })
+            });
+            let microphone = driver.graph().nodes.values().find_map(|node| {
+                if !node.name.eq_ignore_ascii_case(physical_capture_name) {
+                    return None;
+                }
+                node.ports.iter().copied().find(|port| {
+                    driver
+                        .graph()
+                        .port(*port)
+                        .is_some_and(|port| port.direction.is_source())
+                })
+            });
+            if let (Some(source), Some(microphone), Some(destination)) =
+                (source, microphone, destination)
+            {
+                return Ok((source, microphone, destination));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "helper process source, microphone {physical_capture_name:?}, or Relay Sink {relay_render_name:?} did not appear\n{}",
+                    driver.windows_audio_report()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn observe_loopback_tone(
         stream: &AudioStream,
         client: &Audio::IAudioCaptureClient,
@@ -3298,6 +3561,22 @@ mod live {
             })
             .ok_or_else(|| {
                 "no non-QPWGraph active render endpoint is available for the tone helper".into()
+            })
+    }
+
+    fn choose_external_capture(
+        enumerator: &Audio::IMMDeviceEnumerator,
+    ) -> Result<Endpoint, String> {
+        enumerate(enumerator, Flow::Capture)?
+            .into_iter()
+            .find(|endpoint| {
+                let provider_role =
+                    property_string(&endpoint.device, &ROLE_KEY as *const PROPERTYKEY).is_some();
+                !provider_role && !endpoint.name.to_ascii_lowercase().contains("qpwgraph")
+            })
+            .ok_or_else(|| {
+                "no non-QPWGraph active capture endpoint is available for the microphone route"
+                    .into()
             })
     }
 

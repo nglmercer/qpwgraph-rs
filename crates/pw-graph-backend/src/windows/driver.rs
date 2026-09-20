@@ -58,12 +58,9 @@ pub(super) const WINDOWS_AUDIO_CAPABILITIES: BackendCapabilities = BackendCapabi
     topology: true,
     // True because qpwgraph carries these routes itself: a link between two
     // endpoint ports is a real route in `crate::router`, with WASAPI streams
-    // at both ends. It is emphatically *not* true for application sessions --
-    // Core Audio exposes no supported way to move one -- so `connect` refuses
-    // them explicitly and `node_supports_routing` keeps the canvas from
-    // offering a gesture there at all. A session already isolated on the
-    // optional virtual sink is the documented exception and is captured via
-    // process loopback.
+    // at both ends. Application sessions are captured read-only with the
+    // documented process-loopback API; drawing a route never re-points or
+    // otherwise mutates the application's Windows audio policy.
     connect: true,
     disconnect: true,
     volume: true,
@@ -138,9 +135,9 @@ pub struct WindowsAudioDriver {
     /// with the graph, because an unplugged endpoint takes its ports with it.
     pub(super) endpoint_ports: BTreeMap<PortId, EndpointPort>,
     pub(super) endpoint_selectors: BTreeMap<String, WindowsEndpointSelector>,
-    /// Per-session process capabilities. Read-only capture and relay are
-    /// available for ordinary render sessions; mutable routing/effects stay
-    /// limited to sessions proven isolated on the qpwgraph virtual output.
+    /// Per-session process capabilities. Ordinary stable render sessions can
+    /// feed read-only captured-copy routes and effects; mutable Windows audio
+    /// policy remains limited to explicitly isolated applications.
     pub(super) process_audio_capabilities: BTreeMap<NodeId, ProcessAudioCapabilities>,
     /// Live candidates and persisted-rule decisions are kept separate from
     /// the graph so a process restart can be reconciled without inventing a
@@ -633,13 +630,21 @@ impl WindowsAudioDriver {
         self.routed_source_port(node).is_some()
     }
 
+    fn routed_process_source_port(&self, node: NodeId) -> Option<PortId> {
+        let port = self.routed_source_port(node)?;
+        self.endpoint_ports
+            .get(&port)
+            .is_some_and(|endpoint| matches!(&endpoint.role, EndpointPortRole::Process { .. }))
+            .then_some(port)
+    }
+
     /// Fold each route's software gain back into the volume Core Audio just
     /// reported, so a boosted node keeps reading as boosted.
     fn restore_routed_gain(&mut self) {
         let Some(routing) = self.routing.as_ref() else {
             return;
         };
-        let boosted: Vec<(NodeId, f32)> = self
+        let routed: Vec<(NodeId, f32, bool, bool)> = self
             .graph
             .nodes
             .values()
@@ -650,16 +655,25 @@ impl WindowsAudioDriver {
                     .copied()
                     .find(|port| routing.carries_source(*port))?;
                 let gain = routing.source_gain(port);
-                (gain != 1.0).then_some((node.id, gain))
+                let muted = routing.source_muted(port);
+                let process = self.endpoint_ports.get(&port).is_some_and(|endpoint| {
+                    matches!(&endpoint.role, EndpointPortRole::Process { .. })
+                });
+                (process || gain != 1.0 || muted).then_some((node.id, gain, muted, process))
             })
             .collect();
-        if boosted.is_empty() {
+        if routed.is_empty() {
             return;
         }
         if let Ok(mut states) = self.audio_states.lock() {
-            for (node, gain) in boosted {
+            for (node, gain, muted, process) in routed {
                 if let Some(state) = states.get_mut(&node) {
-                    if let Some(volume) = state.volume {
+                    if process {
+                        state.volume = Some(gain);
+                        state.muted = Some(muted);
+                        state.volume_readable = true;
+                        state.mute_readable = true;
+                    } else if let Some(volume) = state.volume {
                         state.volume = Some(volume * gain);
                     }
                 }
@@ -747,30 +761,18 @@ impl WindowsAudioDriver {
         .map_err(|error| BackendError::native(error.to_string()))
     }
 
-    fn process_recorder_request_for_link(
-        &self,
-        link: &Link,
-    ) -> Option<(RecorderId, ProcessCaptureRequest)> {
-        self.process_recorder_request_for_link_with_ports(link, &self.endpoint_ports)
-    }
-
-    fn process_recorder_request_for_link_with_ports(
+    fn process_route_request_for_link_with_ports(
         &self,
         link: &Link,
         endpoint_ports: &BTreeMap<PortId, EndpointPort>,
-    ) -> Option<(RecorderId, ProcessCaptureRequest)> {
-        let recorder_id = self
-            .recorders
-            .values()
-            .find(|recorder| recorder.instance.input_port == link.input_port)
-            .map(|recorder| recorder.instance.id)?;
+    ) -> Option<(PortId, ProcessCaptureRequest)> {
         let EndpointPortRole::Process { pid, selector } =
             &endpoint_ports.get(&link.output_port)?.role
         else {
             return None;
         };
         Some((
-            recorder_id,
+            link.output_port,
             ProcessCaptureRequest {
                 selector: selector.clone(),
                 pid: *pid,
@@ -779,16 +781,23 @@ impl WindowsAudioDriver {
         ))
     }
 
-    fn acquire_process_recorder_source(
+    fn process_route_request_for_link(
+        &self,
+        link: &Link,
+    ) -> Option<(PortId, ProcessCaptureRequest)> {
+        self.process_route_request_for_link_with_ports(link, &self.endpoint_ports)
+    }
+
+    fn acquire_process_route_source(
         &mut self,
-        recorder_id: RecorderId,
+        port: PortId,
         request: ProcessCaptureRequest,
     ) -> BackendResult<RingSource> {
         let (sender, receiver) = mpsc::channel();
         self.command_tx
-            .send(WorkerCommand::AcquireProcessRecorder(
+            .send(WorkerCommand::AcquireProcessGraphRoute(
                 request,
-                recorder_id,
+                port,
                 WINDOWS_RECORDER_FORMAT,
                 sender,
             ))
@@ -798,16 +807,12 @@ impl WindowsAudioDriver {
         Ok(source)
     }
 
-    fn release_process_recorder(
-        &mut self,
-        recorder_id: RecorderId,
-        request: ProcessCaptureRequest,
-    ) {
+    fn release_process_route(&mut self, port: PortId, request: ProcessCaptureRequest) {
         let (sender, receiver) = mpsc::channel();
         if self
             .command_tx
-            .send(WorkerCommand::ReleaseProcessRecorder(
-                recorder_id,
+            .send(WorkerCommand::ReleaseProcessGraphRoute(
+                port,
                 request,
                 WINDOWS_RECORDER_FORMAT,
                 sender,
@@ -820,19 +825,6 @@ impl WindowsAudioDriver {
         }
     }
 
-    fn has_process_recorder_link(
-        &self,
-        recorder_id: RecorderId,
-        request: &ProcessCaptureRequest,
-    ) -> bool {
-        self.routing.as_ref().is_some_and(|routing| {
-            routing.links().any(|link| {
-                self.process_recorder_request_for_link(link)
-                    .is_some_and(|(id, candidate)| id == recorder_id && candidate == *request)
-            })
-        })
-    }
-
     fn shared_process_sources_for_recovery(
         &mut self,
     ) -> BackendResult<BTreeMap<PortId, RingSource>> {
@@ -843,19 +835,13 @@ impl WindowsAudioDriver {
                 routing
                     .links()
                     .filter(|link| routing.uses_shared_process_source(link.output_port))
-                    .filter_map(|link| {
-                        self.process_recorder_request_for_link(link)
-                            .map(|(id, request)| (link.output_port, id, request))
-                    })
+                    .filter_map(|link| self.process_route_request_for_link(link))
                     .collect()
             })
             .unwrap_or_default();
         let mut sources = BTreeMap::new();
-        for (port, recorder_id, request) in candidates {
-            // One router source is shared by all links leaving a port, but
-            // every Recorder identity still gets registered with the manager
-            // so removing one destination cannot stop another consumer.
-            let source = self.acquire_process_recorder_source(recorder_id, request)?;
+        for (port, request) in candidates {
+            let source = self.acquire_process_route_source(port, request)?;
             sources.entry(port).or_insert(source);
         }
         Ok(sources)
@@ -898,8 +884,8 @@ impl GraphDriver for WindowsAudioDriver {
     ///
     /// The graph is only touched after the audio is running, so a link never
     /// appears for a route that failed to start. Ports that name an
-    /// application session are refused with an explanation rather than drawn:
-    /// see [`super::routing`] for what Windows does and does not allow.
+    /// application session are read-only process-loopback captures: the route
+    /// owns PCM, not the application's Windows endpoint assignment.
     fn connect(&mut self, src: PortId, dst: PortId) -> BackendResult<Link> {
         self.validate_route(src, dst)?;
         let support = self.connection_support(src, dst);
@@ -915,20 +901,17 @@ impl GraphDriver for WindowsAudioDriver {
         if self.routing.is_none() {
             self.routing = Some(WindowsRouting::start()?);
         }
-        let capture_lease = if support == ConnectionSupport::CaptureOnly {
-            Some(
-                self.process_recorder_request_for_link(&link)
-                    .ok_or_else(|| {
-                        BackendError::unsupported(
-                            "application capture requires a stable process and Recorder identity",
-                        )
-                    })?,
-            )
-        } else {
+        let source_is_registered = self
+            .routing
+            .as_ref()
+            .is_some_and(|routing| routing.carries_source(src));
+        let capture_lease = if source_is_registered {
             None
+        } else {
+            self.process_route_request_for_link(&link)
         };
-        let shared_process_source = if let Some((recorder_id, request)) = &capture_lease {
-            Some(self.acquire_process_recorder_source(*recorder_id, request.clone())?)
+        let shared_process_source = if let Some((port, request)) = &capture_lease {
+            Some(self.acquire_process_route_source(*port, request.clone())?)
         } else {
             None
         };
@@ -936,18 +919,19 @@ impl GraphDriver for WindowsAudioDriver {
         if let Err(error) =
             routing.connect(link.clone(), &self.endpoint_ports, shared_process_source)
         {
-            if let Some((recorder_id, request)) = capture_lease {
-                self.release_process_recorder(recorder_id, request);
+            if let Some((port, request)) = capture_lease {
+                self.release_process_route(port, request);
             }
             return Err(error);
         }
         if let Err(error) = self.graph.add_link(link.id, src, dst) {
             let _ = routing.disconnect(link.id);
-            if let Some((recorder_id, request)) = capture_lease {
-                self.release_process_recorder(recorder_id, request);
+            if let Some((port, request)) = capture_lease {
+                self.release_process_route(port, request);
             }
             return Err(error.into());
         }
+        self.restore_routed_gain();
         Ok(link)
     }
 
@@ -956,7 +940,7 @@ impl GraphDriver for WindowsAudioDriver {
             .routing
             .as_ref()
             .and_then(|routing| routing.links().find(|candidate| candidate.id == link))
-            .and_then(|candidate| self.process_recorder_request_for_link(candidate));
+            .and_then(|candidate| self.process_route_request_for_link(candidate));
         let Some(routing) = self.routing.as_mut() else {
             return Err(BackendError::unsupported(
                 "that link is a relationship Windows reports, not a route qpwgraph carries",
@@ -967,9 +951,9 @@ impl GraphDriver for WindowsAudioDriver {
         // the graph after its route is gone is exactly the stale link the
         // parity contract forbids.
         let _ = self.graph.remove_link(link);
-        if let Some((recorder_id, request)) = capture_lease {
-            if !self.has_process_recorder_link(recorder_id, &request) {
-                self.release_process_recorder(recorder_id, request);
+        if let Some((port, request)) = capture_lease {
+            if !routing.carries_source(port) {
+                self.release_process_route(port, request);
             }
         }
         Ok(removed)
@@ -987,9 +971,9 @@ impl GraphDriver for WindowsAudioDriver {
             .is_some_and(|routing| routing.owns(link))
     }
 
-    /// Endpoints can be rewired. An application session becomes routable only
-    /// after Windows reports it on QPWGraph Virtual Output, which proves the
-    /// original audible path has been isolated and prevents duplicate audio.
+    /// Endpoints can be rewired. A stable application session can also be used
+    /// as a read-only process-loopback source without changing its normal
+    /// Windows output assignment.
     fn node_supports_routing(&self, node: NodeId) -> bool {
         self.graph.nodes.get(&node).is_some_and(|node_record| {
             node_record.node_type == NodeType::WindowsAudioEndpoint
@@ -997,7 +981,7 @@ impl GraphDriver for WindowsAudioDriver {
                     && self
                         .process_audio_capabilities
                         .get(&node)
-                        .is_some_and(|capabilities| capabilities.mutable_route))
+                        .is_some_and(|capabilities| capabilities.capture_readonly))
         })
     }
 
@@ -1022,18 +1006,27 @@ impl GraphDriver for WindowsAudioDriver {
         };
 
         if input_node.node_type == NodeType::Effect {
-            // An effect is a qpwgraph-owned destination. It may receive a
-            // physical endpoint or an application only after that source is
-            // itself routable/isolated; a plain Windows session therefore
-            // remains unsupported here, just as it is for a normal playback
-            // endpoint. Effect outputs may continue an already-owned chain.
+            // An effect is a qpwgraph-owned destination. A process-loopback
+            // source may feed it without moving the application's endpoint;
+            // effect outputs may continue an already-owned chain.
             let effect_source = self
                 .routing
                 .as_ref()
                 .is_some_and(|routing| routing.carries_effect_output(output));
-            return if self.effects.has_input_port(input)
-                && (self.node_supports_routing(output_node.id) || effect_source)
-            {
+            return if !self.effects.has_input_port(input) {
+                ConnectionSupport::Unsupported
+            } else if output_node.node_type == NodeType::WindowsAudioSession {
+                if self
+                    .process_audio_capabilities
+                    .get(&output_node.id)
+                    .is_some_and(|capabilities| capabilities.capture_readonly)
+                    && self.endpoint_ports.contains_key(&output)
+                {
+                    ConnectionSupport::CaptureOnly
+                } else {
+                    ConnectionSupport::Unsupported
+                }
+            } else if self.node_supports_routing(output_node.id) || effect_source {
                 ConnectionSupport::Route
             } else {
                 ConnectionSupport::Unsupported
@@ -1048,8 +1041,7 @@ impl GraphDriver for WindowsAudioDriver {
             }
             if output_node.node_type == NodeType::WindowsAudioSession {
                 // A session-to-recorder edge is an explicit read-only
-                // process-loopback capture. It never grants general session
-                // rerouting or effect insertion.
+                // process-loopback capture.
                 if self
                     .routing
                     .as_ref()
@@ -1097,6 +1089,19 @@ impl GraphDriver for WindowsAudioDriver {
             .routing
             .as_ref()
             .is_some_and(|routing| routing.carries_effect_output(output));
+        if output_node.node_type == NodeType::WindowsAudioSession {
+            return if self
+                .process_audio_capabilities
+                .get(&output_node.id)
+                .is_some_and(|capabilities| capabilities.capture_readonly)
+                && self.endpoint_ports.contains_key(&output)
+                && self.node_supports_routing(input_node.id)
+            {
+                ConnectionSupport::CaptureOnly
+            } else {
+                ConnectionSupport::Unsupported
+            };
+        }
         if self.capabilities().connect
             && (self.node_supports_routing(output_node.id) || effect_source)
             && self.node_supports_routing(input_node.id)
@@ -1166,6 +1171,19 @@ impl GraphDriver for WindowsAudioDriver {
     }
 
     fn set_node_mute(&mut self, node: NodeId, muted: bool) -> BackendResult<()> {
+        if let Some(port) = self.routed_process_source_port(node) {
+            self.routing
+                .as_mut()
+                .expect("the port came from the router")
+                .set_source_mute(port, muted)?;
+            if let Ok(mut states) = self.audio_states.lock() {
+                if let Some(state) = states.get_mut(&node) {
+                    state.muted = Some(muted);
+                    state.mute_readable = true;
+                }
+            }
+            return Ok(());
+        }
         let (sender, receiver) = mpsc::channel();
         self.command_tx
             .send(WorkerCommand::SetMute(node, muted, sender))
@@ -1192,6 +1210,19 @@ impl GraphDriver for WindowsAudioDriver {
     fn set_node_volume(&mut self, node: NodeId, volume: f32) -> BackendResult<()> {
         let ceiling = self.node_capabilities(node).volume_max.max(UNITY_VOLUME);
         let volume = volume.clamp(0.0, ceiling);
+        if let Some(port) = self.routed_process_source_port(node) {
+            self.routing
+                .as_mut()
+                .expect("the port came from the router")
+                .set_source_gain(port, volume)?;
+            if let Ok(mut states) = self.audio_states.lock() {
+                if let Some(state) = states.get_mut(&node) {
+                    state.volume = Some(volume);
+                    state.volume_readable = true;
+                }
+            }
+            return Ok(());
+        }
         let endpoint_volume = volume.min(UNITY_VOLUME);
 
         let (sender, receiver) = mpsc::channel();

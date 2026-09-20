@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[test]
-fn effect_playback_support_requires_a_registered_output_without_enabling_plain_sessions() {
+fn process_capture_requires_a_registered_source_and_can_feed_effects_or_playback() {
     use crate::api::{EffectCreateRequest, EffectDriver, EffectEvent, EffectTarget};
     use std::time::{Duration, Instant};
 
@@ -82,6 +82,20 @@ fn effect_playback_support_requires_a_registered_output_without_enabling_plain_s
         driver.connection_support(session_port, sink_port),
         ConnectionSupport::Unsupported
     );
+    driver.endpoint_ports.insert(
+        session_port,
+        EndpointPort {
+            device_id: "ordinary-output".into(),
+            role: EndpointPortRole::Process {
+                pid: 42,
+                selector: "sha256:stable-application".into(),
+            },
+        },
+    );
+    assert_eq!(
+        driver.connection_support(session_port, sink_port),
+        ConnectionSupport::CaptureOnly
+    );
 
     let ticket = driver
         .begin_create_effect(EffectCreateRequest {
@@ -118,7 +132,7 @@ fn effect_playback_support_requires_a_registered_output_without_enabling_plain_s
     );
     assert_eq!(
         driver.connection_support(session_port, instance.input_port),
-        ConnectionSupport::Unsupported
+        ConnectionSupport::CaptureOnly
     );
     driver.remove_effect("registered-effect-test").unwrap();
     assert_eq!(
@@ -324,6 +338,18 @@ fn installed_provider_endpoints_expose_durable_selectors_after_refresh() {
             .clone()
             .unwrap_or_else(|| identity.role.stable_selector());
         assert_eq!(selector.stable_id.as_deref(), Some(expected.as_str()));
+        let endpoint_port = driver
+            .endpoint_ports
+            .iter()
+            .find(|(_, endpoint)| endpoint.device_id == identity.mmdevice_id)
+            .map(|(port, _)| *port)
+            .unwrap_or_else(|| panic!("provider endpoint {:?} had no graph port", identity.role));
+        let node = driver
+            .graph()
+            .port(endpoint_port)
+            .and_then(|port| driver.graph().node(port.node_id))
+            .unwrap_or_else(|| panic!("provider endpoint {:?} had no graph node", identity.role));
+        assert_eq!(node.name, identity.role.stable_name());
     }
 }
 
@@ -358,25 +384,23 @@ fn every_playback_endpoint_offers_a_monitor_alongside_its_input() {
 }
 
 #[test]
-fn only_endpoints_or_isolated_sessions_offer_a_connect_gesture() {
+fn endpoints_and_capture_capable_sessions_offer_a_connect_gesture() {
     let Ok(driver) = WindowsAudioDriver::new() else {
         return;
     };
     for node in driver.graph().nodes.values() {
         let routable = driver.node_supports_routing(node.id);
         match node.node_type {
-            // An application session is drawn, selectable, and metered, but
-            // Windows exposes no supported way to move one.  The one
-            // documented exception is an app that the user already moved to
-            // QPWGraph Virtual Output; its process-loopback port is a real
-            // qpwgraph-owned source. Capture-only process ports remain
-            // intentionally non-routable here.
+            // A stable render session is a read-only process-loopback source.
+            // This does not claim that qpwgraph can move its Windows audio
+            // policy; it only controls whether the source pin can start a
+            // RouterCore connection gesture.
             NodeType::WindowsAudioSession => {
-                let mutable_route = driver
+                let capture_readonly = driver
                     .process_audio_capabilities
                     .get(&node.id)
-                    .is_some_and(|capabilities| capabilities.mutable_route);
-                assert_eq!(routable, mutable_route, "{} routing mismatch", node.name);
+                    .is_some_and(|capabilities| capabilities.capture_readonly);
+                assert_eq!(routable, capture_readonly, "{} routing mismatch", node.name);
             }
             _ => assert!(routable, "{} was not routable", node.name),
         }
@@ -384,15 +408,19 @@ fn only_endpoints_or_isolated_sessions_offer_a_connect_gesture() {
 }
 
 #[test]
-fn a_session_port_is_refused_with_an_explanation_rather_than_drawn() {
-    let Ok(mut driver) = WindowsAudioDriver::new() else {
+fn an_ordinary_session_to_endpoint_connection_is_read_only_capture() {
+    let Ok(driver) = WindowsAudioDriver::new() else {
         return;
     };
     let graph = driver.graph();
     let session_port = graph.ports.values().find(|port| {
-        graph
-            .node(port.node_id)
-            .is_some_and(|node| node.node_type == NodeType::WindowsAudioSession)
+        graph.node(port.node_id).is_some_and(|node| {
+            node.node_type == NodeType::WindowsAudioSession
+                && driver
+                    .process_audio_capabilities
+                    .get(&node.id)
+                    .is_some_and(|capabilities| capabilities.capture_readonly)
+        })
     });
     let render_port = graph.ports.values().find(|port| {
         port.direction.is_sink()
@@ -406,20 +434,13 @@ fn a_session_port_is_refused_with_an_explanation_rather_than_drawn() {
     };
     let (session_port, render_port) = (session_port.id, render_port.id);
 
-    let error = driver
-        .connect(session_port, render_port)
-        .expect_err("an application session cannot be re-pointed");
-
-    // Unsupported, not Native: this is a thing Windows does not offer, not a
-    // call that went wrong.
     assert!(
-        matches!(error, BackendError::Unsupported(_) | BackendError::Graph(_)),
-        "expected an explained refusal, got {error:?}"
+        matches!(
+            driver.connection_support(session_port, render_port),
+            ConnectionSupport::CaptureOnly
+        ),
+        "an ordinary application should be capturable without re-pointing it"
     );
-    assert!(driver
-        .graph()
-        .link(managed_link(session_port, render_port).id)
-        .is_none());
 }
 
 #[test]

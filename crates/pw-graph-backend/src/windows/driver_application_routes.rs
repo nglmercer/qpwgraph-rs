@@ -1382,16 +1382,20 @@ impl WindowsAudioDriver {
                     !live.contains(&link.output_port) || !live.contains(&link.input_port)
                 })
                 .filter_map(|link| {
-                    self.process_recorder_request_for_link_with_ports(link, &old_endpoint_ports)
+                    self.process_route_request_for_link_with_ports(link, &old_endpoint_ports)
                 })
                 .collect();
             self.routing
                 .as_mut()
                 .expect("routing exists")
                 .reconcile(&live)?;
-            for (recorder_id, request) in stale_process_leases {
-                if !self.has_process_recorder_link(recorder_id, &request) {
-                    self.release_process_recorder(recorder_id, request);
+            for (port, request) in stale_process_leases {
+                if !self
+                    .routing
+                    .as_ref()
+                    .is_some_and(|routing| routing.carries_source(port))
+                {
+                    self.release_process_route(port, request);
                 }
             }
             let shared_process_sources = self.shared_process_sources_for_recovery()?;

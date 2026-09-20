@@ -9,7 +9,7 @@
 //! The manager owns one process-loopback activation per verified selector and
 //! fans its PCM out through fixed-capacity rings. The relay still owns its
 //! realtime source because it has a different lifetime and format boundary,
-//! while graph-owned Recorder edges lease one of the manager's rings.
+//! while graph routes and Recorder edges lease the manager's rings.
 
 use super::app_route_policy::verify_live_process_identity;
 #[cfg(test)]
@@ -19,7 +19,7 @@ use super::process_loopback::{
 };
 use crate::api::{BackendError, BackendResult};
 use crate::router::{AudioFormat, AudioSource, RingSource, RingSourceFanoutControl, StreamHealth};
-use pw_graph_core::NodeId;
+use pw_graph_core::{NodeId, PortId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,7 @@ pub enum ProcessCaptureConsumer {
     Meter(NodeId),
     Relay,
     OwnedRoute,
+    GraphRoute(PortId),
     Recorder(crate::api::RecorderId),
     Diagnostics,
 }
@@ -125,12 +126,11 @@ struct FailedCapture {
     state: ProcessCaptureState,
 }
 
-/// The worker-thread manager for capture-only process consumers.
+/// The worker-thread manager for read-only process consumers.
 ///
-/// It never owns a process-loopback activation as a graph edge. The only
-/// graph-owned process source remains the isolated route path in
-/// `windows::routing`; this manager leases bounded rings to read-only
-/// consumers such as meters and Recorders.
+/// It owns one activation per verified process identity and leases distinct
+/// bounded rings to the graph, meters, and Recorders. RouterCore then fans one
+/// graph source out to every destination without another capture worker.
 #[derive(Default)]
 pub struct ProcessCaptureManager {
     active: BTreeMap<ProcessCaptureKey, ActiveCapture>,
@@ -141,11 +141,8 @@ pub struct ProcessCaptureManager {
     /// long-lived process-loopback client for the same PID.
     route_probe_states: BTreeMap<CaptureIdentity, ProcessCaptureState>,
     meter_targets: BTreeMap<NodeId, ProcessMeterTarget>,
-    /// Process captures explicitly owned by this manager. The current
-    /// application-route reconciler uses `route_probe_targets` instead so a
-    /// graph route does not open a duplicate manager stream.
-    route_capture_targets: BTreeSet<CaptureIdentity>,
     route_probe_targets: BTreeSet<CaptureIdentity>,
+    graph_route_targets: BTreeMap<(PortId, CaptureIdentity), ProcessCaptureRequest>,
     recorder_targets: BTreeMap<(crate::api::RecorderId, CaptureIdentity), ProcessCaptureRequest>,
     external_relay: Option<ProcessCaptureKey>,
 }
@@ -173,24 +170,54 @@ impl ProcessCaptureManager {
         self.reconcile(format);
     }
 
-    /// Reconcile a long-lived manager-owned capture request. Meter and
-    /// non-graph consumers can share these streams. The graph-owned isolated
-    /// application route uses [`Self::reconcile_route_probes`] instead, then
-    /// opens its one realtime source in the router.
-    pub fn reconcile_routes(
+    /// Lease the one bounded source that feeds all RouterCore branches leaving
+    /// an application port. Metering and Recorder consumers receive separate
+    /// bounded fan-out slots from the same process-loopback activation.
+    pub fn acquire_graph_route(
         &mut self,
-        requests: impl IntoIterator<Item = ProcessCaptureRequest>,
+        port: PortId,
+        request: ProcessCaptureRequest,
+        format: AudioFormat,
+    ) -> BackendResult<RingSource> {
+        validate_capture_selector(&request.selector, request.pid)?;
+        let identity = request_identity(&request);
+        let target_key = (port, identity.clone());
+        let already_requested = self
+            .graph_route_targets
+            .insert(target_key.clone(), request)
+            .is_some();
+        self.reconcile(format);
+
+        let consumer = ProcessCaptureConsumer::GraphRoute(port);
+        let result = self
+            .active
+            .values()
+            .find(|capture| capture_identity(&capture.key) == identity)
+            .ok_or_else(|| self.capture_start_error(&identity))
+            .and_then(|capture| {
+                capture
+                    .sources
+                    .get(&consumer)
+                    .map(RingSource::lease)
+                    .ok_or_else(|| {
+                        BackendError::native("process-loopback graph route has no capture ring")
+                    })
+            });
+        if result.is_err() && !already_requested {
+            self.graph_route_targets.remove(&target_key);
+            self.reconcile(format);
+        }
+        result
+    }
+
+    pub fn release_graph_route(
+        &mut self,
+        port: PortId,
+        request: &ProcessCaptureRequest,
         format: AudioFormat,
     ) {
-        self.route_capture_targets = requests
-            .into_iter()
-            .filter(|request| validate_capture_selector(&request.selector, request.pid).is_ok())
-            .map(|request| CaptureIdentity::Selector {
-                selector: request.selector,
-                pid: request.pid,
-                mode: request.mode,
-            })
-            .collect();
+        let identity = request_identity(request);
+        self.graph_route_targets.remove(&(port, identity));
         self.reconcile(format);
     }
 
@@ -221,14 +248,7 @@ impl ProcessCaptureManager {
             .active
             .values()
             .find(|capture| capture_identity(&capture.key) == identity)
-            .ok_or_else(|| {
-                self.failed
-                    .get(&identity)
-                    .map(|failure| BackendError::unsupported(failure.error.clone()))
-                    .unwrap_or_else(|| {
-                        BackendError::native("process-loopback capture did not become active")
-                    })
-            })
+            .ok_or_else(|| self.capture_start_error(&identity))
             .and_then(|capture| {
                 capture
                     .sources
@@ -261,14 +281,20 @@ impl ProcessCaptureManager {
         self.reconcile(format);
     }
 
+    fn capture_start_error(&self, identity: &CaptureIdentity) -> BackendError {
+        self.failed
+            .get(identity)
+            .map(|failure| BackendError::unsupported(failure.error.clone()))
+            .unwrap_or_else(|| {
+                BackendError::native("process-loopback capture did not become active")
+            })
+    }
+
     /// Probe route capture capability without owning a second realtime source.
     ///
-    /// The graph-owned isolated route opens its own `ProcessLoopbackSource`
-    /// when the plan is applied. Windows 10 can reject two simultaneous
-    /// process-loopback activations for one PID, so a saved route must use the
-    /// bounded activation probe for readiness while leaving the live source to
-    /// the router. Meter and relay consumers continue to use `reconcile` and
-    /// retain their long-lived manager-owned streams.
+    /// Persisted automatic-isolation rules use a bounded activation probe for
+    /// readiness. The live graph route later leases its source through
+    /// [`Self::acquire_graph_route`], avoiding a second activation for a PID.
     pub fn reconcile_route_probes(
         &mut self,
         requests: impl IntoIterator<Item = ProcessCaptureRequest>,
@@ -542,7 +568,11 @@ impl ProcessCaptureManager {
                 pid: target.pid,
                 mode: target.mode,
             })
-            .chain(self.route_capture_targets.iter().cloned())
+            .chain(
+                self.graph_route_targets
+                    .keys()
+                    .map(|(_, identity)| identity.clone()),
+            )
             .chain(
                 self.recorder_targets
                     .keys()
@@ -558,10 +588,13 @@ impl ProcessCaptureManager {
                 consumers.insert(ProcessCaptureConsumer::Meter(target.node_id));
             }
         }
-        if self.route_capture_targets.contains(identity)
-            || self.route_probe_targets.contains(identity)
-        {
+        if self.route_probe_targets.contains(identity) {
             consumers.insert(ProcessCaptureConsumer::OwnedRoute);
+        }
+        for (port, route_identity) in self.graph_route_targets.keys() {
+            if route_identity == identity {
+                consumers.insert(ProcessCaptureConsumer::GraphRoute(*port));
+            }
         }
         for (recorder_id, recorder_identity) in self.recorder_targets.keys() {
             if recorder_identity == identity {
@@ -586,9 +619,8 @@ impl ProcessCaptureManager {
                     consumer,
                     ProcessCaptureConsumer::Meter(_)
                         | ProcessCaptureConsumer::Recorder(_)
-                        | ProcessCaptureConsumer::OwnedRoute
-                ) && (self.route_capture_targets.contains(identity)
-                    || !matches!(consumer, ProcessCaptureConsumer::OwnedRoute))
+                        | ProcessCaptureConsumer::GraphRoute(_)
+                )
             })
             .collect()
     }
@@ -906,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn one_capture_identity_tracks_meter_and_recorder_consumers_together() {
+    fn one_capture_identity_tracks_graph_meter_and_recorder_consumers_together() {
         let request = ProcessCaptureRequest {
             selector: "sha256:example".into(),
             pid: 42,
@@ -926,16 +958,31 @@ mod tests {
         manager
             .recorder_targets
             .insert((3, identity.clone()), request.clone());
+        manager
+            .graph_route_targets
+            .insert((PortId(9), identity.clone()), request.clone());
 
         assert_eq!(
             manager.source_consumers_for(&identity),
             BTreeSet::from([
+                ProcessCaptureConsumer::GraphRoute(PortId(9)),
                 ProcessCaptureConsumer::Meter(NodeId(7)),
                 ProcessCaptureConsumer::Recorder(3),
             ])
         );
 
         manager.recorder_targets.remove(&(3, identity.clone()));
+        assert_eq!(
+            manager.source_consumers_for(&identity),
+            BTreeSet::from([
+                ProcessCaptureConsumer::GraphRoute(PortId(9)),
+                ProcessCaptureConsumer::Meter(NodeId(7)),
+            ])
+        );
+
+        manager
+            .graph_route_targets
+            .remove(&(PortId(9), identity.clone()));
         assert_eq!(
             manager.source_consumers_for(&identity),
             BTreeSet::from([ProcessCaptureConsumer::Meter(NodeId(7))])

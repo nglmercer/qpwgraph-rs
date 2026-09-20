@@ -7,9 +7,9 @@
 //! * **observed** — an application session and the endpoint Windows says it is
 //!   playing to. Visible, selectable, and immutable, because Windows offers no
 //!   supported way to move one.
-//! * **carried** — a route between two endpoint ports that qpwgraph opened
-//!   WASAPI streams for and is moving the PCM through itself. Mutable, because
-//!   qpwgraph owns it.
+//! * **carried** — a route whose endpoint or process-loopback source and WASAPI
+//!   destination qpwgraph opened and whose PCM it moves itself. Mutable,
+//!   because qpwgraph owns the captured copy.
 //!
 //! All COM interfaces stay on the worker thread; the public driver
 //! communicates with that thread through owned commands and snapshots.
@@ -117,9 +117,10 @@ pub use self::virtual_device::{
 use self::worker::*;
 
 /// Capabilities of a Windows application session are intentionally split by
-/// operation. Process-loopback capture is read-only and does not prove that
-/// qpwgraph may rerender the application locally; only an application already
-/// isolated on QPWGraph Virtual Output gets the latter capabilities.
+/// operation. Process-loopback capture is read-only: qpwgraph may route and
+/// process the captured copy, but it does not own or change the application's
+/// Windows endpoint assignment. Isolation remains a separate capability for
+/// automatic application-output policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessAudioCapabilities {
     pub capture_readonly: bool,
@@ -138,7 +139,7 @@ impl ProcessAudioCapabilities {
             meter_peak: true,
             meter_rms: true,
             mutable_route: false,
-            effects: false,
+            effects: true,
         }
     }
 

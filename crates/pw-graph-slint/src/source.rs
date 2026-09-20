@@ -311,11 +311,8 @@ impl ApplicationDriver {
             return true;
         }
 
-        // Windows application sessions are deliberately not generally
-        // routable. They may still be a valid source for a Recorder through
-        // the destination-aware CaptureOnly capability, so expose a canvas
-        // gesture only when an actual recorder input can accept one of this
-        // node's source ports.
+        // Destination-aware support remains useful for backends that expose a
+        // capture-only source without marking its whole node connectable.
         let graph = self.graph();
         let Some(node_record) = graph.node(node) else {
             return false;

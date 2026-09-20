@@ -782,11 +782,10 @@ pub trait GraphDriver: EffectDriver {
 
     /// Whether this node's ports can take part in a new link.
     ///
-    /// A backend-wide `connect` capability is a union: on Windows the audio
-    /// driver can route between endpoints but cannot re-point an application
-    /// session, because Core Audio exposes no supported way to move one. The
-    /// canvas asks per node so it offers a connect gesture only where one can
-    /// actually succeed, rather than enabling a control that always fails.
+    /// A backend-wide `connect` capability is a union. The canvas asks per
+    /// node so it offers a connect gesture only where one can actually
+    /// succeed; on Windows a stable application session can be a documented
+    /// process-loopback source without being re-pointed to another endpoint.
     ///
     /// The default follows the backend-wide capability, which is right for
     /// every backend whose nodes are uniform.
@@ -797,8 +796,8 @@ pub trait GraphDriver: EffectDriver {
     /// Decide what a connection gesture means for this particular pair.
     ///
     /// The default is a normal route for uniform backends. Windows overrides
-    /// this for application-session to Recorder connections: the session is
-    /// captured through process loopback and is not made generally routable.
+    /// this to distinguish read-only application process capture from normal
+    /// endpoint routes.
     fn connection_support(&self, output: PortId, input: PortId) -> ConnectionSupport {
         let Some(output_port) = self.graph().port(output) else {
             return ConnectionSupport::Unsupported;

@@ -36,6 +36,22 @@ take precedence. Arguments after `cargo xtask` are forwarded to Cargo without
 reinterpretation, including `--manifest-path` commands for the nested Windows
 audio-driver workspace.
 
+### Windows application and microphone routing
+
+On supported Windows builds, live applications with a stable process identity
+appear as read-only process-loopback sources. Connect an application and a
+physical microphone to **QPWGraph Relay Sink**; the shared user-space router
+mixes them, and conferencing applications can select **QPWGraph Relay
+Microphone** as their recording device. Capturing an application this way does
+not move it in Windows Volume Mixer, so its normal local playback continues.
+
+The optional virtual-audio driver provides Relay Sink/Relay Microphone and the
+separate Virtual Output/Virtual Monitor pair. Set an application's Windows
+output to **QPWGraph Virtual Output** only when the original dry path should be
+replaced. Routing, gain, effects, resampling, metering, recording, and fan-out
+remain in the Rust `RouterCore`; the driver only exposes endpoints and bounded
+PCM cables.
+
 Press F1 for the shortcut list. The canonical executable is always
 `qpwgraph-rs`.
 

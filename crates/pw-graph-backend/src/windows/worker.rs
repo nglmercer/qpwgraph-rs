@@ -56,9 +56,9 @@ pub(super) struct WorkerSnapshot {
     /// Ports the router can open a real WASAPI stream for.
     ///
     /// Render-session ports are present when Windows supplies a stable process
-    /// identity. They are used for capture-only Recorder links as well as the
-    /// mutable, isolated route path; `GraphDriver::connection_support` keeps
-    /// ordinary application rerouting refused.
+    /// identity. They are used for read-only process-loopback graph routes,
+    /// including Recorder links. The observed Windows session relationship
+    /// remains immutable; only qpwgraph's captured-copy links are mutable.
     pub(super) endpoint_ports: BTreeMap<PortId, EndpointPort>,
     pub(super) endpoint_selectors: BTreeMap<String, WindowsEndpointSelector>,
     /// Per-application capabilities. Capture-only capabilities are separate
@@ -69,7 +69,7 @@ pub(super) struct WorkerSnapshot {
     pub(super) application_route_candidates: Vec<ApplicationRouteCandidate>,
     /// Runtime source ports for application sessions with a stable process
     /// selector. These are looked up by selector/PID during route restoration
-    /// and capture-only Recorder links; they are never stored in configuration.
+    /// and read-only process capture; they are never stored in configuration.
     pub(super) application_route_ports: BTreeMap<(String, u32), PortId>,
     /// Safe, bounded diagnostics for process-loopback workers owned by this
     /// COM worker. The actual PCM never leaves the worker through a snapshot.
@@ -116,7 +116,7 @@ pub(super) enum EndpointPortRole {
     Monitor,
     /// A playback device. Opens as a render sink.
     Render,
-    /// An application already isolated on QPWGraph Virtual Output.
+    /// A stable application render session captured through process loopback.
     /// The selector is carried alongside the PID so route activation can
     /// re-check identity immediately before opening process loopback.
     Process { pid: u32, selector: String },
@@ -134,14 +134,14 @@ pub(super) enum WorkerCommand {
         Vec<ProcessCaptureRequest>,
         Sender<BackendResult<Vec<ProcessCaptureStatus>>>,
     ),
-    AcquireProcessRecorder(
+    AcquireProcessGraphRoute(
         ProcessCaptureRequest,
-        RecorderId,
+        PortId,
         AudioFormat,
         Sender<BackendResult<(RingSource, Vec<ProcessCaptureStatus>)>>,
     ),
-    ReleaseProcessRecorder(
-        RecorderId,
+    ReleaseProcessGraphRoute(
+        PortId,
         ProcessCaptureRequest,
         AudioFormat,
         Sender<BackendResult<Vec<ProcessCaptureStatus>>>,
@@ -224,17 +224,17 @@ pub(super) fn worker_thread(
                 worker.process_captures.reconcile_route_probes(requests);
                 let _ = sender.send(Ok(worker.process_captures.statuses()));
             }
-            WorkerCommand::AcquireProcessRecorder(request, recorder_id, format, sender) => {
+            WorkerCommand::AcquireProcessGraphRoute(request, port, format, sender) => {
                 let result = worker
                     .process_captures
-                    .acquire_recorder(recorder_id, request, format)
+                    .acquire_graph_route(port, request, format)
                     .map(|source| (source, worker.process_captures.statuses()));
                 let _ = sender.send(result);
             }
-            WorkerCommand::ReleaseProcessRecorder(recorder_id, request, format, sender) => {
+            WorkerCommand::ReleaseProcessGraphRoute(port, request, format, sender) => {
                 worker
                     .process_captures
-                    .release_recorder(recorder_id, &request, format);
+                    .release_graph_route(port, &request, format);
                 let _ = sender.send(Ok(worker.process_captures.statuses()));
             }
             #[cfg(feature = "relay")]
@@ -401,16 +401,28 @@ impl CoreAudioWorker {
             let node_id = NodeId(graph_id(endpoint_node_local_id(&endpoint_id)));
             let port_id = PortId(graph_id(endpoint_port_local_id(&endpoint_id)));
             let direction = endpoint_direction(flow);
-            let name = endpoint_name(&device).unwrap_or_else(|| {
-                format!(
-                    "Windows {} endpoint",
-                    if flow == Audio::eRender {
-                        "playback"
-                    } else {
-                        "capture"
-                    }
-                )
-            });
+            let virtual_identity = qpwgraph_virtual_endpoint_identity(&device, &endpoint_id)
+                .filter(|identity| qpwgraph_endpoint_role_matches_flow(flow, identity.role));
+            // All endpoints in one provider pair share the same generic
+            // Windows friendly name (for example "Speakers (...)"), which
+            // cannot distinguish Virtual Output from Relay Sink. A verified
+            // provider role is both safer and clearer, and remains stable if
+            // Windows or the user renames the endpoint.
+            let name = virtual_identity
+                .as_ref()
+                .map(|identity| identity.role.stable_name().to_owned())
+                .unwrap_or_else(|| {
+                    endpoint_name(&device).unwrap_or_else(|| {
+                        format!(
+                            "Windows {} endpoint",
+                            if flow == Audio::eRender {
+                                "playback"
+                            } else {
+                                "capture"
+                            }
+                        )
+                    })
+                });
             graph.add_node(
                 Node::new(node_id, name, NodeType::WindowsAudioEndpoint)
                     .with_serial(stable_local_id(&format!("endpoint:{endpoint_id}")))
@@ -452,8 +464,6 @@ impl CoreAudioWorker {
                     data_flow,
                 },
             );
-            let virtual_identity = qpwgraph_virtual_endpoint_identity(&device, &endpoint_id)
-                .filter(|identity| qpwgraph_endpoint_role_matches_flow(flow, identity.role));
             // Windows 10 images predating PKEY_AudioEndpoint_StableId still
             // expose the provider-owned role property. Once the service,
             // parent, and semantic role have all been verified, that role is
@@ -614,10 +624,8 @@ impl CoreAudioWorker {
     /// Which graph ports the router can open a real stream for.
     ///
     /// Endpoint ports always appear. A render-session port appears when
-    /// Windows supplies a stable process identity: capture-only Recorder
-    /// links use it for selector validation, while the mutable route path
-    /// still requires the separate virtual-output proof in
-    /// `process_audio_capabilities`.
+    /// Windows supplies a stable process identity, allowing a read-only
+    /// process-loopback source without changing the application's endpoint.
     pub(super) fn endpoint_ports(&self) -> BTreeMap<PortId, EndpointPort> {
         let mut ports = BTreeMap::new();
         for endpoint in &self.endpoints {

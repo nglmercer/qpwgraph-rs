@@ -101,12 +101,12 @@ restart only the active worker when the resolved device or default generation
 changes. Install the optional `drivers/windows-audio` package to expose Relay
 Sink/Relay Microphone and select the `virtual-microphone` receive target;
 without it, direct physical output remains available and the virtual selector
-is absent. A live session already assigned to **QPWGraph Virtual Output** also
-appears as an `application:<stable-selector>` Emitter source. Starting that
-choice resolves the current PID, captures it with documented process loopback,
-and feeds the same bounded PCM hand-off as other sources; a process exit or
-loss of isolation stops the source instead of falling back to another app.
-The selector is stable across app restarts, while the PID is runtime-only.
+is absent. Any stable live render session appears as an
+`application:<stable-selector>` Emitter source. Starting that choice resolves
+the current PID, captures it with documented process loopback, and feeds the
+same bounded PCM hand-off as other sources; a process exit stops the source
+instead of falling back to another app. The selector is stable across app
+restarts, while the PID is runtime-only.
 
 ## Local endpoint routing
 

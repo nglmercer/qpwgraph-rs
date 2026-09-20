@@ -19,13 +19,12 @@
 //! | --- | --- | --- |
 //! | a recording endpoint | a playback endpoint | capture → render |
 //! | a playback endpoint's monitor | a playback endpoint | loopback → render |
-//! | a virtualized application session | anything | process loopback → router |
+//! | a stable application session | anything | process loopback → router |
 //!
-//! An ordinary application session is still refused: Windows does not expose
-//! a supported way to re-point it, and capturing it without first moving the
-//! stream to QPWGraph Virtual Output would produce dry + processed duplicate
-//! audio. A session already attached to that virtual endpoint is isolated and
-//! can use process-loopback capture on supported Windows builds.
+//! Capturing an ordinary application does not re-point it: its original local
+//! playback continues while qpwgraph routes the captured copy. Moving the app
+//! to QPWGraph Virtual Output is needed only for the isolated virtual-output
+//! workflow, where the user explicitly replaces the original dry path.
 //!
 //! # Ownership
 //!
@@ -125,6 +124,9 @@ pub(super) struct WindowsRouting {
     effects: BTreeMap<PortId, Effect>,
     /// Software gain per routed source port, applied to everything it feeds.
     source_gains: BTreeMap<PortId, f32>,
+    /// Software mute for captured application copies. Muting one of these
+    /// routes must not mute the application's independent local playback.
+    source_mutes: BTreeMap<PortId, bool>,
     /// Each effect's output port, so a link leaving one is recognised as
     /// routable without searching every effect.
     effect_outputs: BTreeMap<PortId, PortId>,
@@ -164,6 +166,7 @@ impl WindowsRouting {
             effect_outputs: BTreeMap::new(),
             link_routes: BTreeMap::new(),
             source_gains: BTreeMap::new(),
+            source_mutes: BTreeMap::new(),
             next_id: 1,
         })
     }
@@ -343,6 +346,10 @@ impl WindowsRouting {
         self.source_gains.get(&port).copied().unwrap_or(1.0)
     }
 
+    pub(super) fn source_muted(&self, port: PortId) -> bool {
+        self.source_mutes.get(&port).copied().unwrap_or(false)
+    }
+
     /// Apply software gain to everything a source feeds.
     ///
     /// This is the boost §13 of the parity roadmap asks for. A Windows
@@ -368,6 +375,32 @@ impl WindowsRouting {
                     }
                     None => {
                         self.source_gains.remove(&port);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn set_source_mute(&mut self, port: PortId, muted: bool) -> BackendResult<()> {
+        if !self.sources.contains_key(&port) {
+            return Err(BackendError::unsupported(
+                "software mute applies only to a source qpwgraph is routing",
+            ));
+        }
+        if self.source_muted(port) == muted {
+            return Ok(());
+        }
+        let previous = self.source_mutes.insert(port, muted);
+        match self.install() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                match previous {
+                    Some(previous) => {
+                        self.source_mutes.insert(port, previous);
+                    }
+                    None => {
+                        self.source_mutes.remove(&port);
                     }
                 }
                 Err(error)
@@ -906,7 +939,11 @@ impl WindowsRouting {
                 // and counters when a destination is added or removed.
                 id: RouteId(output.0),
                 source: *source,
-                gain: self.source_gains.get(output).copied().unwrap_or(1.0),
+                gain: if self.source_mutes.get(output).copied().unwrap_or(false) {
+                    0.0
+                } else {
+                    self.source_gains.get(output).copied().unwrap_or(1.0)
+                },
                 branches: chains
                     .into_iter()
                     .map(|(processors, destinations)| BranchSpec {
