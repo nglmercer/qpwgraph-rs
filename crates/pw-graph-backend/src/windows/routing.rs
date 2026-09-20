@@ -1239,8 +1239,8 @@ fn routable(
         BackendError::unsupported(match end {
             PortEnd::Output => {
                 "only a recording device, a playback device's monitor, or an application already \
-                 attached to QPWGraph Virtual Output can be the source of a Windows audio route; \
-                 move the application in Windows Volume Mixer before enabling process loopback"
+                 exposed as a stable process-loopback source can be the source of a Windows audio \
+                 route; refresh the Windows audio graph if the application session disappeared"
             }
             PortEnd::Input => {
                 "only a playback device can be the destination of a Windows audio route; Windows \

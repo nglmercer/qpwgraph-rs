@@ -1494,9 +1494,10 @@ pub enum RelaySendSource {
     InputDevice(String),
     DefaultOutputMonitor,
     OutputMonitor(String),
-    /// Capture a live application already isolated on QPWGraph Virtual
-    /// Output. Windows resolves the stable process selector to a PID only at
-    /// activation time; the selector never contains or persists a PID.
+    /// Capture a live application with documented process loopback. Windows
+    /// resolves the stable process selector to a PID only at activation time;
+    /// the selector never contains or persists a PID. The application may be
+    /// on an ordinary endpoint or on QPWGraph Virtual Output.
     Application(String),
     ManualGraph,
 }

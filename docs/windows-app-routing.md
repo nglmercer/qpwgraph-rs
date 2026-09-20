@@ -11,6 +11,14 @@ It returns an actionable instruction:
 > Set this app's output to QPWGraph Virtual Output in Settings > System > Sound
 > > Volume mixer.
 
+An ordinary Windows session can also be used directly as a read-only
+process-loopback source when qpwgraph has a stable process identity. That
+route does not change the session's Windows endpoint, so the application's
+local playback continues while its PCM can be mixed with a physical
+microphone and sent to Relay Sink, a recorder, effects, or another supported
+destination. Virtual Output is only needed when the original dry path must be
+replaced or the application must be isolated before capture.
+
 Once the session is observed on that virtual render endpoint, qpwgraph can
 capture its process tree, route the PCM through the user-mode router, insert
 effects, meter true RMS, and render the processed result to a chosen physical

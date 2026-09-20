@@ -10,9 +10,9 @@ use super::*;
 ///
 /// The engine is the same one PipeWire uses; only the audio endpoints differ.
 /// Direct mode supports physical input capture, playback-monitor loopback,
-/// process loopback for an app already isolated on QPWGraph Virtual Output,
-/// and render output. A separate optional driver is needed only for a
-/// system-wide virtual capture endpoint.
+/// read-only process loopback for a stable live application session, and
+/// render output. A separate optional driver is needed only for a system-wide
+/// virtual capture endpoint.
 #[cfg(feature = "relay")]
 impl api::RelayDriver for WindowsAudioDriver {
     fn relay_available(&self) -> bool {
