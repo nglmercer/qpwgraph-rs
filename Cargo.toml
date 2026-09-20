@@ -24,6 +24,12 @@ exclude = ["drivers/windows-audio"]
 [patch.crates-io]
 audiopus_sys = { path = "vendor/audiopus_sys" }
 libspa = { path = "vendor/libspa" }
+# The upstream menu crate enables the entire Windows globalization API module
+# for one UTF-16 length helper. That module also exposes raw ICU imports in
+# windows-sys 0.61, which conflicts with Slint's bundled ICU when lld-link is
+# used. Keep the menu implementation, but use its small local compatibility
+# patch instead.
+muda = { path = "vendor/muda" }
 
 [workspace.package]
 version = "0.1.0"
