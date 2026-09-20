@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "tools/xtask",
     "crates/pw-graph-utils",
     "crates/pw-graph-app-core",
     "crates/pw-graph-core",

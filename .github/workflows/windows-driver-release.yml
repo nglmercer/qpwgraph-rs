@@ -47,11 +47,11 @@ jobs:
       - name: Format and workspace tests
         run: |
           cargo fmt --all -- --check
-          cargo test --workspace --all-features --locked
-          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo xtask test --workspace --all-features --locked
+          cargo xtask clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Validate driver package metadata
         shell: pwsh
-        run: cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --validate-package
+        run: cargo xtask run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --validate-package
       - name: Parse release scripts without executing them
         shell: pwsh
         run: |
@@ -89,17 +89,15 @@ jobs:
           }
       - name: Audit eWDK toolchain
         shell: pwsh
-        working-directory: drivers/windows-audio
-        run: cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
+        run: cargo xtask run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --audit-toolchain
       - name: Build and stage unsigned release candidate
         shell: pwsh
         run: .\drivers\windows-audio\package\build-release-driver.ps1
       - name: Run core and EOS tests
         shell: pwsh
-        working-directory: drivers/windows-audio
         run: |
-          cargo test --workspace --locked
-          cargo test -p qpwgraph-audio-core render_eos --locked
+          cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml --workspace --locked
+          cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core render_eos --locked
       - name: Upload driver candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -191,7 +189,7 @@ jobs:
           "DRIVER_PACKAGE_ROOT=$driverRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Output "Returned driver package root: $driverRoot"
       - name: Build portable application
-        run: cargo build --release --locked -p pw-graph-app
+        run: cargo xtask build --release --locked -p pw-graph-app
       - name: Verify returned Microsoft package
         shell: pwsh
         run: |

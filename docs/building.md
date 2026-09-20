@@ -55,9 +55,22 @@ the machine's audio.
 On Windows, the standard MSVC commands are:
 
 ```powershell
-cargo run -p pw-graph-app -- --demo
-cargo build --release --locked -p pw-graph-app
+cargo xtask run -p pw-graph-app -- --demo
+cargo xtask build --release --locked -p pw-graph-app
 ```
+
+### Windows linker
+
+MSVC Build Tools are required on Windows.
+
+LLVM `lld-link` is optional. Rust commands launched through `cargo xtask`
+automatically use `lld-link` when it is available on `PATH`. Otherwise Cargo
+uses the normal MSVC linker.
+
+Explicit `CARGO_TARGET_*_LINKER` environment overrides always take precedence.
+The wrapper forwards all remaining arguments to Cargo, so commands such as
+`cargo xtask build --release --locked -p pw-graph-app` retain their normal
+Cargo behavior.
 
 The optional virtual-audio driver is not part of those portable commands. It
 has its own workspace and requires an eWDK/WDK developer prompt with KMDF/ACX

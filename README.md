@@ -17,6 +17,25 @@ An unoptimized debug build (`cargo run` without `--release`) is dramatically
 slower at graph projection and hit-testing; always compare performance in
 release mode.
 
+### Windows linker
+
+MSVC Build Tools are required on Windows. Run Rust commands through the
+workspace `xtask` so they automatically use `lld-link` when it is available on
+`PATH`:
+
+```powershell
+cargo xtask run --release -p pw-graph-app
+cargo xtask test --workspace --all-features --locked -- --test-threads=1
+cargo xtask build --release --locked -p pw-graph-app
+```
+
+LLVM is optional. When `lld-link` is unavailable, Cargo uses the normal MSVC
+linker. Explicit `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` and
+`CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER` environment overrides always
+take precedence. Arguments after `cargo xtask` are forwarded to Cargo without
+reinterpretation, including `--manifest-path` commands for the nested Windows
+audio-driver workspace.
+
 Press F1 for the shortcut list. The canonical executable is always
 `qpwgraph-rs`.
 
@@ -69,6 +88,10 @@ cargo fmt --all -- --check
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
+
+On Windows, use the corresponding `cargo xtask test`, `cargo xtask clippy`,
+and other `cargo xtask <subcommand>` forms so the optional linker selection is
+applied.
 
 [Workspace architecture](docs/architecture.md) explains which crate a change
 belongs in.

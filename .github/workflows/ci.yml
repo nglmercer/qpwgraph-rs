@@ -278,30 +278,30 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Workspace tests
-        run: cargo test --workspace --all-features --locked -- --test-threads=1
+        run: cargo xtask test --workspace --all-features --locked -- --test-threads=1
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo xtask clippy --workspace --all-targets --all-features --locked -- -D warnings
       # The Windows backend is heavily feature-gated -- the router is always
       # compiled, the relay endpoints and the tray are not -- so a subset that
       # nobody builds is a subset that breaks quietly. Each of these is a state
       # a user can actually ship.
       - name: Minimal application build
-        run: cargo check -p pw-graph-app --locked --no-default-features
+        run: cargo xtask check -p pw-graph-app --locked --no-default-features
       - name: Relay-only application build
-        run: cargo check -p pw-graph-app --locked --no-default-features --features relay
+        run: cargo xtask check -p pw-graph-app --locked --no-default-features --features relay
       - name: Tray-only application build
-        run: cargo check -p pw-graph-app --locked --no-default-features --features tray
+        run: cargo xtask check -p pw-graph-app --locked --no-default-features --features tray
       - name: Relay and tray application build
-        run: cargo check -p pw-graph-app --locked --no-default-features --features relay,tray
+        run: cargo xtask check -p pw-graph-app --locked --no-default-features --features relay,tray
       - name: Default application build
-        run: cargo check -p pw-graph-app --locked
+        run: cargo xtask check -p pw-graph-app --locked
       - name: Full application build
-        run: cargo check -p pw-graph-app --locked --all-features
+        run: cargo xtask check -p pw-graph-app --locked --all-features
       - name: Release build
-        run: cargo build --release --locked -p pw-graph-app
+        run: cargo xtask build --release --locked -p pw-graph-app
       - name: Validate Windows driver package metadata
         shell: pwsh
-        run: cargo run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --validate-package
+        run: cargo xtask run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --validate-package
       - name: Validate read-only Windows release tooling
         shell: pwsh
         run: |
@@ -347,13 +347,13 @@ jobs:
         shell: pwsh
         run: ./drivers/windows-audio/tests/release-audit.ps1
       - name: Windows driver ring-core tests
-        run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
+        run: cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
       - name: Windows driver smoke-probe unit tests (no audio clients)
-        run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-smoke --locked
+        run: cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-smoke --locked
       - name: Direct KS probe unit tests (no driver required)
-        run: cargo test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked
+        run: cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --locked
       - name: Direct KS probe lint
-        run: cargo clippy --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --all-targets --locked -- -D warnings
+        run: cargo xtask clippy --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-ks-probe --all-targets --locked -- -D warnings
       - name: Test Windows validation workflows with mocked devices
         shell: powershell
         run: |
@@ -383,33 +383,26 @@ jobs:
           }
       - name: Validate Windows driver package metadata
         shell: pwsh
-        working-directory: drivers/windows-audio
-        run: cargo run -p qpwgraph-audio-xtask --locked -- --validate-package
+        run: cargo xtask run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --validate-package
       - name: Verify the eWDK environment
         shell: pwsh
-        working-directory: drivers/windows-audio
-        run: cargo run -p qpwgraph-audio-xtask --locked -- --audit-toolchain
+        run: cargo xtask run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --audit-toolchain
       - name: Compile the opt-in ACX binding surface
         shell: pwsh
-        working-directory: drivers/windows-audio
-        run: cargo check -p qpwgraph-audio --features acx --locked
+        run: cargo xtask check --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio --features acx --locked
       - name: Test Rust ACX end-of-stream packet boundaries
         shell: pwsh
-        working-directory: drivers/windows-audio
-        run: cargo test -p qpwgraph-audio-core render_eos --locked
+        run: cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core render_eos --locked
       - name: Test installer package binding gate
         shell: pwsh
         run: ./drivers/windows-audio/tests/install-binding.ps1
       - name: Test allocation-free driver core
-        working-directory: drivers/windows-audio
-        run: cargo test -p qpwgraph-audio-core --locked
+        run: cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-core --locked
       - name: Test the nested driver workspace
-        working-directory: drivers/windows-audio
-        run: cargo test --workspace --locked
+        run: cargo xtask test --manifest-path drivers/windows-audio/Cargo.toml --workspace --locked
       - name: Build and package the KMDF driver
         shell: pwsh
-        working-directory: drivers/windows-audio
-        run: cargo run -p qpwgraph-audio-xtask --locked -- --build-package
+        run: cargo xtask run --manifest-path drivers/windows-audio/Cargo.toml -p qpwgraph-audio-xtask --locked -- --build-package
 
   ci:
     name: CI

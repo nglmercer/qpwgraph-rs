@@ -1,0 +1,10 @@
+[package]
+name = "qpwgraph-xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "qpwgraph-xtask"
+path = "src/main.rs"

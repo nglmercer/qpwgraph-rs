@@ -1,186 +1,406 @@
-# Task: Make window close hide to tray instead of exiting
+# Task: Implement Windows app + microphone routing to virtual microphone
 
 Repository:
 
 `https://github.com/nglmercer/qpwgraph-rs`
 
-The desktop UI is implemented with Rust + Slint.
+## Goal
 
-## Current behavior
-
-Closing the main Slint window with the window **X** causes the application to terminate.
-
-This is incorrect when the system tray is enabled.
-
-The application already has tray support on both Linux and Windows.
-
-Relevant files:
+Implement the Windows equivalent of the common PipeWire workflow:
 
 ```text
-crates/pw-graph-slint/src/bridge/mod.rs
-crates/pw-graph-slint/src/tray.rs
-crates/pw-graph-slint/src/tray_windows.rs
+Music App + Physical Microphone
+            |
+            v
+        QPWGraph Mixer
+            |
+            v
+ QPWGraph Relay Microphone
+            |
+            v
+         Discord
 ```
 
-The tray implementations already expose:
+Keep routing, mixing, effects, gain, metering, resampling, and fan-out in user space.
 
-```rust
-Command::Show
-Command::Hide
-Command::Quit
-```
+The kernel driver must only expose virtual Windows audio endpoints and transport PCM.
 
-`Command::Quit` already performs:
+## Architecture
 
-```rust
-slint::quit_event_loop()
-```
-
-Therefore, **do not add another exit mechanism**.
-
-## Desired behavior
-
-When tray support initializes successfully:
+Use the existing components:
 
 ```text
-Window X / close button
-    -> hide the main window
-    -> keep the application running
-    -> keep the tray icon running
-
-Tray -> Show
-    -> show and restore the main window
-
-Tray -> Hide
-    -> hide the main window
-
-Tray -> Quit
-    -> terminate the Slint event loop
-    -> perform normal application cleanup
-    -> remove the tray icon
-    -> terminate the process
+ProcessLoopbackSource ─┐
+                      ├─> RouterCore ─> Relay Sink ─> Relay Microphone
+Physical Mic WASAPI ──┘
 ```
 
-If tray initialization fails or tray support is unavailable, normal window-close behavior may terminate the application.
+Do not implement a PipeWire-like kernel mixer.
 
-## Important Slint lifecycle issue
+## 1. Per-application capture
 
-The application currently uses:
+Implement/complete a Windows `ProcessLoopbackSource`.
 
-```rust
-let result = self.window.run();
-```
+Use:
 
-This is problematic for a custom native tray.
+* `ActivateAudioInterfaceAsync`
+* `AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS`
+* WASAPI process loopback capture
 
-The Linux tray uses `ksni`, and the Windows tray uses a custom Win32 notification-area implementation. These are not Slint-owned tray objects, so they do not keep the Slint event loop alive after the last Slint window closes.
+Requirements:
 
-Closing the window can therefore make `MainWindow::run()` return, after which the application executes tray shutdown code and exits.
+* Capture one selected process/application.
+* Identify applications by stable selector where possible.
+* Do not capture unrelated system audio.
+* Session termination must cleanly stop the source.
+* Do not silently switch to another process.
+* Feed PCM into the existing router abstraction.
 
-## Required implementation
-
-When a tray exists, do not rely on:
-
-```rust
-self.window.run()
-```
-
-Instead, explicitly show the main window and run the Slint event loop until an explicit quit request.
-
-Conceptually:
-
-```rust
-self.window.show()?;
-
-let result = if tray.borrow().is_some() {
-    slint::run_event_loop_until_quit()
-} else {
-    slint::run_event_loop()
-};
-
-let _ = self.window.hide();
-```
-
-Adapt this to the existing code structure and Slint 1.17.1 APIs.
-
-Also explicitly intercept the main-window close request if appropriate:
-
-```rust
-self.window
-    .window()
-    .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
-```
-
-The intent must be:
+Preferred internal format:
 
 ```text
-close request != application quit
+48 kHz
+f32
+stereo when applicable
+bounded buffers
 ```
 
-when tray support is active.
+Reuse the router's existing conversion/resampling pipeline rather than duplicating it.
+
+## 2. Physical microphone source
+
+Expose physical capture endpoints as router sources using WASAPI `eCapture`.
+
+Both sources must be usable simultaneously:
+
+```text
+ProcessLoopbackSource
+WasapiCaptureSource
+```
+
+## 3. Mixing
+
+Use the existing:
+
+`pw-graph-backend::router::RouterCore`
+
+Do not create a separate Windows mixer.
+
+Required behavior:
+
+```text
+music ── gain ──┐
+                ├─> mix -> destination
+mic ─── gain ───┘
+```
+
+Support:
+
+* independent gain
+* mute
+* effects
+* resampling
+* channel conversion
+* fan-out
+* peak/RMS metering
+* bounded buffering
+* underrun/overrun diagnostics
+
+## 4. Virtual microphone path
+
+Use the existing Windows driver under:
+
+`drivers/windows-audio`
+
+Keep the existing ACX/KMDF architecture.
+
+Required endpoint pair:
+
+```text
+QPWGraph Relay Sink
+        |
+        | bounded PCM cable
+        v
+QPWGraph Relay Microphone
+```
+
+Roles:
+
+```text
+relay-render  = Relay Sink
+relay-capture = Relay Microphone
+```
+
+QPWGraph writes mixed PCM to `Relay Sink`.
+
+Applications such as Discord must see `Relay Microphone` as a normal Windows recording device.
+
+Do not put mixing/effects/routing logic inside the driver.
+
+## 5. Virtual application output
+
+Complete/support the second existing endpoint pair:
+
+```text
+QPWGraph Virtual Output
+        |
+        | bounded PCM cable
+        v
+QPWGraph Virtual Monitor
+```
+
+Roles:
+
+```text
+app-render  = Virtual Output
+app-monitor = Virtual Monitor
+```
+
+This enables:
+
+```text
+Spotify -> Virtual Output -> QPWGraph Router
+```
+
+Then QPWGraph may route the stream to:
+
+```text
+Headphones
+Relay Microphone
+Recorder
+Effects
+multiple destinations
+```
+
+## 6. Routing behavior
+
+Support graphs equivalent to:
+
+```text
+Spotify ─────┬─> Headphones
+             ├─> Relay Microphone
+             └─> Recorder
+
+Microphone ──┬─> Relay Microphone
+             └─> Recorder
+```
+
+Each source must be captured once and fan out through `RouterCore`.
+
+Do not duplicate capture workers per destination.
+
+## 7. Application routing policy
+
+Do not depend on undocumented Windows audio-policy APIs for core functionality.
+
+`IAudioPolicyConfig` / private Windows audio policy APIs may remain optional/experimental.
+
+Supported baseline workflow:
+
+```text
+Windows Volume Mixer
+Spotify output -> QPWGraph Virtual Output
+```
+
+Process loopback must still work without moving the application's output.
+
+## 8. Driver constraints
+
+Keep the driver minimal.
+
+Driver responsibilities:
+
+```text
+Expose ACX endpoints
+Advertise supported formats
+Maintain bounded PCM cables
+Handle stream lifecycle
+Handle timing/packet movement
+Expose stable endpoint roles
+```
+
+Driver must NOT:
+
+```text
+mix streams
+apply effects
+route graph edges
+manage application sessions
+perform UI logic
+```
+
+Preserve:
+
+* existing ACX implementation
+* WDK/eWDK build separation
+* test-signing workflow
+* Secure Boot/release gates
+* Driver Verifier tests
+* HLK gates
+* bounded transport
+* fail-closed behavior when driver validation is incomplete
+
+## 9. Threading
+
+Audio callbacks/workers must:
+
+* avoid unbounded allocations
+* avoid UI access
+* avoid blocking locks where possible
+* use bounded queues/rings
+* never allow latency to grow without bound
+
+COM interfaces must remain owned by the thread/apartment that created them.
+
+Structural route changes must happen outside real-time callbacks.
+
+## 10. UI
+
+Expose Windows sources including:
+
+```text
+Microphones
+Playback monitor endpoints
+Live applications
+QPWGraph Virtual Monitor
+```
+
+Allow users to connect:
+
+```text
+Application -> Relay Microphone
+Microphone   -> Relay Microphone
+```
+
+When multiple sources feed the same destination, show it as a normal mixed route.
+
+Expose per-link/source:
+
+```text
+gain
+mute
+effects
+peak
+RMS where PCM is available
+fault state
+```
+
+## 11. Discord use case
+
+Acceptance workflow:
+
+```text
+1. Start Spotify.
+2. Start QPWGraph.
+3. Select Spotify as process-loopback source.
+4. Connect Spotify -> Relay Microphone.
+5. Connect physical microphone -> Relay Microphone.
+6. Select "QPWGraph Relay Microphone" in Discord.
+7. Discord receives both microphone and Spotify.
+8. Local Spotify playback continues normally.
+```
+
+No application rerouting should be required for this workflow.
+
+## 12. Full virtual-output workflow
+
+Also support:
+
+```text
+1. Set Spotify output to "QPWGraph Virtual Output".
+2. QPWGraph receives PCM through Virtual Monitor.
+3. Route it to headphones and Relay Microphone.
+4. Spotify must not produce a duplicate dry path.
+5. Effects may be inserted before either destination.
+```
+
+## 13. Failure handling
+
+Handle gracefully:
+
+* application exits
+* endpoint disappears
+* default device changes
+* driver endpoint disappears
+* device invalidation
+* capture starvation
+* render overrun
+* sample-rate mismatch
+* channel-layout mismatch
+* router restart
+
+Never silently route a stale application selector to another process.
+
+Preserve route diagnostics and existing restart/recovery behavior.
+
+## 14. Tests
+
+Add tests for:
+
+```text
+process loopback -> router
+mic + process mixing
+fan-out
+gain/mute
+sample-rate conversion
+endpoint loss
+process termination
+virtual relay round trip
+virtual output round trip
+bounded-buffer overflow/underflow
+```
+
+Use existing opt-in live Windows tests where physical devices or the driver are required.
+
+Keep normal CI usable without installed virtual hardware.
+
+## 15. Implementation priorities
+
+Implement in this order:
+
+```text
+1. ProcessLoopbackSource
+2. ProcessLoopbackSource -> RouterCore
+3. Physical Mic + ProcessLoopback mixing
+4. RouterCore -> Relay Sink
+5. Relay Sink -> Relay Microphone validation
+6. Discord-compatible end-to-end test
+7. Virtual Output -> Virtual Monitor integration
+8. Full graph routing/fan-out
+9. UI improvements
+10. Optional automatic app reassignment
+```
 
 ## Constraints
 
 Do not:
 
-* remove the existing tray `Quit` action
-* create a second Exit/Quit implementation
-* terminate audio/backend services when only hiding the window
-* recreate the main window every time the tray Show action is used
-* manipulate the Slint UI from the Windows tray thread
-* break the current tray thread shutdown/cleanup logic
-* leave a zombie tray thread or tray icon after explicit Quit
+* port PipeWire to Windows
+* implement routing inside the kernel driver
+* introduce another Windows-specific mixer
+* rely on undocumented APIs for required functionality
+* use unbounded audio queues
+* duplicate PCM processing already implemented in `RouterCore`
+* silently fall back to another process/session
+* break Linux behavior
+* break existing relay functionality
+* break current Windows driver packaging/validation
 
-Preserve the existing architecture where the tray sends commands to the Slint event-loop thread.
-
-## Expected lifecycle
-
-```text
-Application starts
-        |
-        v
-Main window + tray created
-        |
-        +---- user clicks X
-        |          |
-        |          v
-        |      window hidden
-        |      app still running
-        |      tray still active
-        |
-        +---- tray -> Show
-        |          |
-        |          v
-        |      window shown/restored
-        |
-        +---- tray -> Quit
-                   |
-                   v
-           quit_event_loop()
-                   |
-                   v
-           normal cleanup
-                   |
-                   v
-           tray shutdown
-                   |
-                   v
-             process exits
-```
-
-## Acceptance criteria
+## Definition of done
 
 The implementation is complete when:
 
-1. Clicking the main window **X** with a functioning tray does not terminate the process.
-2. The main window disappears after clicking X.
-3. The tray icon remains available.
-4. Clicking tray **Show** restores the same main window.
-5. Clicking tray **Quit** exits the application completely.
-6. Tray shutdown still removes the icon and joins/stops its worker correctly.
-7. Linux and Windows follow the same lifecycle semantics.
-8. Without a successfully initialized tray, closing the window can still exit normally.
-9. Existing backend/audio state remains alive while the UI window is hidden.
-10. `cargo check` / relevant tests still pass.
+```text
+Spotify/process audio + physical microphone
+                |
+                v
+           RouterCore
+                |
+                v
+       Relay Microphone
+                |
+                v
+             Discord
+```
 
-Please inspect the existing lifecycle code first and make the smallest maintainable change necessary.
+works reliably on Windows, while the same router architecture remains shared with the rest of QPWGraph.

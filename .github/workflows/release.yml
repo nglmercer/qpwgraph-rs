@@ -219,12 +219,12 @@ jobs:
         shell: pwsh
         run: |
           cargo fmt --all -- --check
-          cargo check -p pw-graph-app --locked
-          cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo xtask check -p pw-graph-app --locked
+          cargo xtask test --workspace --locked
+          cargo xtask clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build Windows release binary
-        run: cargo build --release --locked -p pw-graph-app
+        run: cargo xtask build --release --locked -p pw-graph-app
 
       - name: Package Windows portable ZIP
         shell: pwsh
