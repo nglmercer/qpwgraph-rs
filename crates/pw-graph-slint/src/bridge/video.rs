@@ -9,13 +9,16 @@
 
 use pw_graph_backend::video::{
     ScreenCastRequest, ScreenCastSource, ScreenCastState, VideoFilterRequest, VideoNodeInfo,
-    VirtualDisplayRequest,
+    VideoNodeState, VirtualDisplayRequest,
 };
 use pw_graph_core::NodeId;
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer, SharedString};
+use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use std::rc::Rc;
 
 use super::app::Application;
-use super::MainWindow;
+use super::{EffectRow, MainWindow};
+use crate::source::ApplicationDriver;
+use pw_graph_i18n::I18n;
 
 /// Which stream a preview dialog shows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -36,7 +39,7 @@ pub(crate) struct VideoUiState {
 }
 
 impl VideoUiState {
-    fn next_instance_id(&mut self, filter_id: &str) -> String {
+    pub(crate) fn next_instance_id(&mut self, filter_id: &str) -> String {
         self.filter_sequence += 1;
         format!("{filter_id}-{}", self.filter_sequence)
     }
@@ -222,7 +225,7 @@ pub(crate) fn add_video_filter(application: &mut Application, spec: &str) {
     }
 }
 
-fn parse_filter_spec(
+pub(crate) fn parse_filter_spec(
     spec: &str,
 ) -> Result<(String, pw_graph_video::filters::FilterParams), String> {
     use pw_graph_video::filters::{CropRect, FilterParams, ScaleSize};
@@ -289,13 +292,24 @@ pub(crate) fn remove_selected_video_filter(application: &mut Application) {
         application.status = application.t("status.video_select_filter");
         return;
     };
-    match application.source.remove_video_filter(&instance_id) {
+    remove_video_filter_by_id(application, &instance_id);
+}
+
+/// Remove one filter by instance id. Shared by the canvas action (which
+/// resolves the selection first) and the effects-dialog video tab.
+pub(crate) fn remove_video_filter_by_id(application: &mut Application, instance_id: &str) {
+    if !require_video(application) {
+        return;
+    }
+    match application.source.remove_video_filter(instance_id) {
         Ok(()) => {
-            if application.video.preview == PreviewTarget::Filter(instance_id.clone()) {
+            if application.video.preview == PreviewTarget::Filter(instance_id.to_owned()) {
                 application.video.preview = PreviewTarget::None;
             }
-            application.status =
-                application.tf("status.video_filter_removed", &[("name", instance_id)]);
+            application.status = application.tf(
+                "status.video_filter_removed",
+                &[("name", instance_id.to_owned())],
+            );
             let _ = application.source.refresh();
         }
         Err(error) => {
@@ -312,24 +326,35 @@ pub(crate) fn toggle_selected_video_filter(application: &mut Application) {
         application.status = application.t("status.video_select_filter");
         return;
     };
+    toggle_video_filter(application, &instance_id);
+}
+
+/// Flip one filter between enabled and bypassed by instance id. Shared by
+/// the canvas action and the effects-dialog video tab.
+pub(crate) fn toggle_video_filter(application: &mut Application, instance_id: &str) {
+    if !require_video(application) {
+        return;
+    }
+    let Some(node_id) = application
+        .source
+        .video_filters()
+        .iter()
+        .find(|filter| filter.instance_id == instance_id)
+        .map(|filter| filter.node_id)
+    else {
+        application.status = application.t("status.video_select_filter");
+        return;
+    };
     // Enable state is not tracked locally; enabling an already-enabled
     // filter is a no-op, so toggle via disable-then-decide is avoidable:
     // query node info and flip Bypassed <-> Live/Idle.
     let disable = application
         .source
-        .video_node_info(
-            application
-                .source
-                .video_filters()
-                .iter()
-                .find(|filter| filter.instance_id == instance_id)
-                .map(|filter| filter.node_id)
-                .unwrap_or(NodeId(0)),
-        )
-        .is_none_or(|info| info.state != pw_graph_backend::video::VideoNodeState::Bypassed);
+        .video_node_info(node_id)
+        .is_none_or(|info| info.state != VideoNodeState::Bypassed);
     match application
         .source
-        .set_video_filter_enabled(&instance_id, !disable)
+        .set_video_filter_enabled(instance_id, !disable)
     {
         Ok(()) => {
             application.status = application.t(if disable {
@@ -521,6 +546,341 @@ pub(crate) fn video_summaries_by_node(
         .collect()
 }
 
+/// Effects-dialog video tab: the same gallery workflow as audio, backed by
+/// video filter instances. Dialog components, draft state, and verbs are
+/// shared; only this data source differs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VideoCatalogEntry {
+    /// Backend filter id, also the draft/selection identity.
+    pub(crate) id: &'static str,
+    /// Short localized name key (`video.name_*`).
+    pub(crate) name_key: &'static str,
+    /// Creation spec; geometry filters carry the same defaults as the rail.
+    pub(crate) spec: &'static str,
+}
+
+pub(crate) const VIDEO_FILTER_CATALOG: &[VideoCatalogEntry] = &[
+    VideoCatalogEntry {
+        id: "passthrough",
+        name_key: "video.name_passthrough",
+        spec: "passthrough",
+    },
+    VideoCatalogEntry {
+        id: "grayscale",
+        name_key: "video.name_grayscale",
+        spec: "grayscale",
+    },
+    VideoCatalogEntry {
+        id: "hflip",
+        name_key: "video.name_hflip",
+        spec: "hflip",
+    },
+    VideoCatalogEntry {
+        id: "vflip",
+        name_key: "video.name_vflip",
+        spec: "vflip",
+    },
+    VideoCatalogEntry {
+        id: "crop",
+        name_key: "video.name_crop",
+        spec: "crop;crop=0,0,640,480",
+    },
+    VideoCatalogEntry {
+        id: "scale",
+        name_key: "video.name_scale",
+        spec: "scale;scale=640x480",
+    },
+];
+
+pub(crate) fn video_catalog_entry(filter_id: &str) -> Option<&'static VideoCatalogEntry> {
+    VIDEO_FILTER_CATALOG
+        .iter()
+        .find(|entry| entry.id == filter_id)
+}
+
+/// ComboBox options for the video tab, in catalog order.
+pub(crate) fn video_effect_options(i18n: &I18n) -> Vec<SharedString> {
+    VIDEO_FILTER_CATALOG
+        .iter()
+        .map(|entry| SharedString::from(i18n.text(entry.name_key)))
+        .collect()
+}
+
+/// Map video states onto the dialog's health tokens so rows keep the same
+/// color coding: red failed, purple bypassed, teal live, gray idle.
+fn video_health_label(state: VideoNodeState) -> &'static str {
+    match state {
+        VideoNodeState::Live => "HEALTHY",
+        VideoNodeState::Bypassed => "BYPASSED",
+        VideoNodeState::Failed => "FAILED",
+        VideoNodeState::Idle => "IDLE",
+    }
+}
+
+/// Gallery rows for the video tab, reusing the audio `EffectRow` shape.
+/// Video has no runtime parameter API, so rows carry no sliders; the
+/// subtitle shows the same summary line as the canvas cards.
+pub(crate) fn video_effect_rows(source: &ApplicationDriver, i18n: &I18n) -> Vec<EffectRow> {
+    let mut filters = source.video_filters();
+    filters.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+    filters
+        .into_iter()
+        .map(|filter| {
+            let info = source.video_node_info(filter.node_id);
+            let name = video_catalog_entry(&filter.filter_id)
+                .map(|entry| i18n.text(entry.name_key))
+                .unwrap_or_else(|| filter.filter_id.clone());
+            let vendor = info
+                .as_ref()
+                .map(video_node_summary)
+                .unwrap_or_else(|| filter.filter_id.clone());
+            let state = info.as_ref().map(|info| info.state);
+            EffectRow {
+                instance_id: SharedString::from(filter.instance_id.clone()),
+                name: SharedString::from(name),
+                vendor: SharedString::from(vendor),
+                health: SharedString::from(state.map(video_health_label).unwrap_or("IDLE")),
+                diagnostics: SharedString::new(),
+                description: SharedString::from(filter.instance_id),
+                enabled: state.is_none_or(|state| state != VideoNodeState::Bypassed),
+                parameters: ModelRc::from(Rc::new(VecModel::default())),
+            }
+        })
+        .collect()
+}
+
+fn video_row_vitals_equal(current: &EffectRow, next: &EffectRow) -> bool {
+    // `parameters` is always an empty model for video; compare everything
+    // else so an unchanged gallery survives the sync untouched.
+    current.instance_id == next.instance_id
+        && current.name == next.name
+        && current.vendor == next.vendor
+        && current.health == next.health
+        && current.diagnostics == next.diagnostics
+        && current.description == next.description
+        && current.enabled == next.enabled
+}
+
+/// Synchronize video rows like the audio gallery: rebuild the model when
+/// membership changes, otherwise patch changed rows in place.
+pub(crate) fn sync_video_effect_rows(
+    current: ModelRc<EffectRow>,
+    source: &ApplicationDriver,
+    i18n: &I18n,
+) -> Option<ModelRc<EffectRow>> {
+    let rows = video_effect_rows(source, i18n);
+    let Some(model) = current.as_any().downcast_ref::<VecModel<EffectRow>>() else {
+        return Some(ModelRc::from(Rc::new(VecModel::from(rows))));
+    };
+    let same_members = model.row_count() == rows.len()
+        && rows.iter().enumerate().all(|(index, row)| {
+            model
+                .row_data(index)
+                .is_some_and(|current| current.instance_id == row.instance_id)
+        });
+    if !same_members {
+        return Some(ModelRc::from(Rc::new(VecModel::from(rows))));
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if model
+            .row_data(index)
+            .is_some_and(|current| video_row_vitals_equal(&current, &row))
+        {
+            continue;
+        }
+        model.set_row_data(index, row);
+    }
+    None
+}
+
+pub(crate) fn select_video_draft(window: &MainWindow, application: &mut Application, index: usize) {
+    if let Some(entry) = VIDEO_FILTER_CATALOG.get(index) {
+        application.effect_selection_id = Some(entry.id.to_owned());
+    }
+    window.set_effect_selection_index(index as i32);
+    prepare_video_draft(window, application);
+}
+
+pub(crate) fn prepare_video_draft(window: &MainWindow, application: &mut Application) {
+    let entry = application
+        .effect_selection_id
+        .as_deref()
+        .and_then(video_catalog_entry)
+        .or(VIDEO_FILTER_CATALOG.first());
+    let Some(entry) = entry else {
+        application.effect_draft_id = None;
+        application.effect_draft_parameters.clear();
+        window.set_effect_configuring(false);
+        application.status = application.t("status.video_unavailable");
+        return;
+    };
+    let index = VIDEO_FILTER_CATALOG
+        .iter()
+        .position(|candidate| candidate.id == entry.id)
+        .unwrap_or(0);
+    application.effect_draft_id = Some(entry.id.to_owned());
+    application.effect_selection_id = Some(entry.id.to_owned());
+    application.effect_draft_enabled = true;
+    application.effect_draft_parameters.clear();
+    window.set_effect_selection_index(index as i32);
+    window.set_effect_configuring(true);
+}
+
+/// Video half of the shared Add/create flow: first call opens the setup
+/// form, the second creates the filter. Creation is synchronous (no
+/// tickets), then the draft closes like the audio one.
+pub(crate) fn create_video_effect(window: &MainWindow, application: &mut Application) {
+    if !require_video(application) {
+        return;
+    }
+    if !application.source.capabilities().connect {
+        application.status = application.t("status.connections_unavailable");
+        return;
+    }
+    let entry = application
+        .effect_selection_id
+        .as_deref()
+        .and_then(video_catalog_entry)
+        .or(VIDEO_FILTER_CATALOG.first());
+    let Some(entry) = entry else {
+        application.status = application.t("status.video_unavailable");
+        return;
+    };
+    if application.effect_draft_id.as_deref() != Some(entry.id) || !window.get_effect_configuring()
+    {
+        prepare_video_draft(window, application);
+        application.status = application.t("effects.setup_hint");
+        return;
+    }
+    let (filter_id, params) = match parse_filter_spec(entry.spec) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            application.status =
+                application.tf("status.video_filter_failed", &[("error", message)]);
+            return;
+        }
+    };
+    let instance_id = application.video.next_instance_id(&filter_id);
+    let enabled = application.effect_draft_enabled;
+    match application.source.create_video_filter(VideoFilterRequest {
+        instance_id: instance_id.clone(),
+        filter_id: filter_id.clone(),
+        params,
+        position: [260.0, 180.0],
+    }) {
+        Ok(instance) => {
+            if !enabled {
+                let _ = application
+                    .source
+                    .set_video_filter_enabled(&instance_id, false);
+            }
+            application.view.selected_nodes.clear();
+            application.view.selected_nodes.insert(instance.node_id);
+            application.status = application.tf(
+                "status.video_filter_added",
+                &[("name", format!("{filter_id} {instance_id}"))],
+            );
+            let _ = application.source.refresh();
+            super::effects::finish_effect_setup(window, application);
+        }
+        Err(error) => {
+            application.status = application.tf("status.video_filter_failed", &[("error", error)]);
+        }
+    }
+}
+
+/// Inspect opens a live preview of the instance: the video equivalent of
+/// the audio setup sheet.
+pub(crate) fn inspect_video_filter(application: &mut Application, instance_id: &str) {
+    if !require_video(application) {
+        return;
+    }
+    if !application
+        .source
+        .video_filters()
+        .iter()
+        .any(|filter| filter.instance_id == instance_id)
+    {
+        application.status = application.t("status.video_select_filter");
+        return;
+    }
+    open_preview(application, Some(instance_id));
+    application.status = application.tf(
+        "video.preview_filter_title",
+        &[("name", instance_id.to_owned())],
+    );
+}
+
+/// Fill the shared effect-diagnostics dialog from the instance's node info.
+pub(crate) fn debug_video_filter(
+    window: &MainWindow,
+    application: &mut Application,
+    instance_id: &str,
+) {
+    if !require_video(application) {
+        return;
+    }
+    let instance = application
+        .source
+        .video_filters()
+        .into_iter()
+        .find(|filter| filter.instance_id == instance_id);
+    let Some(instance) = instance else {
+        application.status = application.t("status.video_select_filter");
+        return;
+    };
+    let info = application.source.video_node_info(instance.node_id);
+    let name = video_catalog_entry(&instance.filter_id)
+        .map(|entry| application.t(entry.name_key))
+        .unwrap_or_else(|| instance.filter_id.clone());
+    let mut report = format!(
+        "filter: {} ({})\nnode: {}\n",
+        name, instance.instance_id, instance.node_id.0
+    );
+    match info {
+        Some(info) => {
+            report.push_str(&format!("state: {}\n", info.state.as_str()));
+            match &info.spec {
+                Some(spec) => report.push_str(&format!("spec: {spec}\n")),
+                None => report.push_str("spec: -\n"),
+            }
+            if let Some(counters) = &info.counters {
+                report.push_str(&format!(
+                    "received {} · processed {} · output {} · dropped {} · bypassed {} · rejected {}\nqueue: {}/{}\nlast process: {}us · max: {}us\n",
+                    counters.frames_received,
+                    counters.frames_processed,
+                    counters.frames_output,
+                    counters.frames_dropped,
+                    counters.frames_bypassed,
+                    counters.frames_rejected,
+                    counters.queue_depth,
+                    counters.queue_capacity,
+                    counters.last_processing_time_us,
+                    counters.max_processing_time_us,
+                ));
+            }
+            report.push_str(&format!("preview: {}\n", preview_word(&info.preview_state)));
+            application.effect_debug_health = video_health_label(info.state).to_owned();
+        }
+        None => {
+            report.push_str("state: unknown (no node info)\n");
+            application.effect_debug_health = "IDLE".to_owned();
+        }
+    }
+    application.effect_debug_name = name;
+    application.effect_debug_report = report;
+    window.set_show_effect_diagnostics(true);
+}
+
+fn preview_word(state: &pw_graph_video::preview::PreviewState) -> &'static str {
+    match state {
+        pw_graph_video::preview::PreviewState::Idle => "idle",
+        pw_graph_video::preview::PreviewState::Live => "live",
+        pw_graph_video::preview::PreviewState::Ended => "ended",
+        pw_graph_video::preview::PreviewState::Error(_) => "error",
+    }
+}
+
 /// One-line video summary for node cards: resolution, fps, format, state,
 /// and dropped frames.
 pub(crate) fn video_node_summary(info: &VideoNodeInfo) -> String {
@@ -643,5 +1003,148 @@ mod tests {
             parse_virtual_geometry(Some("0x0@0")),
             VirtualDisplayRequest::default()
         );
+    }
+
+    #[test]
+    fn video_tab_lists_the_catalog_and_starts_empty() {
+        use super::super::app::EffectMediaTab;
+
+        let application = demo_application();
+        assert_eq!(application.effect_media_tab, EffectMediaTab::Audio);
+        let options = video_effect_options(&application.i18n);
+        let names: Vec<String> = options.iter().map(|name| name.to_string()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Passthrough",
+                "Grayscale",
+                "Horizontal flip",
+                "Vertical flip",
+                "Crop (0,0 640x480)",
+                "Scale (640x480)"
+            ]
+        );
+        assert!(video_effect_rows(&application.source, &application.i18n).is_empty());
+    }
+
+    #[test]
+    fn video_dialog_runs_the_shared_gallery_workflow() {
+        use super::super::app::EffectMediaTab;
+        use super::super::effects;
+
+        let window = super::super::tests::test_window();
+        let mut application = demo_application();
+        effects::select_effect_media_tab(&window, &mut application, 1);
+        assert_eq!(application.effect_media_tab, EffectMediaTab::Video);
+        assert_eq!(window.get_effect_media_tab(), 1);
+
+        // Pick a catalog entry: opens the setup form like audio does.
+        effects::select_effect_draft(&window, &mut application, 1);
+        assert_eq!(application.effect_draft_id.as_deref(), Some("grayscale"));
+        assert!(window.get_effect_configuring());
+
+        // Confirm: creates the filter and closes the form.
+        effects::create_effect(&window, &mut application);
+        assert!(!window.get_effect_configuring());
+        assert_eq!(application.source.video_filters().len(), 1);
+        let rows = video_effect_rows(&application.source, &application.i18n);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name.as_str(), "Grayscale");
+        assert_eq!(rows[0].health.as_str(), "IDLE");
+        assert!(rows[0].enabled);
+        assert!(rows[0].vendor.as_str().contains("idle"));
+        let instance_id = rows[0].instance_id.to_string();
+
+        // Row verbs route to the video backend through the shared dispatch.
+        effects::toggle_effect(&mut application, &instance_id);
+        let rows = video_effect_rows(&application.source, &application.i18n);
+        assert_eq!(rows[0].health.as_str(), "BYPASSED");
+        assert!(!rows[0].enabled);
+        effects::toggle_effect(&mut application, &instance_id);
+        let rows = video_effect_rows(&application.source, &application.i18n);
+        assert!(rows[0].enabled);
+
+        effects::inspect_effect(&mut application, Some(&instance_id));
+        assert_eq!(
+            application.video.preview,
+            PreviewTarget::Filter(instance_id.clone())
+        );
+
+        effects::open_effect_diagnostics(&window, &mut application, Some(&instance_id));
+        assert!(window.get_show_effect_diagnostics());
+        assert!(application.effect_debug_report.contains("grayscale"));
+
+        effects::remove_effect(&mut application, &instance_id);
+        assert!(application.source.video_filters().is_empty());
+        assert_eq!(application.video.preview, PreviewTarget::None);
+
+        // Back to audio: the tab and the window property follow together.
+        effects::select_effect_media_tab(&window, &mut application, 0);
+        assert_eq!(application.effect_media_tab, EffectMediaTab::Audio);
+        assert_eq!(window.get_effect_media_tab(), 0);
+    }
+
+    #[test]
+    fn switching_tabs_discards_the_unsubmitted_draft() {
+        use super::super::app::EffectMediaTab;
+        use super::super::effects;
+
+        let window = super::super::tests::test_window();
+        let mut application = demo_application();
+        effects::prepare_effect_draft(&window, &mut application);
+        assert!(application.effect_draft_id.is_some());
+
+        effects::select_effect_media_tab(&window, &mut application, 1);
+        assert_eq!(application.effect_media_tab, EffectMediaTab::Video);
+        assert!(application.effect_draft_id.is_none());
+        assert!(application.effect_selection_id.is_none());
+        assert!(!window.get_effect_configuring());
+
+        effects::select_effect_media_tab(&window, &mut application, 7);
+        assert_eq!(application.effect_media_tab, EffectMediaTab::Audio);
+        assert_eq!(window.get_effect_media_tab(), 0);
+    }
+
+    #[test]
+    fn video_row_sync_rebuilds_on_membership_and_patches_vitals() {
+        use slint::Model;
+
+        let mut application = demo_application();
+        let current = ModelRc::from(Rc::new(VecModel::from(video_effect_rows(
+            &application.source,
+            &application.i18n,
+        ))));
+        assert!(
+            sync_video_effect_rows(current.clone(), &application.source, &application.i18n)
+                .is_none()
+        );
+
+        add_video_filter(&mut application, "grayscale");
+        let rebuilt =
+            sync_video_effect_rows(current, &application.source, &application.i18n).unwrap();
+        assert_eq!(
+            rebuilt
+                .as_any()
+                .downcast_ref::<VecModel<EffectRow>>()
+                .unwrap()
+                .row_count(),
+            1
+        );
+
+        // Same membership: state flips patch the row in place.
+        let instance_id = application.source.video_filters()[0].instance_id.clone();
+        toggle_video_filter(&mut application, &instance_id);
+        assert!(
+            sync_video_effect_rows(rebuilt.clone(), &application.source, &application.i18n)
+                .is_none()
+        );
+        let row = rebuilt
+            .as_any()
+            .downcast_ref::<VecModel<EffectRow>>()
+            .unwrap()
+            .row_data(0)
+            .unwrap();
+        assert_eq!(row.health.as_str(), "BYPASSED");
+        assert!(!row.enabled);
     }
 }

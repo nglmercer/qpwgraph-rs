@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use super::app::{toast_visible, Application};
+use super::app::{toast_visible, Application, EffectMediaTab};
 use super::effects::{
     effect_operation_rows, effect_options, effect_setup_rows, sync_effect_rows,
     sync_effect_setup_rows,
@@ -34,7 +34,9 @@ use super::utils::{
     color, language_index, localized_meter_label, localized_node_type, meter_fraction,
     meter_policy_index, track_position_from_volume,
 };
-use super::video::video_summaries_by_node;
+use super::video::{
+    sync_video_effect_rows, video_effect_options, video_summaries_by_node, VIDEO_FILTER_CATALOG,
+};
 use super::{
     HistoryRow, LinkRow, MainWindow, MinimapNode, NodeRow, PortRow, RuleRow, ShortcutRow, UiI18n,
 };
@@ -333,7 +335,22 @@ pub(crate) fn sync_models(
         window.set_relay_send_source_index(0);
         window.set_relay_receive_sink_index(0);
     }
-    if let Some(model) =
+    // The effects dialog shows one catalog at a time; without video
+    // support the video tab coerces back to audio like the relay tabs do.
+    if application.effect_media_tab == EffectMediaTab::Video
+        && !application.source.video_supported()
+    {
+        application.effect_media_tab = EffectMediaTab::Audio;
+        window.set_effect_media_tab(EffectMediaTab::Audio.index());
+    }
+    let video_tab = application.effect_media_tab == EffectMediaTab::Video;
+    if video_tab {
+        if let Some(model) =
+            sync_video_effect_rows(window.get_effects(), &application.source, &application.i18n)
+        {
+            window.set_effects(model);
+        }
+    } else if let Some(model) =
         sync_effect_rows(window.get_effects(), &application.source, &application.i18n)
     {
         window.set_effects(model);
@@ -354,41 +371,66 @@ pub(crate) fn sync_models(
     window.set_node_debug_report(SharedString::from(application.node_debug_report.clone()));
     if let Some(model) = set_window_model_if_changed(
         window.get_effect_options(),
-        effect_options(&application.source),
+        if video_tab {
+            video_effect_options(&application.i18n)
+        } else {
+            effect_options(&application.source)
+        },
     ) {
         window.set_effect_options(model);
     }
-    let descriptors = application.source.effect_descriptors();
-    let selected_index = application
-        .effect_selection_id
-        .as_deref()
-        .and_then(|id| {
-            descriptors
-                .iter()
-                .position(|descriptor| descriptor.id == id)
-        })
-        .or_else(|| {
-            descriptors
-                .iter()
-                .position(|descriptor| descriptor.id == pw_graph_effects::DEFAULT_EFFECT_ID)
-        })
-        .or_else(|| (!descriptors.is_empty()).then_some(0))
-        .unwrap_or(0) as i32;
-    if application.effect_selection_id.is_none() {
-        application.effect_selection_id = descriptors
-            .get(selected_index as usize)
-            .map(|descriptor| descriptor.id.clone());
+    if video_tab {
+        let selected_index = application
+            .effect_selection_id
+            .as_deref()
+            .and_then(|id| VIDEO_FILTER_CATALOG.iter().position(|entry| entry.id == id))
+            .or((!VIDEO_FILTER_CATALOG.is_empty()).then_some(0))
+            .unwrap_or(0) as i32;
+        if application.effect_selection_id.is_none() {
+            application.effect_selection_id = VIDEO_FILTER_CATALOG
+                .get(selected_index as usize)
+                .map(|entry| entry.id.to_owned());
+        }
+        window.set_effect_selection_index(selected_index);
+    } else {
+        let descriptors = application.source.effect_descriptors();
+        let selected_index = application
+            .effect_selection_id
+            .as_deref()
+            .and_then(|id| {
+                descriptors
+                    .iter()
+                    .position(|descriptor| descriptor.id == id)
+            })
+            .or_else(|| {
+                descriptors
+                    .iter()
+                    .position(|descriptor| descriptor.id == pw_graph_effects::DEFAULT_EFFECT_ID)
+            })
+            .or_else(|| (!descriptors.is_empty()).then_some(0))
+            .unwrap_or(0) as i32;
+        if application.effect_selection_id.is_none() {
+            application.effect_selection_id = descriptors
+                .get(selected_index as usize)
+                .map(|descriptor| descriptor.id.clone());
+        }
+        window.set_effect_selection_index(selected_index);
     }
-    window.set_effect_selection_index(selected_index);
     window.set_effect_configuring(application.effect_draft_id.is_some());
     window.set_effect_setup_enabled(application.effect_draft_enabled);
     if let Some(model) = sync_effect_setup_rows(
         window.get_effect_setup_parameters(),
-        effect_setup_rows(
-            &application.source,
-            application.effect_draft_id.as_deref(),
-            &application.effect_draft_parameters,
-        ),
+        if video_tab {
+            // Video filters take no draft parameters; the setup form shows
+            // only the enabled checkbox.
+            Vec::new()
+        } else {
+            effect_setup_rows(
+                &application.source,
+                application.effect_draft_id.as_deref(),
+                &application.effect_draft_parameters,
+            )
+        },
     ) {
         window.set_effect_setup_parameters(model);
     }
@@ -412,7 +454,11 @@ pub(crate) fn sync_models(
     {
         window.set_redo_history(model);
     }
-    window.set_effects_available(application.source.supports_effect_nodes());
+    window.set_effects_available(if video_tab {
+        application.source.video_supported()
+    } else {
+        application.source.supports_effect_nodes()
+    });
     if let Some(model) = set_window_model_if_changed(
         window.get_relay_rows(),
         relay_rows(application, &application.i18n),

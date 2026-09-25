@@ -2,7 +2,7 @@ import { CheckBox, ComboBox, ScrollView, Slider, VerticalBox } from "std-widgets
 import { UiTheme } from "../foundation/theme.slint";
 import { UiI18n } from "../foundation/i18n.slint";
 import { AppTokens } from "../foundation/tokens.slint";
-import { ActionButton } from "../components/button.slint";
+import { ActionButton, DialogButton } from "../components/button.slint";
 import { IconButton } from "../components/icon-button.slint";
 import { Tooltip } from "../components/tooltip.slint";
 import { EffectRow, EffectParameterRow } from "../foundation/structs.slint";
@@ -17,6 +17,9 @@ export component EffectsDialog inherits DialogShell {
     in-out property <bool> effect-configuring: false;
     in-out property <bool> effect-setup-enabled: true;
     in property <int> effect-selection-index: 0;
+    in-out property <int> effect-media-tab: 0;
+    in property <bool> video-available: false;
+    callback effect-media-tab-selected(int);
     callback effect-selected(int);
     callback effect-create-requested();
     callback effect-config-back();
@@ -50,10 +53,28 @@ export component EffectsDialog inherits DialogShell {
         }
     }
 
-    Text {
+    DialogButton {
         x: 20px;
+        y: 44px;
+        width: 104px;
+        text: UiI18n.localized("filter.audio");
+        selected: root.effect-media-tab == 0;
+        clicked => { root.effect-media-tab = 0; root.effect-media-tab-selected(0); }
+    }
+    DialogButton {
+        x: 132px;
+        y: 44px;
+        width: 104px;
+        text: UiI18n.localized("filter.video");
+        selected: root.effect-media-tab == 1;
+        enabled: root.video-available;
+        clicked => { root.effect-media-tab = 1; root.effect-media-tab-selected(1); }
+    }
+
+    Text {
+        x: 244px;
         y: 45px;
-        width: parent.width - 74px;
+        width: max(1px, parent.width - 298px);
         height: 22px;
         text: UiI18n.localized("effects.gallery_hint");
         color: AppTokens.text-secondary;

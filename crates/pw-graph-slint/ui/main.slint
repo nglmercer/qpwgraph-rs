@@ -152,6 +152,8 @@ export component MainWindow inherits Window {
     in-out property <int> relay-send-source-index: 0;
     in-out property <int> relay-receive-sink-index: 0;
     in property <int> effect-selection-index: 0;
+    in-out property <int> effect-media-tab: 0;
+    callback effect-media-tab-selected(int);
     callback effect-selected(int);
     callback effect-create-requested();
     callback effect-config-back();
@@ -661,6 +663,9 @@ export component MainWindow inherits Window {
                 effect-configuring <=> root.effect-configuring;
                 effect-setup-enabled <=> root.effect-setup-enabled;
                 effect-selection-index: root.effect-selection-index;
+                effect-media-tab <=> root.effect-media-tab;
+                video-available: root.video-available;
+                effect-media-tab-selected(index) => { root.effect-media-tab-selected(index); }
                 effect-selected(index) => { root.effect-selected(index); }
                 effect-create-requested => { root.effect-create-requested(); }
                 effect-config-back => { root.effect-config-back(); }

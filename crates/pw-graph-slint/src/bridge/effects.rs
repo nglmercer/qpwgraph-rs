@@ -11,7 +11,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use super::app::{set_app_feedback, Application, PendingEffectUi};
+use super::app::{set_app_feedback, Application, EffectMediaTab, PendingEffectUi};
+use super::video as video_dialog;
 use super::{EffectOperationRow, EffectParameterRow, EffectRow, MainWindow};
 
 pub(crate) use super::effects_restore::{restore_inserted_effects, restore_standalone_effects};
@@ -34,6 +35,10 @@ fn available_descriptors(driver: &dyn GraphDriver) -> Vec<EffectDescriptor> {
 }
 
 pub(crate) fn create_effect(window: &MainWindow, application: &mut Application) {
+    if on_video_tab(application) {
+        video_dialog::create_video_effect(window, application);
+        return;
+    }
     if !application.source.supports_effect_nodes() {
         application.status = application.t("status.effect_processing_unavailable");
         return;
@@ -203,6 +208,10 @@ pub(crate) fn poll_effect_events(application: &mut Application) -> bool {
 }
 
 pub(crate) fn toggle_effect(application: &mut Application, instance_id: &str) {
+    if on_video_tab(application) {
+        video_dialog::toggle_video_filter(application, instance_id);
+        return;
+    }
     let Some(instance) = application
         .source
         .effect_instances()
@@ -253,6 +262,10 @@ pub(crate) fn set_effect_parameter_typed(
     parameter: &str,
     value: f32,
 ) {
+    // Video rows carry no sliders (no runtime parameter API); unreachable.
+    if on_video_tab(application) {
+        return;
+    }
     match application
         .source
         .set_effect_parameter(instance_id, parameter, value)
@@ -286,6 +299,10 @@ pub(crate) fn set_effect_parameter_typed(
 }
 
 pub(crate) fn remove_effect(application: &mut Application, instance_id: &str) {
+    if on_video_tab(application) {
+        video_dialog::remove_video_filter_by_id(application, instance_id);
+        return;
+    }
     let effect_node_name = application
         .source
         .effect_instances()
@@ -342,6 +359,21 @@ pub(crate) fn open_effect_diagnostics(
     application: &mut Application,
     instance_id: Option<&str>,
 ) {
+    if on_video_tab(application) {
+        let resolved = instance_id.map(str::to_owned).or_else(|| {
+            application
+                .source
+                .video_filters()
+                .into_iter()
+                .map(|filter| filter.instance_id)
+                .min()
+        });
+        match resolved {
+            Some(resolved) => video_dialog::debug_video_filter(window, application, &resolved),
+            None => application.status = application.t("status.video_select_filter"),
+        }
+        return;
+    }
     let instance = match instance_id {
         Some(instance_id) => application
             .source
@@ -384,6 +416,21 @@ pub(crate) fn open_effect_diagnostics(
 }
 
 pub(crate) fn inspect_effect(application: &mut Application, instance_id: Option<&str>) {
+    if on_video_tab(application) {
+        let resolved = instance_id.map(str::to_owned).or_else(|| {
+            application
+                .source
+                .video_filters()
+                .into_iter()
+                .map(|filter| filter.instance_id)
+                .min()
+        });
+        match resolved {
+            Some(resolved) => video_dialog::inspect_video_filter(application, &resolved),
+            None => application.status = application.t("status.video_select_filter"),
+        }
+        return;
+    }
     let instance = match instance_id {
         Some(instance_id) => application
             .source
@@ -772,6 +819,10 @@ pub(crate) fn sync_effect_setup_rows(
 }
 
 pub(crate) fn prepare_effect_draft(window: &MainWindow, application: &mut Application) {
+    if on_video_tab(application) {
+        video_dialog::prepare_video_draft(window, application);
+        return;
+    }
     let descriptors = available_descriptors(&application.source);
     let descriptor = application
         .effect_selection_id
@@ -808,6 +859,31 @@ pub(crate) fn discard_effect_draft(window: &MainWindow, application: &mut Applic
     finish_effect_setup(window, application);
 }
 
+/// Adopt the dialog tab from the window. A draft belongs to its catalog,
+/// so switching tabs discards the unsubmitted draft and restarts the
+/// picker at the first entry. Video without backend support coerces back
+/// to audio, mirroring the relay tab coercion.
+pub(crate) fn select_effect_media_tab(
+    window: &MainWindow,
+    application: &mut Application,
+    index: i32,
+) {
+    let mut tab = EffectMediaTab::from_index(index);
+    if tab == EffectMediaTab::Video && !application.source.video_supported() {
+        tab = EffectMediaTab::Audio;
+    }
+    if tab != application.effect_media_tab {
+        discard_effect_draft(window, application);
+        application.effect_selection_id = None;
+    }
+    application.effect_media_tab = tab;
+    window.set_effect_media_tab(tab.index());
+}
+
+fn on_video_tab(application: &Application) -> bool {
+    application.effect_media_tab == EffectMediaTab::Video
+}
+
 /// Compatibility name for callers that used the old setup-only operation.
 /// It now discards only the unsubmitted draft; submitted tickets are owned by
 /// the background lifecycle until explicit cancellation or shutdown.
@@ -818,7 +894,8 @@ pub(crate) fn cancel_effect_setup(window: &MainWindow, application: &mut Applica
 /// Close the setup form after a successful queue operation. This must not
 /// cancel the ticket that was just returned: preparation continues while the
 /// dialog is closed and the control pump will publish its terminal event.
-fn finish_effect_setup(window: &MainWindow, application: &mut Application) {
+/// Shared with the video tab, whose creation is synchronous.
+pub(crate) fn finish_effect_setup(window: &MainWindow, application: &mut Application) {
     application.effect_draft_id = None;
     application.effect_draft_enabled = true;
     application.effect_draft_parameters.clear();
@@ -871,6 +948,10 @@ pub(crate) fn select_effect_draft(
     application: &mut Application,
     index: usize,
 ) {
+    if on_video_tab(application) {
+        video_dialog::select_video_draft(window, application, index);
+        return;
+    }
     let descriptors = available_descriptors(&application.source);
     if let Some(descriptor) = descriptors.get(index) {
         application.effect_selection_id = Some(descriptor.id.clone());
@@ -890,6 +971,10 @@ pub(crate) fn set_effect_draft_parameter_typed(
     parameter_id: &str,
     value: f32,
 ) {
+    // The video setup form has no parameter sliders; unreachable.
+    if on_video_tab(application) {
+        return;
+    }
     let Some(effect_id) = application.effect_draft_id.as_deref() else {
         return;
     };

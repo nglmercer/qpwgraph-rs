@@ -12,8 +12,35 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "relay")]
 use pw_graph_backend::RelayPeerInfo;
 
+/// Which catalog the effects dialog shows. Audio and video share every
+/// dialog component and the same gallery workflow; the tab only switches
+/// the data source behind the rows, options, and actions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EffectMediaTab {
+    #[default]
+    Audio,
+    Video,
+}
+
+impl EffectMediaTab {
+    pub(crate) fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::Video,
+            _ => Self::Audio,
+        }
+    }
+
+    pub(crate) fn index(self) -> i32 {
+        match self {
+            Self::Audio => 0,
+            Self::Video => 1,
+        }
+    }
+}
+
 pub(crate) enum UiEvent {
     Action(String),
+    EffectMediaTabSelected(i32),
     EffectSelected(i32),
     EffectCreateRequested,
     EffectConfigBack,
@@ -126,8 +153,14 @@ pub(crate) struct Application {
     /// of `AppConfig` until the user confirms creation.
     pub(crate) effect_draft_id: Option<String>,
     /// Stable descriptor identity projected into the ComboBox as an index.
-    /// The index is never persisted or used as the effect identity.
+    /// The index is never persisted or used as the effect identity. Holds
+    /// an audio descriptor id or a video filter id depending on the tab;
+    /// switching tabs clears it so each catalog restarts at its first entry.
     pub(crate) effect_selection_id: Option<String>,
+    /// Last effects-dialog tab adopted from the window. The tab buttons are
+    /// Slint-owned like the relay tabs; Rust adopts the value on the tab
+    /// event and the models sync branches on this field.
+    pub(crate) effect_media_tab: EffectMediaTab,
     pub(crate) effect_draft_enabled: bool,
     pub(crate) effect_draft_parameters: BTreeMap<String, f32>,
     /// Submitted effect preparations. Closing the effects dialog only drops

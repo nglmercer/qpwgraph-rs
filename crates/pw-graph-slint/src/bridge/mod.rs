@@ -129,6 +129,12 @@ impl UiBridge {
                 .push(UiEvent::Action(action.to_string()));
         });
         let events = self.events.clone();
+        self.window.on_effect_media_tab_selected(move |index| {
+            events
+                .borrow_mut()
+                .push(UiEvent::EffectMediaTabSelected(index))
+        });
+        let events = self.events.clone();
         self.window.on_effect_selected(move |index| {
             events.borrow_mut().push(UiEvent::EffectSelected(index))
         });

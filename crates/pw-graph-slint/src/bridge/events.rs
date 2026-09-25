@@ -15,8 +15,8 @@ use super::connections::{
 use super::effects::{
     cancel_effect_setup, cancel_effect_ticket, close_effect_diagnostics, copy_effect_diagnostics,
     create_effect, inspect_effect, open_effect_diagnostics, poll_effect_events, remove_effect,
-    select_effect_draft, set_effect_draft_enabled, set_effect_draft_parameter_typed,
-    set_effect_parameter_typed, toggle_effect,
+    select_effect_draft, select_effect_media_tab, set_effect_draft_enabled,
+    set_effect_draft_parameter_typed, set_effect_parameter_typed, toggle_effect,
 };
 use super::meters::refresh_meters;
 use super::models::{shortcut_rows, sync_meter_rows, sync_models, vec_model_rows_equal};
@@ -201,6 +201,9 @@ pub(crate) fn coalesce_audio_volume_events(pending: Vec<UiEvent>) -> Vec<UiEvent
 pub(crate) fn process_event(window: &MainWindow, application: &mut Application, event: UiEvent) {
     match event {
         UiEvent::Action(action) => handle_action(window, application, &action),
+        UiEvent::EffectMediaTabSelected(index) => {
+            select_effect_media_tab(window, application, index)
+        }
         UiEvent::EffectSelected(index) => {
             select_effect_draft(window, application, index.max(0) as usize)
         }
