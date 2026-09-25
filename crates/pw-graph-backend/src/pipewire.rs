@@ -765,6 +765,7 @@ impl PipewireDriver {
                 description: record.description.clone(),
                 media_role: record.media_role.clone(),
                 media_name: record.media_name.clone(),
+                media_class: record.media_class.clone(),
                 client_name: record
                     .client_name
                     .clone()

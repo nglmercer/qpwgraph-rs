@@ -117,6 +117,7 @@ export component MainWindow inherits Window {
     in property <string> video-preview-status: "";
     in property <bool> video-available: false;
     in property <bool> capture-active: false;
+    in property <bool> virtual-active: false;
     // --- Keyboard policy -------------------------------------------------
     // The three questions every key handler needs to ask, answered once here
     // instead of being re-derived at each call site. `docs/keyboard.md` and
@@ -426,7 +427,8 @@ export component MainWindow inherits Window {
                     // Filter add/remove/toggle live in the effects dialog video tab; preview
                     // and capture stop live on the video node cards. The rail keeps only
                     // the actions that have no node yet: start capture, new display.
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/device_generic.svg"); label: UiI18n.localized("video.virtual_create"); clicked => { root.action("virtual-display-create"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available && !root.virtual-active : RailActionButton { icon: @image-url("../../../assets/icons/device_generic.svg"); label: UiI18n.localized("video.virtual_create"); clicked => { root.action("virtual-display-create"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available && root.virtual-active : RailActionButton { icon: @image-url("../../../assets/icons/close.svg"); label: UiI18n.localized("video.virtual_stop"); clicked => { root.action("virtual-display-stop"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/save.svg"); label: UiI18n.localized("toolbar.save_patchbay"); clicked => { root.action("save-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/load.svg"); label: UiI18n.localized("toolbar.load_patchbay"); clicked => { root.action("load-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/snapshot.svg"); label: UiI18n.localized("toolbar.snapshot"); clicked => { root.action("snapshot-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }

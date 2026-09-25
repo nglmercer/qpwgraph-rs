@@ -673,6 +673,7 @@
   "video.capture_monitor": "Capturer le moniteur",
   "video.capture_window": "Capturer la fenêtre",
   "video.virtual_create": "Créer un écran virtuel",
+  "video.virtual_stop": "Arrêter l’écran virtuel",
   "video.name_passthrough": "Direct",
   "video.name_grayscale": "Niveaux de gris",
   "video.name_hflip": "Miroir horizontal",

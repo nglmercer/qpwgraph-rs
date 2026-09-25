@@ -673,6 +673,7 @@
   "video.capture_monitor": "Capturar monitor",
   "video.capture_window": "Capturar ventana",
   "video.virtual_create": "Crear pantalla virtual",
+  "video.virtual_stop": "Detener pantalla virtual",
   "video.name_passthrough": "Directo",
   "video.name_grayscale": "Escala de grises",
   "video.name_hflip": "Volteo horizontal",

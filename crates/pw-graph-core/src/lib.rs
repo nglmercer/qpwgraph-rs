@@ -297,6 +297,10 @@ pub struct NodeIdentity {
     pub media_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_name: Option<String>,
+    /// Daemon `media.class` (e.g. `Video/Source`). Empty when the backend
+    /// does not report one; used for camera detection, never matching.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -495,13 +499,20 @@ impl Node {
     }
 
     /// Whether this node is a camera source (V4L2 or libcamera). PipeWire
-    /// marks camera nodes with `media.role=Camera`; the name prefixes cover
-    /// daemons that don't set the role.
+    /// marks camera nodes with `media.role=Camera` or
+    /// `media.class=Video/Source`; the monitor name prefixes cover daemons
+    /// that set neither. Screencast streams (`Stream/Output/Video`) and our
+    /// own helper streams never reach the graph, so a bare `Video/Source`
+    /// class is unambiguous here.
     pub fn is_camera(&self) -> bool {
         self.identity
             .media_role
             .as_deref()
             .is_some_and(|role| role.eq_ignore_ascii_case("camera"))
+            || self
+                .identity
+                .media_class
+                .eq_ignore_ascii_case("video/source")
             || self.name.starts_with("v4l2_input.")
             || self.name.starts_with("libcamera_input.")
     }
@@ -2284,6 +2295,15 @@ mod tests {
         assert!(v4l2.is_camera());
         let libcamera = Node::new(NodeId(3), "libcamera_input.ipu6", NodeType::PipeWire);
         assert!(libcamera.is_camera());
+
+        // A bare Video/Source class catches cameras with unusual names.
+        let mut classed = Node::new(NodeId(6), "HD WebCam", NodeType::PipeWire);
+        classed.identity.media_class = "Video/Source".into();
+        assert!(classed.is_camera());
+        // Screencast streams share the video world but are not cameras.
+        let mut stream = Node::new(NodeId(7), "spot", NodeType::PipeWire);
+        stream.identity.media_class = "Stream/Output/Video".into();
+        assert!(!stream.is_camera());
 
         // Ordinary nodes are not cameras.
         let plain = Node::new(NodeId(4), "alsa_output.usb", NodeType::PipeWire);

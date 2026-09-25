@@ -1244,4 +1244,43 @@ mod tests {
         preview_node_video(&mut application, 424242);
         stop_node_video(&mut application, 424242);
     }
+
+    #[test]
+    fn virtual_display_stop_is_reachable_and_reports_status() {
+        use super::super::models::sync_models;
+        use super::super::{LinkRow, MinimapNode, NodeRow};
+        use crate::canvas::CanvasGeometry;
+        use std::cell::{Cell, RefCell};
+
+        let window = super::super::tests::test_window();
+        let mut application = demo_application();
+        let nodes_typed: Rc<VecModel<NodeRow>> = Rc::new(VecModel::default());
+        let links_typed: Rc<VecModel<LinkRow>> = Rc::new(VecModel::default());
+        let minimap: Rc<VecModel<MinimapNode>> = Rc::new(VecModel::default());
+        let geometry = Rc::new(RefCell::new(CanvasGeometry::default()));
+        let version = Rc::new(Cell::new(0));
+        let sync = |window: &MainWindow, application: &mut Application| {
+            sync_models(
+                window,
+                application,
+                &nodes_typed,
+                &links_typed,
+                &minimap,
+                &geometry,
+                &version,
+            );
+        };
+        // The demo driver simulates the portal: create activates, and the
+        // rail flag follows so the stop button replaces the create button.
+        create_virtual_display(&mut application, None);
+        assert_eq!(application.status, application.t("status.virtual_active"));
+        sync(&window, &mut application);
+        assert!(window.get_virtual_active());
+        // The stop path (previously unreachable from any UI) resolves,
+        // reports, and clears the flag.
+        stop_virtual_display(&mut application);
+        assert_eq!(application.status, application.t("status.virtual_stopped"));
+        sync(&window, &mut application);
+        assert!(!window.get_virtual_active());
+    }
 }

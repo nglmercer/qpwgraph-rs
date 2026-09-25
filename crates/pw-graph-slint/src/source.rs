@@ -483,6 +483,10 @@ impl ApplicationDriver {
         VideoDriver::stop_virtual_display(self).map_err(|error| error.to_string())
     }
 
+    pub(crate) fn virtual_display_status(&self) -> VirtualDisplayStatus {
+        VideoDriver::virtual_display_status(self)
+    }
+
     pub(crate) fn connect_by_key_if_missing(
         &mut self,
         output: &PortKey,

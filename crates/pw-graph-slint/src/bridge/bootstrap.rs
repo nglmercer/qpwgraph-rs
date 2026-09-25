@@ -37,6 +37,13 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
             &[("count", recovered_recordings.len().to_string())],
         ));
     }
+    // A deferred decision stays deferred: auto-open only for pending files
+    // the user has not dismissed yet. Dismissed files are still listed when
+    // the dialog opens, so nothing becomes unreachable.
+    let unseen_recovery = super::recorders::prune_dismissed_recovery(
+        &recovered_recordings,
+        &mut config.recovery_dismissed,
+    );
     #[cfg(target_os = "windows")]
     source.configure_windows_app_routing(config.windows.experimental_app_routing);
     restore_node_positions(&mut source, &config);
@@ -123,7 +130,7 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         node_debug_report: String::new(),
         recorders: BTreeMap::new(),
         pending_recorder_stops: BTreeSet::new(),
-        recovery_dialog_visible: !recovered_recordings.is_empty(),
+        recovery_dialog_visible: unseen_recovery,
         recovered_recordings,
         debug: args.debug,
         last_refresh: Instant::now(),

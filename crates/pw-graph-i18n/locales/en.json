@@ -673,6 +673,7 @@
   "video.capture_monitor": "Capture monitor",
   "video.capture_window": "Capture window",
   "video.virtual_create": "Create virtual display",
+  "video.virtual_stop": "Stop virtual display",
   "video.name_passthrough": "Passthrough",
   "video.name_grayscale": "Grayscale",
   "video.name_hflip": "Horizontal flip",

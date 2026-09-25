@@ -193,7 +193,39 @@ pub(crate) fn recovered_recording_rows(application: &Application) -> Vec<String>
 
 pub(crate) fn close_recovery_dialog(application: &mut Application) {
     application.recovery_dialog_visible = false;
+    // Remember the deferral so the dialog does not auto-open on every
+    // launch; autosave persists the config. New pending files still open it.
+    for recording in &application.recovered_recordings {
+        let seen = recording.path.to_string_lossy().into_owned();
+        if !application.config.recovery_dismissed.contains(&seen) {
+            application.config.recovery_dismissed.push(seen);
+        }
+    }
     application.status = application.t("status.recorder_recovery_deferred");
+}
+
+fn forget_recovered_path(application: &mut Application, path: &std::path::Path) {
+    let resolved = path.to_string_lossy();
+    application
+        .config
+        .recovery_dismissed
+        .retain(|seen| *seen != resolved);
+}
+
+/// Prune dismissal memory against the current scan and report whether any
+/// pending file is still unseen (i.e. the dialog should auto-open).
+pub(crate) fn prune_dismissed_recovery(
+    recovered: &[pw_graph_backend::router::RecoveredRecording],
+    dismissed: &mut Vec<String>,
+) -> bool {
+    dismissed.retain(|seen| {
+        recovered
+            .iter()
+            .any(|recording| recording.path.to_string_lossy() == *seen)
+    });
+    recovered
+        .iter()
+        .any(|recording| !dismissed.contains(&recording.path.to_string_lossy().into_owned()))
 }
 
 pub(crate) fn save_recovered_recording(application: &mut Application, index: usize) {
@@ -223,6 +255,7 @@ pub(crate) fn save_recovered_recording(application: &mut Application, index: usi
     };
     match pw_graph_backend::router::copy_recording(&recording.path, &destination) {
         Ok(()) => {
+            forget_recovered_path(application, &recording.path);
             application
                 .recovered_recordings
                 .retain(|candidate| candidate.path != recording.path);
@@ -250,6 +283,7 @@ pub(crate) fn discard_recovered_recording(application: &mut Application, index: 
     };
     match fs::remove_file(&recording.path) {
         Ok(()) => {
+            forget_recovered_path(application, &recording.path);
             application
                 .recovered_recordings
                 .retain(|candidate| candidate.path != recording.path);
@@ -571,8 +605,65 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_wav_extension;
+    use super::{ensure_wav_extension, prune_dismissed_recovery};
+    use pw_graph_backend::router::{RecoveredRecording, WavHeader};
     use std::path::PathBuf;
+
+    fn recovered(path: &str) -> RecoveredRecording {
+        RecoveredRecording {
+            path: PathBuf::from(path),
+            header: WavHeader {
+                sample_rate: 48_000,
+                channels: 2,
+                frames: 0,
+                data_bytes: 0,
+                file_bytes: 0,
+            },
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn recovery_auto_opens_only_for_unseen_pending_files() {
+        let scan = vec![recovered("/tmp/a.wav.part"), recovered("/tmp/b.wav.part")];
+        // First sighting: everything is unseen.
+        let mut dismissed = Vec::new();
+        assert!(prune_dismissed_recovery(&scan, &mut dismissed));
+        // After a deferral, the same scan stays silent.
+        dismissed = vec!["/tmp/a.wav.part".into(), "/tmp/b.wav.part".into()];
+        assert!(!prune_dismissed_recovery(&scan, &mut dismissed));
+        // A new crash reopens the dialog; stale entries are pruned.
+        dismissed.push("/tmp/gone.wav.part".into());
+        let mut rescan = scan.clone();
+        rescan.push(recovered("/tmp/c.wav.part"));
+        assert!(prune_dismissed_recovery(&rescan, &mut dismissed));
+        assert_eq!(dismissed.len(), 2);
+        assert!(!dismissed.contains(&"/tmp/gone.wav.part".to_string()));
+        // Nothing pending: silent and memory emptied.
+        assert!(!prune_dismissed_recovery(&[], &mut dismissed));
+        assert!(dismissed.is_empty());
+    }
+
+    #[test]
+    fn dismissing_recovery_remembers_the_deferred_files() {
+        use super::super::tests::demo_application;
+        use super::close_recovery_dialog;
+
+        let mut application = demo_application();
+        application.recovered_recordings =
+            vec![recovered("/tmp/a.wav.part"), recovered("/tmp/b.wav.part")];
+        application.recovery_dialog_visible = true;
+        close_recovery_dialog(&mut application);
+        assert!(!application.recovery_dialog_visible);
+        assert_eq!(
+            application.config.recovery_dismissed,
+            vec!["/tmp/a.wav.part".to_string(), "/tmp/b.wav.part".to_string()]
+        );
+        // Dismissing twice does not duplicate the memory.
+        application.recovery_dialog_visible = true;
+        close_recovery_dialog(&mut application);
+        assert_eq!(application.config.recovery_dismissed.len(), 2);
+    }
 
     #[test]
     fn wav_extension_is_enforced() {

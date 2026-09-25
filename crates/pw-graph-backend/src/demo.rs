@@ -46,6 +46,7 @@ pub struct DemoDriver {
     next_recorder_id: RecorderId,
     video_filters: BTreeMap<String, DemoVideoFilter>,
     screen_cast: Option<DemoScreenCast>,
+    virtual_display: Option<crate::video::VirtualDisplayRequest>,
     /// Suppression state used by backends that remember an explicit manual
     /// disconnect. Keeping it in the demo driver makes command rollback tests
     /// able to verify that unrelated pairs are not accidentally unsuppressed.
@@ -119,6 +120,7 @@ impl DemoDriver {
             next_recorder_id: 1,
             video_filters: BTreeMap::new(),
             screen_cast: None,
+            virtual_display: None,
             suppressed_connections: Vec::new(),
             forced_failures: None,
         }
@@ -131,6 +133,7 @@ impl DemoDriver {
         self.recorders.clear();
         self.video_filters.clear();
         self.screen_cast = None;
+        self.virtual_display = None;
         self.next_link_id = graph.links.keys().map(|id| id.0).max().unwrap_or(0) + 1;
         self.graph = graph;
         self.observed_links.clear();
@@ -1449,6 +1452,28 @@ impl crate::video::VideoDriver for DemoDriver {
             .as_ref()
             .map(DemoScreenCast::status)
             .unwrap_or_default()
+    }
+
+    fn create_virtual_display(
+        &mut self,
+        request: crate::video::VirtualDisplayRequest,
+    ) -> BackendResult<crate::video::VirtualDisplayStatus> {
+        crate::video::validate_virtual_display(&request)?;
+        self.virtual_display = Some(request);
+        Ok(self.virtual_display_status())
+    }
+
+    fn stop_virtual_display(&mut self) -> BackendResult<()> {
+        self.virtual_display = None;
+        Ok(())
+    }
+
+    fn virtual_display_status(&self) -> crate::video::VirtualDisplayStatus {
+        crate::video::VirtualDisplayStatus {
+            supported: Some(true),
+            active: self.virtual_display.is_some(),
+            error: None,
+        }
     }
 }
 

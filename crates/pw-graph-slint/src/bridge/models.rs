@@ -157,6 +157,7 @@ pub(crate) fn sync_models(
         application.source.screen_cast_status().state
             == pw_graph_backend::video::ScreenCastState::Active,
     );
+    window.set_virtual_active(application.source.virtual_display_status().active);
     window.set_graph_counts(SharedString::from(application.i18n.format(
         "status.graph_counts",
         &[

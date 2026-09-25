@@ -510,6 +510,12 @@ pub struct AppConfig {
     /// the native Save dialog. Active recordings are never persisted here.
     #[serde(default)]
     pub recording_dir: Option<PathBuf>,
+    /// Pending crash-recovery files the user already dismissed. The
+    /// recovery dialog auto-opens only for files not on this list, so a
+    /// deferred decision stops nagging on every launch. Entries are
+    /// pruned when their files disappear.
+    #[serde(default)]
+    pub recovery_dismissed: Vec<String>,
     #[serde(default = "default_recording_save_mode")]
     pub recording_save_mode: String,
     #[serde(default = "default_recording_filename_template")]
@@ -742,6 +748,7 @@ impl Default for AppConfig {
             active_patchbay_profile: "default".into(),
             effects: Vec::new(),
             recording_dir: None,
+            recovery_dismissed: Vec::new(),
             recording_save_mode: default_recording_save_mode(),
             recording_filename_template: default_recording_filename_template(),
             recording_format: default_recording_format(),
