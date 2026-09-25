@@ -16,6 +16,7 @@ members = [
     "crates/pw-graph-relay",
     "crates/pw-graph-relay-sdk",
     "crates/pw-graph-relay-android",
+    "crates/pw-graph-video",
     "crates/windows-audio-test-tone",
     "vendor/nnnoiseless",
 ]

@@ -494,6 +494,8 @@ pub struct BackendCapabilities {
     pub effects: bool,
     pub relay: bool,
     pub recorders: bool,
+    /// Linux PipeWire video: filter nodes, capture, and previews.
+    pub video: bool,
 }
 
 impl BackendCapabilities {
@@ -509,6 +511,7 @@ impl BackendCapabilities {
             effects: self.effects || other.effects,
             relay: self.relay || other.relay,
             recorders: self.recorders || other.recorders,
+            video: self.video || other.video,
         }
     }
 }

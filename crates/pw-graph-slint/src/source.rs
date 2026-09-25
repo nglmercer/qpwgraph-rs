@@ -7,6 +7,10 @@
 
 use crate::args::Args;
 use pw_graph_app_core::{BackendAvailability, CompositeDriver};
+use pw_graph_backend::video::{
+    ScreenCastRequest, ScreenCastStatus, VideoDriver, VideoFilterInstance, VideoFilterRequest,
+    VideoNodeInfo, VideoPreviewHandle, VirtualDisplayRequest, VirtualDisplayStatus,
+};
 #[cfg(all(feature = "relay", target_os = "windows"))]
 use pw_graph_backend::RelayEndpoints;
 use pw_graph_backend::{
@@ -407,6 +411,72 @@ impl ApplicationDriver {
 
     pub(crate) fn discard_recording(&mut self, id: RecorderId) -> Result<(), String> {
         RecorderDriver::discard_recording(self, id).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn video_supported(&self) -> bool {
+        VideoDriver::video_supported(self)
+    }
+
+    pub(crate) fn create_video_filter(
+        &mut self,
+        request: VideoFilterRequest,
+    ) -> Result<VideoFilterInstance, String> {
+        VideoDriver::create_video_filter(self, request).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn remove_video_filter(&mut self, instance_id: &str) -> Result<(), String> {
+        VideoDriver::remove_video_filter(self, instance_id).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn set_video_filter_enabled(
+        &mut self,
+        instance_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        VideoDriver::set_video_filter_enabled(self, instance_id, enabled)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn video_filters(&self) -> Vec<VideoFilterInstance> {
+        VideoDriver::video_filters(self)
+    }
+
+    pub(crate) fn video_node_info(&self, node: NodeId) -> Option<VideoNodeInfo> {
+        VideoDriver::video_node_info(self, node)
+    }
+
+    pub(crate) fn video_preview(&self, instance_id: &str) -> Option<VideoPreviewHandle> {
+        VideoDriver::video_preview(self, instance_id)
+    }
+
+    pub(crate) fn screen_cast_preview(&self) -> Option<VideoPreviewHandle> {
+        VideoDriver::screen_cast_preview(self)
+    }
+
+    pub(crate) fn start_screen_cast(
+        &mut self,
+        request: ScreenCastRequest,
+    ) -> Result<ScreenCastStatus, String> {
+        VideoDriver::start_screen_cast(self, request).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn stop_screen_cast(&mut self) -> Result<(), String> {
+        VideoDriver::stop_screen_cast(self).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn screen_cast_status(&self) -> ScreenCastStatus {
+        VideoDriver::screen_cast_status(self)
+    }
+
+    pub(crate) fn create_virtual_display(
+        &mut self,
+        request: VirtualDisplayRequest,
+    ) -> Result<VirtualDisplayStatus, String> {
+        VideoDriver::create_virtual_display(self, request).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn stop_virtual_display(&mut self) -> Result<(), String> {
+        VideoDriver::stop_virtual_display(self).map_err(|error| error.to_string())
     }
 
     pub(crate) fn connect_by_key_if_missing(
@@ -1142,6 +1212,119 @@ impl RecorderDriver for ApplicationDriver {
         match &mut self.backend {
             BackendKind::Demo(driver) => driver.poll_recording(id),
             BackendKind::Live(driver) => driver.poll_recording(id),
+        }
+    }
+}
+
+impl VideoDriver for ApplicationDriver {
+    fn video_supported(&self) -> bool {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.video_supported(),
+            BackendKind::Live(driver) => driver.video_supported(),
+        }
+    }
+
+    fn create_video_filter(
+        &mut self,
+        request: VideoFilterRequest,
+    ) -> pw_graph_backend::BackendResult<VideoFilterInstance> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.create_video_filter(request),
+            BackendKind::Live(driver) => driver.create_video_filter(request),
+        }
+    }
+
+    fn remove_video_filter(&mut self, instance_id: &str) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.remove_video_filter(instance_id),
+            BackendKind::Live(driver) => driver.remove_video_filter(instance_id),
+        }
+    }
+
+    fn set_video_filter_enabled(
+        &mut self,
+        instance_id: &str,
+        enabled: bool,
+    ) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.set_video_filter_enabled(instance_id, enabled),
+            BackendKind::Live(driver) => driver.set_video_filter_enabled(instance_id, enabled),
+        }
+    }
+
+    fn video_filters(&self) -> Vec<VideoFilterInstance> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.video_filters(),
+            BackendKind::Live(driver) => driver.video_filters(),
+        }
+    }
+
+    fn video_node_info(&self, node: NodeId) -> Option<VideoNodeInfo> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.video_node_info(node),
+            BackendKind::Live(driver) => driver.video_node_info(node),
+        }
+    }
+
+    fn video_preview(&self, instance_id: &str) -> Option<VideoPreviewHandle> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.video_preview(instance_id),
+            BackendKind::Live(driver) => driver.video_preview(instance_id),
+        }
+    }
+
+    fn screen_cast_preview(&self) -> Option<VideoPreviewHandle> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.screen_cast_preview(),
+            BackendKind::Live(driver) => driver.screen_cast_preview(),
+        }
+    }
+
+    fn start_screen_cast(
+        &mut self,
+        request: ScreenCastRequest,
+    ) -> pw_graph_backend::BackendResult<ScreenCastStatus> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.start_screen_cast(request),
+            BackendKind::Live(driver) => driver.start_screen_cast(request),
+        }
+    }
+
+    fn stop_screen_cast(&mut self) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.stop_screen_cast(),
+            BackendKind::Live(driver) => driver.stop_screen_cast(),
+        }
+    }
+
+    fn screen_cast_status(&self) -> ScreenCastStatus {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.screen_cast_status(),
+            BackendKind::Live(driver) => driver.screen_cast_status(),
+        }
+    }
+
+    fn create_virtual_display(
+        &mut self,
+        request: VirtualDisplayRequest,
+    ) -> pw_graph_backend::BackendResult<VirtualDisplayStatus> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.create_virtual_display(request),
+            BackendKind::Live(driver) => driver.create_virtual_display(request),
+        }
+    }
+
+    fn stop_virtual_display(&mut self) -> pw_graph_backend::BackendResult<()> {
+        match &mut self.backend {
+            BackendKind::Demo(driver) => driver.stop_virtual_display(),
+            BackendKind::Live(driver) => driver.stop_virtual_display(),
+        }
+    }
+
+    fn virtual_display_status(&self) -> VirtualDisplayStatus {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.virtual_display_status(),
+            BackendKind::Live(driver) => driver.virtual_display_status(),
         }
     }
 }

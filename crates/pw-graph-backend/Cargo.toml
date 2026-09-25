@@ -13,11 +13,23 @@ in-memory = []
 pipewire = ["dep:pipewire"]
 relay = ["dep:pw-graph-relay"]
 wasm = ["pw-graph-effects/wasm"]
+# Live XDG ScreenCast portal access via ashpd (Linux only). Off by default so
+# headless CI builds without a D-Bus session or compositor. The portal state
+# machine, session tracking, and virtual-display detection API are always
+# compiled; only the live D-Bus connector is feature-gated.
+#
+# ashpd must use its `async-std` runtime: the app pulls `rfd`, which enables
+# `ashpd/async-std`, and ashpd 0.11 refuses to build with both `async-std`
+# and `tokio` at once. The connector drives futures with `pollster` (the
+# same crate rfd uses) plus `async_io::Timer`, so no second runtime enters
+# the tree — both crates are already in the lockfile.
+screencast = ["dep:ashpd", "dep:pollster", "dep:async-io", "dep:futures-util"]
 
 [dependencies]
 pw-graph-core = { path = "../pw-graph-core" }
 pw-graph-config = { path = "../pw-graph-config" }
 pw-graph-effects = { path = "../pw-graph-effects" }
+pw-graph-video = { path = "../pw-graph-video" }
 thiserror.workspace = true
 serde_json.workspace = true
 pw-graph-utils = { path = "../pw-graph-utils" }
@@ -27,6 +39,10 @@ pw-graph-relay = { path = "../pw-graph-relay", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = { workspace = true, optional = true }
+ashpd = { version = "0.11", optional = true, default-features = false, features = ["async-std"] }
+pollster = { version = "0.4", optional = true }
+async-io = { version = "2", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [

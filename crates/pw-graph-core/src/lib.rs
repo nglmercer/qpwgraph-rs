@@ -2144,4 +2144,119 @@ mod tests {
             Some(BackendKind::AlsaMidi)
         );
     }
+
+    fn video_graph() -> Graph {
+        let mut graph = Graph::default();
+        graph
+            .add_node(Node::new(NodeId(1), "Screen Capture", NodeType::PipeWire))
+            .unwrap();
+        graph
+            .add_node(Node::new(NodeId(2), "Grayscale Filter", NodeType::Effect))
+            .unwrap();
+        graph
+            .add_node(Node::new(NodeId(3), "Video Sink", NodeType::PipeWire))
+            .unwrap();
+        graph
+            .add_node(Node::new(NodeId(4), "Speakers", NodeType::PipeWire))
+            .unwrap();
+        graph
+            .add_port(Port::new(
+                PortId(10),
+                NodeId(1),
+                "video_out",
+                Direction::Source,
+                PortType::Video,
+            ))
+            .unwrap();
+        graph
+            .add_port(Port::new(
+                PortId(20),
+                NodeId(2),
+                "video_in",
+                Direction::Sink,
+                PortType::Video,
+            ))
+            .unwrap();
+        graph
+            .add_port(Port::new(
+                PortId(21),
+                NodeId(2),
+                "video_out",
+                Direction::Source,
+                PortType::Video,
+            ))
+            .unwrap();
+        graph
+            .add_port(Port::new(
+                PortId(30),
+                NodeId(3),
+                "video_in",
+                Direction::Sink,
+                PortType::Video,
+            ))
+            .unwrap();
+        graph
+            .add_port(Port::new(
+                PortId(40),
+                NodeId(4),
+                "playback_FL",
+                Direction::Sink,
+                PortType::Audio,
+            ))
+            .unwrap();
+        graph
+            .add_port(Port::new(
+                PortId(11),
+                NodeId(1),
+                "audio_out",
+                Direction::Source,
+                PortType::Audio,
+            ))
+            .unwrap();
+        graph
+    }
+
+    #[test]
+    fn video_source_links_to_video_sink_through_a_filter() {
+        let mut graph = video_graph();
+        graph.add_link(LinkId(100), PortId(10), PortId(20)).unwrap();
+        graph.add_link(LinkId(101), PortId(21), PortId(30)).unwrap();
+        assert_eq!(graph.links.len(), 2);
+    }
+
+    #[test]
+    fn audio_and_video_ports_never_link() {
+        let mut graph = video_graph();
+        assert_eq!(
+            graph.add_link(LinkId(100), PortId(11), PortId(20)),
+            Err(GraphError::IncompatiblePorts(PortId(11), PortId(20)))
+        );
+        assert_eq!(
+            graph.add_link(LinkId(101), PortId(10), PortId(40)),
+            Err(GraphError::IncompatiblePorts(PortId(10), PortId(40)))
+        );
+        assert_eq!(
+            graph.add_link(LinkId(102), PortId(21), PortId(40)),
+            Err(GraphError::IncompatiblePorts(PortId(21), PortId(40)))
+        );
+        assert!(graph.links.is_empty());
+    }
+
+    #[test]
+    fn video_links_still_enforce_direction_and_duplicates() {
+        let mut graph = video_graph();
+        assert_eq!(
+            graph.add_link(LinkId(100), PortId(20), PortId(30)),
+            Err(GraphError::NotSource(PortId(20)))
+        );
+        assert_eq!(
+            graph.add_link(LinkId(100), PortId(10), PortId(21)),
+            Err(GraphError::NotSink(PortId(21)))
+        );
+        graph.add_link(LinkId(100), PortId(10), PortId(20)).unwrap();
+        assert_eq!(
+            graph.add_link(LinkId(101), PortId(10), PortId(20)),
+            Err(GraphError::DuplicateConnection(PortId(10), PortId(20)))
+        );
+    }
 }

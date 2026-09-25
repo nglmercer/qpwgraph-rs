@@ -1,0 +1,17 @@
+import { UiTheme } from "../foundation/theme.slint";
+import { UiI18n } from "../foundation/i18n.slint";
+import { ActionButton } from "../components/button.slint";
+import { DialogShell } from "../components/dialog-shell.slint";
+
+export component VideoPreviewDialog inherits DialogShell {
+    title: root.preview-title == "" ? UiI18n.localized("video.preview_title") : root.preview-title;
+    title-size: 18px * UiTheme.ui-scale;
+    title-x: 18px;
+    show-header-close: false;
+    in property <string> preview-title: "";
+    in property <string> preview-status: "";
+    in property <image> preview-image;
+    Rectangle { x: 18px; y: 52px; width: parent.width - 36px; height: parent.height - 130px; background: #0a0e12; border-radius: 4px; Image { width: parent.width; height: parent.height; source: root.preview-image; image-fit: contain; } }
+    Text { x: 22px; y: parent.height - 70px; width: parent.width - 44px; text: root.preview-status; color: #aebdca; font-size: 11px * UiTheme.panel-scale; horizontal-alignment: center; overflow: elide; }
+    ActionButton { x: parent.width - 105px; y: parent.height - 45px; width: 88px; text: UiI18n.localized("shortcuts.close"); clicked => { root.close(); } }
+}

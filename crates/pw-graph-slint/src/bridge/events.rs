@@ -25,6 +25,7 @@ use super::recorders::{
 };
 use super::relay::{poll_relay_events, poll_relay_usb_hotplug};
 use super::utils::volume_from_track_position;
+use super::video::poll_video_preview;
 use super::{CanvasGeometry, LinkRow, MainWindow, MinimapNode, NodeRow, ShortcutRow};
 
 /// Slower cadence for the full model sync. Meters still refresh every 50 ms
@@ -66,6 +67,7 @@ pub(crate) fn pump(
     poll_relay_events(&mut application);
     let effect_events_changed = poll_effect_events(&mut application);
     let recorder_events_changed = poll_recordings(&mut application);
+    poll_video_preview(window, &mut application);
     let mut graph_changed = application.source.graph_dirty();
     if graph_changed || application.last_refresh.elapsed() >= refresh_interval(&application) {
         if let Err(error) = application.source.refresh_if_needed() {

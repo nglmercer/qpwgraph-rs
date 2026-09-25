@@ -1295,6 +1295,7 @@ fn load_xml_selector_sidecar(path: &Path, patchbay: &mut Patchbay) {
 mod tests {
     use super::*;
     use pw_graph_backend::{
+        video::{VideoDriver, VideoFilterRequest},
         BackendResult, EffectDriver, EffectNodeRequest, GraphDriver, InMemoryDriver,
     };
     use std::collections::BTreeMap;
@@ -2535,5 +2536,69 @@ mod tests {
             assert_eq!(patchbay.connections.len(), 1);
             now += Duration::from_millis(1);
         }
+    }
+
+    #[test]
+    fn video_links_round_trip_through_xml_with_video_types() {
+        let mut driver = InMemoryDriver::demo();
+        let first = driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "persist-a".into(),
+                filter_id: "passthrough".into(),
+                params: pw_graph_video::filters::FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .unwrap();
+        let second = driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "persist-b".into(),
+                filter_id: "grayscale".into(),
+                params: pw_graph_video::filters::FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .unwrap();
+        driver
+            .connect(first.output_port, second.input_port)
+            .unwrap();
+
+        let mut patchbay = Patchbay::new("video-test");
+        patchbay.add_graph_connection(driver.graph(), first.output_port, second.input_port, false);
+        assert_eq!(patchbay.connections.len(), 1);
+        let xml = patchbay.to_xml().unwrap();
+        assert!(xml.contains("pipewire-video"), "{xml}");
+
+        let restored = Patchbay::from_xml(&xml).unwrap();
+        assert_eq!(restored.connections.len(), 1);
+        let connection = &restored.connections[0];
+        assert_eq!(connection.port_type, pw_graph_core::PortType::Video);
+        assert_eq!(connection.output_name, "video_out");
+        assert_eq!(connection.input_name, "video_in");
+
+        // Activation resolves the persisted names/types against the graph.
+        let mut fresh = InMemoryDriver::demo();
+        let fresh_first = fresh
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "persist-a".into(),
+                filter_id: "passthrough".into(),
+                params: pw_graph_video::filters::FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .unwrap();
+        let fresh_second = fresh
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "persist-b".into(),
+                filter_id: "grayscale".into(),
+                params: pw_graph_video::filters::FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .unwrap();
+        let report = restored.activate(&mut fresh, false, false).unwrap();
+        assert_eq!(report.connected, 1, "{report:?}");
+        assert!(fresh
+            .graph()
+            .links
+            .values()
+            .any(|link| link.output_port == fresh_first.output_port
+                && link.input_port == fresh_second.input_port));
     }
 }

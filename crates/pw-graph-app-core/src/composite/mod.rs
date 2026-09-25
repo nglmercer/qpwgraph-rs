@@ -21,6 +21,7 @@ mod platform;
 pub(crate) mod refresh;
 mod relay;
 mod routing;
+mod video;
 
 pub use routing::{route_for_ports, CompositeRoute};
 

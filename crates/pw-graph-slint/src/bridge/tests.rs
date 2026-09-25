@@ -15,6 +15,24 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// Create a window on the Slint testing backend, initializing it exactly once
+/// per test thread. `init_no_event_loop` panics on repeat calls from one
+/// thread, while `MainWindow::new` without it races the default platform init
+/// across threads ("platform was initialized in another thread"). Every
+/// window-creating test must go through here (or an equivalent per-thread
+/// guard) instead of calling `MainWindow::new` directly.
+pub(super) fn test_window() -> MainWindow {
+    thread_local! {
+        static READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    READY.with(|ready| {
+        if !ready.replace(true) {
+            i_slint_backend_testing::init_no_event_loop();
+        }
+    });
+    MainWindow::new().expect("test window")
+}
+
 pub(super) fn demo_application() -> Application {
     let args = Args {
         demo: true,
@@ -66,6 +84,7 @@ pub(super) fn demo_application() -> Application {
         config_layout_fingerprint: 0,
         meters: BTreeMap::new(),
         meter_error: None,
+        video: super::video::VideoUiState::default(),
         #[cfg(feature = "relay")]
         relay_levels: BTreeMap::new(),
         #[cfg(feature = "relay")]
@@ -536,7 +555,7 @@ fn effect_nodes_stay_canvas_connectable_into_a_recorder() {
 
 #[test]
 fn programmatic_effect_selection_does_not_emit_user_event() {
-    let window = MainWindow::new().expect("test window");
+    let window = test_window();
     let events = Rc::new(Cell::new(0));
     let observed = events.clone();
     window.on_effect_selected(move |_| observed.set(observed.get() + 1));
@@ -577,14 +596,13 @@ const RAIL_WIDTH: f32 = 76.0;
 
 impl CanvasHarness {
     fn new(connect_mode: ConnectMode) -> Self {
-        i_slint_backend_testing::init_no_event_loop();
         let mut application = demo_application();
         application.view.connect_mode = connect_mode;
         // Anchor the viewport so world and screen differ only by the rail.
         application.view.pan = [0.0, 0.0];
         application.view.zoom = 1.0;
 
-        let window = MainWindow::new().unwrap();
+        let window = test_window();
         window
             .window()
             .set_size(slint::LogicalSize::new(1400.0, 900.0));
@@ -1560,13 +1578,12 @@ fn toggling_to_easy_mode_enables_body_connect() {
 
 #[test]
 fn pump_path_connects_body_to_body_after_toggling_to_easy() {
-    i_slint_backend_testing::init_no_event_loop();
     let application = Rc::new(RefCell::new(demo_application()));
     application.borrow_mut().view.connect_mode = ConnectMode::Advanced;
     application.borrow_mut().view.pan = [0.0, 0.0];
     application.borrow_mut().view.zoom = 1.0;
 
-    let window = MainWindow::new().unwrap();
+    let window = test_window();
     window
         .window()
         .set_size(slint::LogicalSize::new(1400.0, 900.0));

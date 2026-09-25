@@ -40,6 +40,8 @@ mod registry;
 mod relay;
 #[cfg(all(target_os = "linux", feature = "relay"))]
 mod relay_driver;
+mod video;
+mod video_driver;
 
 use crate::router::{
     replace_recording_preserving_source, RecorderWriterState, DEFAULT_RECORDER_CAPACITY_MS,
@@ -113,6 +115,24 @@ const MEDIA_CATEGORY_FILTER: &str = "Filter";
 const METER_NODE_PREFIX: &str = "qpwgraph-rs meter";
 const RECORDER_NODE_PREFIX: &str = "qpwgraph-rs recorder";
 
+/// PipeWire object properties and classes for client-owned video streams.
+pub(super) const MEDIA_TYPE_VIDEO: &str = "Video";
+pub(super) const MEDIA_CATEGORY_CAPTURE: &str = "Capture";
+pub(super) const MEDIA_CATEGORY_PLAYBACK: &str = "Playback";
+pub(super) const MEDIA_ROLE_VIDEO: &str = "Video";
+pub(super) const MEDIA_CLASS_VIDEO_CAPTURE: &str = "Stream/Input/Video";
+pub(super) const MEDIA_CLASS_VIDEO_OUTPUT: &str = "Stream/Output/Video";
+/// Bounded per-filter queue depth: low latency with room for one hiccup.
+pub(super) const DEFAULT_VIDEO_QUEUE_DEPTH: usize = 3;
+/// Prefix for client-owned video helper streams. Like meter streams, these
+/// are filtered out of the rendered graph; the synthetic filter node
+/// represents them.
+pub(super) const VIDEO_STREAM_PREFIX: &str = "qpwgraph-video-";
+/// Base of the synthetic local-id range for video filter nodes, ports, and
+/// links. Daemon global ids are small sequential integers; synthetic ids
+/// live far above them and never collide in practice.
+pub(super) const VIDEO_SYNTHETIC_BASE: u64 = 0x4000_0000;
+
 /// How long a metering stream outlives the last request for it. Without a
 /// grace period, minimizing and immediately restoring the window would tear
 /// down and rebuild every visible stream.
@@ -179,6 +199,19 @@ pub struct PipewireDriver {
     /// recreate an application's link when it resumes; the next synchronized
     /// snapshot removes only those links the user explicitly deleted.
     blocked_connections: Vec<(PortKey, PortKey)>,
+    /// Linux video filter bridges by instance id, plus the synthetic link
+    /// projections that involve them. See `video_driver`.
+    video_bridges: BTreeMap<String, video::bridge::VideoBridge>,
+    video_links: BTreeMap<LinkId, video_driver::VideoLinkProjection>,
+    video_id_seq: u64,
+    /// XDG ScreenCast capture session (monitor/window) and its preview tap.
+    screen_cast: crate::linux::screencast::ScreenCastManager,
+    screen_cast_preview: Option<video::capture::VideoCaptureHandle>,
+    screen_cast_preview_slot: pw_graph_video::preview::VideoPreview,
+    screen_cast_preview_sequence: u64,
+    /// Virtual-display session plus cached support probe (`None` = unprobed).
+    virtual_cast: crate::linux::screencast::ScreenCastManager,
+    virtual_support: Option<bool>,
     /// Relay engine plus the two virtual devices. Created on first relay use
     /// and kept until the driver drops so reconnects stay cheap.
     #[cfg(all(target_os = "linux", feature = "relay"))]
@@ -238,6 +271,19 @@ impl PipewireDriver {
             effect_loader: EffectComponentManager::new(2, 16),
             pending_effects: BTreeMap::new(),
             blocked_connections: Vec::new(),
+            video_bridges: BTreeMap::new(),
+            video_links: BTreeMap::new(),
+            video_id_seq: 0,
+            screen_cast: crate::linux::screencast::ScreenCastManager::new(
+                video_driver::new_portal_connector(),
+            ),
+            screen_cast_preview: None,
+            screen_cast_preview_slot: pw_graph_video::preview::VideoPreview::new(),
+            screen_cast_preview_sequence: 0,
+            virtual_cast: crate::linux::screencast::ScreenCastManager::new(
+                video_driver::new_portal_connector(),
+            ),
+            virtual_support: None,
             #[cfg(all(target_os = "linux", feature = "relay"))]
             relay: None,
             #[cfg(all(target_os = "linux", feature = "relay"))]
@@ -651,6 +697,12 @@ impl PipewireDriver {
             if record.name.starts_with(METER_NODE_PREFIX) {
                 continue;
             }
+            if record.name.starts_with(VIDEO_STREAM_PREFIX) {
+                // Client-owned video helper streams are represented by
+                // their synthetic filter node; showing them separately
+                // would triple every filter in the canvas.
+                continue;
+            }
             node_media_classes.insert(node_id, record.media_class.to_ascii_lowercase());
             let effect_instance_id = effect_nodes.get(&node_id);
             let recorder = self.recorders.values().find(|recorder| {
@@ -763,6 +815,10 @@ impl PipewireDriver {
             graph.add_port(port)?;
         }
 
+        // Daemon link liveness for synthetic video projections. Helper-stream
+        // ports are filtered out of the graph, so their daemon links never
+        // appear as graph links; liveness must come from the registry.
+        let daemon_links = state.links.clone();
         for (id, record) in state.links {
             let _ = graph.insert_existing_link(Link {
                 id: LinkId(graph_id(id as u64)),
@@ -770,6 +826,10 @@ impl PipewireDriver {
                 input_port: PortId(graph_id(record.input_port as u64)),
             });
         }
+
+        // Project synthetic video filter nodes and links onto the registry
+        // snapshot before layout, so filters participate in arrangement.
+        self.inject_video_nodes(&mut graph, &daemon_links);
 
         // Compute defaults after links are in the graph. Otherwise the first
         // refresh has no topology for the layered layout to follow and every
@@ -799,7 +859,14 @@ impl PipewireDriver {
                 .graph
                 .links
                 .values()
-                .filter(|link| self.connection_is_blocked(link))
+                .filter(|link| {
+                    // Synthetic video projections have no daemon global;
+                    // asking the registry to destroy one would fail the
+                    // whole rebuild. They are pruned by endpoint liveness
+                    // during injection instead.
+                    !video_driver::is_video_synthetic_id(link.id.0)
+                        && self.connection_is_blocked(link)
+                })
                 .map(|link| link.id)
                 .collect();
             if suppressed.is_empty() || pass == 2 {
@@ -1574,6 +1641,7 @@ impl GraphDriver for PipewireDriver {
             effects: true,
             relay: cfg!(feature = "relay"),
             recorders: true,
+            video: true,
         }
     }
 
@@ -1588,6 +1656,7 @@ impl GraphDriver for PipewireDriver {
                 // route; ordinary user links remain untouched.
                 driver.ensure_relay_local_route_locked(mode)?;
             }
+            driver.reconcile_video_locked()?;
             driver.registry_dirty.store(false, Ordering::Relaxed);
             Ok(driver.graph.nodes.values().cloned().collect())
         })
@@ -1596,14 +1665,24 @@ impl GraphDriver for PipewireDriver {
     fn connect(&mut self, src: PortId, dst: PortId) -> BackendResult<Link> {
         self.with_loop(|driver| {
             driver.sync()?;
-            driver.connect_locked(src, dst)
+            if video_driver::is_video_synthetic_id(src.0)
+                || video_driver::is_video_synthetic_id(dst.0)
+            {
+                driver.video_connect_locked(src, dst)
+            } else {
+                driver.connect_locked(src, dst)
+            }
         })
     }
 
     fn disconnect(&mut self, link: LinkId) -> BackendResult<Link> {
         self.with_loop(|driver| {
             driver.sync()?;
-            driver.disconnect_locked(link)
+            if driver.video_links.contains_key(&link) {
+                driver.video_disconnect_locked(link)
+            } else {
+                driver.disconnect_locked(link)
+            }
         })
     }
 

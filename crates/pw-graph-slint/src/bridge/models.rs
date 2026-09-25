@@ -34,6 +34,7 @@ use super::utils::{
     color, language_index, localized_meter_label, localized_node_type, meter_fraction,
     meter_policy_index, track_position_from_volume,
 };
+use super::video::video_summaries_by_node;
 use super::{
     HistoryRow, LinkRow, MainWindow, MinimapNode, NodeRow, PortRow, RuleRow, ShortcutRow, UiI18n,
 };
@@ -57,6 +58,7 @@ pub(crate) fn sync_models(
         &backend_profiles,
     );
     let recorder_statuses = recorder_statuses_by_node(application);
+    let video_summaries = video_summaries_by_node(application);
     let node_rows = snapshot
         .nodes
         .iter()
@@ -65,6 +67,7 @@ pub(crate) fn sync_models(
                 node,
                 &application.i18n,
                 recorder_statuses.get(&node.node_id),
+                video_summaries.get(&node.node_id),
             )
         })
         .collect::<Vec<_>>();
@@ -144,6 +147,11 @@ pub(crate) fn sync_models(
     window.set_has_selected_link(!application.view.selected_links.is_empty());
     window.set_has_selected_node(!application.view.selected_nodes.is_empty());
     window.set_connections_available(application.source.capabilities().connect);
+    window.set_video_available(application.source.capabilities().video);
+    window.set_capture_active(
+        application.source.screen_cast_status().state
+            == pw_graph_backend::video::ScreenCastState::Active,
+    );
     window.set_graph_counts(SharedString::from(application.i18n.format(
         "status.graph_counts",
         &[
@@ -610,6 +618,7 @@ fn node_row(
     node: &NodeView,
     i18n: &I18n,
     recorder_status: Option<&pw_graph_backend::RecorderStatus>,
+    video_summary: Option<&String>,
 ) -> NodeRow {
     let icon = load_node_icon(node.icon_name.as_deref());
     let has_icon = icon.is_some();
@@ -627,10 +636,17 @@ fn node_row(
     let recorder_error = recorder_status
         .and_then(|status| status.error.clone())
         .unwrap_or_default();
+    let mut subtitle = localized_node_type(i18n, node.node_type);
+    if let Some(summary) = video_summary {
+        if !summary.is_empty() {
+            subtitle.push_str(" · ");
+            subtitle.push_str(summary);
+        }
+    }
     NodeRow {
         id: node.id,
         node_title: SharedString::from(compact_label(&display_node_name(&node.title, i18n), 22)),
-        node_subtitle: SharedString::from(localized_node_type(i18n, node.node_type)),
+        node_subtitle: SharedString::from(subtitle),
         icon: icon.unwrap_or_default(),
         has_icon,
         x: node.position[0],

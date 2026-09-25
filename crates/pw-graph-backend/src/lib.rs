@@ -6,6 +6,8 @@
 
 mod api;
 mod demo;
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 mod pipewire;
 #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
@@ -16,6 +18,8 @@ mod pipewire_stub;
 /// arbitrary routing, routed effects, and RMS metering can be anything but
 /// unsupported, and it is exercised by in-memory tests on every host.
 pub mod router;
+/// Linux video contracts: filters, screen capture, previews.
+pub mod video;
 
 pub use api::*;
 pub use demo::{DemoDriver, InMemoryDriver};
@@ -60,8 +64,9 @@ pub use windows_relay::RelayEndpoints;
 // details.
 #[allow(unused_imports)]
 pub(crate) use pw_graph_core::{
-    decode_backend_local_id, encode_backend_id, BackendNamespace, Direction, Graph, GraphError,
-    Link, LinkId, Node, NodeId, NodeType, Port, PortId, PortKey, PortType,
+    decode_backend_local_id, decode_backend_namespace, encode_backend_id, BackendNamespace,
+    Direction, Graph, GraphError, Link, LinkId, Node, NodeId, NodeType, Port, PortId, PortKey,
+    PortType,
 };
 
 use std::collections::BTreeSet;
@@ -79,9 +84,7 @@ pub fn existing_connections(driver: &dyn GraphDriver) -> BTreeSet<(PortId, PortI
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(target_os = "linux", feature = "pipewire"))]
-    use pw_graph_core::PortType;
-    use pw_graph_core::{NodeType, PortId};
+    use pw_graph_core::{NodeType, PortId, PortType};
     use std::collections::BTreeMap;
     #[cfg(all(target_os = "linux", feature = "pipewire"))]
     use std::collections::BTreeSet;
@@ -843,5 +846,176 @@ mod tests {
         driver
             .disconnect(link.id)
             .expect("PipeWire link destruction should succeed");
+    }
+
+    #[test]
+    fn demo_backend_manages_video_filters() {
+        use crate::video::{VideoDriver, VideoFilterRequest, VideoNodeState};
+        use pw_graph_video::filters::FilterParams;
+
+        let mut driver = DemoDriver::demo();
+        assert!(driver.video_supported());
+        let filter = driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "gray-1".into(),
+                filter_id: pw_graph_video::filters::FILTER_GRAYSCALE.into(),
+                params: FilterParams::default(),
+                position: [300.0, 200.0],
+            })
+            .expect("demo video filter should be creatable");
+        assert_eq!(driver.video_filters().len(), 1);
+        assert_eq!(
+            driver.graph().port(filter.input_port).unwrap().port_type,
+            PortType::Video
+        );
+        let info = driver.video_node_info(filter.node_id).unwrap();
+        assert_eq!(info.instance_id.as_deref(), Some("gray-1"));
+        assert_eq!(info.state, VideoNodeState::Idle);
+        assert!(info.counters.is_some());
+        assert!(driver.video_preview("gray-1").is_some());
+        assert!(driver.video_preview("missing").is_none());
+
+        // Duplicates and unknown filters are errors, not panics.
+        assert!(driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "gray-1".into(),
+                filter_id: pw_graph_video::filters::FILTER_GRAYSCALE.into(),
+                params: FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .is_err());
+        assert!(driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "nope".into(),
+                filter_id: "bloom".into(),
+                params: FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .is_err());
+
+        driver.set_video_filter_enabled("gray-1", false).unwrap();
+        assert_eq!(
+            driver.video_node_info(filter.node_id).unwrap().state,
+            VideoNodeState::Bypassed
+        );
+        assert!(driver.set_video_filter_enabled("missing", true).is_err());
+
+        driver.remove_video_filter("gray-1").unwrap();
+        assert!(driver.video_filters().is_empty());
+        assert!(driver.graph().node(filter.node_id).is_none());
+        assert!(driver.remove_video_filter("gray-1").is_err());
+    }
+
+    #[test]
+    fn demo_backend_validates_video_links() {
+        use crate::video::{VideoDriver, VideoFilterRequest};
+        use pw_graph_video::filters::FilterParams;
+
+        let mut driver = DemoDriver::demo();
+        let first = driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "a".into(),
+                filter_id: pw_graph_video::filters::FILTER_PASSTHROUGH.into(),
+                params: FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .unwrap();
+        let second = driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "b".into(),
+                filter_id: pw_graph_video::filters::FILTER_HFLIP.into(),
+                params: FilterParams::default(),
+                position: [0.0, 0.0],
+            })
+            .unwrap();
+
+        // Video -> Video routes.
+        assert_eq!(
+            driver.connection_support(first.output_port, second.input_port),
+            ConnectionSupport::Route
+        );
+        let link = driver
+            .connect(first.output_port, second.input_port)
+            .unwrap();
+        assert!(driver.graph().link(link.id).is_some());
+        driver.disconnect(link.id).unwrap();
+
+        // Audio <-> Video never routes: demo audio ports are 1..4.
+        assert_eq!(
+            driver.connection_support(PortId(1), second.input_port),
+            ConnectionSupport::Unsupported
+        );
+        assert_eq!(
+            driver.connection_support(first.output_port, PortId(3)),
+            ConnectionSupport::Unsupported
+        );
+        assert!(driver.connect(PortId(1), second.input_port).is_err());
+        assert!(driver.connect(first.output_port, PortId(3)).is_err());
+    }
+
+    #[test]
+    fn virtual_display_requests_are_bounded() {
+        use crate::video::{validate_virtual_display, VirtualDisplayRequest};
+
+        assert!(validate_virtual_display(&VirtualDisplayRequest::default()).is_ok());
+        assert!(validate_virtual_display(&VirtualDisplayRequest {
+            width: 0,
+            height: 1080,
+            refresh_hz: 60,
+        })
+        .is_err());
+        assert!(validate_virtual_display(&VirtualDisplayRequest {
+            width: 9000,
+            height: 1080,
+            refresh_hz: 60,
+        })
+        .is_err());
+        assert!(validate_virtual_display(&VirtualDisplayRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 0,
+        })
+        .is_err());
+        assert!(validate_virtual_display(&VirtualDisplayRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 1000,
+        })
+        .is_err());
+    }
+
+    /// Opt-in: exercises a real video filter node against the live daemon —
+    /// node creation, projection into the graph, and removal. Requires a
+    /// running PipeWire; never part of a default run.
+    #[cfg(all(target_os = "linux", feature = "pipewire"))]
+    #[test]
+    fn native_backend_projects_a_video_filter_node() {
+        use crate::video::{VideoDriver, VideoFilterRequest};
+        use pw_graph_video::filters::FilterParams;
+
+        if std::env::var_os("PW_GRAPH_TEST_VIDEO").is_none() {
+            return;
+        }
+        let Ok(mut driver) = PipewireDriver::new() else {
+            return;
+        };
+        driver.refresh().expect("registry snapshot should succeed");
+        let filter = driver
+            .create_video_filter(VideoFilterRequest {
+                instance_id: "live-test".into(),
+                filter_id: pw_graph_video::filters::FILTER_PASSTHROUGH.into(),
+                params: FilterParams::default(),
+                position: [100.0, 100.0],
+            })
+            .expect("video filter should be creatable");
+        assert!(driver.graph().node(filter.node_id).is_some());
+        assert_eq!(driver.video_filters().len(), 1);
+        assert!(driver.video_preview("live-test").is_some());
+        driver
+            .refresh()
+            .expect("reprojection should survive refresh");
+        assert!(driver.graph().node(filter.node_id).is_some());
+        driver.remove_video_filter("live-test").unwrap();
+        assert!(driver.video_filters().is_empty());
     }
 }

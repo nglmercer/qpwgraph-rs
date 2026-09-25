@@ -164,6 +164,8 @@ pub(crate) struct Application {
     pub(crate) meter_error: Option<String>,
     /// Audio controls are live UI state only. They are intentionally not
     /// restored from a second Slint-specific file on startup.
+    /// Linux video UI state: open preview target and filter numbering.
+    pub(crate) video: super::video::VideoUiState,
     #[cfg(feature = "relay")]
     pub(crate) relay_levels: BTreeMap<u64, f32>,
     #[cfg(feature = "relay")]

@@ -25,6 +25,7 @@ import { EffectDiagnosticsDialog } from "dialogs/effect-diagnostics-dialog.slint
 import { PatchbayDiagnosticsDialog } from "dialogs/patchbay-diagnostics-dialog.slint";
 import { NodeDiagnosticsDialog } from "dialogs/node-diagnostics-dialog.slint";
 import { QrDialog } from "dialogs/qr-dialog.slint";
+import { VideoPreviewDialog } from "dialogs/video-preview-dialog.slint";
 import { RelayPanel } from "panels/relay-panel.slint";
 import { NodeAppearancePanel } from "panels/node-appearance-panel.slint";
 import { DialogShell } from "components/dialog-shell.slint";
@@ -110,6 +111,12 @@ export component MainWindow inherits Window {
     in property <string> node-debug-report: "";
     in-out property <bool> show-relay: false;
     in-out property <bool> show-qr: false;
+    in-out property <bool> show-video-preview: false;
+    in property <image> video-preview-image;
+    in property <string> video-preview-title: "";
+    in property <string> video-preview-status: "";
+    in property <bool> video-available: false;
+    in property <bool> capture-active: false;
     // --- Keyboard policy -------------------------------------------------
     // The three questions every key handler needs to ask, answered once here
     // instead of being re-derived at each call site. `docs/keyboard.md` and
@@ -122,7 +129,7 @@ export component MainWindow inherits Window {
     out property <bool> modal-open: root.show-preferences || root.show-history
         || root.show-shortcuts || root.show-effects || root.show-effect-diagnostics || root.show-node-editor
         || root.show-node-diagnostics || root.show-patchbay-diagnostics
-        || root.show-qr || root.relay-pending-active || root.show-recovery;
+        || root.show-qr || root.relay-pending-active || root.show-recovery || root.show-video-preview;
     // Text editing always wins: a typed 'r', 'a' or digit belongs to the field.
     out property <bool> text-editing: TextInputInterface.text-input-focused;
     out property <bool> canvas-shortcuts-enabled: !root.modal-open && !root.text-editing;
@@ -410,6 +417,19 @@ export component MainWindow inherits Window {
                     if root.show-common-actions && root.has-selected-node : RailActionButton { enabled: root.connections-available; icon: @image-url("../../../assets/icons/disconnect_node.svg"); label: UiI18n.localized("canvas.disconnect_node"); clicked => { root.action("disconnect-node"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-common-actions : RailActionButton { icon: @image-url("../../../assets/icons/effects.svg"); label: UiI18n.localized("effects.title"); active: root.show-effects; clicked => { root.action("effects"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-common-actions : RailActionButton { icon: @image-url("../../../assets/icons/volume.svg"); label: UiI18n.localized("toolbar.add_recorder"); clicked => { root.action("add-recorder"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available && !root.capture-active : RailActionButton { icon: @image-url("../../../assets/icons/video.svg"); label: UiI18n.localized("video.capture_monitor"); clicked => { root.action("capture-monitor"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available && !root.capture-active : RailActionButton { icon: @image-url("../../../assets/icons/device_desktop.svg"); label: UiI18n.localized("video.capture_window"); clicked => { root.action("capture-window"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available && root.capture-active : RailActionButton { icon: @image-url("../../../assets/icons/close.svg"); label: UiI18n.localized("video.stop_capture"); clicked => { root.action("stop-capture"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/device_generic.svg"); label: UiI18n.localized("video.virtual_create"); clicked => { root.action("virtual-display-create"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_passthrough"); clicked => { root.action("add-video-filter:passthrough"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_grayscale"); clicked => { root.action("add-video-filter:grayscale"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_hflip"); clicked => { root.action("add-video-filter:hflip"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_vflip"); clicked => { root.action("add-video-filter:vflip"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_crop"); clicked => { root.action("add-video-filter:crop;crop=0,0,640,480"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_scale"); clicked => { root.action("add-video-filter:scale;scale=640x480"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available && root.has-selected-node : RailActionButton { icon: @image-url("../../../assets/icons/delete.svg"); label: UiI18n.localized("video.remove_filter"); clicked => { root.action("remove-video-filter"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available && root.has-selected-node : RailActionButton { icon: @image-url("../../../assets/icons/check.svg"); label: UiI18n.localized("video.toggle_filter"); clicked => { root.action("toggle-video-filter"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_preview.svg"); label: UiI18n.localized("video.open_preview"); clicked => { root.action("open-preview"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/save.svg"); label: UiI18n.localized("toolbar.save_patchbay"); clicked => { root.action("save-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/load.svg"); label: UiI18n.localized("toolbar.load_patchbay"); clicked => { root.action("load-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/snapshot.svg"); label: UiI18n.localized("toolbar.snapshot"); clicked => { root.action("snapshot-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
@@ -690,6 +710,14 @@ export component MainWindow inherits Window {
                 relay-qr-payload: root.relay-qr-payload;
                 relay-qr-image: root.relay-qr-image;
                 close => { root.action("close-qr"); }
+            }
+            if root.show-video-preview: VideoPreviewDialog {
+                z: 100;
+                x: max(24px, (parent.width - 560px) / 2); y: max(28px, (parent.height - 470px) / 2); width: min(560px, parent.width - 48px); height: min(470px, parent.height - 56px);
+                preview-title: root.video-preview-title;
+                preview-status: root.video-preview-status;
+                preview-image: root.video-preview-image;
+                close => { root.action("close-video-preview"); }
             }
             if root.relay-pending-active: Rectangle {
                 z: 101;

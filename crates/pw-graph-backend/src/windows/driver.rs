@@ -71,6 +71,7 @@ pub(super) const WINDOWS_AUDIO_CAPABILITIES: BackendCapabilities = BackendCapabi
     // endpoints exist whenever the feature is compiled in.
     relay: cfg!(feature = "relay"),
     recorders: true,
+    video: false,
 };
 
 /// Audio state shared between the COM worker, the Core Audio change callbacks,

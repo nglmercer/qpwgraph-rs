@@ -44,6 +44,7 @@ pub struct DemoDriver {
     next_effect_id: u64,
     recorders: BTreeMap<RecorderId, DemoRecorder>,
     next_recorder_id: RecorderId,
+    video_filters: BTreeMap<String, DemoVideoFilter>,
     /// Suppression state used by backends that remember an explicit manual
     /// disconnect. Keeping it in the demo driver makes command rollback tests
     /// able to verify that unrelated pairs are not accidentally unsuppressed.
@@ -59,6 +60,16 @@ struct DemoRecorder {
     sink: Option<RecorderSink>,
     writer: Option<RecorderWriter>,
     result: Option<RecorderResult>,
+}
+
+/// In-memory video filter: graph node plus idle diagnostics and preview.
+/// No worker threads or streams; the deterministic driver models topology
+/// and link validation, not frame flow.
+struct DemoVideoFilter {
+    instance: crate::video::VideoFilterInstance,
+    diagnostics: pw_graph_video::VideoDiagnostics,
+    preview: pw_graph_video::preview::VideoPreview,
+    enabled: bool,
 }
 
 /// Operations a test wants the driver to refuse.
@@ -96,6 +107,7 @@ impl DemoDriver {
             next_effect_id: 1000,
             recorders: BTreeMap::new(),
             next_recorder_id: 1,
+            video_filters: BTreeMap::new(),
             suppressed_connections: Vec::new(),
             forced_failures: None,
         }
@@ -106,6 +118,7 @@ impl DemoDriver {
     /// destroy/recreate cycle without exposing the driver's private state.
     pub fn replace_graph(&mut self, graph: Graph) {
         self.recorders.clear();
+        self.video_filters.clear();
         self.next_link_id = graph.links.keys().map(|id| id.0).max().unwrap_or(0) + 1;
         self.graph = graph;
         self.observed_links.clear();
@@ -704,6 +717,7 @@ impl GraphDriver for DemoDriver {
             effects: true,
             relay: false,
             recorders: true,
+            video: true,
         }
     }
 
@@ -1186,6 +1200,157 @@ impl RecorderDriver for DemoDriver {
 
 #[cfg(feature = "relay")]
 impl RelayDriver for DemoDriver {}
+
+impl crate::video::VideoDriver for DemoDriver {
+    fn video_supported(&self) -> bool {
+        true
+    }
+
+    fn create_video_filter(
+        &mut self,
+        request: crate::video::VideoFilterRequest,
+    ) -> BackendResult<crate::video::VideoFilterInstance> {
+        if request.instance_id.trim().is_empty() {
+            return Err(BackendError::Native(
+                "video filter instance id is empty".into(),
+            ));
+        }
+        if self.video_filters.contains_key(&request.instance_id) {
+            return Err(BackendError::Native(format!(
+                "video filter instance {} already exists",
+                request.instance_id
+            )));
+        }
+        pw_graph_video::filters::create_filter(&request.filter_id, &request.params).map_err(
+            |error| {
+                BackendError::Native(format!(
+                    "unknown video filter {}: {error}",
+                    request.filter_id
+                ))
+            },
+        )?;
+        let mut node_id = NodeId(self.next_effect_id);
+        while self.graph.nodes.contains_key(&node_id) {
+            self.next_effect_id = self.next_effect_id.saturating_add(1);
+            node_id = NodeId(self.next_effect_id);
+        }
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let input_port = PortId(self.next_effect_id);
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let output_port = PortId(self.next_effect_id);
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let mut node = Node::new(
+            node_id,
+            format!("Video {} ({})", request.filter_id, request.instance_id),
+            NodeType::Effect,
+        );
+        node.position = request.position;
+        self.graph.add_node(node)?;
+        if let Err(error) = self.graph.add_port(Port::new(
+            input_port,
+            node_id,
+            "video_in",
+            Direction::Sink,
+            PortType::Video,
+        )) {
+            self.graph.nodes.remove(&node_id);
+            return Err(error.into());
+        }
+        if let Err(error) = self.graph.add_port(Port::new(
+            output_port,
+            node_id,
+            "video_out",
+            Direction::Source,
+            PortType::Video,
+        )) {
+            self.graph.nodes.remove(&node_id);
+            self.graph.ports.remove(&input_port);
+            return Err(error.into());
+        }
+        let instance = crate::video::VideoFilterInstance {
+            instance_id: request.instance_id.clone(),
+            node_id,
+            input_port,
+            output_port,
+            filter_id: request.filter_id.clone(),
+        };
+        self.video_filters.insert(
+            request.instance_id,
+            DemoVideoFilter {
+                instance: instance.clone(),
+                diagnostics: pw_graph_video::VideoDiagnostics::new(),
+                preview: pw_graph_video::preview::VideoPreview::new(),
+                enabled: true,
+            },
+        );
+        Ok(instance)
+    }
+
+    fn remove_video_filter(&mut self, instance_id: &str) -> BackendResult<()> {
+        let filter = self.video_filters.remove(instance_id).ok_or_else(|| {
+            BackendError::Native(format!("unknown video filter instance {instance_id}"))
+        })?;
+        let links: Vec<LinkId> = self
+            .graph
+            .links
+            .values()
+            .filter(|link| {
+                link.output_port == filter.instance.output_port
+                    || link.input_port == filter.instance.input_port
+            })
+            .map(|link| link.id)
+            .collect();
+        for link in links {
+            let _ = self.graph.remove_link(link);
+        }
+        self.graph.ports.remove(&filter.instance.input_port);
+        self.graph.ports.remove(&filter.instance.output_port);
+        self.graph.nodes.remove(&filter.instance.node_id);
+        Ok(())
+    }
+
+    fn set_video_filter_enabled(&mut self, instance_id: &str, enabled: bool) -> BackendResult<()> {
+        self.video_filters
+            .get_mut(instance_id)
+            .map(|filter| filter.enabled = enabled)
+            .ok_or_else(|| {
+                BackendError::Native(format!("unknown video filter instance {instance_id}"))
+            })
+    }
+
+    fn video_filters(&self) -> Vec<crate::video::VideoFilterInstance> {
+        self.video_filters
+            .values()
+            .map(|filter| filter.instance.clone())
+            .collect()
+    }
+
+    fn video_node_info(&self, node: NodeId) -> Option<crate::video::VideoNodeInfo> {
+        self.video_filters.values().find_map(|filter| {
+            if filter.instance.node_id != node {
+                return None;
+            }
+            Some(crate::video::VideoNodeInfo {
+                node_id: node,
+                instance_id: Some(filter.instance.instance_id.clone()),
+                spec: None,
+                state: if filter.enabled {
+                    crate::video::VideoNodeState::Idle
+                } else {
+                    crate::video::VideoNodeState::Bypassed
+                },
+                counters: Some(filter.diagnostics.snapshot()),
+                preview_state: filter.preview.state(),
+            })
+        })
+    }
+
+    fn video_preview(&self, instance_id: &str) -> Option<pw_graph_video::preview::VideoPreview> {
+        self.video_filters
+            .get(instance_id)
+            .map(|filter| filter.preview.clone())
+    }
+}
 
 impl EffectDriver for DemoDriver {
     fn effect_descriptors(&self) -> Vec<pw_graph_effects::EffectDescriptor> {

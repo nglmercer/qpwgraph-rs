@@ -31,6 +31,7 @@ mod patchbay;
 mod recorders;
 mod relay;
 mod utils;
+pub(crate) mod video;
 use app::*;
 use callbacks::*;
 use config::*;

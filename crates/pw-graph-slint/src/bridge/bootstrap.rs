@@ -130,6 +130,7 @@ pub(super) fn bootstrap_application(args: &Args) -> (Rc<RefCell<Application>>, M
         config_layout_fingerprint: 0,
         meters: BTreeMap::new(),
         meter_error: None,
+        video: super::video::VideoUiState::default(),
         #[cfg(feature = "relay")]
         relay_levels: BTreeMap::new(),
         #[cfg(feature = "relay")]
