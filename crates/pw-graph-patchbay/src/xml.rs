@@ -1,6 +1,7 @@
 //! qpwgraph XML serialization and parsing.
 
 use super::*;
+use pw_graph_core::{NodeType, PortType};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer, XmlVersion};
 use std::collections::BTreeMap;
