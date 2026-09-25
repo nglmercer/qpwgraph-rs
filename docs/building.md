@@ -50,6 +50,64 @@ features: they are compiled whenever the target is Windows. Adding a feature
 for them would only create a state in which the application has no way to see
 the machine's audio.
 
+## Development CLI (`cargo xtask`)
+
+All primary development operations go through the workspace `xtask`:
+
+```bash
+cargo xtask run
+cargo xtask run --mold
+cargo xtask run --no-mold
+cargo xtask test --all-features
+cargo xtask clippy --all-features
+```
+
+Supported commands are `run`, `build`, `check`, `test`, `clippy`, `fmt`,
+`doc`, and `clean`. Release, feature, and package options are forwarded to
+Cargo unchanged, and arguments after `--` go to the application or test
+harness:
+
+```bash
+cargo xtask run -p pw-graph-app -- --help
+cargo xtask build --release -p pw-graph-app
+cargo xtask run -p pw-graph-app --features pipewire,relay
+cargo xtask build --all-features
+```
+
+Run `cargo xtask help` for the full usage.
+
+### Linux linker (optional mold)
+
+On Linux, `cargo xtask` automatically uses the `mold` linker when `mold` is
+available on `PATH` (`mold --version` succeeds), purely to speed up
+development linking. Otherwise it uses the normal system linker. The wrapper
+prints which one was selected:
+
+```text
+Linker: mold
+```
+
+```text
+Linker: system default
+```
+
+mold is only a development optimization: the project builds normally without
+it, no user configuration changes are required, and packaging and release
+correctness never depend on it. When mold is selected, xtask passes
+`clang` plus `-fuse-ld=mold` flags to the child Cargo process via
+process-local `RUSTFLAGS`; the user's global Cargo configuration is never
+modified. If `clang` is unavailable, only `-fuse-ld=mold` is added to the
+default linker driver.
+
+Explicit overrides:
+
+```bash
+cargo xtask run --mold     # require mold; fail clearly if unavailable
+cargo xtask test --no-mold # always use the system linker
+```
+
+macOS and other non-Linux platforms keep normal Cargo linker behavior.
+
 ## Windows
 
 On Windows, the standard MSVC commands are:
@@ -68,9 +126,10 @@ automatically use `lld-link` when it is available on `PATH`. Otherwise Cargo
 uses the normal MSVC linker.
 
 Explicit `CARGO_TARGET_*_LINKER` environment overrides always take precedence.
-The wrapper forwards all remaining arguments to Cargo, so commands such as
-`cargo xtask build --release --locked -p pw-graph-app` retain their normal
-Cargo behavior.
+The wrapper parses the dev command (`run`, `build`, `check`, `test`,
+`clippy`, `fmt`, `doc`, `clean`) and forwards every other option to Cargo, so
+commands such as `cargo xtask build --release --locked -p pw-graph-app`
+retain their normal Cargo behavior.
 
 The optional virtual-audio driver is not part of those portable commands. It
 has its own workspace and requires an eWDK/WDK developer prompt with KMDF/ACX
@@ -125,6 +184,15 @@ cargo fmt --all -- --check
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo build --release --locked
+```
+
+The same checks are available through the dev CLI, which additionally applies
+the platform linker selection (mold on Linux, `lld-link` on Windows):
+
+```bash
+cargo xtask fmt --all -- --check
+cargo xtask test --workspace --all-features
+cargo xtask clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 CI sets `RUSTFLAGS=-D warnings` for every job, so a plain `cargo check` on a

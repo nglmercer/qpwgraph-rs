@@ -17,11 +17,10 @@ An unoptimized debug build (`cargo run` without `--release`) is dramatically
 slower at graph projection and hit-testing; always compare performance in
 release mode.
 
-### Windows linker
+### Development CLI and linkers
 
-MSVC Build Tools are required on Windows. Run Rust commands through the
-workspace `xtask` so they automatically use `lld-link` when it is available on
-`PATH`:
+Run Rust commands through the workspace `xtask` so platform linker selection
+is applied automatically:
 
 ```powershell
 cargo xtask run --release -p pw-graph-app
@@ -29,12 +28,22 @@ cargo xtask test --workspace --all-features --locked -- --test-threads=1
 cargo xtask build --release --locked -p pw-graph-app
 ```
 
-LLVM is optional. When `lld-link` is unavailable, Cargo uses the normal MSVC
-linker. Explicit `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` and
+Supported commands are `run`, `build`, `check`, `test`, `clippy`, `fmt`,
+`doc`, and `clean`; every other option (including `--manifest-path`) is
+forwarded to Cargo unchanged. `cargo xtask help` prints the full usage.
+
+On Linux, xtask automatically uses the `mold` linker when it is available on
+`PATH`, purely to speed up development linking, and prints `Linker: mold` or
+`Linker: system default`. mold is optional: the project builds normally
+without it, and `--mold`/`--no-mold` force either choice
+(`cargo xtask run --mold`, `cargo xtask test --no-mold`).
+
+On Windows, MSVC Build Tools are required and LLVM is optional. Commands
+launched through `cargo xtask` automatically use `lld-link` when it is
+available on `PATH`; otherwise Cargo uses the normal MSVC linker. Explicit
+`CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` and
 `CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER` environment overrides always
-take precedence. Arguments after `cargo xtask` are forwarded to Cargo without
-reinterpretation, including `--manifest-path` commands for the nested Windows
-audio-driver workspace.
+take precedence.
 
 ### Windows application and microphone routing
 
@@ -105,9 +114,9 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-On Windows, use the corresponding `cargo xtask test`, `cargo xtask clippy`,
-and other `cargo xtask <subcommand>` forms so the optional linker selection is
-applied.
+Use the corresponding `cargo xtask test`, `cargo xtask clippy`, and other
+`cargo xtask <command>` forms so the optional linker selection (mold on
+Linux, `lld-link` on Windows) is applied.
 
 [Workspace architecture](docs/architecture.md) explains which crate a change
 belongs in.
