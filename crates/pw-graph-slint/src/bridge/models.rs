@@ -19,7 +19,7 @@ use super::effects::{
     effect_operation_rows, effect_options, effect_setup_rows, sync_effect_rows,
     sync_effect_setup_rows,
 };
-use super::icons::load_node_icon;
+use super::icons::{load_node_icon, video_fallback_icon_name};
 use super::meters::meter_fallback;
 use super::recorders::{recorder_state_slug, recorder_statuses_by_node, recovered_recording_rows};
 #[cfg(feature = "relay")]
@@ -35,7 +35,8 @@ use super::utils::{
     meter_policy_index, track_position_from_volume,
 };
 use super::video::{
-    sync_video_effect_rows, video_effect_options, video_summaries_by_node, VIDEO_FILTER_CATALOG,
+    sync_video_effect_rows, video_effect_options, video_panels_by_node, video_summaries_by_node,
+    VIDEO_FILTER_CATALOG,
 };
 use super::{
     HistoryRow, LinkRow, MainWindow, MinimapNode, NodeRow, PortRow, RuleRow, ShortcutRow, UiI18n,
@@ -52,12 +53,14 @@ pub(crate) fn sync_models(
 ) {
     application.view.relay_nodes_visible = relay_nodes_visible(application);
     let backend_profiles = read_backend_profiles(&application.source);
+    let video_panels = video_panels_by_node(application);
     let snapshot = application.view.snapshot_with_meters(
         application.source.graph(),
         &application.config,
         &application.meters,
         meter_fallback(&application.source),
         &backend_profiles,
+        &video_panels,
     );
     let recorder_statuses = recorder_statuses_by_node(application);
     let video_summaries = video_summaries_by_node(application);
@@ -666,7 +669,13 @@ fn node_row(
     recorder_status: Option<&pw_graph_backend::RecorderStatus>,
     video_summary: Option<&String>,
 ) -> NodeRow {
-    let icon = load_node_icon(node.icon_name.as_deref());
+    // Camera and capture stream nodes rarely publish an icon; fall back to
+    // the freedesktop names so the cards still render distinctly. A missing
+    // theme icon resolves to no icon, same as before.
+    let icon = load_node_icon(node.icon_name.as_deref()).or_else(|| {
+        video_fallback_icon_name(node.video_stop, node.is_camera)
+            .and_then(|name| load_node_icon(Some(name)))
+    });
     let has_icon = icon.is_some();
     let is_recorder = node.node_type == pw_graph_core::NodeType::Recorder;
     let recorder_state = recorder_status
@@ -713,6 +722,9 @@ fn node_row(
         ),
         has_audio_controls: node.has_audio_controls,
         has_audio_panel: node.has_audio_panel,
+        has_video_panel: node.has_video_panel,
+        video_preview: node.video_preview,
+        video_stop: node.video_stop,
         is_recorder,
         recorder_state: SharedString::from(recorder_state),
         recorder_elapsed: SharedString::from(recorder_elapsed),
@@ -753,6 +765,7 @@ fn node_row(
                         index,
                         node.has_audio_panel,
                         node.node_type == pw_graph_core::NodeType::Recorder,
+                        node.has_video_panel,
                         is_output,
                     );
                     PortRow {
@@ -764,6 +777,7 @@ fn node_row(
                             index,
                             node.has_audio_panel,
                             node.node_type == pw_graph_core::NodeType::Recorder,
+                            node.has_video_panel,
                         ),
                         pin_x,
                         pin_y,
@@ -814,6 +828,7 @@ fn rebuild_geometry(
                 index,
                 node.has_audio_panel,
                 node.node_type == pw_graph_core::NodeType::Recorder,
+                node.has_video_panel,
                 is_output,
             );
             pin_geometry.push(PinGeometry {

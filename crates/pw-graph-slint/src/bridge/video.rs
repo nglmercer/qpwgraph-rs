@@ -8,8 +8,8 @@
 //! realtime thread.
 
 use pw_graph_backend::video::{
-    ScreenCastRequest, ScreenCastSource, ScreenCastState, VideoFilterRequest, VideoNodeInfo,
-    VideoNodeState, VirtualDisplayRequest,
+    ScreenCastRequest, ScreenCastSource, ScreenCastState, VideoFilterInstance, VideoFilterRequest,
+    VideoNodeInfo, VideoNodeState, VirtualDisplayRequest,
 };
 use pw_graph_core::NodeId;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
@@ -17,8 +17,10 @@ use std::rc::Rc;
 
 use super::app::Application;
 use super::{EffectRow, MainWindow};
+use crate::model::VideoPanel;
 use crate::source::ApplicationDriver;
 use pw_graph_i18n::I18n;
+use std::collections::BTreeMap;
 
 /// Which stream a preview dialog shows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -185,21 +187,25 @@ fn parse_virtual_geometry(geometry: Option<&str>) -> VirtualDisplayRequest {
 }
 
 /// Add a filter. `spec` is `filter-id` plus optional `;crop=x,y,w,h` or
-/// `;scale=WxH` parameters for the geometry filters.
-pub(crate) fn add_video_filter(application: &mut Application, spec: &str) {
+/// `;scale=WxH` parameters for the geometry filters. Returns the instance
+/// on success so the effects dialog can apply the draft's enabled flag.
+pub(crate) fn add_video_filter(
+    application: &mut Application,
+    spec: &str,
+) -> Option<VideoFilterInstance> {
     if !require_video(application) {
-        return;
+        return None;
     }
     if !application.source.capabilities().connect {
         application.status = application.t("status.connections_unavailable");
-        return;
+        return None;
     }
     let (filter_id, params) = match parse_filter_spec(spec) {
         Ok(parsed) => parsed,
         Err(message) => {
             application.status =
                 application.tf("status.video_filter_failed", &[("error", message)]);
-            return;
+            return None;
         }
     };
     let instance_id = application.video.next_instance_id(&filter_id);
@@ -218,9 +224,11 @@ pub(crate) fn add_video_filter(application: &mut Application, spec: &str) {
                 &[("name", format!("{filter_id} {instance_id}"))],
             );
             let _ = application.source.refresh();
+            Some(instance)
         }
         Err(error) => {
             application.status = application.tf("status.video_filter_failed", &[("error", error)]);
+            None
         }
     }
 }
@@ -284,19 +292,7 @@ fn selected_video_instance(application: &Application) -> Option<String> {
         .map(|filter| filter.instance_id.clone())
 }
 
-pub(crate) fn remove_selected_video_filter(application: &mut Application) {
-    if !require_video(application) {
-        return;
-    }
-    let Some(instance_id) = selected_video_instance(application) else {
-        application.status = application.t("status.video_select_filter");
-        return;
-    };
-    remove_video_filter_by_id(application, &instance_id);
-}
-
-/// Remove one filter by instance id. Shared by the canvas action (which
-/// resolves the selection first) and the effects-dialog video tab.
+/// Remove one filter by instance id. Used by the effects-dialog video tab.
 pub(crate) fn remove_video_filter_by_id(application: &mut Application, instance_id: &str) {
     if !require_video(application) {
         return;
@@ -318,19 +314,8 @@ pub(crate) fn remove_video_filter_by_id(application: &mut Application, instance_
     }
 }
 
-pub(crate) fn toggle_selected_video_filter(application: &mut Application) {
-    if !require_video(application) {
-        return;
-    }
-    let Some(instance_id) = selected_video_instance(application) else {
-        application.status = application.t("status.video_select_filter");
-        return;
-    };
-    toggle_video_filter(application, &instance_id);
-}
-
-/// Flip one filter between enabled and bypassed by instance id. Shared by
-/// the canvas action and the effects-dialog video tab.
+/// Flip one filter between enabled and bypassed by instance id. Used by
+/// the effects-dialog video tab.
 pub(crate) fn toggle_video_filter(application: &mut Application, instance_id: &str) {
     if !require_video(application) {
         return;
@@ -730,13 +715,6 @@ pub(crate) fn prepare_video_draft(window: &MainWindow, application: &mut Applica
 /// form, the second creates the filter. Creation is synchronous (no
 /// tickets), then the draft closes like the audio one.
 pub(crate) fn create_video_effect(window: &MainWindow, application: &mut Application) {
-    if !require_video(application) {
-        return;
-    }
-    if !application.source.capabilities().connect {
-        application.status = application.t("status.connections_unavailable");
-        return;
-    }
     let entry = application
         .effect_selection_id
         .as_deref()
@@ -752,40 +730,14 @@ pub(crate) fn create_video_effect(window: &MainWindow, application: &mut Applica
         application.status = application.t("effects.setup_hint");
         return;
     }
-    let (filter_id, params) = match parse_filter_spec(entry.spec) {
-        Ok(parsed) => parsed,
-        Err(message) => {
-            application.status =
-                application.tf("status.video_filter_failed", &[("error", message)]);
-            return;
-        }
-    };
-    let instance_id = application.video.next_instance_id(&filter_id);
     let enabled = application.effect_draft_enabled;
-    match application.source.create_video_filter(VideoFilterRequest {
-        instance_id: instance_id.clone(),
-        filter_id: filter_id.clone(),
-        params,
-        position: [260.0, 180.0],
-    }) {
-        Ok(instance) => {
-            if !enabled {
-                let _ = application
-                    .source
-                    .set_video_filter_enabled(&instance_id, false);
-            }
-            application.view.selected_nodes.clear();
-            application.view.selected_nodes.insert(instance.node_id);
-            application.status = application.tf(
-                "status.video_filter_added",
-                &[("name", format!("{filter_id} {instance_id}"))],
-            );
-            let _ = application.source.refresh();
-            super::effects::finish_effect_setup(window, application);
+    if let Some(instance) = add_video_filter(application, entry.spec) {
+        if !enabled {
+            let _ = application
+                .source
+                .set_video_filter_enabled(&instance.instance_id, false);
         }
-        Err(error) => {
-            application.status = application.tf("status.video_filter_failed", &[("error", error)]);
-        }
+        super::effects::finish_effect_setup(window, application);
     }
 }
 
@@ -881,6 +833,68 @@ fn preview_word(state: &pw_graph_video::preview::PreviewState) -> &'static str {
     }
 }
 
+/// Node cards that show the video action block: filter instances get
+/// preview, the active capture gets preview plus stop.
+pub(crate) fn video_panels_by_node(application: &Application) -> BTreeMap<NodeId, VideoPanel> {
+    let mut panels = BTreeMap::new();
+    if !video_available(application) {
+        return panels;
+    }
+    for filter in application.source.video_filters() {
+        panels.insert(
+            filter.node_id,
+            VideoPanel {
+                preview: true,
+                stop: false,
+            },
+        );
+    }
+    if let Some(node_id) = application.source.screen_cast_node() {
+        panels.insert(
+            node_id,
+            VideoPanel {
+                preview: true,
+                stop: true,
+            },
+        );
+    }
+    panels
+}
+
+/// Card Preview button: preview a filter instance or the active capture.
+pub(crate) fn preview_node_video(application: &mut Application, rendered_id: i32) {
+    if !require_video(application) {
+        return;
+    }
+    let Some(node_id) = application.view.ids.node_id(rendered_id) else {
+        return;
+    };
+    if let Some(instance_id) = application
+        .source
+        .video_filters()
+        .into_iter()
+        .find(|filter| filter.node_id == node_id)
+        .map(|filter| filter.instance_id)
+    {
+        open_preview(application, Some(&instance_id));
+    } else if application.source.screen_cast_node() == Some(node_id) {
+        open_preview(application, Some("capture"));
+    }
+}
+
+/// Card Stop button: only the active capture offers it.
+pub(crate) fn stop_node_video(application: &mut Application, rendered_id: i32) {
+    if !require_video(application) {
+        return;
+    }
+    let Some(node_id) = application.view.ids.node_id(rendered_id) else {
+        return;
+    };
+    if application.source.screen_cast_node() == Some(node_id) {
+        stop_capture(application);
+    }
+}
+
 /// One-line video summary for node cards: resolution, fps, format, state,
 /// and dropped frames.
 pub(crate) fn video_node_summary(info: &VideoNodeInfo) -> String {
@@ -925,16 +939,13 @@ mod tests {
         add_video_filter(&mut application, "bloom");
         assert_eq!(application.source.video_filters().len(), 3);
 
-        // Removal works on the selected filter node.
-        let node = application.source.video_filters()[0].node_id;
-        application.view.selected_nodes.clear();
-        application.view.selected_nodes.insert(node);
-        remove_selected_video_filter(&mut application);
+        // Removal works by instance id.
+        let instance = application.source.video_filters()[0].instance_id.clone();
+        remove_video_filter_by_id(&mut application, &instance);
         assert_eq!(application.source.video_filters().len(), 2);
 
-        // Nothing selected: a status hint, not a panic.
-        application.view.selected_nodes.clear();
-        remove_selected_video_filter(&mut application);
+        // Unknown id: a backend error, not a panic.
+        remove_video_filter_by_id(&mut application, "no-such-filter");
         assert_eq!(application.source.video_filters().len(), 2);
     }
 
@@ -1146,5 +1157,91 @@ mod tests {
             .unwrap();
         assert_eq!(row.health.as_str(), "BYPASSED");
         assert!(!row.enabled);
+    }
+
+    #[test]
+    fn panels_cover_filters_with_preview_and_capture_with_stop() {
+        use pw_graph_backend::video::{ScreenCastRequest, ScreenCastSource};
+
+        let mut application = demo_application();
+        assert!(video_panels_by_node(&application).is_empty());
+
+        add_video_filter(&mut application, "grayscale");
+        let filter_node = application.source.video_filters()[0].node_id;
+        let panels = video_panels_by_node(&application);
+        assert_eq!(
+            panels.get(&filter_node),
+            Some(&VideoPanel {
+                preview: true,
+                stop: false,
+            })
+        );
+
+        application
+            .source
+            .start_screen_cast(ScreenCastRequest {
+                source: ScreenCastSource::Monitor,
+                show_cursor: true,
+                multiple: false,
+            })
+            .unwrap();
+        let capture_node = application.source.screen_cast_node().unwrap();
+        let panels = video_panels_by_node(&application);
+        assert_eq!(
+            panels.get(&capture_node),
+            Some(&VideoPanel {
+                preview: true,
+                stop: true,
+            })
+        );
+        // The filter keeps its preview-only panel while capturing.
+        assert_eq!(
+            panels.get(&filter_node),
+            Some(&VideoPanel {
+                preview: true,
+                stop: false,
+            })
+        );
+    }
+
+    #[test]
+    fn card_actions_preview_and_stop_by_rendered_id() {
+        use pw_graph_backend::video::{ScreenCastRequest, ScreenCastSource};
+
+        let mut application = demo_application();
+        add_video_filter(&mut application, "grayscale");
+        let filter_node = application.source.video_filters()[0].node_id;
+        application
+            .source
+            .start_screen_cast(ScreenCastRequest {
+                source: ScreenCastSource::Monitor,
+                show_cursor: true,
+                multiple: false,
+            })
+            .unwrap();
+        let capture_node = application.source.screen_cast_node().unwrap();
+        // Rendered ids resolve through the view map like the card callbacks.
+        application.view.ids.rebuild(application.source.graph());
+        let filter_card = application.view.ids.node(filter_node).unwrap();
+        let capture_card = application.view.ids.node(capture_node).unwrap();
+
+        // Filter card previews its instance.
+        preview_node_video(&mut application, filter_card);
+        assert_eq!(
+            application.video.preview,
+            PreviewTarget::Filter(application.source.video_filters()[0].instance_id.clone())
+        );
+
+        // Capture card previews the stream, then stops the session.
+        preview_node_video(&mut application, capture_card);
+        assert_eq!(application.video.preview, PreviewTarget::Capture);
+        stop_node_video(&mut application, capture_card);
+        assert!(application.source.screen_cast_node().is_none());
+        assert_eq!(application.video.preview, PreviewTarget::None);
+
+        // Unknown cards and non-video cards are ignored, not fatal.
+        stop_node_video(&mut application, filter_card);
+        preview_node_video(&mut application, 424242);
+        stop_node_video(&mut application, 424242);
     }
 }

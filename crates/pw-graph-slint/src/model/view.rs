@@ -31,6 +31,16 @@ pub(crate) struct NodeView {
     pub(crate) has_audio_controls: bool,
     /// Whether the node has any audio panel, including a meter-only panel.
     pub(crate) has_audio_panel: bool,
+    /// Whether the card shows the video action block (preview/stop). Video
+    /// nodes never have audio ports in practice; when both panels would
+    /// apply, the audio panel wins and this stays false.
+    pub(crate) has_video_panel: bool,
+    /// The video block offers a live preview of this node.
+    pub(crate) video_preview: bool,
+    /// The video block offers to stop this node (the active capture).
+    pub(crate) video_stop: bool,
+    /// Whether the node is a camera source (V4L2 or libcamera).
+    pub(crate) is_camera: bool,
     /// Whether this node''s backend can rewire it. Backend-wide `connect` is a
     /// union across children, so it is true on Windows because MIDI can route
     /// even though Core Audio cannot.
@@ -41,6 +51,14 @@ pub(crate) struct NodeView {
     pub(crate) audio: NodeBackendProfile,
     pub(crate) meter: MeterReading,
     pub(crate) ports: Vec<PortGroupView>,
+}
+
+/// Which video actions a node card offers. Capture nodes get preview plus
+/// stop; filter instances get preview only; anything else gets no panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VideoPanel {
+    pub(crate) preview: bool,
+    pub(crate) stop: bool,
 }
 
 /// What the owning backend says about one node.

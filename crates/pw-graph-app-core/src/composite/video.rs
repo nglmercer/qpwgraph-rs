@@ -74,6 +74,19 @@ impl pw_graph_backend::video::VideoDriver for CompositeDriver {
         }
     }
 
+    fn screen_cast_node(&self) -> Option<NodeId> {
+        #[cfg(all(target_os = "linux", feature = "pipewire"))]
+        {
+            self.pipewire
+                .as_ref()
+                .and_then(|driver| driver.screen_cast_node())
+        }
+        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        {
+            None
+        }
+    }
+
     fn video_node_info(&self, node: NodeId) -> Option<pw_graph_backend::video::VideoNodeInfo> {
         #[cfg(all(target_os = "linux", feature = "pipewire"))]
         {

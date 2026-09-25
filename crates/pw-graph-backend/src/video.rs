@@ -230,6 +230,13 @@ pub trait VideoDriver {
         Vec::new()
     }
 
+    /// Graph node currently carrying the active screen-capture stream, if
+    /// the backend can resolve it. Lets the UI render capture controls on
+    /// the node card instead of the sidebar.
+    fn screen_cast_node(&self) -> Option<NodeId> {
+        None
+    }
+
     /// Diagnostics snapshot for one video node, if the backend tracks it.
     fn video_node_info(&self, node: NodeId) -> Option<VideoNodeInfo> {
         let _ = node;

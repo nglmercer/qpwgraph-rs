@@ -16,6 +16,8 @@ pub(crate) const BODY_TOP: f32 = 41.0;
 pub(crate) const AUDIO_BLOCK_HEIGHT: f32 = 45.0;
 /// Space reserved inside a Recorder body for its status and transport buttons.
 pub(crate) const RECORDER_BLOCK_HEIGHT: f32 = 68.0;
+/// Space reserved inside a video node body for the preview/stop buttons.
+pub(crate) const VIDEO_BLOCK_HEIGHT: f32 = 38.0;
 /// Padding above the first port row when there are no audio controls.
 pub(crate) const PORT_LIST_TOP: f32 = 5.0;
 /// Vertical pitch between two port rows.
@@ -55,6 +57,7 @@ pub(crate) fn pin_offset_for_node(
     index: usize,
     has_audio_panel: bool,
     is_recorder: bool,
+    has_video_panel: bool,
     is_output: bool,
 ) -> (f32, f32) {
     let x = if is_output {
@@ -64,17 +67,27 @@ pub(crate) fn pin_offset_for_node(
     };
     (
         x,
-        port_row_top_for_node(index, has_audio_panel, is_recorder) + PORT_ROW_HEIGHT / 2.0,
+        port_row_top_for_node(index, has_audio_panel, is_recorder, has_video_panel)
+            + PORT_ROW_HEIGHT / 2.0,
     )
 }
 
-/// Top edge of a port row for a node with an optional Recorder panel.
-pub(crate) fn port_row_top_for_node(index: usize, has_audio_panel: bool, is_recorder: bool) -> f32 {
+/// Top edge of a port row for a node with an optional control block. The
+/// audio panel wins over the video panel when both would apply, matching
+/// the height projection.
+pub(crate) fn port_row_top_for_node(
+    index: usize,
+    has_audio_panel: bool,
+    is_recorder: bool,
+    has_video_panel: bool,
+) -> f32 {
     BODY_TOP
         + if is_recorder {
             RECORDER_BLOCK_HEIGHT
         } else if has_audio_panel {
             AUDIO_BLOCK_HEIGHT
+        } else if has_video_panel {
+            VIDEO_BLOCK_HEIGHT
         } else {
             PORT_LIST_TOP
         }
@@ -680,7 +693,9 @@ mod tests {
                     node_id: 7,
                     is_output: true,
                     x: 100.0 + 244.0 - PIN_INSET,
-                    y: 100.0 + port_row_top_for_node(0, false, false) + PORT_ROW_HEIGHT / 2.0,
+                    y: 100.0
+                        + port_row_top_for_node(0, false, false, false)
+                        + PORT_ROW_HEIGHT / 2.0,
                     visible: true,
                     node_selected: false,
                     connectable: true,
@@ -690,7 +705,9 @@ mod tests {
                     node_id: 8,
                     is_output: false,
                     x: 500.0 + PIN_INSET,
-                    y: 100.0 + port_row_top_for_node(0, false, false) + PORT_ROW_HEIGHT / 2.0,
+                    y: 100.0
+                        + port_row_top_for_node(0, false, false, false)
+                        + PORT_ROW_HEIGHT / 2.0,
                     visible: true,
                     node_selected: false,
                     connectable: true,
@@ -877,7 +894,9 @@ mod tests {
                     node_id: 7,
                     is_output: true,
                     x: 100.0 + 244.0 - PIN_INSET,
-                    y: 100.0 + port_row_top_for_node(0, false, false) + PORT_ROW_HEIGHT / 2.0,
+                    y: 100.0
+                        + port_row_top_for_node(0, false, false, false)
+                        + PORT_ROW_HEIGHT / 2.0,
                     visible: true,
                     node_selected: false,
                     connectable: true,
@@ -887,7 +906,9 @@ mod tests {
                     node_id: 8,
                     is_output: false,
                     x: 1500.0 + PIN_INSET,
-                    y: 700.0 + port_row_top_for_node(0, false, false) + PORT_ROW_HEIGHT / 2.0,
+                    y: 700.0
+                        + port_row_top_for_node(0, false, false, false)
+                        + PORT_ROW_HEIGHT / 2.0,
                     visible: true,
                     node_selected: false,
                     connectable: true,

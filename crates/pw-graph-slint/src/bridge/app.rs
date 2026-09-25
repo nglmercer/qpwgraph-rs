@@ -73,6 +73,8 @@ pub(crate) enum UiEvent {
     EffectDraftEnabledChanged(bool),
     RecorderRecord(i32),
     RecorderStop(i32),
+    VideoPreview(i32),
+    VideoStop(i32),
     RecorderSave(i32),
     RecorderDiscard(i32),
     SelectNode(i32, bool),

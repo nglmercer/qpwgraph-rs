@@ -1018,4 +1018,49 @@ mod tests {
         driver.remove_video_filter("live-test").unwrap();
         assert!(driver.video_filters().is_empty());
     }
+
+    #[test]
+    fn demo_capture_adds_and_removes_a_resolvable_stream_node() {
+        use crate::video::{ScreenCastRequest, ScreenCastSource, ScreenCastState, VideoDriver};
+
+        let mut driver = DemoDriver::demo();
+        assert!(driver.screen_cast_node().is_none());
+        assert!(!driver.screen_cast_status().state.is_active());
+
+        let status = driver
+            .start_screen_cast(ScreenCastRequest {
+                source: ScreenCastSource::Monitor,
+                show_cursor: true,
+                multiple: false,
+            })
+            .unwrap();
+        assert_eq!(status.state, ScreenCastState::Active);
+        // A second start reports the still-active session instead of
+        // duplicating the node.
+        let again = driver
+            .start_screen_cast(ScreenCastRequest {
+                source: ScreenCastSource::Window,
+                show_cursor: true,
+                multiple: false,
+            })
+            .unwrap();
+        assert_eq!(again.state, ScreenCastState::Active);
+
+        let node_id = driver.screen_cast_node().expect("capture node");
+        let node = driver.graph().node(node_id).expect("capture node in graph");
+        assert_eq!(node.serial, status.object_serial);
+        assert!(node.ports.iter().any(|port| matches!(
+            driver.graph().port(*port).map(|port| port.port_type),
+            Some(PortType::Video)
+        )));
+        let info = driver.video_node_info(node_id).expect("capture info");
+        assert!(info.instance_id.is_none());
+
+        driver.stop_screen_cast().unwrap();
+        assert!(driver.screen_cast_node().is_none());
+        assert!(driver.graph().node(node_id).is_none());
+        assert!(!driver.screen_cast_status().state.is_active());
+        // Stopping an idle capture is a no-op, not an error.
+        driver.stop_screen_cast().unwrap();
+    }
 }

@@ -494,6 +494,18 @@ impl Node {
         self
     }
 
+    /// Whether this node is a camera source (V4L2 or libcamera). PipeWire
+    /// marks camera nodes with `media.role=Camera`; the name prefixes cover
+    /// daemons that don't set the role.
+    pub fn is_camera(&self) -> bool {
+        self.identity
+            .media_role
+            .as_deref()
+            .is_some_and(|role| role.eq_ignore_ascii_case("camera"))
+            || self.name.starts_with("v4l2_input.")
+            || self.name.starts_with("libcamera_input.")
+    }
+
     /// Return the current node identity while preserving compatibility with
     /// graph values deserialized before the identity field was introduced.
     pub fn matching_identity(&self) -> NodeIdentity {
@@ -2258,5 +2270,26 @@ mod tests {
             graph.add_link(LinkId(101), PortId(10), PortId(20)),
             Err(GraphError::DuplicateConnection(PortId(10), PortId(20)))
         );
+    }
+
+    #[test]
+    fn camera_nodes_are_detected_by_role_or_monitor_prefix() {
+        // media.role=Camera is what PipeWire sets on camera nodes.
+        let mut role = Node::new(NodeId(1), "some-camera", NodeType::PipeWire);
+        role.identity.media_role = Some("Camera".into());
+        assert!(role.is_camera());
+
+        // Name prefixes cover daemons that don't set the role.
+        let v4l2 = Node::new(NodeId(2), "v4l2_input.pci-0000_00_10.0", NodeType::PipeWire);
+        assert!(v4l2.is_camera());
+        let libcamera = Node::new(NodeId(3), "libcamera_input.ipu6", NodeType::PipeWire);
+        assert!(libcamera.is_camera());
+
+        // Ordinary nodes are not cameras.
+        let plain = Node::new(NodeId(4), "alsa_output.usb", NodeType::PipeWire);
+        assert!(!plain.is_camera());
+        let mut roleless = Node::new(NodeId(5), "v4l2_output.sink", NodeType::PipeWire);
+        roleless.identity.media_role = Some("DSP".into());
+        assert!(!roleless.is_camera());
     }
 }

@@ -702,6 +702,15 @@ impl VideoDriver for PipewireDriver {
             .collect()
     }
 
+    fn screen_cast_node(&self) -> Option<NodeId> {
+        let active = self.screen_cast.status().pipewire_node_id?;
+        self.graph
+            .nodes
+            .keys()
+            .find(|id| native_node_id(**id) == active)
+            .copied()
+    }
+
     fn video_node_info(&self, node: NodeId) -> Option<VideoNodeInfo> {
         if let Some(bridge) = self
             .video_bridges

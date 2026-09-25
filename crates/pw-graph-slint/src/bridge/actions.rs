@@ -25,11 +25,7 @@ use super::relay::{
     relay_qr_payload, start_relay_discovery, start_relay_host, stop_relay_discovery,
     stop_relay_host,
 };
-use super::video::{
-    add_video_filter, close_preview, create_virtual_display, open_preview,
-    remove_selected_video_filter, start_capture, stop_capture, stop_virtual_display,
-    toggle_selected_video_filter,
-};
+use super::video::{close_preview, create_virtual_display, start_capture, stop_virtual_display};
 use super::MainWindow;
 
 pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, action: &str) {
@@ -435,24 +431,12 @@ pub(crate) fn handle_action(window: &MainWindow, application: &mut Application, 
                 pw_graph_backend::video::ScreenCastSource::Window,
             );
         }
-        "stop-capture" => stop_capture(application),
         "virtual-display-create" => create_virtual_display(application, None),
         _ if action.strip_prefix("virtual-display-create:").is_some() => {
             let geometry = action.strip_prefix("virtual-display-create:");
             create_virtual_display(application, geometry);
         }
         "virtual-display-stop" => stop_virtual_display(application),
-        _ if action.strip_prefix("add-video-filter:").is_some() => {
-            let spec = action.strip_prefix("add-video-filter:").unwrap_or_default();
-            add_video_filter(application, spec);
-        }
-        "remove-video-filter" => remove_selected_video_filter(application),
-        "toggle-video-filter" => toggle_selected_video_filter(application),
-        "open-preview" => open_preview(application, None),
-        _ if action.strip_prefix("open-preview:").is_some() => {
-            let target = action.strip_prefix("open-preview:");
-            open_preview(application, target);
-        }
         "close-video-preview" => close_preview(window, application),
         "relay-enrollment-accept" => accept_pending_enrollment(application),
         "relay-enrollment-reject" => reject_pending_enrollment(application),

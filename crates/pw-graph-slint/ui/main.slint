@@ -243,6 +243,8 @@ export component MainWindow inherits Window {
     callback graph-recorder-stop(int);
     callback graph-recorder-save(int);
     callback graph-recorder-discard(int);
+    callback graph-video-preview(int);
+    callback graph-video-stop(int);
     // Geometry lives in Rust; these are the only questions the canvas asks.
     pure callback graph-hit-test(/* world-x */ float, /* world-y */ float, /* zoom */ float) -> HitResult;
     callback graph-link-rerouted(/* link-id */ int, /* new-pin */ int);
@@ -421,17 +423,10 @@ export component MainWindow inherits Window {
                     if root.show-common-actions : RailActionButton { icon: @image-url("../../../assets/icons/volume.svg"); label: UiI18n.localized("toolbar.add_recorder"); clicked => { root.action("add-recorder"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-common-actions && root.video-available && !root.capture-active : RailActionButton { icon: @image-url("../../../assets/icons/video.svg"); label: UiI18n.localized("video.capture_monitor"); clicked => { root.action("capture-monitor"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-common-actions && root.video-available && !root.capture-active : RailActionButton { icon: @image-url("../../../assets/icons/device_desktop.svg"); label: UiI18n.localized("video.capture_window"); clicked => { root.action("capture-window"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available && root.capture-active : RailActionButton { icon: @image-url("../../../assets/icons/close.svg"); label: UiI18n.localized("video.stop_capture"); clicked => { root.action("stop-capture"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
+                    // Filter add/remove/toggle live in the effects dialog video tab; preview
+                    // and capture stop live on the video node cards. The rail keeps only
+                    // the actions that have no node yet: start capture, new display.
                     if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/device_generic.svg"); label: UiI18n.localized("video.virtual_create"); clicked => { root.action("virtual-display-create"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_passthrough"); clicked => { root.action("add-video-filter:passthrough"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_grayscale"); clicked => { root.action("add-video-filter:grayscale"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_hflip"); clicked => { root.action("add-video-filter:hflip"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_vflip"); clicked => { root.action("add-video-filter:vflip"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_crop"); clicked => { root.action("add-video-filter:crop;crop=0,0,640,480"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_filter.svg"); label: UiI18n.localized("video.filter_scale"); clicked => { root.action("add-video-filter:scale;scale=640x480"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available && root.has-selected-node : RailActionButton { icon: @image-url("../../../assets/icons/delete.svg"); label: UiI18n.localized("video.remove_filter"); clicked => { root.action("remove-video-filter"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available && root.has-selected-node : RailActionButton { icon: @image-url("../../../assets/icons/check.svg"); label: UiI18n.localized("video.toggle_filter"); clicked => { root.action("toggle-video-filter"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
-                    if root.show-common-actions && root.video-available : RailActionButton { icon: @image-url("../../../assets/icons/video_preview.svg"); label: UiI18n.localized("video.open_preview"); clicked => { root.action("open-preview"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/save.svg"); label: UiI18n.localized("toolbar.save_patchbay"); clicked => { root.action("save-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/load.svg"); label: UiI18n.localized("toolbar.load_patchbay"); clicked => { root.action("load-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
                     if root.show-patchbay-toolbar : RailActionButton { icon: @image-url("../../../assets/icons/snapshot.svg"); label: UiI18n.localized("toolbar.snapshot"); clicked => { root.action("snapshot-patchbay"); } hover-changed(entered, label, anchor) => { root.rail-hover(entered, label, anchor); } }
@@ -515,6 +510,8 @@ export component MainWindow inherits Window {
                 recorder-stop(id) => { root.graph-recorder-stop(id); }
                 recorder-save(id) => { root.graph-recorder-save(id); }
                 recorder-discard(id) => { root.graph-recorder-discard(id); }
+                video-preview(id) => { root.graph-video-preview(id); }
+                video-stop(id) => { root.graph-video-stop(id); }
             }
 
             LineEdit {

@@ -15,6 +15,8 @@ export component GraphNode inherits Rectangle {
     callback recorder-stop(int);
     callback recorder-save(int);
     callback recorder-discard(int);
+    callback video-preview(int);
+    callback video-stop(int);
 
     x: data.x * 1px + root.offset-x;
     y: data.y * 1px + root.offset-y;
@@ -154,6 +156,21 @@ export component GraphNode inherits Rectangle {
                 text: UiI18n.localized("canvas.recorder_discard");
                 clicked => { root.recorder-discard(data.id); }
             }
+        }
+    }
+
+    if !data.collapsed && !data.thumbnail && data.has-video-panel: Rectangle {
+        x: 1px; y: 41px; width: parent.width - 2px; height: 38px;
+        background: transparent;
+        if data.video-stop: ActionButton {
+            x: parent.width - 78px; y: 8px; width: 70px; height: 22px;
+            text: UiI18n.localized("video.node_stop");
+            clicked => { root.video-stop(data.id); }
+        }
+        if data.video-preview: ActionButton {
+            x: data.video-stop ? parent.width - 156px : parent.width - 78px; y: 8px; width: 70px; height: 22px;
+            text: UiI18n.localized("video.node_preview");
+            clicked => { root.video-preview(data.id); }
         }
     }
 

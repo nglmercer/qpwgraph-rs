@@ -45,6 +45,7 @@ pub struct DemoDriver {
     recorders: BTreeMap<RecorderId, DemoRecorder>,
     next_recorder_id: RecorderId,
     video_filters: BTreeMap<String, DemoVideoFilter>,
+    screen_cast: Option<DemoScreenCast>,
     /// Suppression state used by backends that remember an explicit manual
     /// disconnect. Keeping it in the demo driver makes command rollback tests
     /// able to verify that unrelated pairs are not accidentally unsuppressed.
@@ -70,6 +71,15 @@ struct DemoVideoFilter {
     diagnostics: pw_graph_video::VideoDiagnostics,
     preview: pw_graph_video::preview::VideoPreview,
     enabled: bool,
+}
+
+/// In-memory screen capture: a fake external stream node so the UI can
+/// exercise capture rendering, node actions, and status with no portal.
+struct DemoScreenCast {
+    node_id: NodeId,
+    port: PortId,
+    serial: u64,
+    source: crate::video::ScreenCastSource,
 }
 
 /// Operations a test wants the driver to refuse.
@@ -108,6 +118,7 @@ impl DemoDriver {
             recorders: BTreeMap::new(),
             next_recorder_id: 1,
             video_filters: BTreeMap::new(),
+            screen_cast: None,
             suppressed_connections: Vec::new(),
             forced_failures: None,
         }
@@ -119,6 +130,7 @@ impl DemoDriver {
     pub fn replace_graph(&mut self, graph: Graph) {
         self.recorders.clear();
         self.video_filters.clear();
+        self.screen_cast = None;
         self.next_link_id = graph.links.keys().map(|id| id.0).max().unwrap_or(0) + 1;
         self.graph = graph;
         self.observed_links.clear();
@@ -1326,11 +1338,12 @@ impl crate::video::VideoDriver for DemoDriver {
     }
 
     fn video_node_info(&self, node: NodeId) -> Option<crate::video::VideoNodeInfo> {
-        self.video_filters.values().find_map(|filter| {
-            if filter.instance.node_id != node {
-                return None;
-            }
-            Some(crate::video::VideoNodeInfo {
+        if let Some(filter) = self
+            .video_filters
+            .values()
+            .find(|filter| filter.instance.node_id == node)
+        {
+            return Some(crate::video::VideoNodeInfo {
                 node_id: node,
                 instance_id: Some(filter.instance.instance_id.clone()),
                 spec: None,
@@ -1341,14 +1354,113 @@ impl crate::video::VideoDriver for DemoDriver {
                 },
                 counters: Some(filter.diagnostics.snapshot()),
                 preview_state: filter.preview.state(),
-            })
-        })
+            });
+        }
+        if self
+            .screen_cast
+            .as_ref()
+            .is_some_and(|capture| capture.node_id == node)
+        {
+            return Some(crate::video::VideoNodeInfo {
+                node_id: node,
+                instance_id: None,
+                spec: None,
+                state: crate::video::VideoNodeState::Live,
+                counters: None,
+                preview_state: pw_graph_video::preview::PreviewState::Idle,
+            });
+        }
+        None
     }
 
     fn video_preview(&self, instance_id: &str) -> Option<pw_graph_video::preview::VideoPreview> {
         self.video_filters
             .get(instance_id)
             .map(|filter| filter.preview.clone())
+    }
+
+    fn screen_cast_node(&self) -> Option<NodeId> {
+        self.screen_cast.as_ref().map(|capture| capture.node_id)
+    }
+
+    fn start_screen_cast(
+        &mut self,
+        request: crate::video::ScreenCastRequest,
+    ) -> BackendResult<crate::video::ScreenCastStatus> {
+        if let Some(capture) = &self.screen_cast {
+            return Ok(capture.status());
+        }
+        let mut node_id = NodeId(self.next_effect_id);
+        while self.graph.nodes.contains_key(&node_id) {
+            self.next_effect_id = self.next_effect_id.saturating_add(1);
+            node_id = NodeId(self.next_effect_id);
+        }
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let port = PortId(self.next_effect_id);
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let serial = self.next_effect_id;
+        self.next_effect_id = self.next_effect_id.saturating_add(1);
+        let mut node = Node::new(node_id, "Demo Screen Capture", NodeType::PipeWire);
+        node.position = [520.0, 620.0];
+        node.serial = Some(serial);
+        self.graph.add_node(node)?;
+        if let Err(error) = self.graph.add_port(Port::new(
+            port,
+            node_id,
+            "capture",
+            Direction::Source,
+            PortType::Video,
+        )) {
+            self.graph.nodes.remove(&node_id);
+            return Err(error.into());
+        }
+        let capture = DemoScreenCast {
+            node_id,
+            port,
+            serial,
+            source: request.source,
+        };
+        let status = capture.status();
+        self.screen_cast = Some(capture);
+        Ok(status)
+    }
+
+    fn stop_screen_cast(&mut self) -> BackendResult<()> {
+        let Some(capture) = self.screen_cast.take() else {
+            return Ok(());
+        };
+        let links: Vec<LinkId> = self
+            .graph
+            .links
+            .values()
+            .filter(|link| link.output_port == capture.port || link.input_port == capture.port)
+            .map(|link| link.id)
+            .collect();
+        for link in links {
+            let _ = self.graph.remove_link(link);
+        }
+        self.graph.ports.remove(&capture.port);
+        self.graph.nodes.remove(&capture.node_id);
+        Ok(())
+    }
+
+    fn screen_cast_status(&self) -> crate::video::ScreenCastStatus {
+        self.screen_cast
+            .as_ref()
+            .map(DemoScreenCast::status)
+            .unwrap_or_default()
+    }
+}
+
+impl DemoScreenCast {
+    fn status(&self) -> crate::video::ScreenCastStatus {
+        crate::video::ScreenCastStatus {
+            state: crate::video::ScreenCastState::Active,
+            source: Some(self.source),
+            pipewire_node_id: None,
+            object_serial: Some(self.serial),
+            error: None,
+        }
     }
 }
 

@@ -29,6 +29,22 @@ struct IconIndex {
 
 static ICON_INDEX: OnceLock<IconIndex> = OnceLock::new();
 
+/// Freedesktop fallback icon for video nodes that publish none. Camera
+/// and capture-stream nodes rarely carry an icon property, so the cards
+/// resolve these theme names instead of rendering bare.
+pub(crate) fn video_fallback_icon_name(
+    has_video_stop: bool,
+    is_camera: bool,
+) -> Option<&'static str> {
+    if has_video_stop {
+        Some("video-display")
+    } else if is_camera {
+        Some("camera-video")
+    } else {
+        None
+    }
+}
+
 /// Load an optional backend icon reference. A missing or invalid icon is
 /// treated as normal: nodes without usable icon data simply render without
 /// an image.
@@ -401,5 +417,15 @@ mod tests {
         let _ = std::fs::remove_file(&exe);
         let _ = std::fs::remove_file(&svg);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn video_fallback_prefers_the_capture_icon_over_the_camera_one() {
+        use super::video_fallback_icon_name;
+
+        assert_eq!(video_fallback_icon_name(true, false), Some("video-display"));
+        assert_eq!(video_fallback_icon_name(true, true), Some("video-display"));
+        assert_eq!(video_fallback_icon_name(false, true), Some("camera-video"));
+        assert_eq!(video_fallback_icon_name(false, false), None);
     }
 }

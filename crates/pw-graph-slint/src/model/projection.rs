@@ -67,6 +67,7 @@ pub(super) fn node_height_for_node(
     collapsed: bool,
     has_audio_panel: bool,
     is_recorder: bool,
+    has_video_panel: bool,
     port_count: usize,
 ) -> f32 {
     if thumbnail {
@@ -79,6 +80,8 @@ pub(super) fn node_height_for_node(
                 crate::canvas::RECORDER_BLOCK_HEIGHT
             } else if has_audio_panel {
                 AUDIO_CONTROLS_HEIGHT
+            } else if has_video_panel {
+                crate::canvas::VIDEO_BLOCK_HEIGHT
             } else {
                 0.0
             }

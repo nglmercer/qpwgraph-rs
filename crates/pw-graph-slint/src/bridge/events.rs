@@ -25,7 +25,7 @@ use super::recorders::{
 };
 use super::relay::{poll_relay_events, poll_relay_usb_hotplug};
 use super::utils::volume_from_track_position;
-use super::video::poll_video_preview;
+use super::video::{poll_video_preview, preview_node_video, stop_node_video};
 use super::{CanvasGeometry, LinkRow, MainWindow, MinimapNode, NodeRow, ShortcutRow};
 
 /// Slower cadence for the full model sync. Meters still refresh every 50 ms
@@ -232,6 +232,8 @@ pub(crate) fn process_event(window: &MainWindow, application: &mut Application, 
         }
         UiEvent::RecorderRecord(id) => record_for_node(application, id),
         UiEvent::RecorderStop(id) => stop_for_node(application, id),
+        UiEvent::VideoPreview(id) => preview_node_video(application, id),
+        UiEvent::VideoStop(id) => stop_node_video(application, id),
         UiEvent::RecorderSave(id) => save_for_node(application, id),
         UiEvent::RecorderDiscard(id) => discard_for_node(application, id),
         UiEvent::SelectNode(id, shift) => application.view.select_node(id, shift),

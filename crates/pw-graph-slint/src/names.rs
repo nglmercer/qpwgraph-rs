@@ -25,7 +25,7 @@ pub(crate) fn display_node_name(name: &str, i18n: &I18n) -> String {
         )
     } else if name.starts_with("bluez_midi.") {
         ("canvas.node_name_bluetooth_midi", None)
-    } else if name.starts_with("v4l2_input.") {
+    } else if name.starts_with("v4l2_input.") || name.starts_with("libcamera_input.") {
         ("canvas.node_name_camera_input", None)
     } else if name.starts_with("Midi Through:") {
         ("canvas.node_name_midi_through", None)
@@ -145,6 +145,20 @@ mod tests {
         assert_eq!(
             display_port_name("Midi Through: Port-0 (capture)", &i18n),
             "Port 0 Captura"
+        );
+    }
+
+    #[test]
+    fn cameras_are_named_by_role_regardless_of_monitor() {
+        let i18n = I18n::default();
+        let camera = i18n.text("canvas.node_name_camera_input");
+        assert_eq!(
+            display_node_name("v4l2_input.pci-0000_00_10.0-usb-0_2_1.0", &i18n),
+            camera
+        );
+        assert_eq!(
+            display_node_name("libcamera_input.ipu6-ov01a10-uf-0", &i18n),
+            camera
         );
     }
 }

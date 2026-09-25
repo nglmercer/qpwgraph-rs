@@ -59,6 +59,8 @@ export component NodeCanvas inherits Rectangle {
     callback recorder-stop(int);
     callback recorder-save(int);
     callback recorder-discard(int);
+    callback video-preview(int);
+    callback video-stop(int);
 
     property <int> gesture: 0;
     property <int> reroute-anchor: 0;
@@ -378,6 +380,8 @@ export component NodeCanvas inherits Rectangle {
             recorder-stop(id) => { root.recorder-stop(id); }
             recorder-save(id) => { root.recorder-save(id); }
             recorder-discard(id) => { root.recorder-discard(id); }
+            video-preview(id) => { root.video-preview(id); }
+            video-stop(id) => { root.video-stop(id); }
         }
     }
 

@@ -177,6 +177,14 @@ pub(crate) fn install_canvas_callbacks(
     window.on_graph_recorder_discard(move |node_id| {
         events.borrow_mut().push(UiEvent::RecorderDiscard(node_id));
     });
+    let events = events_source.clone();
+    window.on_graph_video_preview(move |node_id| {
+        events.borrow_mut().push(UiEvent::VideoPreview(node_id));
+    });
+    let events = events_source.clone();
+    window.on_graph_video_stop(move |node_id| {
+        events.borrow_mut().push(UiEvent::VideoStop(node_id));
+    });
 }
 
 fn set_selection_flags<T: Clone + 'static>(

@@ -57,6 +57,7 @@ impl UiGraphState {
             &BTreeMap::new(),
             MeterState::Unavailable,
             &fully_capable_backend_profiles(graph),
+            &BTreeMap::new(),
         )
     }
 
@@ -67,6 +68,7 @@ impl UiGraphState {
         meters: &BTreeMap<NodeId, MeterReading>,
         meter_fallback: MeterState,
         backend_profiles: &BTreeMap<NodeId, NodeBackendProfile>,
+        video_panels: &BTreeMap<NodeId, VideoPanel>,
     ) -> GraphSnapshot {
         self.ids.rebuild(graph);
         self.local_positions
@@ -121,6 +123,10 @@ impl UiGraphState {
             let has_meter = audio.capabilities.has_any_meter() && has_audio;
             let has_audio_panel =
                 node.node_type == NodeType::Recorder || has_audio_controls || has_meter;
+            let video_panel = video_panels.get(&node.id).copied().unwrap_or_default();
+            let has_video_panel = (video_panel.preview || video_panel.stop)
+                && node.node_type != NodeType::Recorder
+                && !has_audio_panel;
             let collapsed = appearance.collapsed;
             let thumbnail = self.thumbnail_mode;
             let height = node_height_for_node(
@@ -128,6 +134,7 @@ impl UiGraphState {
                 collapsed,
                 has_audio_panel,
                 node.node_type == NodeType::Recorder,
+                has_video_panel,
                 ports.len(),
             );
             nodes.push(NodeView {
@@ -149,6 +156,10 @@ impl UiGraphState {
                 appearance,
                 has_audio_controls,
                 has_audio_panel,
+                has_video_panel,
+                video_preview: has_video_panel && video_panel.preview,
+                video_stop: has_video_panel && video_panel.stop,
+                is_camera: node.is_camera(),
                 connectable: audio.connectable,
                 audio,
                 meter: meters
@@ -298,6 +309,7 @@ impl UiGraphState {
                         index,
                         node.has_audio_panel,
                         node.node_type == NodeType::Recorder,
+                        node.has_video_panel,
                         port.direction != Direction::Sink,
                     );
                     (node.position[0] + offset_x, node.position[1] + offset_y)

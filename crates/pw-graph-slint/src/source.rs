@@ -441,6 +441,10 @@ impl ApplicationDriver {
         VideoDriver::video_filters(self)
     }
 
+    pub(crate) fn screen_cast_node(&self) -> Option<pw_graph_core::NodeId> {
+        VideoDriver::screen_cast_node(self)
+    }
+
     pub(crate) fn video_node_info(&self, node: NodeId) -> Option<VideoNodeInfo> {
         VideoDriver::video_node_info(self, node)
     }
@@ -1263,6 +1267,13 @@ impl VideoDriver for ApplicationDriver {
         match &self.backend {
             BackendKind::Demo(driver) => driver.video_node_info(node),
             BackendKind::Live(driver) => driver.video_node_info(node),
+        }
+    }
+
+    fn screen_cast_node(&self) -> Option<NodeId> {
+        match &self.backend {
+            BackendKind::Demo(driver) => driver.screen_cast_node(),
+            BackendKind::Live(driver) => driver.screen_cast_node(),
         }
     }
 

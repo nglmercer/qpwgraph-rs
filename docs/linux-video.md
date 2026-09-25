@@ -58,8 +58,15 @@ PipeWire Video
   negotiation (`format.rs`), capture streams (`capture.rs`), output streams
   (`output.rs`), and filter bridges (`bridge.rs`).
 - UI: `crates/pw-graph-slint/src/bridge/video.rs`, the `VideoPreviewDialog`,
-  rail buttons, and per-card video subtitles (resolution, fps, format,
-  state, dropped frames).
+  the effects dialog video tab, per-card video actions (preview on filter
+  and capture cards, stop on the capture card), and per-card video
+  subtitles (resolution, fps, format, state, dropped frames). The rail
+  keeps only capture monitor/window and virtual display creation —
+  everything with a node lives on the node or in the dialog.
+- Webcams (V4L2 and libcamera) are detected by `media.role=Camera` with
+  `v4l2_input.`/`libcamera_input.` name-prefix fallback, render with the
+  camera icon fallback and the localized camera name, and route through
+  the normal video ports. Live webcam preview is not implemented yet.
 
 ## Video filter nodes
 

@@ -340,6 +340,7 @@ fn cards_hide_controls_the_backend_does_not_support() {
         &BTreeMap::new(),
         MeterState::Unavailable,
         &uncontrollable,
+        &BTreeMap::new(),
     );
 
     assert!(
@@ -416,6 +417,7 @@ fn unknown_mute_is_not_projected_as_unmuted() {
         &BTreeMap::new(),
         MeterState::Unavailable,
         &profiles,
+        &BTreeMap::new(),
     );
     assert!(snapshot
         .nodes
@@ -441,6 +443,7 @@ fn known_mute_values_are_distinct_from_unknown() {
         &BTreeMap::new(),
         MeterState::Unavailable,
         &profiles,
+        &BTreeMap::new(),
     );
     let source = snapshot
         .nodes
@@ -484,6 +487,7 @@ fn meter_only_and_peak_only_nodes_get_an_independent_panel() {
         &BTreeMap::new(),
         MeterState::Waiting,
         &profiles,
+        &BTreeMap::new(),
     );
     assert!(snapshot
         .nodes
@@ -553,6 +557,7 @@ fn supplied_meters_are_projected_without_changing_the_graph() {
         &meters,
         MeterState::Waiting,
         &fully_capable_backend_profiles(&graph),
+        &BTreeMap::new(),
     );
     let source = snapshot
         .nodes
@@ -601,6 +606,7 @@ fn easy_mode_pairs_a_source_into_the_relay_speaker() {
         &BTreeMap::new(),
         MeterState::Waiting,
         &fully_capable_backend_profiles(&graph),
+        &BTreeMap::new(),
     );
     let relay = snapshot
         .nodes
@@ -841,6 +847,7 @@ fn drag_collision_uses_the_projected_easy_mode_height() {
         false,
         true,
         false,
+        false,
         graph.node(NodeId(1)).unwrap().ports.len(),
     );
     assert!(raw_height > projected_height);
@@ -1019,4 +1026,77 @@ fn repulsion_ignores_distant_cards() {
         .filter(|node| !selected.contains(&node.node_id))
         .collect::<Vec<_>>();
     assert!(drag_is_clear(&dragged, &stationary, resolved));
+}
+
+#[test]
+fn video_panels_grow_the_card_and_cameras_flag_without_a_panel() {
+    use std::collections::BTreeMap;
+
+    let mut graph = Graph::default();
+    graph
+        .add_node(Node::new(NodeId(1), "Video Filter", NodeType::Effect))
+        .unwrap();
+    let mut camera = Node::new(NodeId(2), "v4l2_input.pci-cam", NodeType::PipeWire);
+    camera.identity.media_role = Some("Camera".into());
+    graph.add_node(camera).unwrap();
+    for (id, node) in [(11, NodeId(1)), (12, NodeId(1)), (21, NodeId(2))] {
+        graph
+            .add_port(Port::new(
+                PortId(id),
+                node,
+                "video",
+                Direction::Source,
+                PortType::Video,
+            ))
+            .unwrap();
+    }
+    let config = AppConfig::default();
+    let mut state = UiGraphState::from_config(&config);
+    let mut panels = BTreeMap::new();
+    panels.insert(
+        NodeId(1),
+        VideoPanel {
+            preview: true,
+            stop: false,
+        },
+    );
+    let snapshot = state.snapshot_with_meters(
+        &graph,
+        &config,
+        &BTreeMap::new(),
+        MeterState::Unavailable,
+        &BTreeMap::new(),
+        &panels,
+    );
+    let card = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.node_id == NodeId(1))
+        .unwrap();
+    assert!(card.has_video_panel);
+    assert!(card.video_preview);
+    assert!(!card.video_stop);
+    assert!(!card.is_camera);
+    let camera_card = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.node_id == NodeId(2))
+        .unwrap();
+    assert!(camera_card.is_camera);
+    assert!(!camera_card.has_video_panel);
+    // Heights follow the projection with the resolved panel flags.
+    assert_eq!(
+        camera_card.height,
+        node_height_for_node(false, false, false, false, false, camera_card.ports.len())
+    );
+    assert_eq!(
+        card.height,
+        node_height_for_node(false, false, false, false, true, card.ports.len())
+    );
+    // The panel reserves exactly one video block above the port rows.
+    assert_eq!(
+        crate::canvas::port_row_top_for_node(0, false, false, true)
+            - crate::canvas::port_row_top_for_node(0, false, false, false),
+        crate::canvas::VIDEO_BLOCK_HEIGHT - crate::canvas::PORT_LIST_TOP
+    );
 }
