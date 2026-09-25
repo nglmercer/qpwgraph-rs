@@ -1,0 +1,22 @@
+{
+  "video.capture_monitor": "Capturar monitor",
+  "video.capture_window": "Capturar ventana",
+  "video.virtual_create": "Crear pantalla virtual",
+  "video.virtual_stop": "Detener pantalla virtual",
+  "video.name_passthrough": "Directo",
+  "video.name_grayscale": "Escala de grises",
+  "video.name_hflip": "Volteo horizontal",
+  "video.name_vflip": "Volteo vertical",
+  "video.name_crop": "Recorte (0,0 640x480)",
+  "video.name_scale": "Escala (640x480)",
+  "video.node_preview": "Vista previa",
+  "video.node_stop": "Detener",
+  "video.preview_title": "Vista previa de vídeo",
+  "video.preview_idle": "Esperando fotogramas…",
+  "video.preview_live": "En directo",
+  "video.preview_ended": "Transmisión terminada",
+  "video.preview_error": "Error de vista previa: {error}",
+  "video.preview_unavailable": "Vista previa no disponible",
+  "video.preview_filter_title": "Vista previa: {name}",
+  "video.preview_capture_title": "Vista previa: captura de pantalla"
+}

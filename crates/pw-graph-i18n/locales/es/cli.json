@@ -1,0 +1,9 @@
+{
+  "cli.debug": "activar registro de depuración",
+  "cli.demo": "usar el backend de demostración determinista en lugar de un backend nativo activo",
+  "cli.lang": "establecer el idioma de la interfaz (en, es o fr)",
+  "cli.minimized": "iniciar minimizado",
+  "cli.no_midi": "desactivar el backend MIDI opcional",
+  "cli.options": "Opciones:",
+  "cli.unknown_option": "Ignorando opción desconocida: {option}"
+}

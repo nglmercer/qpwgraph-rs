@@ -55,17 +55,67 @@ impl Default for I18n {
     }
 }
 
+/// Translation modules: one file per key-prefix section under
+/// `locales/<lang>/<module>.json`. This list is the single source of truth for
+/// which module files are merged into each locale catalog; keep it sorted and
+/// mirror every entry in all three locale directories (see `locales/README.md`).
+macro_rules! define_catalog {
+    ($($module:literal),+ $(,)?) => {
+        pub const MODULES: &[&str] = &[$($module),+];
+        const MODULE_COUNT: usize = MODULES.len();
+
+        fn locale_sources(locale: Locale) -> [&'static str; MODULE_COUNT] {
+            match locale {
+                Locale::English => {
+                    [$(include_str!(concat!("../locales/en/", $module, ".json"))),+]
+                }
+                Locale::Spanish => {
+                    [$(include_str!(concat!("../locales/es/", $module, ".json"))),+]
+                }
+                Locale::French => {
+                    [$(include_str!(concat!("../locales/fr/", $module, ".json"))),+]
+                }
+            }
+        }
+    };
+}
+
+define_catalog!(
+    "app",
+    "canvas",
+    "cli",
+    "connect",
+    "debug",
+    "effects",
+    "filter",
+    "help",
+    "history",
+    "inspector",
+    "language",
+    "meters",
+    "nav",
+    "patchbay",
+    "port",
+    "preferences",
+    "recorder",
+    "relay",
+    "screen",
+    "search",
+    "shortcuts",
+    "sort",
+    "status",
+    "toolbar",
+    "tray",
+    "video",
+);
+
 impl I18n {
     pub fn new(locale: Locale) -> Self {
-        let english = load_catalog(include_str!("../locales/en.json"));
+        let english = load_locale(Locale::English);
         let current = if locale == Locale::English {
             english.clone()
         } else {
-            load_catalog(match locale {
-                Locale::Spanish => include_str!("../locales/es.json"),
-                Locale::French => include_str!("../locales/fr.json"),
-                Locale::English => unreachable!(),
-            })
+            load_locale(locale)
         };
         Self {
             locale,
@@ -87,11 +137,7 @@ impl I18n {
         self.current = if locale == Locale::English {
             self.english.clone()
         } else {
-            load_catalog(match locale {
-                Locale::Spanish => include_str!("../locales/es.json"),
-                Locale::French => include_str!("../locales/fr.json"),
-                Locale::English => unreachable!(),
-            })
+            load_locale(locale)
         };
     }
 
@@ -114,6 +160,14 @@ impl I18n {
 
 fn load_catalog(text: &str) -> BTreeMap<String, String> {
     serde_json::from_str(text).expect("bundled locale catalog must be valid JSON")
+}
+
+fn load_locale(locale: Locale) -> BTreeMap<String, String> {
+    let mut catalog = BTreeMap::new();
+    for text in locale_sources(locale) {
+        catalog.extend(load_catalog(text));
+    }
+    catalog
 }
 
 #[cfg(test)]
@@ -141,9 +195,9 @@ mod tests {
 
     #[test]
     fn locale_catalogs_cover_the_same_keys() {
-        let english = load_catalog(include_str!("../locales/en.json"));
-        let spanish = load_catalog(include_str!("../locales/es.json"));
-        let french = load_catalog(include_str!("../locales/fr.json"));
+        let english = load_locale(Locale::English);
+        let spanish = load_locale(Locale::Spanish);
+        let french = load_locale(Locale::French);
         assert_eq!(
             english.keys().collect::<Vec<_>>(),
             spanish.keys().collect::<Vec<_>>()
@@ -152,6 +206,47 @@ mod tests {
             english.keys().collect::<Vec<_>>(),
             french.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn locale_modules_do_not_shadow_keys() {
+        for locale in Locale::ALL {
+            let mut total = 0;
+            for text in locale_sources(locale) {
+                total += load_catalog(text).len();
+            }
+            assert_eq!(
+                load_locale(locale).len(),
+                total,
+                "duplicate keys across {locale:?} modules"
+            );
+        }
+    }
+
+    #[test]
+    fn every_module_file_is_loaded() {
+        let locales = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        let mut expected: Vec<String> = MODULES
+            .iter()
+            .map(|module| format!("{module}.json"))
+            .collect();
+        expected.sort();
+        for locale in Locale::ALL {
+            let mut files: Vec<String> = std::fs::read_dir(locales.join(locale.code()))
+                .expect("locale directory must exist")
+                .map(|entry| {
+                    entry
+                        .expect("locale entry must be readable")
+                        .file_name()
+                        .to_str()
+                        .expect("module file name must be UTF-8")
+                        .to_owned()
+                })
+                .filter(|name| name.ends_with(".json"))
+                .collect();
+            files.sort();
+            assert_eq!(files, expected, "unloaded module file in {locale:?}");
+        }
     }
 
     #[test]

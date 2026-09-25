@@ -1,0 +1,9 @@
+{
+  "history.empty": "No actions.",
+  "history.hint": "Actions are separated into undoable and redoable entries.",
+  "history.redo": "Redoable",
+  "history.redoable": "Redoable",
+  "history.title": "Action history",
+  "history.undo": "Undoable",
+  "history.undoable": "Undoable"
+}

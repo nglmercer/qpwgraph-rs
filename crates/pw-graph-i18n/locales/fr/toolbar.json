@@ -1,0 +1,17 @@
+{
+  "toolbar.activate": "Activer",
+  "toolbar.add_recorder": "Ajouter un enregistreur",
+  "toolbar.connect_mode_advanced": "Advanced connect",
+  "toolbar.connect_mode_easy": "Easy connect",
+  "toolbar.disconnect": "Déconnecter",
+  "toolbar.disconnect_all": "Tout déconnecter",
+  "toolbar.history": "History",
+  "toolbar.load_patchbay": "Charger le patchbay",
+  "toolbar.media_filter": "Filter",
+  "toolbar.minimap": "Minicarte",
+  "toolbar.redo": "Rétablir",
+  "toolbar.refresh": "Actualiser",
+  "toolbar.save_patchbay": "Enregistrer le patchbay",
+  "toolbar.snapshot": "Capturer les connexions",
+  "toolbar.undo": "Annuler"
+}

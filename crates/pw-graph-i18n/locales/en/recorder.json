@@ -1,0 +1,17 @@
+{
+  "recorder.ask_on_stop": "Ask where to save",
+  "recorder.auto_save": "Automatically save",
+  "recorder.choose_folder": "Choose…",
+  "recorder.default_folder": "Application recording folder",
+  "recorder.recovery_title": "Recovered recordings",
+  "recorder.recovery_help": "These recordings were recovered from the pending folder. Save them or discard them explicitly.",
+  "recorder.recovery_save": "Save…",
+  "recorder.recovery_discard": "Discard",
+  "recorder.recovery_later": "Later",
+  "recorder.recovered_item": "{name} — {duration} — {size}",
+  "recorder.format": "Recording format",
+  "recorder.format_value": "WAV 32-bit float",
+  "recorder.save_mode": "After recording",
+  "recorder.save_mode_help": "Choose whether Stop opens Save As or saves automatically.",
+  "recorder.settings": "Recording"
+}

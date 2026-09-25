@@ -1,0 +1,22 @@
+{
+  "video.capture_monitor": "Capturer le moniteur",
+  "video.capture_window": "Capturer la fenêtre",
+  "video.virtual_create": "Créer un écran virtuel",
+  "video.virtual_stop": "Arrêter l’écran virtuel",
+  "video.name_passthrough": "Direct",
+  "video.name_grayscale": "Niveaux de gris",
+  "video.name_hflip": "Miroir horizontal",
+  "video.name_vflip": "Miroir vertical",
+  "video.name_crop": "Recadrage (0,0 640x480)",
+  "video.name_scale": "Mise à l’échelle (640x480)",
+  "video.node_preview": "Aperçu",
+  "video.node_stop": "Arrêter",
+  "video.preview_title": "Aperçu vidéo",
+  "video.preview_idle": "En attente d’images…",
+  "video.preview_live": "En direct",
+  "video.preview_ended": "Flux terminé",
+  "video.preview_error": "Erreur d’aperçu : {error}",
+  "video.preview_unavailable": "Aperçu indisponible",
+  "video.preview_filter_title": "Aperçu : {name}",
+  "video.preview_capture_title": "Aperçu : capture d’écran"
+}

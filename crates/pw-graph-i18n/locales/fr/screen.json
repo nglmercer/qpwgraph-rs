@@ -1,0 +1,8 @@
+{
+  "screen.graph": "Graph",
+  "screen.graph_hint": "Inspect nodes, ports, links, and layout.",
+  "screen.interface": "Interface",
+  "screen.interface_hint": "Choose language and presentation preferences.",
+  "screen.patchbay": "Patchbay",
+  "screen.patchbay_hint": "Save and activate persistent connection rules."
+}

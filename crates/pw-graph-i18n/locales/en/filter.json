@@ -1,0 +1,6 @@
+{
+  "filter.all": "All",
+  "filter.audio": "Audio",
+  "filter.midi": "MIDI",
+  "filter.video": "Video"
+}

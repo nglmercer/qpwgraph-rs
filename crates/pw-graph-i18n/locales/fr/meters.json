@@ -1,0 +1,8 @@
+{
+  "meters.always": "Always",
+  "meters.always_hint": "Every audio node is measured continuously. This keeps devices awake.",
+  "meters.off": "Off",
+  "meters.off_hint": "No metering streams are ever created.",
+  "meters.on_demand": "On demand",
+  "meters.on_demand_hint": "Streams stay active for the audio nodes shown while this window is visible."
+}

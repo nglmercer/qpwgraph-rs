@@ -1,0 +1,3 @@
+{
+  "debug.backend": "backend={backend} alsa_midi={enabled}"
+}

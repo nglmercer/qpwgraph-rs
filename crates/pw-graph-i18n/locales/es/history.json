@@ -1,0 +1,9 @@
+{
+  "history.empty": "No hay acciones.",
+  "history.hint": "Las acciones están separadas entre pendientes de deshacer y de rehacer.",
+  "history.redo": "Redoable",
+  "history.redoable": "Se pueden rehacer",
+  "history.title": "Historial de acciones",
+  "history.undo": "Undoable",
+  "history.undoable": "Se pueden deshacer"
+}

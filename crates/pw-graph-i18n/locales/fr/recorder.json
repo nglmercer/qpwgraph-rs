@@ -1,0 +1,17 @@
+{
+  "recorder.ask_on_stop": "Demander où enregistrer",
+  "recorder.auto_save": "Enregistrer automatiquement",
+  "recorder.choose_folder": "Choisir…",
+  "recorder.default_folder": "Dossier d’enregistrement de l’application",
+  "recorder.recovery_title": "Enregistrements récupérés",
+  "recorder.recovery_help": "Ces enregistrements ont été récupérés du dossier des éléments en attente. Enregistrez-les ou supprimez-les explicitement.",
+  "recorder.recovery_save": "Enregistrer…",
+  "recorder.recovery_discard": "Supprimer",
+  "recorder.recovery_later": "Plus tard",
+  "recorder.recovered_item": "{name} — {duration} — {size}",
+  "recorder.format": "Format d’enregistrement",
+  "recorder.format_value": "WAV flottant 32 bits",
+  "recorder.save_mode": "Après l’enregistrement",
+  "recorder.save_mode_help": "Choisissez si Arrêter ouvre Enregistrer sous ou sauvegarde automatiquement.",
+  "recorder.settings": "Enregistrement"
+}

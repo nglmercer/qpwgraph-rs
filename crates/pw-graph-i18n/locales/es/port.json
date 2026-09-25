@@ -1,0 +1,6 @@
+{
+  "port.alsa_midi": "MIDI ALSA",
+  "port.audio": "Audio",
+  "port.pw_midi": "MIDI PW/JACK",
+  "port.video": "Vídeo"
+}

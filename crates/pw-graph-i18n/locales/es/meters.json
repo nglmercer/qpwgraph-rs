@@ -1,0 +1,8 @@
+{
+  "meters.always": "Siempre",
+  "meters.always_hint": "Se mide cada nodo de audio de forma continua. Esto mantiene los dispositivos activos.",
+  "meters.off": "Desactivada",
+  "meters.off_hint": "Nunca se crean flujos de medición.",
+  "meters.on_demand": "A demanda",
+  "meters.on_demand_hint": "Los flujos permanecen activos para los nodos de audio mostrados mientras esta ventana está visible."
+}

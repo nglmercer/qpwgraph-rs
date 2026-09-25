@@ -1,0 +1,17 @@
+{
+  "toolbar.activate": "Activate",
+  "toolbar.add_recorder": "Add recorder",
+  "toolbar.connect_mode_advanced": "Advanced connect",
+  "toolbar.connect_mode_easy": "Easy connect",
+  "toolbar.disconnect": "Disconnect",
+  "toolbar.disconnect_all": "Disconnect all",
+  "toolbar.history": "History",
+  "toolbar.load_patchbay": "Load Patchbay",
+  "toolbar.media_filter": "Filter",
+  "toolbar.minimap": "Minimap",
+  "toolbar.redo": "Redo",
+  "toolbar.refresh": "Refresh",
+  "toolbar.save_patchbay": "Save Patchbay",
+  "toolbar.snapshot": "Snapshot links",
+  "toolbar.undo": "Undo"
+}

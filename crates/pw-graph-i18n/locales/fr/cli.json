@@ -1,0 +1,9 @@
+{
+  "cli.debug": "enable debug logging",
+  "cli.demo": "utiliser le backend de démonstration déterministe au lieu d’un backend natif actif",
+  "cli.lang": "définir la langue de l’interface (en, es ou fr)",
+  "cli.minimized": "start minimized",
+  "cli.no_midi": "désactiver le backend MIDI optionnel",
+  "cli.options": "Options:",
+  "cli.unknown_option": "Ignoring unknown option: {option}"
+}

@@ -1,0 +1,17 @@
+{
+  "recorder.ask_on_stop": "Preguntar dónde guardar",
+  "recorder.auto_save": "Guardar automáticamente",
+  "recorder.choose_folder": "Elegir…",
+  "recorder.default_folder": "Carpeta de grabaciones de la aplicación",
+  "recorder.recovery_title": "Grabaciones recuperadas",
+  "recorder.recovery_help": "Estas grabaciones se recuperaron de la carpeta pendiente. Guárdalas o descártalas explícitamente.",
+  "recorder.recovery_save": "Guardar…",
+  "recorder.recovery_discard": "Descartar",
+  "recorder.recovery_later": "Más tarde",
+  "recorder.recovered_item": "{name} — {duration} — {size}",
+  "recorder.format": "Formato de grabación",
+  "recorder.format_value": "WAV de coma flotante de 32 bits",
+  "recorder.save_mode": "Después de grabar",
+  "recorder.save_mode_help": "Elige si Detener abre Guardar como o guarda automáticamente.",
+  "recorder.settings": "Grabación"
+}

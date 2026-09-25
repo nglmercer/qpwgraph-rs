@@ -1,0 +1,22 @@
+{
+  "video.capture_monitor": "Capture monitor",
+  "video.capture_window": "Capture window",
+  "video.virtual_create": "Create virtual display",
+  "video.virtual_stop": "Stop virtual display",
+  "video.name_passthrough": "Passthrough",
+  "video.name_grayscale": "Grayscale",
+  "video.name_hflip": "Horizontal flip",
+  "video.name_vflip": "Vertical flip",
+  "video.name_crop": "Crop (0,0 640x480)",
+  "video.name_scale": "Scale (640x480)",
+  "video.node_preview": "Preview",
+  "video.node_stop": "Stop",
+  "video.preview_title": "Video preview",
+  "video.preview_idle": "Waiting for frames…",
+  "video.preview_live": "Live",
+  "video.preview_ended": "Stream ended",
+  "video.preview_error": "Preview error: {error}",
+  "video.preview_unavailable": "Preview unavailable",
+  "video.preview_filter_title": "Preview: {name}",
+  "video.preview_capture_title": "Preview: screen capture"
+}
