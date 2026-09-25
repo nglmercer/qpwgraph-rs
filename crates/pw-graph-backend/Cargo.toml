@@ -13,10 +13,10 @@ in-memory = []
 pipewire = ["dep:pipewire"]
 relay = ["dep:pw-graph-relay"]
 wasm = ["pw-graph-effects/wasm"]
-# Live XDG ScreenCast portal access via ashpd (Linux only). Off by default so
-# headless CI builds without a D-Bus session or compositor. The portal state
-# machine, session tracking, and virtual-display detection API are always
-# compiled; only the live D-Bus connector is feature-gated.
+# Live XDG ScreenCast portal access via ashpd (Linux only). The app enables
+# this by default; backend-only builds stay headless unless requested. The
+# portal state machine, session tracking, and virtual-display detection API
+# are always compiled; only the live D-Bus connector is feature-gated.
 #
 # ashpd must use its `async-std` runtime: the app pulls `rfd`, which enables
 # `ashpd/async-std`, and ashpd 0.11 refuses to build with both `async-std`

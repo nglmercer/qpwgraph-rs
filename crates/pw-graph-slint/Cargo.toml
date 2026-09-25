@@ -14,11 +14,13 @@ name = "qpwgraph-rs"
 path = "src/main.rs"
 
 [features]
-default = ["pipewire", "alsa", "relay", "tray"]
+default = ["pipewire", "alsa", "relay", "tray", "screencast", "wasm"]
 pipewire = ["pw-graph-backend/pipewire", "pw-graph-app-core/pipewire"]
 alsa = ["dep:pw-graph-alsamidi", "pw-graph-alsamidi/alsa", "pw-graph-app-core/alsa"]
 relay = ["pw-graph-backend/relay", "pw-graph-app-core/relay"]
 tray = ["dep:ksni"]
+screencast = ["pw-graph-backend/screencast"]
+wasm = ["pw-graph-backend/wasm"]
 
 [dependencies]
 slint.workspace = true

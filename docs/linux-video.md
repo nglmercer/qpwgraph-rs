@@ -78,22 +78,22 @@ instead of crashing; stream stalls and format mismatches surface as
 
 ## Screen capture
 
-Build with `--features screencast` (Linux) for live portal access via
-`ashpd`:
+Default builds include live portal access via `ashpd` (Linux):
 
 ```text
 CreateSession -> SelectSources -> Start -> OpenPipeWireRemote
 ```
 
 The compositor permission dialog is always shown; cancellation is a clean
-terminal state. One OS thread per session owns the private tokio runtime,
-the ashpd session, and the PipeWire remote FD, so no D-Bus lifetime crosses
+terminal state. One OS thread per session drives the ashpd session and the
+PipeWire remote FD with `pollster::block_on`, so no D-Bus lifetime crosses
 threads. Handled cleanly: user cancel, session close/revocation, window
 close, monitor unplug (stream disappearance), compositor restart, and
 PipeWire stream renegotiation.
 
-Without the feature (default, headless CI), capture reports unavailability
-and the same state machine stays unit-tested with scripted connectors.
+Without the `screencast` feature (backend-only or `--no-default-features`
+builds), capture reports unavailability and the same state machine stays
+unit-tested with scripted connectors.
 
 ## Virtual displays
 
